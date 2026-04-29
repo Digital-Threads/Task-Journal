@@ -140,7 +140,9 @@ mod tests {
         let b = Event::new("tj-1", EventType::Open, Author::User, Source::Manual, "second".into());
         assert_ne!(a.event_id, b.event_id);
         assert_eq!(a.event_id.len(), 26);
-        assert!(a.event_id <= b.event_id, "ULIDs must be monotonic-ish");
+        // ULID = 48-bit timestamp (10 base32 chars) + 80-bit random (16 base32 chars).
+        // Random portion is independent per call, so only the timestamp prefix is monotonic.
+        assert!(a.event_id[..10] <= b.event_id[..10], "ULID timestamp prefix must be monotonic");
         assert_eq!(a.schema_version, "1.0");
         assert_eq!(a.status, EventStatus::Confirmed);
         chrono::DateTime::parse_from_rfc3339(&a.timestamp).expect("RFC3339");
