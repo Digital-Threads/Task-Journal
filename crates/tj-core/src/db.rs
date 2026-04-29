@@ -57,6 +57,50 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 );
 "#;
 
+use crate::event::{Event, EventType};
+
+pub fn upsert_task_from_event(
+    conn: &Connection,
+    event: &Event,
+    project_hash: &str,
+) -> anyhow::Result<()> {
+    match event.event_type {
+        EventType::Open => {
+            let title = event
+                .meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&event.text)
+                .to_string();
+            conn.execute(
+                "INSERT INTO tasks(task_id, title, status, project_hash, opened_at, last_event_at)
+                 VALUES (?1, ?2, 'open', ?3, ?4, ?4)
+                 ON CONFLICT(task_id) DO UPDATE SET last_event_at = ?4",
+                rusqlite::params![event.task_id, title, project_hash, event.timestamp],
+            )?;
+        }
+        EventType::Close => {
+            conn.execute(
+                "UPDATE tasks SET status='closed', closed_at=?2, last_event_at=?2 WHERE task_id=?1",
+                rusqlite::params![event.task_id, event.timestamp],
+            )?;
+        }
+        EventType::Reopen => {
+            conn.execute(
+                "UPDATE tasks SET status='open', closed_at=NULL, last_event_at=?2 WHERE task_id=?1",
+                rusqlite::params![event.task_id, event.timestamp],
+            )?;
+        }
+        _ => {
+            conn.execute(
+                "UPDATE tasks SET last_event_at=?2 WHERE task_id=?1",
+                rusqlite::params![event.task_id, event.timestamp],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     if let Some(parent) = path.as_ref().parent() {
         std::fs::create_dir_all(parent)
@@ -101,5 +145,30 @@ mod tests {
         let p = d.path().join("state.sqlite");
         let _ = open(&p).unwrap();
         let _ = open(&p).unwrap();
+    }
+
+    #[test]
+    fn upsert_task_from_open_event_inserts_row() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        let mut e = crate::event::Event::new(
+            "tj-7f3a", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli,
+            "Add OAuth".into()
+        );
+        e.meta = serde_json::json!({ "title": "Add OAuth login" });
+
+        upsert_task_from_event(&conn, &e, "abcd1234abcd1234").unwrap();
+
+        let (id, title, status): (String, String, String) = conn.query_row(
+            "SELECT task_id, title, status FROM tasks WHERE task_id = ?1",
+            ["tj-7f3a"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+
+        assert_eq!(id, "tj-7f3a");
+        assert_eq!(title, "Add OAuth login");
+        assert_eq!(status, "open");
     }
 }
