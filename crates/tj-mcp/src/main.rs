@@ -37,6 +37,60 @@ pub struct TaskPackMetadata {
     pub stub: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskSearchParams {
+    pub query: String,
+    pub status: Option<String>,
+    pub project: Option<String>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskSearchResult {
+    pub query: String,
+    pub results: Vec<String>,
+    pub stub: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskCreateParams {
+    pub title: String,
+    pub initial_context: Option<String>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskCreateResult {
+    pub task_id: String,
+    pub title: String,
+    pub stub: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EventAddParams {
+    pub task_id: String,
+    pub event_type: String,
+    pub text: String,
+    pub corrects: Option<String>,
+    pub supersedes: Option<String>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EventAddResult {
+    pub event_id: String,
+    pub task_id: String,
+    pub event_type: String,
+    pub stub: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskCloseParams {
+    pub task_id: String,
+    pub reason: String,
+    pub outcome: Option<String>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskCloseResult {
+    pub task_id: String,
+    pub closed: bool,
+    pub stub: bool,
+}
+
 #[tool_router]
 impl TaskJournalServer {
     #[tool(name = "task_pack", description = "Return a compact resume pack for a task. Pass mode=compact|full.")]
@@ -50,6 +104,55 @@ impl TaskJournalServer {
             schema_version: "1.0".into(),
             text: "[STUB] task_pack not yet implemented (Phase 2)".into(),
             metadata: TaskPackMetadata { stub: true },
+        })
+    }
+
+    #[tool(name = "task_search", description = "Search tasks by query, status, project.")]
+    async fn task_search(
+        &self,
+        Parameters(p): Parameters<TaskSearchParams>,
+    ) -> Json<TaskSearchResult> {
+        Json(TaskSearchResult {
+            query: p.query,
+            results: vec![],
+            stub: true,
+        })
+    }
+
+    #[tool(name = "task_create", description = "Open a new task with title and optional initial context.")]
+    async fn task_create(
+        &self,
+        Parameters(p): Parameters<TaskCreateParams>,
+    ) -> Json<TaskCreateResult> {
+        Json(TaskCreateResult {
+            task_id: format!("tj-stub-{}", &ulid::Ulid::new().to_string()[..6].to_lowercase()),
+            title: p.title,
+            stub: true,
+        })
+    }
+
+    #[tool(name = "event_add", description = "Append a typed event (decision, finding, etc.) to a task.")]
+    async fn event_add(
+        &self,
+        Parameters(p): Parameters<EventAddParams>,
+    ) -> Json<EventAddResult> {
+        Json(EventAddResult {
+            event_id: ulid::Ulid::new().to_string(),
+            task_id: p.task_id,
+            event_type: p.event_type,
+            stub: true,
+        })
+    }
+
+    #[tool(name = "task_close", description = "Close a task with reason and outcome.")]
+    async fn task_close(
+        &self,
+        Parameters(p): Parameters<TaskCloseParams>,
+    ) -> Json<TaskCloseResult> {
+        Json(TaskCloseResult {
+            task_id: p.task_id,
+            closed: true,
+            stub: true,
         })
     }
 }
