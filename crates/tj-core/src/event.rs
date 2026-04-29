@@ -26,6 +26,22 @@ impl EventType {
     ];
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Author { User, Agent, Classifier, Hook }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Source { Chat, Hook, Manual, Cli }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventStatus { Confirmed, Suggested }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStrength { Weak, Medium, Strong }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +60,13 @@ mod tests {
             let back: EventType = serde_json::from_str(&s).unwrap();
             assert_eq!(*ty, back);
         }
+    }
+
+    #[test]
+    fn author_source_status_strength_serialize_snake_case() {
+        assert_eq!(serde_json::to_string(&Author::Classifier).unwrap(), "\"classifier\"");
+        assert_eq!(serde_json::to_string(&Source::Hook).unwrap(), "\"hook\"");
+        assert_eq!(serde_json::to_string(&EventStatus::Suggested).unwrap(), "\"suggested\"");
+        assert_eq!(serde_json::to_string(&EvidenceStrength::Strong).unwrap(), "\"strong\"");
     }
 }
