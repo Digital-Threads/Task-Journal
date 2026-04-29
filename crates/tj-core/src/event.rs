@@ -78,6 +78,34 @@ pub struct Event {
     pub meta: serde_json::Value,
 }
 
+impl Event {
+    pub fn new(
+        task_id: impl Into<String>,
+        event_type: EventType,
+        author: Author,
+        source: Source,
+        text: String,
+    ) -> Self {
+        Event {
+            event_id: ulid::Ulid::new().to_string(),
+            schema_version: "1.0".to_string(),
+            task_id: task_id.into(),
+            event_type,
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            author,
+            source,
+            confidence: None,
+            evidence_strength: None,
+            text,
+            refs: Refs::default(),
+            corrects: None,
+            supersedes: None,
+            status: EventStatus::Confirmed,
+            meta: serde_json::json!({}),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +132,18 @@ mod tests {
         assert_eq!(serde_json::to_string(&Source::Hook).unwrap(), "\"hook\"");
         assert_eq!(serde_json::to_string(&EventStatus::Suggested).unwrap(), "\"suggested\"");
         assert_eq!(serde_json::to_string(&EvidenceStrength::Strong).unwrap(), "\"strong\"");
+    }
+
+    #[test]
+    fn event_new_assigns_ulid_and_now() {
+        let a = Event::new("tj-1", EventType::Open, Author::User, Source::Manual, "first".into());
+        let b = Event::new("tj-1", EventType::Open, Author::User, Source::Manual, "second".into());
+        assert_ne!(a.event_id, b.event_id);
+        assert_eq!(a.event_id.len(), 26);
+        assert!(a.event_id <= b.event_id, "ULIDs must be monotonic-ish");
+        assert_eq!(a.schema_version, "1.0");
+        assert_eq!(a.status, EventStatus::Confirmed);
+        chrono::DateTime::parse_from_rfc3339(&a.timestamp).expect("RFC3339");
     }
 
     #[test]
