@@ -42,6 +42,42 @@ pub enum EventStatus { Confirmed, Suggested }
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceStrength { Weak, Medium, Strong }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Refs {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Event {
+    pub event_id: String,
+    pub schema_version: String,
+    pub task_id: String,
+    #[serde(rename = "type")]
+    pub event_type: EventType,
+    pub timestamp: String,
+    pub author: Author,
+    pub source: Source,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_strength: Option<EvidenceStrength>,
+    pub text: String,
+    #[serde(default)]
+    pub refs: Refs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrects: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    pub status: EventStatus,
+    #[serde(default)]
+    pub meta: serde_json::Value,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +104,36 @@ mod tests {
         assert_eq!(serde_json::to_string(&Source::Hook).unwrap(), "\"hook\"");
         assert_eq!(serde_json::to_string(&EventStatus::Suggested).unwrap(), "\"suggested\"");
         assert_eq!(serde_json::to_string(&EvidenceStrength::Strong).unwrap(), "\"strong\"");
+    }
+
+    #[test]
+    fn event_round_trip_all_fields() {
+        let e = Event {
+            event_id: "01HZX5K8000000000000000000".to_string(),
+            schema_version: "1.0".to_string(),
+            task_id: "tj-7f3a".to_string(),
+            event_type: EventType::Decision,
+            timestamp: "2026-05-14T12:00:00+04:00".to_string(),
+            author: Author::Agent,
+            source: Source::Chat,
+            confidence: Some(0.92),
+            evidence_strength: Some(EvidenceStrength::Strong),
+            text: "Adopt Rust + rmcp.".to_string(),
+            refs: Refs {
+                commits: vec!["a3f2dd".into()],
+                files: vec!["Cargo.toml".into()],
+                events: vec![],
+            },
+            corrects: None,
+            supersedes: None,
+            status: EventStatus::Confirmed,
+            meta: serde_json::json!({}),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let back: Event = serde_json::from_str(&s).unwrap();
+        assert_eq!(e.event_id, back.event_id);
+        assert_eq!(e.event_type, back.event_type);
+        assert_eq!(e.refs.commits, back.refs.commits);
+        assert_eq!(e.confidence, back.confidence);
     }
 }
