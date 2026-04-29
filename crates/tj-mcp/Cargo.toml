@@ -1,0 +1,16 @@
+[package]
+name = "tj-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "task-journal-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tj-core = { path = "../tj-core" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
