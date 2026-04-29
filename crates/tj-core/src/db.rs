@@ -101,6 +101,32 @@ pub fn upsert_task_from_event(
     Ok(())
 }
 
+use std::io::BufRead;
+
+pub fn rebuild_state(
+    conn: &Connection,
+    jsonl_path: impl AsRef<Path>,
+    project_hash: &str,
+) -> anyhow::Result<usize> {
+    let f = std::fs::File::open(&jsonl_path)
+        .with_context(|| format!("open {:?}", jsonl_path.as_ref()))?;
+    let reader = std::io::BufReader::new(f);
+
+    let tx = conn.unchecked_transaction()?;
+    let mut count = 0;
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("read line {i}"))?;
+        if line.trim().is_empty() { continue; }
+        let event: Event = serde_json::from_str(&line)
+            .with_context(|| format!("parse line {i}"))?;
+        upsert_task_from_event(&tx, &event, project_hash)?;
+        index_event(&tx, &event)?;
+        count += 1;
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
 pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     let type_str = serde_json::to_value(event.event_type)?
         .as_str()
@@ -169,6 +195,39 @@ mod tests {
         let p = d.path().join("state.sqlite");
         let _ = open(&p).unwrap();
         let _ = open(&p).unwrap();
+    }
+
+    #[test]
+    fn rebuild_state_reads_jsonl_and_populates_db() {
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let events_path = d.path().join("events.jsonl");
+        let db_path = d.path().join("s.sqlite");
+
+        let mut f = std::fs::File::create(&events_path).unwrap();
+        let mut e1 = crate::event::Event::new(
+            "tj-9", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli,
+            "x".into()
+        );
+        e1.meta = serde_json::json!({"title": "Nine"});
+        let e2 = crate::event::Event::new(
+            "tj-9", crate::event::EventType::Decision,
+            crate::event::Author::Agent, crate::event::Source::Chat,
+            "Adopt Rust".into()
+        );
+        writeln!(f, "{}", serde_json::to_string(&e1).unwrap()).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&e2).unwrap()).unwrap();
+        drop(f);
+
+        let conn = open(&db_path).unwrap();
+        let n = rebuild_state(&conn, &events_path, "deadbeefdeadbeef").unwrap();
+        assert_eq!(n, 2);
+
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM events_index", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]
