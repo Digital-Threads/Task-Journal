@@ -52,6 +52,35 @@ fn events_list_shows_recent_events() {
 }
 
 #[test]
+fn rebuild_state_creates_sqlite_with_one_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["create", "Build it"])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["rebuild-state"])
+        .assert()
+        .success()
+        .stdout(contains("rebuilt"));
+
+    let state_dir = dir.path().join("task-journal").join("state");
+    let mut found = 0;
+    for entry in std::fs::read_dir(&state_dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) == Some("sqlite") {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1);
+            found += 1;
+        }
+    }
+    assert_eq!(found, 1);
+}
+
+#[test]
 fn help_lists_subcommands() {
     Command::cargo_bin("task-journal").unwrap()
         .arg("--help")

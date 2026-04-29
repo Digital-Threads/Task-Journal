@@ -88,7 +88,18 @@ fn main() -> Result<()> {
             }
         },
         Commands::RebuildState => {
-            println!("[stub] would rebuild SQLite from JSONL");
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+
+            if !events_path.exists() {
+                anyhow::bail!("no events file at {events_path:?}");
+            }
+
+            let conn = tj_core::db::open(&state_path)?;
+            let n = tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+            println!("rebuilt {n} events into {state_path:?}");
         }
     }
     Ok(())
