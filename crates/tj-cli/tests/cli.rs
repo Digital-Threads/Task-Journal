@@ -31,6 +31,27 @@ fn create_writes_open_event_to_jsonl() {
 }
 
 #[test]
+fn events_list_shows_recent_events() {
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["create", "First task"])
+        .assert().success();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["create", "Second task"])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["events", "list", "--limit", "10"])
+        .assert()
+        .success()
+        .stdout(contains("First task").and(contains("Second task")));
+}
+
+#[test]
 fn help_lists_subcommands() {
     Command::cargo_bin("task-journal").unwrap()
         .arg("--help")

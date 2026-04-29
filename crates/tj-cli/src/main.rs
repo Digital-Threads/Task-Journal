@@ -65,7 +65,26 @@ fn main() -> Result<()> {
         }
         Commands::Events { action } => match action {
             EventsCmd::List { limit } => {
-                println!("[stub] would list last {limit} events");
+                let cwd = std::env::current_dir()?;
+                let project_hash = tj_core::project_hash::from_path(&cwd)?;
+                let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+                if !events_path.exists() {
+                    println!("(no events yet)");
+                    return Ok(());
+                }
+                let body = std::fs::read_to_string(&events_path)?;
+                let mut events: Vec<tj_core::event::Event> = body.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(serde_json::from_str)
+                    .collect::<Result<_, _>>()?;
+                events.reverse();
+                for e in events.into_iter().take(limit) {
+                    let title = e.meta.get("title")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| e.text.clone());
+                    println!("{}  [{:?}]  {}", e.timestamp, e.event_type, title);
+                }
             }
         },
         Commands::RebuildState => {
