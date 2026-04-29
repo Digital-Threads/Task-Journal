@@ -101,6 +101,30 @@ pub fn upsert_task_from_event(
     Ok(())
 }
 
+pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
+    let type_str = serde_json::to_value(event.event_type)?
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status_str = serde_json::to_value(event.status)?
+        .as_str()
+        .unwrap()
+        .to_string();
+    conn.execute(
+        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            event.event_id, event.task_id, type_str,
+            event.timestamp, event.confidence, status_str
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO search_fts(task_id, event_id, text, type) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![event.task_id, event.event_id, event.text, type_str],
+    )?;
+    Ok(())
+}
+
 pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     if let Some(parent) = path.as_ref().parent() {
         std::fs::create_dir_all(parent)
@@ -145,6 +169,49 @@ mod tests {
         let p = d.path().join("state.sqlite");
         let _ = open(&p).unwrap();
         let _ = open(&p).unwrap();
+    }
+
+    #[test]
+    fn index_event_writes_index_and_fts() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = crate::event::Event::new(
+            "tj-1", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli,
+            "Title".into()
+        );
+        open_e.meta = serde_json::json!({"title": "Title"});
+        upsert_task_from_event(&conn, &open_e, "deadbeefdeadbeef").unwrap();
+        index_event(&conn, &open_e).unwrap();
+
+        let mut decision = crate::event::Event::new(
+            "tj-1", crate::event::EventType::Decision,
+            crate::event::Author::Agent, crate::event::Source::Chat,
+            "Adopt Rust".into()
+        );
+        decision.confidence = Some(0.92);
+        upsert_task_from_event(&conn, &decision, "deadbeefdeadbeef").unwrap();
+        index_event(&conn, &decision).unwrap();
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
+            rusqlite::params!["tj-1"], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(count, 2);
+
+        let mut stmt = conn.prepare(
+            "SELECT event_id FROM search_fts WHERE search_fts MATCH ?1"
+        ).unwrap();
+        let hits: Vec<String> = stmt
+            .query_map(rusqlite::params!["Rust"], |r| {
+                let s: String = r.get(0)?;
+                Ok(s)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0], decision.event_id);
     }
 
     #[test]
