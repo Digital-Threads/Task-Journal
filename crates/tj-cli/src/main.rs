@@ -41,7 +41,27 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Create { title, context } => {
-            println!("[stub] would create task with title={title:?} context={context:?}");
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_dir = tj_core::paths::events_dir()?;
+            let events_path = events_dir.join(format!("{project_hash}.jsonl"));
+            std::fs::create_dir_all(&events_dir)?;
+
+            let task_id = format!("tj-{}", &ulid::Ulid::new().to_string()[..6].to_lowercase());
+            let mut event = tj_core::event::Event::new(
+                task_id.clone(),
+                tj_core::event::EventType::Open,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                context.clone().unwrap_or_else(|| title.clone()),
+            );
+            event.meta = serde_json::json!({ "title": title });
+
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+
+            println!("{}", task_id);
         }
         Commands::Events { action } => match action {
             EventsCmd::List { limit } => {
