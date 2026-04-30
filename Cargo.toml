@@ -26,7 +26,7 @@ schemars = "1.0"
 rmcp = { version = "0.3", features = ["server", "transport-io", "macros", "schemars"] }
 chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 dunce = "1"
 directories = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
