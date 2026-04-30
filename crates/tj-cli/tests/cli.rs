@@ -118,6 +118,185 @@ fn e2e_create_event_close_pack_search() {
 }
 
 #[test]
+fn e2e_hook_simulation_classifies_and_packs_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Stack choice for journal"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--kind", "Stop",
+            "--text", "After review, we adopt Rust because of the single-binary distribution.",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.92",
+        ])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert().success()
+        .stdout(contains("Stack choice for journal")
+            .and(contains("[decision]"))
+            .and(contains("single-binary"))
+            .and(contains("[?]").not()));
+}
+
+#[test]
+fn event_correct_links_to_corrected_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Correct me"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    let bad = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["event", &task_id, "--type", "finding", "--text", "Migration done (wrong)"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event-correct",
+            "--corrects", &bad,
+            "--task", &task_id,
+            "--text", "Migration was NOT done; finding was wrong",
+        ])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert().success()
+        .stdout(contains("Migration was NOT done").and(contains("[correction]")));
+}
+
+#[test]
+fn install_hooks_writes_to_settings_json() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+
+    let settings_path = dir.path().join(".claude").join("settings.json");
+    assert!(settings_path.exists());
+    let content = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(content.contains("UserPromptSubmit"));
+    assert!(content.contains("PostToolUse"));
+    assert!(content.contains("task-journal ingest-hook"));
+}
+
+#[test]
+fn install_hooks_is_idempotent_and_uninstall_works() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("settings.json"),
+        serde_json::json!({"theme": "dark"}).to_string()).unwrap();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+
+    let after_install = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(after_install.contains("\"theme\":\"dark\"") || after_install.contains("\"theme\": \"dark\""), "must preserve unrelated keys");
+    assert!(after_install.contains("UserPromptSubmit"));
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--uninstall"])
+        .assert().success();
+
+    let after_uninstall = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(after_uninstall.contains("\"theme\":\"dark\"") || after_uninstall.contains("\"theme\": \"dark\""), "must still preserve theme");
+    assert!(!after_uninstall.contains("UserPromptSubmit"));
+}
+
+#[test]
+fn ingest_hook_drains_pending_queue_via_mock() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Drain"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("01stuck.json"), serde_json::json!({
+        "text": "We decided to adopt PKCE flow.",
+        "queued_at": "2026-04-30T00:00:00Z"
+    }).to_string()).unwrap();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--kind", "Stop",
+            "--text", "Live chunk",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.95",
+        ])
+        .assert().success();
+
+    let remaining: Vec<_> = std::fs::read_dir(&pending).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+        .collect();
+    assert_eq!(remaining.len(), 0, "pending queue must be empty after successful ingest");
+}
+
+#[test]
+fn ingest_hook_with_mock_writes_classified_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Mock target"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--kind", "Stop",
+            "--text", "We decided to adopt Rust.",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.95",
+        ])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("We decided to adopt Rust.").and(contains("[decision]")));
+}
+
+#[test]
 fn create_back_to_back_yields_distinct_task_ids() {
     let dir = assert_fs::TempDir::new().unwrap();
 
