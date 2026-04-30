@@ -57,6 +57,21 @@ mod tests {
     }
 
     #[test]
+    fn prompt_truncates_event_lines_to_keep_size_bounded() {
+        let input = ClassifyInput {
+            text: "abc".into(),
+            author_hint: "user".into(),
+            recent_tasks: (0..20).map(|i| TaskContext {
+                task_id: format!("tj-{i:03}"),
+                title: format!("Task {i}"),
+                last_events: (0..30).map(|j| format!("[finding] very long evidence text {i}/{j} ").repeat(20)).collect(),
+            }).collect(),
+        };
+        let p = build(&input);
+        assert!(p.len() < 64 * 1024, "prompt must stay under 64KB; got {}", p.len());
+    }
+
+    #[test]
     fn prompt_handles_empty_tasks() {
         let input = ClassifyInput {
             text: "Hello".into(),

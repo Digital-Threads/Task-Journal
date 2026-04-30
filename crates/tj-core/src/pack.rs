@@ -291,6 +291,33 @@ mod tests {
     }
 
     #[test]
+    fn corrected_events_appear_with_correction_event_type() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-co", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Corr"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let bad = Event::new("tj-co", EventType::Finding, Author::Classifier, Source::Hook, "Migration done (wrong)".into());
+        db::upsert_task_from_event(&conn, &bad, "feedface").unwrap();
+        db::index_event(&conn, &bad).unwrap();
+
+        let mut corr = Event::new("tj-co", EventType::Correction, Author::User, Source::Cli, "Migration NOT done; finding was wrong".into());
+        corr.corrects = Some(bad.event_id.clone());
+        db::upsert_task_from_event(&conn, &corr, "feedface").unwrap();
+        db::index_event(&conn, &corr).unwrap();
+
+        let pack = assemble(&conn, "tj-co", PackMode::Full).unwrap();
+        assert!(pack.text.contains("[correction]"));
+        assert!(pack.text.contains("Migration NOT done"));
+    }
+
+    #[test]
     fn suggested_events_get_question_mark_marker_in_pack() {
         use crate::db;
         use crate::event::*;

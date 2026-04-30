@@ -118,6 +118,38 @@ fn e2e_create_event_close_pack_search() {
 }
 
 #[test]
+fn e2e_hook_simulation_classifies_and_packs_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Stack choice for journal"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--kind", "Stop",
+            "--text", "After review, we adopt Rust because of the single-binary distribution.",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.92",
+        ])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert().success()
+        .stdout(contains("Stack choice for journal")
+            .and(contains("[decision]"))
+            .and(contains("single-binary"))
+            .and(contains("[?]").not()));
+}
+
+#[test]
 fn event_correct_links_to_corrected_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
