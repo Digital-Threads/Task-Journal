@@ -219,6 +219,31 @@ mod tests {
     }
 
     #[test]
+    fn cache_is_invalidated_on_new_event() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-inv", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Inv"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let _ = assemble(&conn, "tj-inv", PackMode::Compact).unwrap();
+        let p2 = assemble(&conn, "tj-inv", PackMode::Compact).unwrap();
+        assert!(p2.metadata.cache_hit);
+
+        let dec = Event::new("tj-inv", EventType::Decision, Author::Agent, Source::Chat, "D".into());
+        db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        db::index_event(&conn, &dec).unwrap();
+
+        let p3 = assemble(&conn, "tj-inv", PackMode::Compact).unwrap();
+        assert!(!p3.metadata.cache_hit, "new event must invalidate the cache");
+    }
+
+    #[test]
     fn pack_cache_returns_cached_text_on_second_call() {
         use crate::db;
         use crate::event::*;

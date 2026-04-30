@@ -177,6 +177,12 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         )?;
     }
 
+    // Invalidate any cached pack for this task.
+    conn.execute(
+        "DELETE FROM task_pack_cache WHERE task_id=?1",
+        rusqlite::params![event.task_id],
+    )?;
+
     Ok(())
 }
 
