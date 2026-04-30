@@ -64,7 +64,10 @@ mod tests {
     /// and TASK_JOURNAL_DATA_DIR on every OS. Using a thread-isolated env block since std env
     /// is process-global; one test exercises both vars by serially restoring state.
     #[test]
-    #[cfg_attr(not(unix), ignore = "env semantics differ on Windows test runners; covered by integration tests")]
+    #[cfg_attr(
+        not(unix),
+        ignore = "env semantics differ on Windows test runners; covered by integration tests"
+    )]
     fn env_overrides_take_precedence() {
         // Snapshot existing values (best-effort cleanup).
         let prev_tjdd = std::env::var("TASK_JOURNAL_DATA_DIR").ok();
@@ -73,10 +76,16 @@ mod tests {
         // SAFETY: tests run in a separate process; setting env here is fine.
         unsafe { std::env::remove_var("TASK_JOURNAL_DATA_DIR") };
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/tj-paths-test-xdg") };
-        assert_eq!(data_dir().unwrap(), PathBuf::from("/tmp/tj-paths-test-xdg/task-journal"));
+        assert_eq!(
+            data_dir().unwrap(),
+            PathBuf::from("/tmp/tj-paths-test-xdg/task-journal")
+        );
 
         unsafe { std::env::set_var("TASK_JOURNAL_DATA_DIR", "/tmp/tj-paths-test-explicit") };
-        assert_eq!(data_dir().unwrap(), PathBuf::from("/tmp/tj-paths-test-explicit"));
+        assert_eq!(
+            data_dir().unwrap(),
+            PathBuf::from("/tmp/tj-paths-test-explicit")
+        );
 
         // Restore.
         unsafe { std::env::remove_var("TASK_JOURNAL_DATA_DIR") };
