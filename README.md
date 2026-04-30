@@ -45,9 +45,25 @@ Sample output:
 - 2026-04-30T... [open] Add OAuth login
 ```
 
-## MCP integration with Claude Code
+## Claude Code integration (two paths)
 
-Add to `~/.claude/settings.json`:
+### Path A — Plugin (recommended)
+
+Adds slash-commands like `/task-journal:create` and `/task-journal:pack`, plus declarative hooks for auto-capture, plus the MCP server, all in one install.
+
+```bash
+# In Claude Code (the in-chat slash):
+/plugin install /path/to/this/repo/plugin
+
+# OR (if you have a marketplace):
+/plugin install task-journal@<your-marketplace>
+```
+
+Six slash-commands become available: `/task-journal:create`, `:event`, `:pack`, `:search`, `:close`, `:stats`.
+
+### Path B — Plain MCP (no plugin)
+
+If you don't want slash-commands or auto-capture hooks, just register the MCP server in `~/.claude/settings.json`:
 
 ```json
 {
