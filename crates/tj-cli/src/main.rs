@@ -33,6 +33,36 @@ enum Commands {
         #[arg(long, default_value = "compact")]
         mode: String,
     },
+    /// Append a typed event to a task.
+    Event {
+        task_id: String,
+        /// Event type: hypothesis, finding, evidence, decision, rejection,
+        /// constraint, correction, reopen, supersede, close, redirect.
+        #[arg(long, name = "type")]
+        r#type: String,
+        /// Event text body.
+        #[arg(long)]
+        text: String,
+        /// Optional event id this corrects (for type=correction).
+        #[arg(long)]
+        corrects: Option<String>,
+        /// Optional event id this supersedes (for type=supersede).
+        #[arg(long)]
+        supersedes: Option<String>,
+    },
+    /// Close a task (writes a `close` event).
+    Close {
+        task_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Full-text search across events (FTS5).
+    Search {
+        /// Query string.
+        query: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -130,6 +160,81 @@ fn main() -> Result<()> {
             let n = tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
             println!("rebuilt {n} events into {state_path:?}");
         }
+        Commands::Event { task_id, r#type, text, corrects, supersedes } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            std::fs::create_dir_all(events_path.parent().unwrap())?;
+
+            let event_type = parse_event_type(&r#type)?;
+            let mut event = tj_core::event::Event::new(
+                &task_id, event_type,
+                tj_core::event::Author::User, tj_core::event::Source::Cli,
+                text,
+            );
+            event.corrects = corrects;
+            event.supersedes = supersedes;
+
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+            println!("{}", event.event_id);
+        }
+        Commands::Close { task_id, reason } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+
+            let mut event = tj_core::event::Event::new(
+                &task_id, tj_core::event::EventType::Close,
+                tj_core::event::Author::User, tj_core::event::Source::Cli,
+                reason.clone().unwrap_or_else(|| "(closed)".into()),
+            );
+            if let Some(r) = reason { event.meta = serde_json::json!({"reason": r}); }
+
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+            println!("{}", event.event_id);
+        }
+        Commands::Search { query, limit } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(rusqlite::params![query, limit as i64], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?;
+            for id in ids { println!("{id}"); }
+        }
     }
     Ok(())
+}
+
+fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
+    use tj_core::event::EventType::*;
+    Ok(match s {
+        "open" => Open,
+        "hypothesis" => Hypothesis,
+        "finding" => Finding,
+        "evidence" => Evidence,
+        "decision" => Decision,
+        "rejection" => Rejection,
+        "constraint" => Constraint,
+        "correction" => Correction,
+        "reopen" => Reopen,
+        "supersede" => Supersede,
+        "close" => Close,
+        "redirect" => Redirect,
+        other => anyhow::bail!("unknown event type: {other}"),
+    })
 }

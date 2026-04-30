@@ -1316,7 +1316,6 @@ dependencies = [
  "assert_cmd",
  "assert_fs",
  "clap",
- "directories",
  "predicates",
  "rusqlite",
  "serde_json",
