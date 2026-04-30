@@ -1,0 +1,15 @@
+# P5 task map: plan-task# -> bd-id
+# epic: claude-memory-d36
+
+01  claude-memory-sp6
+02  claude-memory-j3k
+03  claude-memory-4l6
+04  claude-memory-djm
+05  claude-memory-gzl
+06  claude-memory-b7d
+07  claude-memory-2zi
+08  claude-memory-dz1
+09  claude-memory-xrd
+10  claude-memory-7vb
+11  claude-memory-1y3
+12  claude-memory-4ns
