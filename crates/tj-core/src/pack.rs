@@ -24,6 +24,28 @@ pub struct PackMetadata {
 use anyhow::Context;
 use rusqlite::Connection;
 
+fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyhow::Result<String> {
+    let mut out = format!("## Recent events (last {limit})\n");
+    let mut stmt = conn.prepare(
+        "SELECT ei.timestamp, ei.type, sf.text FROM events_index ei
+         LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+         WHERE ei.task_id=?1 ORDER BY ei.timestamp DESC LIMIT ?2"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![task_id, limit as i64], |r| {
+        let ts: String = r.get(0)?;
+        let ty: String = r.get(1)?;
+        let txt: Option<String> = r.get(2)?;
+        Ok((ts, ty, txt.unwrap_or_default()))
+    })?;
+    for row in rows {
+        let (ts, ty, txt) = row?;
+        let one_line = txt.lines().next().unwrap_or("").chars().take(120).collect::<String>();
+        out.push_str(&format!("- {ts} [{ty}] {one_line}\n"));
+    }
+    out.push('\n');
+    Ok(out)
+}
+
 fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Evidence\n");
     let mut stmt = conn.prepare(
@@ -134,6 +156,8 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     text.push_str(&render_active_decisions(conn, task_id)?);
     text.push_str(&render_rejected(conn, task_id)?);
     text.push_str(&render_evidence(conn, task_id)?);
+    let recent_limit = match mode { PackMode::Compact => 3, PackMode::Full => 10 };
+    text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
     Ok(TaskPack {
         task_id: task_id.to_string(),
@@ -156,6 +180,31 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn pack_renders_recent_events_full_mode() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-re", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Recent"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+        for i in 0..6 {
+            let e = Event::new("tj-re", EventType::Hypothesis, Author::Agent, Source::Chat,
+                format!("hypothesis {i}"));
+            db::upsert_task_from_event(&conn, &e, "feedface").unwrap();
+            db::index_event(&conn, &e).unwrap();
+        }
+
+        let pack = assemble(&conn, "tj-re", PackMode::Full).unwrap();
+        assert!(pack.text.contains("## Recent events"));
+        let count = pack.text.matches("[hypothesis]").count();
+        assert!(count >= 5, "expected >=5 hypotheses, got {count} in {}", pack.text);
     }
 
     #[test]
