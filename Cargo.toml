@@ -30,7 +30,10 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+ureq = { version = "2", features = ["json"] }
+
 # Test deps
 assert_fs = "1"
 predicates = "3"
 tempfile = "3"
+mockito = "1"

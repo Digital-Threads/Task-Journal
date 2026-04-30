@@ -16,6 +16,8 @@ sha2 = { workspace = true }
 dunce = { workspace = true }
 directories = { workspace = true }
 rusqlite = { workspace = true }
+ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+mockito = { workspace = true }
