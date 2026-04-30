@@ -24,6 +24,22 @@ pub struct PackMetadata {
 use anyhow::Context;
 use rusqlite::Connection;
 
+fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
+    let mut out = String::from("## Active decisions\n");
+    let mut stmt = conn.prepare(
+        "SELECT text FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id ASC"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
+    let mut count = 0;
+    for row in rows {
+        out.push_str(&format!("- {}\n", row?));
+        count += 1;
+    }
+    if count == 0 { out.push_str("- (none)\n"); }
+    out.push('\n');
+    Ok(out)
+}
+
 fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Lifecycle\n");
     let mut stmt = conn.prepare(
@@ -70,6 +86,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
 
     let mut text = format!("# {title}  [status: {status}]\n\n");
     text.push_str(&render_lifecycle(conn, task_id)?);
+    text.push_str(&render_active_decisions(conn, task_id)?);
 
     Ok(TaskPack {
         task_id: task_id.to_string(),
@@ -92,6 +109,28 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn pack_renders_active_decisions() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-ad", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Decisions test"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let dec = Event::new("tj-ad", EventType::Decision, Author::Agent, Source::Chat, "Adopt Rust".into());
+        db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        db::index_event(&conn, &dec).unwrap();
+
+        let pack = assemble(&conn, "tj-ad", PackMode::Full).unwrap();
+        assert!(pack.text.contains("## Active decisions"), "missing section: {}", pack.text);
+        assert!(pack.text.contains("Adopt Rust"), "decision text missing: {}", pack.text);
     }
 
     #[test]
