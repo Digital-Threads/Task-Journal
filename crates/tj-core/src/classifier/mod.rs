@@ -46,6 +46,7 @@ pub fn decide_status(confidence: f64) -> EventStatus {
 pub mod mock;
 pub mod prompt;
 pub mod http;
+pub mod telemetry;
 
 #[cfg(test)]
 mod tests {

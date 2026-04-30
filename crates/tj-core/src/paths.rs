@@ -19,6 +19,10 @@ pub fn state_dir() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join("state"))
 }
 
+pub fn metrics_dir() -> anyhow::Result<PathBuf> {
+    Ok(data_dir()?.join("metrics"))
+}
+
 pub fn project_storage_dir(project_hash: &str) -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join(project_hash))
 }

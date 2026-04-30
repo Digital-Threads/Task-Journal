@@ -84,6 +84,8 @@ enum Commands {
         #[arg(long)]
         uninstall: bool,
     },
+    /// Show local classifier and journal statistics.
+    Stats,
     /// Hook entry point: ingest a chat chunk through the classifier.
     IngestHook {
         /// Hook kind: UserPromptSubmit | PostToolUse | Stop | SessionStart.
@@ -286,6 +288,40 @@ fn main() -> Result<()> {
             std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
             println!("{}", settings_path.display());
         }
+        Commands::Stats => {
+            let metrics_dir = tj_core::paths::metrics_dir()?;
+            let mut total = 0usize;
+            let mut confirmed = 0usize;
+            let mut suggested = 0usize;
+            let mut errors = 0usize;
+            if metrics_dir.exists() {
+                for entry in std::fs::read_dir(&metrics_dir)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                    let body = std::fs::read_to_string(&path)?;
+                    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                        total += 1;
+                        let v: serde_json::Value = match serde_json::from_str(line) {
+                            Ok(v) => v,
+                            Err(_) => { errors += 1; continue; }
+                        };
+                        match v.get("status").and_then(|s| s.as_str()) {
+                            Some("confirmed") => confirmed += 1,
+                            Some("suggested") => suggested += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            println!("classified: {total}");
+            println!("  confirmed: {confirmed}");
+            println!("  suggested: {suggested}");
+            println!("  parse errors: {errors}");
+            if total > 0 {
+                let ratio = confirmed as f64 / total as f64 * 100.0;
+                println!("  confirmed ratio: {ratio:.1}%");
+            }
+        }
         Commands::IngestHook { kind: _, text, mock_event_type, mock_task_id, mock_confidence } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -340,6 +376,27 @@ fn main() -> Result<()> {
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
+
+            // Append telemetry. Errors here MUST NOT fail the hook (best-effort).
+            let metrics_path = tj_core::paths::metrics_dir()?
+                .join(format!("{project_hash}.jsonl"));
+            let etype_str = serde_json::to_value(&etype)?
+                .as_str().unwrap_or("?").to_string();
+            let status_str = serde_json::to_value(&event.status)?
+                .as_str().unwrap_or("?").to_string();
+            let _ = tj_core::classifier::telemetry::append(
+                &metrics_path,
+                &tj_core::classifier::telemetry::TelemetryRecord {
+                    timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    project_hash: project_hash.clone(),
+                    task_id_guess: Some(task_id.clone()),
+                    event_type: etype_str,
+                    confidence,
+                    status: status_str,
+                    error: None,
+                },
+            );
+
             println!("{}", event.event_id);
         }
         Commands::Search { query, limit, all_projects } => {

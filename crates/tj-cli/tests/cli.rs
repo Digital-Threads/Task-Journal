@@ -296,6 +296,59 @@ fn ingest_hook_drains_pending_queue_via_mock() {
 }
 
 #[test]
+fn stats_command_shows_classifier_counts() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let metrics = dir.path().join("task-journal").join("metrics");
+    std::fs::create_dir_all(&metrics).unwrap();
+    let body = vec![
+        r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"decision","confidence":0.95,"status":"confirmed","error":null}"#,
+        r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"finding","confidence":0.65,"status":"suggested","error":null}"#,
+    ].join("\n");
+    std::fs::write(metrics.join("feedface.jsonl"), body).unwrap();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["stats"])
+        .assert().success()
+        .stdout(contains("classified: 2")
+            .and(contains("confirmed: 1"))
+            .and(contains("suggested: 1")));
+}
+
+#[test]
+fn ingest_hook_writes_telemetry_record() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Tel"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook", "--kind", "Stop", "--text", "decided to use Rust",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.92",
+        ])
+        .assert().success();
+
+    let metrics_dir = dir.path().join("task-journal").join("metrics");
+    let mut total_lines = 0;
+    if metrics_dir.exists() {
+        for entry in std::fs::read_dir(&metrics_dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                total_lines += std::fs::read_to_string(&p).unwrap().lines().count();
+            }
+        }
+    }
+    assert!(total_lines >= 1, "expected at least one telemetry line, got {total_lines}");
+}
+
+#[test]
 fn ingest_hook_with_mock_writes_classified_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
