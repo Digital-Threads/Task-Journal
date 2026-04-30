@@ -50,3 +50,14 @@ The plugin's MCP server exposes 5 tools:
 ## Storage
 
 Events live at `$XDG_DATA_HOME/task-journal/events/<project_hash>.jsonl` (Linux/WSL) or platform-equivalent. SQLite cache in `state/<hash>.sqlite` is rebuildable from JSONL via `task-journal rebuild-state`.
+
+## Auto-capture (optional, requires Anthropic API key)
+
+This plugin does **not** auto-classify chat chunks by default. The optional auto-capture pipeline (UserPromptSubmit/PostToolUse/Stop hooks → Claude Haiku classifier) requires a separate `ANTHROPIC_API_KEY` from console.anthropic.com — **not** the same as a Claude Code Pro/Max subscription. To enable later:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+task-journal install-hooks --scope user
+```
+
+Without auto-capture the user records events manually via slash commands or MCP tools.

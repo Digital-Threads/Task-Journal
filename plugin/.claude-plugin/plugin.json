@@ -12,43 +12,5 @@
     "reasoning",
     "ai-coding",
     "mcp"
-  ],
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "task-journal ingest-hook --kind=UserPromptSubmit --text=\"$CLAUDE_HOOK_TEXT\" || true",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "task-journal ingest-hook --kind=PostToolUse --text=\"$CLAUDE_HOOK_TEXT\" || true",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "task-journal ingest-hook --kind=Stop --text=\"$CLAUDE_HOOK_TEXT\" || true",
-            "timeout": 5
-          }
-        ]
-      }
-    ]
-  }
+  ]
 }
