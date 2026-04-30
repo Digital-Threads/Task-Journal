@@ -3,3 +3,10 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Rust / Cargo
+/target
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+.DS_Store
