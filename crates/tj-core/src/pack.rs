@@ -139,6 +139,29 @@ fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> 
 }
 
 pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Result<TaskPack> {
+    let mode_str = match mode { PackMode::Compact => "compact", PackMode::Full => "full" };
+
+    // Read-through cache: if we have a stored pack with the same mode, return it.
+    let cached: Option<(String, String, i64)> = conn.query_row(
+        "SELECT text, generated_at, source_event_count FROM task_pack_cache
+         WHERE task_id=?1 AND mode=?2",
+        rusqlite::params![task_id, mode_str],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).ok();
+    if let Some((cached_text, cached_at, cached_count)) = cached {
+        return Ok(TaskPack {
+            task_id: task_id.to_string(),
+            mode,
+            schema_version: "1.0".into(),
+            text: cached_text,
+            metadata: PackMetadata {
+                generated_at: cached_at,
+                source_event_count: cached_count as usize,
+                cache_hit: true,
+            },
+        });
+    }
+
     let (title, status): (String, String) = conn.query_row(
         "SELECT title, status FROM tasks WHERE task_id=?1",
         rusqlite::params![task_id],
@@ -163,13 +186,22 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     let recent_limit = match mode { PackMode::Compact => 3, PackMode::Full => 10 };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // Write-through cache: store the pack so the next call hits.
+    conn.execute(
+        "INSERT OR REPLACE INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![task_id, mode_str, text, generated_at, event_count as i64],
+    )?;
+
     Ok(TaskPack {
         task_id: task_id.to_string(),
         mode,
         schema_version: "1.0".into(),
         text,
         metadata: PackMetadata {
-            generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            generated_at,
             source_event_count: event_count,
             cache_hit: false,
         },
@@ -184,6 +216,26 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn pack_cache_returns_cached_text_on_second_call() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-c", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Cache"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let p1 = assemble(&conn, "tj-c", PackMode::Compact).unwrap();
+        assert!(!p1.metadata.cache_hit);
+        let p2 = assemble(&conn, "tj-c", PackMode::Compact).unwrap();
+        assert!(p2.metadata.cache_hit, "second call should hit cache");
+        assert_eq!(p1.text, p2.text);
     }
 
     #[test]
