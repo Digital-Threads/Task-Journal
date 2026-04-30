@@ -7,3 +7,4 @@ pub mod storage;
 pub mod paths;
 pub mod project_hash;
 pub mod db;
+pub mod pack;

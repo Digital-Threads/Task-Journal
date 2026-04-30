@@ -1316,7 +1316,6 @@ dependencies = [
  "assert_cmd",
  "assert_fs",
  "clap",
- "directories",
  "predicates",
  "rusqlite",
  "serde_json",
@@ -1350,6 +1349,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

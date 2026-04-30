@@ -4,6 +4,120 @@ use predicates::prelude::*;
 use predicates::str::contains;
 
 #[test]
+fn pack_command_prints_markdown_for_existing_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Pack me"])
+            .assert().success()
+            .get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("# Pack me"));
+}
+
+#[test]
+fn event_command_appends_decision_visible_in_pack() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "T"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["event", &task_id, "--type", "decision", "--text", "Adopt Rust"])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Adopt Rust"));
+}
+
+#[test]
+fn close_command_marks_task_closed_in_pack() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "T"]).assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", &task_id, "--reason", "shipped"])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert().success()
+        .stdout(contains("status: closed"));
+}
+
+#[test]
+fn search_command_finds_task_by_event_text() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "OAuth thing"]).assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["event", &task_id, "--type", "decision", "--text", "Adopt Rust + rmcp"])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "rmcp"])
+        .assert().success()
+        .stdout(contains(&task_id));
+}
+
+#[test]
+fn e2e_create_event_close_pack_search() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let env = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+
+    let task_id = String::from_utf8(
+        env().args(["create", "Build pack assembler"]).assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    env().args(["event", &task_id, "--type", "hypothesis", "--text", "Use SQLite views"]).assert().success();
+    env().args(["event", &task_id, "--type", "decision", "--text", "Rust + rmcp"]).assert().success();
+    env().args(["event", &task_id, "--type", "rejection", "--text", "Node loses binary"]).assert().success();
+    env().args(["close", &task_id, "--reason", "shipped"]).assert().success();
+
+    env().args(["pack", &task_id, "--mode", "full"])
+        .assert().success()
+        .stdout(contains("Build pack assembler")
+            .and(contains("Rust + rmcp"))
+            .and(contains("Node loses binary"))
+            .and(contains("status: closed")));
+
+    env().args(["search", "rmcp"])
+        .assert().success()
+        .stdout(contains(&task_id));
+}
+
+#[test]
 fn create_back_to_back_yields_distinct_task_ids() {
     let dir = assert_fs::TempDir::new().unwrap();
 
