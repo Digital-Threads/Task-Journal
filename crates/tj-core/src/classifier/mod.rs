@@ -18,7 +18,7 @@ pub struct TaskContext {
     pub last_events: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClassifyOutput {
     pub event_type: EventType,
     pub task_id_guess: Option<String>,
