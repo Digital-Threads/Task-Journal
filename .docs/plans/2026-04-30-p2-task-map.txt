@@ -1,0 +1,26 @@
+# P2 task map: plan-task# -> bd-id
+# epic: claude-memory-d36
+
+01  claude-memory-l27
+02  claude-memory-a90
+03  claude-memory-3vx
+04  claude-memory-9y9
+05  claude-memory-amc
+06  claude-memory-jcd
+07  claude-memory-9wq
+08  claude-memory-ppw
+09  claude-memory-9lm
+10  claude-memory-1yv
+11  claude-memory-x2g
+12  claude-memory-d0h
+13  claude-memory-7gg
+14  claude-memory-lkc
+15  claude-memory-tvp
+16  claude-memory-63v
+17  claude-memory-jza
+18  claude-memory-ufq
+19  claude-memory-f5r
+20  claude-memory-j28
+21  claude-memory-4va
+22  claude-memory-ulb
+23  claude-memory-0gs
