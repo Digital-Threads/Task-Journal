@@ -94,6 +94,11 @@ enum Commands {
         /// The chat chunk text.
         #[arg(long)]
         text: String,
+        /// Classifier backend: "cli" uses `claude -p` (free with your Pro/Max
+        /// subscription) or "api" uses Anthropic API (requires `ANTHROPIC_API_KEY`).
+        /// Default: cli.
+        #[arg(long, default_value = "cli")]
+        backend: String,
         /// Test/dev override: bypass classifier and force this event type. Hidden from --help.
         #[arg(long, hide = true)]
         mock_event_type: Option<String>,
@@ -314,7 +319,9 @@ fn main() -> Result<()> {
                 // Wrap with `|| true` so a failed classifier (network down, rate limit,
                 // missing API key) NEVER breaks Claude Code. Failures land in pending/
                 // and replay on next ingest.
-                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\" || true";
+                // Default to subscription-based classifier (`claude -p`).
+                // Power users with API key can run install-hooks --backend=api below.
+                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\" --backend=cli || true";
                 let entries = serde_json::json!({
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
@@ -367,6 +374,7 @@ fn main() -> Result<()> {
         Commands::IngestHook {
             kind: _,
             text,
+            backend,
             mock_event_type,
             mock_task_id,
             mock_confidence,
@@ -405,7 +413,11 @@ fn main() -> Result<()> {
                 }
 
                 use tj_core::classifier::Classifier;
-                let classifier = tj_core::classifier::http::AnthropicClassifier::from_env()?;
+                let classifier: Box<dyn Classifier> = match backend.as_str() {
+                    "cli" => Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default()),
+                    "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
+                    other => anyhow::bail!("unknown backend: {other} (expected `cli` or `api`)"),
+                };
                 let input = tj_core::classifier::ClassifyInput {
                     text: text.clone(),
                     author_hint: "assistant".into(),

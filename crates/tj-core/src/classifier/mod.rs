@@ -43,6 +43,7 @@ pub fn decide_status(confidence: f64) -> EventStatus {
     }
 }
 
+pub mod cli;
 pub mod http;
 pub mod mock;
 pub mod prompt;
