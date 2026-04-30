@@ -1,7 +1,7 @@
 //! Append-only classifier telemetry: one JSONL line per classification call.
 
-use serde::{Deserialize, Serialize};
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +22,9 @@ pub fn append(metrics_path: impl AsRef<Path>, record: &TelemetryRecord) -> anyho
     let line = serde_json::to_string(record).context("serialize telemetry")?;
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
-        .create(true).append(true).open(&metrics_path)?;
+        .create(true)
+        .append(true)
+        .open(&metrics_path)?;
     writeln!(f, "{line}")?;
     Ok(())
 }
@@ -46,7 +48,11 @@ mod tests {
             status: "confirmed".into(),
             error: None,
         };
-        let r2 = TelemetryRecord { confidence: 0.4, status: "suggested".into(), ..r1.clone() };
+        let r2 = TelemetryRecord {
+            confidence: 0.4,
+            status: "suggested".into(),
+            ..r1.clone()
+        };
         append(&path, &r1).unwrap();
         append(&path, &r2).unwrap();
 

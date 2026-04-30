@@ -1,16 +1,37 @@
 # Task Journal
 
+[![CI](https://github.com/shahinyanm/claude-memory/workflows/CI/badge.svg)](https://github.com/shahinyanm/claude-memory/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Append-only journal for AI-coding tasks. Captures the *reasoning chain* — goals, hypotheses, decisions, rejections, evidence — and renders a compact resume pack on demand so an agent can pick up a 2-week-old task with full context.
 
 **Why:** existing memory tools store sessions, issues, or do flat semantic search. None store the *logical chain* of a single task. After two weeks, the code remains but the *why* is gone. Task Journal fixes that.
 
+> Task Journal is the first plugin in the `claude-memory` marketplace.
+
+## Install
+
+**Option 1 — from crates.io (recommended)**
+
+```bash
+cargo install task-journal-cli task-journal-mcp
+```
+
+**Option 2 — pre-built binary**
+
+Download the right archive for your OS/arch from [GitHub Releases](https://github.com/shahinyanm/claude-memory/releases), unpack, put `task-journal` and `task-journal-mcp` somewhere in your `$PATH`.
+
+**Option 3 — build from source**
+
+```bash
+git clone https://github.com/shahinyanm/claude-memory
+cd claude-memory
+cargo install --path crates/tj-cli --path crates/tj-mcp
+```
+
 ## Quick start
 
 ```bash
-# Build & install
-cargo install --path crates/tj-cli
-cargo install --path crates/tj-mcp
-
 # Open a task
 task-journal create "Add OAuth login"
 # → tj-x9rz1f

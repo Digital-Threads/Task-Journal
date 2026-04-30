@@ -2,10 +2,10 @@
 
 #![deny(rust_2018_idioms)]
 
+pub mod classifier;
+pub mod db;
 pub mod event;
-pub mod storage;
+pub mod pack;
 pub mod paths;
 pub mod project_hash;
-pub mod db;
-pub mod pack;
-pub mod classifier;
+pub mod storage;

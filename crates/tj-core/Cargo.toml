@@ -1,8 +1,19 @@
 [package]
-name = "tj-core"
+name = "task-journal-core"
+description = "Append-only event log + derived SQLite state for task-journal: schema, storage, pack assembler, classifier client."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[lib]
+name = "tj_core"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = { workspace = true }

@@ -12,8 +12,8 @@ pub struct AnthropicClassifier {
 
 impl AnthropicClassifier {
     pub fn from_env() -> anyhow::Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .context("ANTHROPIC_API_KEY env var not set")?;
+        let api_key =
+            std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY env var not set")?;
         Ok(Self {
             api_key,
             model: "claude-haiku-4-5-20251001".into(),
@@ -51,7 +51,10 @@ impl Classifier for AnthropicClassifier {
         let body = MessagesRequest {
             model: &self.model,
             max_tokens: 256,
-            messages: vec![MessageIn { role: "user", content: &prompt }],
+            messages: vec![MessageIn {
+                role: "user",
+                content: &prompt,
+            }],
         };
 
         let url = format!("{}/v1/messages", self.base_url);
@@ -64,14 +67,17 @@ impl Classifier for AnthropicClassifier {
             .into_json()
             .context("decode Anthropic response")?;
 
-        let text = resp.content.iter()
+        let text = resp
+            .content
+            .iter()
             .find(|b| b.kind == "text")
             .map(|b| b.text.clone())
             .ok_or_else(|| anyhow!("no text content in response"))?;
 
         let json_str = text
             .trim()
-            .trim_start_matches("```json").trim_start_matches("```")
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
             .trim_end_matches("```")
             .trim();
         let out: ClassifyOutput = serde_json::from_str(json_str)
@@ -101,7 +107,8 @@ mod tests {
             "stop_reason": "end_turn"
         });
 
-        let mock = server.mock("POST", "/v1/messages")
+        let mock = server
+            .mock("POST", "/v1/messages")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(body.to_string())
@@ -112,11 +119,13 @@ mod tests {
             model: "claude-haiku-4-5-20251001".into(),
             base_url: url,
         };
-        let out = c.classify(&ClassifyInput {
-            text: "We adopted Rust.".into(),
-            author_hint: "assistant".into(),
-            recent_tasks: vec![],
-        }).unwrap();
+        let out = c
+            .classify(&ClassifyInput {
+                text: "We adopted Rust.".into(),
+                author_hint: "assistant".into(),
+                recent_tasks: vec![],
+            })
+            .unwrap();
 
         assert_eq!(out.event_type, EventType::Decision);
         assert_eq!(out.task_id_guess.as_deref(), Some("tj-x"));

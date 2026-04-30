@@ -13,20 +13,24 @@ impl JsonlWriter {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {parent:?}"))?;
+            std::fs::create_dir_all(parent).with_context(|| format!("create dir {parent:?}"))?;
         }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("open {path:?} for append"))?;
-        Ok(Self { path, inner: BufWriter::new(file) })
+        Ok(Self {
+            path,
+            inner: BufWriter::new(file),
+        })
     }
 
     pub fn append(&mut self, event: &Event) -> anyhow::Result<()> {
         let line = serde_json::to_string(event).context("serialize event")?;
-        self.inner.write_all(line.as_bytes()).context("write event line")?;
+        self.inner
+            .write_all(line.as_bytes())
+            .context("write event line")?;
         self.inner.write_all(b"\n").context("write newline")?;
         Ok(())
     }
@@ -35,11 +39,16 @@ impl JsonlWriter {
     /// survive a crash. Call after every batch of appends that must be durable.
     pub fn flush_durable(&mut self) -> anyhow::Result<()> {
         self.inner.flush().context("flush BufWriter")?;
-        self.inner.get_ref().sync_all().context("fsync events file")?;
+        self.inner
+            .get_ref()
+            .sync_all()
+            .context("fsync events file")?;
         Ok(())
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[cfg(test)]
@@ -49,7 +58,13 @@ mod tests {
     use tempfile::TempDir;
 
     fn sample_event(text: &str) -> Event {
-        Event::new("tj-1", EventType::Open, Author::User, Source::Cli, text.into())
+        Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            text.into(),
+        )
     }
 
     #[test]

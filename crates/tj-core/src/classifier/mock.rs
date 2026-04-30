@@ -28,11 +28,13 @@ mod tests {
                 suggested_text: "...".into(),
             },
         };
-        let out = m.classify(&ClassifyInput {
-            text: "ignored".into(),
-            author_hint: "user".into(),
-            recent_tasks: vec![],
-        }).unwrap();
+        let out = m
+            .classify(&ClassifyInput {
+                text: "ignored".into(),
+                author_hint: "user".into(),
+                recent_tasks: vec![],
+            })
+            .unwrap();
         assert_eq!(out.event_type, EventType::Decision);
         assert_eq!(out.confidence, 0.95);
     }

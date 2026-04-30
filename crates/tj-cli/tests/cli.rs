@@ -1,5 +1,4 @@
 use assert_cmd::Command;
-use assert_fs::prelude::*;
 use predicates::prelude::*;
 use predicates::str::contains;
 
@@ -7,14 +6,22 @@ use predicates::str::contains;
 fn pack_command_prints_markdown_for_existing_task() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["create", "Pack me"])
-            .assert().success()
-            .get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["pack", &task_id, "--mode", "compact"])
         .assert()
@@ -26,18 +33,36 @@ fn pack_command_prints_markdown_for_existing_task() {
 fn event_command_appends_decision_visible_in_pack() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["create", "T"])
-            .assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
-        .args(["event", &task_id, "--type", "decision", "--text", "Adopt Rust"])
-        .assert().success();
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt Rust",
+        ])
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["pack", &task_id, "--mode", "full"])
         .assert()
@@ -49,20 +74,33 @@ fn event_command_appends_decision_visible_in_pack() {
 fn close_command_marks_task_closed_in_pack() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
-            .args(["create", "T"]).assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .args(["create", "T"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["close", &task_id, "--reason", "shipped"])
-        .assert().success();
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["pack", &task_id, "--mode", "full"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(contains("status: closed"));
 }
 
@@ -88,10 +126,12 @@ fn search_all_projects_finds_match_in_other_project_hash() {
         tj_core::db::index_event(&conn, &e).unwrap();
     }
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["search", "Marker", "--all-projects"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(contains("aaaa1111").and(contains("bbbb2222")));
 }
 
@@ -99,20 +139,40 @@ fn search_all_projects_finds_match_in_other_project_hash() {
 fn search_command_finds_task_by_event_text() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
-            .args(["create", "OAuth thing"]).assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .args(["create", "OAuth thing"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
-        .args(["event", &task_id, "--type", "decision", "--text", "Adopt Rust + rmcp"])
-        .assert().success();
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt Rust + rmcp",
+        ])
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["search", "rmcp"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(contains(&task_id));
 }
 
@@ -126,23 +186,71 @@ fn e2e_create_event_close_pack_search() {
     };
 
     let task_id = String::from_utf8(
-        env().args(["create", "Build pack assembler"]).assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+        env()
+            .args(["create", "Build pack assembler"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    env().args(["event", &task_id, "--type", "hypothesis", "--text", "Use SQLite views"]).assert().success();
-    env().args(["event", &task_id, "--type", "decision", "--text", "Rust + rmcp"]).assert().success();
-    env().args(["event", &task_id, "--type", "rejection", "--text", "Node loses binary"]).assert().success();
-    env().args(["close", &task_id, "--reason", "shipped"]).assert().success();
+    env()
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "hypothesis",
+            "--text",
+            "Use SQLite views",
+        ])
+        .assert()
+        .success();
+    env()
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Rust + rmcp",
+        ])
+        .assert()
+        .success();
+    env()
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Node loses binary",
+        ])
+        .assert()
+        .success();
+    env()
+        .args(["close", &task_id, "--reason", "shipped"])
+        .assert()
+        .success();
 
-    env().args(["pack", &task_id, "--mode", "full"])
-        .assert().success()
-        .stdout(contains("Build pack assembler")
-            .and(contains("Rust + rmcp"))
-            .and(contains("Node loses binary"))
-            .and(contains("status: closed")));
+    env()
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(
+            contains("Build pack assembler")
+                .and(contains("Rust + rmcp"))
+                .and(contains("Node loses binary"))
+                .and(contains("status: closed")),
+        );
 
-    env().args(["search", "rmcp"])
-        .assert().success()
+    env()
+        .args(["search", "rmcp"])
+        .assert()
+        .success()
         .stdout(contains(&task_id));
 }
 
@@ -150,75 +258,126 @@ fn e2e_create_event_close_pack_search() {
 fn e2e_hook_simulation_classifies_and_packs_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["create", "Stack choice for journal"])
-            .assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args([
             "ingest-hook",
-            "--kind", "Stop",
-            "--text", "After review, we adopt Rust because of the single-binary distribution.",
-            "--mock-event-type", "decision",
-            "--mock-task-id", &task_id,
-            "--mock-confidence", "0.92",
+            "--kind",
+            "Stop",
+            "--text",
+            "After review, we adopt Rust because of the single-binary distribution.",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.92",
         ])
-        .assert().success();
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["pack", &task_id, "--mode", "full"])
-        .assert().success()
-        .stdout(contains("Stack choice for journal")
-            .and(contains("[decision]"))
-            .and(contains("single-binary"))
-            .and(contains("[?]").not()));
+        .assert()
+        .success()
+        .stdout(
+            contains("Stack choice for journal")
+                .and(contains("[decision]"))
+                .and(contains("single-binary"))
+                .and(contains("[?]").not()),
+        );
 }
 
 #[test]
 fn event_correct_links_to_corrected_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["create", "Correct me"])
-            .assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
     let bad = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
-            .args(["event", &task_id, "--type", "finding", "--text", "Migration done (wrong)"])
-            .assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .args([
+                "event",
+                &task_id,
+                "--type",
+                "finding",
+                "--text",
+                "Migration done (wrong)",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args([
             "event-correct",
-            "--corrects", &bad,
-            "--task", &task_id,
-            "--text", "Migration was NOT done; finding was wrong",
+            "--corrects",
+            &bad,
+            "--task",
+            &task_id,
+            "--text",
+            "Migration was NOT done; finding was wrong",
         ])
-        .assert().success();
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["pack", &task_id, "--mode", "full"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(contains("Migration was NOT done").and(contains("[correction]")));
 }
 
 #[test]
 fn install_hooks_command_uses_no_fail_pattern() {
     let dir = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("HOME", dir.path())
         .args(["install-hooks", "--scope", "user"])
-        .assert().success();
+        .assert()
+        .success();
     let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
     assert!(
         s.contains("|| true"),
@@ -229,10 +388,12 @@ fn install_hooks_command_uses_no_fail_pattern() {
 #[test]
 fn install_hooks_writes_to_settings_json() {
     let dir = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("HOME", dir.path())
         .args(["install-hooks", "--scope", "user"])
-        .assert().success();
+        .assert()
+        .success();
 
     let settings_path = dir.path().join(".claude").join("settings.json");
     assert!(settings_path.exists());
@@ -247,29 +408,46 @@ fn install_hooks_is_idempotent_and_uninstall_works() {
     let dir = assert_fs::TempDir::new().unwrap();
     let claude_dir = dir.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
-    std::fs::write(claude_dir.join("settings.json"),
-        serde_json::json!({"theme": "dark"}).to_string()).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::json!({"theme": "dark"}).to_string(),
+    )
+    .unwrap();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("HOME", dir.path())
         .args(["install-hooks", "--scope", "user"])
-        .assert().success();
-    Command::cargo_bin("task-journal").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("HOME", dir.path())
         .args(["install-hooks", "--scope", "user"])
-        .assert().success();
+        .assert()
+        .success();
 
     let after_install = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
-    assert!(after_install.contains("\"theme\":\"dark\"") || after_install.contains("\"theme\": \"dark\""), "must preserve unrelated keys");
+    assert!(
+        after_install.contains("\"theme\":\"dark\"")
+            || after_install.contains("\"theme\": \"dark\""),
+        "must preserve unrelated keys"
+    );
     assert!(after_install.contains("UserPromptSubmit"));
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("HOME", dir.path())
         .args(["install-hooks", "--scope", "user", "--uninstall"])
-        .assert().success();
+        .assert()
+        .success();
 
     let after_uninstall = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
-    assert!(after_uninstall.contains("\"theme\":\"dark\"") || after_uninstall.contains("\"theme\": \"dark\""), "must still preserve theme");
+    assert!(
+        after_uninstall.contains("\"theme\":\"dark\"")
+            || after_uninstall.contains("\"theme\": \"dark\""),
+        "must still preserve theme"
+    );
     assert!(!after_uninstall.contains("UserPromptSubmit"));
 }
 
@@ -277,36 +455,61 @@ fn install_hooks_is_idempotent_and_uninstall_works() {
 fn ingest_hook_drains_pending_queue_via_mock() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["create", "Drain"])
-            .assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
     let pending = dir.path().join("task-journal").join("pending");
     std::fs::create_dir_all(&pending).unwrap();
-    std::fs::write(pending.join("01stuck.json"), serde_json::json!({
-        "text": "We decided to adopt PKCE flow.",
-        "queued_at": "2026-04-30T00:00:00Z"
-    }).to_string()).unwrap();
+    std::fs::write(
+        pending.join("01stuck.json"),
+        serde_json::json!({
+            "text": "We decided to adopt PKCE flow.",
+            "queued_at": "2026-04-30T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args([
             "ingest-hook",
-            "--kind", "Stop",
-            "--text", "Live chunk",
-            "--mock-event-type", "decision",
-            "--mock-task-id", &task_id,
-            "--mock-confidence", "0.95",
+            "--kind",
+            "Stop",
+            "--text",
+            "Live chunk",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.95",
         ])
-        .assert().success();
+        .assert()
+        .success();
 
-    let remaining: Vec<_> = std::fs::read_dir(&pending).unwrap()
+    let remaining: Vec<_> = std::fs::read_dir(&pending)
+        .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
         .collect();
-    assert_eq!(remaining.len(), 0, "pending queue must be empty after successful ingest");
+    assert_eq!(
+        remaining.len(),
+        0,
+        "pending queue must be empty after successful ingest"
+    );
 }
 
 #[test]
@@ -314,40 +517,59 @@ fn stats_command_shows_classifier_counts() {
     let dir = assert_fs::TempDir::new().unwrap();
     let metrics = dir.path().join("task-journal").join("metrics");
     std::fs::create_dir_all(&metrics).unwrap();
-    let body = vec![
-        r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"decision","confidence":0.95,"status":"confirmed","error":null}"#,
-        r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"finding","confidence":0.65,"status":"suggested","error":null}"#,
-    ].join("\n");
+    let body = [r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"decision","confidence":0.95,"status":"confirmed","error":null}"#,
+        r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"finding","confidence":0.65,"status":"suggested","error":null}"#].join("\n");
     std::fs::write(metrics.join("feedface.jsonl"), body).unwrap();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["stats"])
-        .assert().success()
-        .stdout(contains("classified: 2")
-            .and(contains("confirmed: 1"))
-            .and(contains("suggested: 1")));
+        .assert()
+        .success()
+        .stdout(
+            contains("classified: 2")
+                .and(contains("confirmed: 1"))
+                .and(contains("suggested: 1")),
+        );
 }
 
 #[test]
 fn ingest_hook_writes_telemetry_record() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["create", "Tel"])
-            .assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args([
-            "ingest-hook", "--kind", "Stop", "--text", "decided to use Rust",
-            "--mock-event-type", "decision",
-            "--mock-task-id", &task_id,
-            "--mock-confidence", "0.92",
+            "ingest-hook",
+            "--kind",
+            "Stop",
+            "--text",
+            "decided to use Rust",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.92",
         ])
-        .assert().success();
+        .assert()
+        .success();
 
     let metrics_dir = dir.path().join("task-journal").join("metrics");
     let mut total_lines = 0;
@@ -359,32 +581,51 @@ fn ingest_hook_writes_telemetry_record() {
             }
         }
     }
-    assert!(total_lines >= 1, "expected at least one telemetry line, got {total_lines}");
+    assert!(
+        total_lines >= 1,
+        "expected at least one telemetry line, got {total_lines}"
+    );
 }
 
 #[test]
 fn ingest_hook_with_mock_writes_classified_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal").unwrap()
+        Command::cargo_bin("task-journal")
+            .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["create", "Mock target"])
-            .assert().success().get_output().stdout.clone()
-    ).unwrap().trim().to_string();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args([
             "ingest-hook",
-            "--kind", "Stop",
-            "--text", "We decided to adopt Rust.",
-            "--mock-event-type", "decision",
-            "--mock-task-id", &task_id,
-            "--mock-confidence", "0.95",
+            "--kind",
+            "Stop",
+            "--text",
+            "We decided to adopt Rust.",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.95",
         ])
-        .assert().success();
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["pack", &task_id, "--mode", "full"])
         .assert()
@@ -396,14 +637,20 @@ fn ingest_hook_with_mock_writes_classified_event() {
 fn create_back_to_back_yields_distinct_task_ids() {
     let dir = assert_fs::TempDir::new().unwrap();
 
-    let ids: Vec<String> = (0..5).map(|_| {
-        let out = Command::cargo_bin("task-journal").unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .args(["create", "Same title"])
-            .assert().success()
-            .get_output().stdout.clone();
-        String::from_utf8(out).unwrap().trim().to_string()
-    }).collect();
+    let ids: Vec<String> = (0..5)
+        .map(|_| {
+            let out = Command::cargo_bin("task-journal")
+                .unwrap()
+                .env("XDG_DATA_HOME", dir.path())
+                .args(["create", "Same title"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            String::from_utf8(out).unwrap().trim().to_string()
+        })
+        .collect();
 
     let unique: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(unique.len(), 5, "task ids must be unique, got: {ids:?}");
@@ -413,7 +660,8 @@ fn create_back_to_back_yields_distinct_task_ids() {
 fn create_writes_open_event_to_jsonl() {
     let dir = assert_fs::TempDir::new().unwrap();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["create", "Add OAuth login"])
         .assert()
@@ -440,16 +688,21 @@ fn create_writes_open_event_to_jsonl() {
 fn events_list_shows_recent_events() {
     let dir = assert_fs::TempDir::new().unwrap();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["create", "First task"])
-        .assert().success();
-    Command::cargo_bin("task-journal").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["create", "Second task"])
-        .assert().success();
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["events", "list", "--limit", "10"])
         .assert()
@@ -460,12 +713,15 @@ fn events_list_shows_recent_events() {
 #[test]
 fn rebuild_state_creates_sqlite_with_one_task() {
     let dir = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["create", "Build it"])
-        .assert().success();
+        .assert()
+        .success();
 
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args(["rebuild-state"])
         .assert()
@@ -478,7 +734,9 @@ fn rebuild_state_creates_sqlite_with_one_task() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) == Some("sqlite") {
             let conn = rusqlite::Connection::open(&p).unwrap();
-            let n: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(n, 1);
             found += 1;
         }
@@ -488,7 +746,8 @@ fn rebuild_state_creates_sqlite_with_one_task() {
 
 #[test]
 fn ingest_hook_help_hides_mock_flags() {
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .args(["ingest-hook", "--help"])
         .assert()
         .success()
@@ -501,7 +760,8 @@ fn ingest_hook_help_hides_mock_flags() {
 
 #[test]
 fn help_lists_subcommands() {
-    Command::cargo_bin("task-journal").unwrap()
+    Command::cargo_bin("task-journal")
+        .unwrap()
         .arg("--help")
         .assert()
         .success()

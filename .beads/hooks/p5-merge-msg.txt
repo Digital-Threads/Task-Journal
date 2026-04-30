@@ -1,0 +1,13 @@
+Merge feature/p5-claude-plugin: Claude Code plugin wrapper
+
+12 P5 tasks closed under epic claude-memory-d36:
+- plugin/.claude-plugin/plugin.json: name, version, declarative hooks (UserPromptSubmit/PostToolUse/Stop)
+- plugin/.mcp.json: task-journal-mcp via wsl wrapper
+- 6 slash commands: /task-journal:create, :event, :pack, :search, :close, :stats
+- skills/task-journal/SKILL.md: tool-usage guide for the agent
+- README: Path A (plugin) vs Path B (plain MCP)
+
+Plugin = MCP server + slash-commands + skill + auto-capture hooks, all in one /plugin install.
+Plain MCP path still works for users who don't want hooks/slash-commands.
+
+68 tests green. v1 feature complete with plugin wrapper.

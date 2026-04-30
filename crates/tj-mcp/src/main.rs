@@ -3,15 +3,12 @@
 //! Phase 2 wires real implementations into all 5 tools, calling tj-core.
 
 use anyhow::Result;
-use std::future::Future;
 use rmcp::{
-    handler::server::tool::Parameters,
-    handler::server::wrapper::Json,
-    transport::io::stdio,
-    tool, tool_router, tool_handler,
-    ServerHandler, ServiceExt,
+    handler::server::tool::Parameters, handler::server::wrapper::Json, tool, tool_handler,
+    tool_router, transport::io::stdio, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 #[derive(Clone, Default)]
 pub struct TaskJournalServer;
@@ -95,11 +92,18 @@ pub struct TaskCloseResult {
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
     use tj_core::event::EventType::*;
     Ok(match s {
-        "open" => Open, "hypothesis" => Hypothesis, "finding" => Finding,
-        "evidence" => Evidence, "decision" => Decision, "rejection" => Rejection,
-        "constraint" => Constraint, "correction" => Correction,
-        "reopen" => Reopen, "supersede" => Supersede,
-        "close" => Close, "redirect" => Redirect,
+        "open" => Open,
+        "hypothesis" => Hypothesis,
+        "finding" => Finding,
+        "evidence" => Evidence,
+        "decision" => Decision,
+        "rejection" => Rejection,
+        "constraint" => Constraint,
+        "correction" => Correction,
+        "reopen" => Reopen,
+        "supersede" => Supersede,
+        "close" => Close,
+        "redirect" => Redirect,
         other => anyhow::bail!("unknown event type: {other}"),
     })
 }
@@ -114,11 +118,11 @@ fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::Pat
 
 #[tool_router]
 impl TaskJournalServer {
-    #[tool(name = "task_pack", description = "Return a compact resume pack for a task. Pass mode=compact|full.")]
-    async fn task_pack(
-        &self,
-        Parameters(p): Parameters<TaskPackParams>,
-    ) -> Json<TaskPackResult> {
+    #[tool(
+        name = "task_pack",
+        description = "Return a compact resume pack for a task. Pass mode=compact|full."
+    )]
+    async fn task_pack(&self, Parameters(p): Parameters<TaskPackParams>) -> Json<TaskPackResult> {
         let result = (|| -> anyhow::Result<TaskPackResult> {
             let (project_hash, events_path, state_path) = project_paths()?;
             let conn = tj_core::db::open(&state_path)?;
@@ -132,7 +136,10 @@ impl TaskJournalServer {
             let pack = tj_core::pack::assemble(&conn, &p.task_id, pmode)?;
             Ok(TaskPackResult {
                 task_id: pack.task_id,
-                mode: match pack.mode { tj_core::pack::PackMode::Compact => "compact".into(), tj_core::pack::PackMode::Full => "full".into() },
+                mode: match pack.mode {
+                    tj_core::pack::PackMode::Compact => "compact".into(),
+                    tj_core::pack::PackMode::Full => "full".into(),
+                },
                 schema_version: pack.schema_version,
                 text: pack.text,
                 metadata: TaskPackMetadata {
@@ -149,12 +156,19 @@ impl TaskJournalServer {
                 mode: p.mode.unwrap_or_else(|| "compact".into()),
                 schema_version: "1.0".into(),
                 text: format!("[error] {e}"),
-                metadata: TaskPackMetadata { stub: false, source_event_count: None, cache_hit: None },
+                metadata: TaskPackMetadata {
+                    stub: false,
+                    source_event_count: None,
+                    cache_hit: None,
+                },
             }),
         }
     }
 
-    #[tool(name = "task_search", description = "Full-text search tasks by query (FTS5).")]
+    #[tool(
+        name = "task_search",
+        description = "Full-text search tasks by query (FTS5)."
+    )]
     async fn task_search(
         &self,
         Parameters(p): Parameters<TaskSearchParams>,
@@ -166,7 +180,7 @@ impl TaskJournalServer {
                 tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
             }
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT 50"
+                "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT 50",
             )?;
             let ids: Vec<String> = stmt
                 .query_map(rusqlite::params![p.query], |r| r.get::<_, String>(0))?
@@ -180,7 +194,10 @@ impl TaskJournalServer {
         })
     }
 
-    #[tool(name = "task_create", description = "Open a new task with title and optional initial context.")]
+    #[tool(
+        name = "task_create",
+        description = "Open a new task with title and optional initial context."
+    )]
     async fn task_create(
         &self,
         Parameters(p): Parameters<TaskCreateParams>,
@@ -189,7 +206,10 @@ impl TaskJournalServer {
             let (_, events_path, _) = project_paths()?;
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
-            let task_id = format!("tj-{}", &ulid::Ulid::new().to_string()[10..16].to_lowercase());
+            let task_id = format!(
+                "tj-{}",
+                &ulid::Ulid::new().to_string()[10..16].to_lowercase()
+            );
             let mut event = tj_core::event::Event::new(
                 task_id.clone(),
                 tj_core::event::EventType::Open,
@@ -203,26 +223,34 @@ impl TaskJournalServer {
             writer.append(&event)?;
             writer.flush_durable()?;
 
-            Ok(TaskCreateResult { task_id, title: p.title.clone(), stub: false })
+            Ok(TaskCreateResult {
+                task_id,
+                title: p.title.clone(),
+                stub: false,
+            })
         })();
         Json(result.unwrap_or_else(|e| TaskCreateResult {
-            task_id: format!("[error] {e}"), title: p.title, stub: false
+            task_id: format!("[error] {e}"),
+            title: p.title,
+            stub: false,
         }))
     }
 
-    #[tool(name = "event_add", description = "Append a typed event (decision, finding, evidence, rejection, etc.) to a task.")]
-    async fn event_add(
-        &self,
-        Parameters(p): Parameters<EventAddParams>,
-    ) -> Json<EventAddResult> {
+    #[tool(
+        name = "event_add",
+        description = "Append a typed event (decision, finding, evidence, rejection, etc.) to a task."
+    )]
+    async fn event_add(&self, Parameters(p): Parameters<EventAddParams>) -> Json<EventAddResult> {
         let result = (|| -> anyhow::Result<EventAddResult> {
             let (_, events_path, _) = project_paths()?;
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
             let event_type = parse_event_type(&p.event_type)?;
             let mut event = tj_core::event::Event::new(
-                &p.task_id, event_type,
-                tj_core::event::Author::Agent, tj_core::event::Source::Chat,
+                &p.task_id,
+                event_type,
+                tj_core::event::Author::Agent,
+                tj_core::event::Source::Chat,
                 p.text.clone(),
             );
             event.corrects = p.corrects.clone();
@@ -241,11 +269,16 @@ impl TaskJournalServer {
         })();
         Json(result.unwrap_or_else(|e| EventAddResult {
             event_id: format!("[error] {e}"),
-            task_id: p.task_id, event_type: p.event_type, stub: false,
+            task_id: p.task_id,
+            event_type: p.event_type,
+            stub: false,
         }))
     }
 
-    #[tool(name = "task_close", description = "Close a task with reason and outcome.")]
+    #[tool(
+        name = "task_close",
+        description = "Close a task with reason and outcome."
+    )]
     async fn task_close(
         &self,
         Parameters(p): Parameters<TaskCloseParams>,
@@ -253,13 +286,17 @@ impl TaskJournalServer {
         let result = (|| -> anyhow::Result<()> {
             let (_, events_path, _) = project_paths()?;
             let mut event = tj_core::event::Event::new(
-                &p.task_id, tj_core::event::EventType::Close,
-                tj_core::event::Author::Agent, tj_core::event::Source::Chat,
+                &p.task_id,
+                tj_core::event::EventType::Close,
+                tj_core::event::Author::Agent,
+                tj_core::event::Source::Chat,
                 p.reason.clone(),
             );
             let mut meta = serde_json::Map::new();
             meta.insert("reason".into(), serde_json::Value::String(p.reason.clone()));
-            if let Some(o) = &p.outcome { meta.insert("outcome".into(), serde_json::Value::String(o.clone())); }
+            if let Some(o) = &p.outcome {
+                meta.insert("outcome".into(), serde_json::Value::String(o.clone()));
+            }
             event.meta = serde_json::Value::Object(meta);
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
@@ -298,7 +335,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let server = TaskJournalServer::default();
+    let server = TaskJournalServer;
     let (stdin, stdout) = stdio();
     server.serve((stdin, stdout)).await?.waiting().await?;
     Ok(())

@@ -1,8 +1,8 @@
 //! Event classifier: takes a chat chunk + recent task context,
 //! returns suggested event_type + task_id + confidence.
 
-use serde::{Deserialize, Serialize};
 use crate::event::{EventType, EvidenceStrength};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassifyInput {
@@ -43,9 +43,9 @@ pub fn decide_status(confidence: f64) -> EventStatus {
     }
 }
 
+pub mod http;
 pub mod mock;
 pub mod prompt;
-pub mod http;
 pub mod telemetry;
 
 #[cfg(test)]

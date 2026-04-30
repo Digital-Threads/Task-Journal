@@ -6,15 +6,30 @@ pub fn build(input: &ClassifyInput) -> String {
     let recent = if input.recent_tasks.is_empty() {
         "(no active tasks)".to_string()
     } else {
-        input.recent_tasks.iter().take(10).map(|t| {
-            let trimmed_events: Vec<String> = t.last_events.iter().take(3)
-                .map(|s| s.chars().take(120).collect::<String>())
-                .collect();
-            format!("- {} \"{}\": {}",
-                t.task_id, t.title,
-                if trimmed_events.is_empty() { "(no events)".into() } else { trimmed_events.join("; ") }
-            )
-        }).collect::<Vec<_>>().join("\n")
+        input
+            .recent_tasks
+            .iter()
+            .take(10)
+            .map(|t| {
+                let trimmed_events: Vec<String> = t
+                    .last_events
+                    .iter()
+                    .take(3)
+                    .map(|s| s.chars().take(120).collect::<String>())
+                    .collect();
+                format!(
+                    "- {} \"{}\": {}",
+                    t.task_id,
+                    t.title,
+                    if trimmed_events.is_empty() {
+                        "(no events)".into()
+                    } else {
+                        trimmed_events.join("; ")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     format!(
@@ -61,14 +76,22 @@ mod tests {
         let input = ClassifyInput {
             text: "abc".into(),
             author_hint: "user".into(),
-            recent_tasks: (0..20).map(|i| TaskContext {
-                task_id: format!("tj-{i:03}"),
-                title: format!("Task {i}"),
-                last_events: (0..30).map(|j| format!("[finding] very long evidence text {i}/{j} ").repeat(20)).collect(),
-            }).collect(),
+            recent_tasks: (0..20)
+                .map(|i| TaskContext {
+                    task_id: format!("tj-{i:03}"),
+                    title: format!("Task {i}"),
+                    last_events: (0..30)
+                        .map(|j| format!("[finding] very long evidence text {i}/{j} ").repeat(20))
+                        .collect(),
+                })
+                .collect(),
         };
         let p = build(&input);
-        assert!(p.len() < 64 * 1024, "prompt must stay under 64KB; got {}", p.len());
+        assert!(
+            p.len() < 64 * 1024,
+            "prompt must stay under 64KB; got {}",
+            p.len()
+        );
     }
 
     #[test]

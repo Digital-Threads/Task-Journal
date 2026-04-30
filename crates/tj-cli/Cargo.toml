@@ -1,15 +1,22 @@
 [package]
-name = "tj-cli"
+name = "task-journal-cli"
+description = "task-journal: CLI for append-only AI-coding task reasoning chains. Records hypotheses, decisions, rejections, evidence and renders compact resume packs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "task-journal"
 path = "src/main.rs"
 
 [dependencies]
-tj-core = { path = "../tj-core" }
+tj-core = { package = "task-journal-core", version = "0.1.0", path = "../tj-core" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

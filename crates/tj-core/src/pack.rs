@@ -3,7 +3,10 @@
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum PackMode { Compact, Full }
+pub enum PackMode {
+    Compact,
+    Full,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskPack {
@@ -30,7 +33,7 @@ fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyho
     let mut stmt = conn.prepare(
         "SELECT ei.timestamp, ei.type, ei.status, sf.text FROM events_index ei
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.task_id=?1 ORDER BY ei.timestamp DESC LIMIT ?2"
+         WHERE ei.task_id=?1 ORDER BY ei.timestamp DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id, limit as i64], |r| {
         let ts: String = r.get(0)?;
@@ -41,7 +44,13 @@ fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyho
     })?;
     for row in rows {
         let (ts, ty, st, txt) = row?;
-        let one_line = txt.lines().next().unwrap_or("").chars().take(120).collect::<String>();
+        let one_line = txt
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
         let marker = if st == "suggested" { " [?]" } else { "" };
         out.push_str(&format!("- {ts} [{ty}]{marker} {one_line}\n"));
     }
@@ -51,9 +60,8 @@ fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyho
 
 fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Evidence\n");
-    let mut stmt = conn.prepare(
-        "SELECT text, strength FROM evidence WHERE task_id=?1 ORDER BY evidence_id ASC"
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT text, strength FROM evidence WHERE task_id=?1 ORDER BY evidence_id ASC")?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
         let t: String = r.get(0)?;
         let s: String = r.get(1)?;
@@ -65,7 +73,9 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
         out.push_str(&format!("- {t} ({s})\n"));
         count += 1;
     }
-    if count == 0 { out.push_str("- (none)\n"); }
+    if count == 0 {
+        out.push_str("- (none)\n");
+    }
     out.push('\n');
     Ok(out)
 }
@@ -75,11 +85,9 @@ fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut id_stmt = conn.prepare(
         "SELECT event_id FROM events_index
          WHERE task_id=?1 AND type='rejection'
-         ORDER BY timestamp ASC"
+         ORDER BY timestamp ASC",
     )?;
-    let mut text_stmt = conn.prepare(
-        "SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1"
-    )?;
+    let mut text_stmt = conn.prepare("SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1")?;
     let event_ids: Vec<String> = id_stmt
         .query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
@@ -89,7 +97,9 @@ fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
         out.push_str(&format!("- {text}\n"));
         count += 1;
     }
-    if count == 0 { out.push_str("- (none)\n"); }
+    if count == 0 {
+        out.push_str("- (none)\n");
+    }
     out.push('\n');
     Ok(out)
 }
@@ -97,7 +107,7 @@ fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
 fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Active decisions\n");
     let mut stmt = conn.prepare(
-        "SELECT text FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id ASC"
+        "SELECT text FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
     let mut count = 0;
@@ -105,7 +115,9 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
         out.push_str(&format!("- {}\n", row?));
         count += 1;
     }
-    if count == 0 { out.push_str("- (none)\n"); }
+    if count == 0 {
+        out.push_str("- (none)\n");
+    }
     out.push('\n');
     Ok(out)
 }
@@ -115,7 +127,7 @@ fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> 
     let mut stmt = conn.prepare(
         "SELECT timestamp, type FROM events_index
          WHERE task_id=?1 AND type IN ('open','close','reopen','supersede','redirect')
-         ORDER BY timestamp ASC"
+         ORDER BY timestamp ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
         let ts: String = r.get(0)?;
@@ -136,21 +148,28 @@ fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> 
         out.push_str(&format!("- {ts} {verb}\n"));
         count += 1;
     }
-    if count == 0 { out.push_str("- (none)\n"); }
+    if count == 0 {
+        out.push_str("- (none)\n");
+    }
     out.push('\n');
     Ok(out)
 }
 
 pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Result<TaskPack> {
-    let mode_str = match mode { PackMode::Compact => "compact", PackMode::Full => "full" };
+    let mode_str = match mode {
+        PackMode::Compact => "compact",
+        PackMode::Full => "full",
+    };
 
     // Read-through cache: if we have a stored pack with the same mode, return it.
-    let cached: Option<(String, String, i64)> = conn.query_row(
-        "SELECT text, generated_at, source_event_count FROM task_pack_cache
+    let cached: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT text, generated_at, source_event_count FROM task_pack_cache
          WHERE task_id=?1 AND mode=?2",
-        rusqlite::params![task_id, mode_str],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).ok();
+            rusqlite::params![task_id, mode_str],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
     if let Some((cached_text, cached_at, cached_count)) = cached {
         // Detect truncation by re-checking for the marker.
         let was_truncated = cached_text.contains("_(truncated to fit pack budget)_");
@@ -168,11 +187,13 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         });
     }
 
-    let (title, status): (String, String) = conn.query_row(
-        "SELECT title, status FROM tasks WHERE task_id=?1",
-        rusqlite::params![task_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ).with_context(|| format!("task not found: {task_id}"))?;
+    let (title, status): (String, String) = conn
+        .query_row(
+            "SELECT title, status FROM tasks WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .with_context(|| format!("task not found: {task_id}"))?;
 
     let event_count: usize = conn.query_row(
         "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
@@ -189,14 +210,20 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         text.push_str(&render_rejected(conn, task_id)?);
         text.push_str(&render_evidence(conn, task_id)?);
     }
-    let recent_limit = match mode { PackMode::Compact => 3, PackMode::Full => 10 };
+    let recent_limit = match mode {
+        PackMode::Compact => 3,
+        PackMode::Full => 10,
+    };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
     // Token-budget truncation: cap pack size so it always fits an LLM context window.
     const FULL_BUDGET: usize = 10 * 1024;
     const COMPACT_BUDGET: usize = 2 * 1024;
     const TRUNC_MARKER: &str = "\n\n_(truncated to fit pack budget)_\n";
-    let budget = match mode { PackMode::Full => FULL_BUDGET, PackMode::Compact => COMPACT_BUDGET };
+    let budget = match mode {
+        PackMode::Full => FULL_BUDGET,
+        PackMode::Compact => COMPACT_BUDGET,
+    };
     let truncated = text.len() > budget;
     if truncated {
         let cutoff = text[..budget].rfind('\n').unwrap_or(budget);
@@ -245,7 +272,13 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-inv", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-inv",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Inv"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
@@ -254,12 +287,21 @@ mod tests {
         let p2 = assemble(&conn, "tj-inv", PackMode::Compact).unwrap();
         assert!(p2.metadata.cache_hit);
 
-        let dec = Event::new("tj-inv", EventType::Decision, Author::Agent, Source::Chat, "D".into());
+        let dec = Event::new(
+            "tj-inv",
+            EventType::Decision,
+            Author::Agent,
+            Source::Chat,
+            "D".into(),
+        );
         db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
         db::index_event(&conn, &dec).unwrap();
 
         let p3 = assemble(&conn, "tj-inv", PackMode::Compact).unwrap();
-        assert!(!p3.metadata.cache_hit, "new event must invalidate the cache");
+        assert!(
+            !p3.metadata.cache_hit,
+            "new event must invalidate the cache"
+        );
     }
 
     #[test]
@@ -270,7 +312,13 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-c", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-c",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Cache"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
@@ -290,11 +338,23 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-cm", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-cm",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Compact"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
-        let dec = Event::new("tj-cm", EventType::Decision, Author::Agent, Source::Chat, "D1".into());
+        let dec = Event::new(
+            "tj-cm",
+            EventType::Decision,
+            Author::Agent,
+            Source::Chat,
+            "D1".into(),
+        );
         db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
         db::index_event(&conn, &dec).unwrap();
 
@@ -302,9 +362,21 @@ mod tests {
         assert!(pack.text.contains("# Compact"));
         assert!(pack.text.contains("Active decisions"));
         assert!(pack.text.contains("Recent events"));
-        assert!(!pack.text.contains("Lifecycle"), "compact should omit Lifecycle: {}", pack.text);
-        assert!(!pack.text.contains("Rejected"), "compact should omit Rejected: {}", pack.text);
-        assert!(!pack.text.contains("Evidence"), "compact should omit Evidence: {}", pack.text);
+        assert!(
+            !pack.text.contains("Lifecycle"),
+            "compact should omit Lifecycle: {}",
+            pack.text
+        );
+        assert!(
+            !pack.text.contains("Rejected"),
+            "compact should omit Rejected: {}",
+            pack.text
+        );
+        assert!(
+            !pack.text.contains("Evidence"),
+            "compact should omit Evidence: {}",
+            pack.text
+        );
     }
 
     #[test]
@@ -315,18 +387,33 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-big", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-big",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Big"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
         for i in 0..100 {
-            let ev = Event::new("tj-big", EventType::Evidence, Author::Agent, Source::Chat,
-                format!("Evidence #{i}: {}", "lorem ipsum ".repeat(50)));
+            let ev = Event::new(
+                "tj-big",
+                EventType::Evidence,
+                Author::Agent,
+                Source::Chat,
+                format!("Evidence #{i}: {}", "lorem ipsum ".repeat(50)),
+            );
             db::upsert_task_from_event(&conn, &ev, "feedface").unwrap();
             db::index_event(&conn, &ev).unwrap();
         }
         let pack = assemble(&conn, "tj-big", PackMode::Full).unwrap();
-        assert!(pack.text.len() <= 12 * 1024, "pack must stay under ~12KB; got {} bytes", pack.text.len());
+        assert!(
+            pack.text.len() <= 12 * 1024,
+            "pack must stay under ~12KB; got {} bytes",
+            pack.text.len()
+        );
         assert!(pack.metadata.truncated, "metadata.truncated must be true");
         assert!(pack.text.contains("truncated to fit pack budget"));
     }
@@ -339,16 +426,34 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-co", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-co",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Corr"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
 
-        let bad = Event::new("tj-co", EventType::Finding, Author::Classifier, Source::Hook, "Migration done (wrong)".into());
+        let bad = Event::new(
+            "tj-co",
+            EventType::Finding,
+            Author::Classifier,
+            Source::Hook,
+            "Migration done (wrong)".into(),
+        );
         db::upsert_task_from_event(&conn, &bad, "feedface").unwrap();
         db::index_event(&conn, &bad).unwrap();
 
-        let mut corr = Event::new("tj-co", EventType::Correction, Author::User, Source::Cli, "Migration NOT done; finding was wrong".into());
+        let mut corr = Event::new(
+            "tj-co",
+            EventType::Correction,
+            Author::User,
+            Source::Cli,
+            "Migration NOT done; finding was wrong".into(),
+        );
         corr.corrects = Some(bad.event_id.clone());
         db::upsert_task_from_event(&conn, &corr, "feedface").unwrap();
         db::index_event(&conn, &corr).unwrap();
@@ -366,12 +471,24 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-q", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-q",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Q"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
 
-        let mut suggested = Event::new("tj-q", EventType::Decision, Author::Classifier, Source::Hook, "Adopt Rust".into());
+        let mut suggested = Event::new(
+            "tj-q",
+            EventType::Decision,
+            Author::Classifier,
+            Source::Hook,
+            "Adopt Rust".into(),
+        );
         suggested.status = EventStatus::Suggested;
         db::upsert_task_from_event(&conn, &suggested, "feedface").unwrap();
         db::index_event(&conn, &suggested).unwrap();
@@ -393,13 +510,24 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-re", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-re",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Recent"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
         for i in 0..6 {
-            let e = Event::new("tj-re", EventType::Hypothesis, Author::Agent, Source::Chat,
-                format!("hypothesis {i}"));
+            let e = Event::new(
+                "tj-re",
+                EventType::Hypothesis,
+                Author::Agent,
+                Source::Chat,
+                format!("hypothesis {i}"),
+            );
             db::upsert_task_from_event(&conn, &e, "feedface").unwrap();
             db::index_event(&conn, &e).unwrap();
         }
@@ -407,7 +535,11 @@ mod tests {
         let pack = assemble(&conn, "tj-re", PackMode::Full).unwrap();
         assert!(pack.text.contains("## Recent events"));
         let count = pack.text.matches("[hypothesis]").count();
-        assert!(count >= 5, "expected >=5 hypotheses, got {count} in {}", pack.text);
+        assert!(
+            count >= 5,
+            "expected >=5 hypotheses, got {count} in {}",
+            pack.text
+        );
     }
 
     #[test]
@@ -418,13 +550,24 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-ev", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-ev",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Ev"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
 
-        let mut ev = Event::new("tj-ev", EventType::Evidence, Author::Agent, Source::Chat,
-            "Hook startup at 12ms vs 380ms node".into());
+        let mut ev = Event::new(
+            "tj-ev",
+            EventType::Evidence,
+            Author::Agent,
+            Source::Chat,
+            "Hook startup at 12ms vs 380ms node".into(),
+        );
         ev.evidence_strength = Some(EvidenceStrength::Strong);
         db::upsert_task_from_event(&conn, &ev, "feedface").unwrap();
         db::index_event(&conn, &ev).unwrap();
@@ -443,13 +586,24 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-r", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-r",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Rej"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
 
-        let rej = Event::new("tj-r", EventType::Rejection, Author::Agent, Source::Chat,
-            "TypeScript: loses single-binary distribution".into());
+        let rej = Event::new(
+            "tj-r",
+            EventType::Rejection,
+            Author::Agent,
+            Source::Chat,
+            "TypeScript: loses single-binary distribution".into(),
+        );
         db::upsert_task_from_event(&conn, &rej, "feedface").unwrap();
         db::index_event(&conn, &rej).unwrap();
 
@@ -466,18 +620,38 @@ mod tests {
 
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
-        let mut open_e = Event::new("tj-ad", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-ad",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Decisions test"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
 
-        let dec = Event::new("tj-ad", EventType::Decision, Author::Agent, Source::Chat, "Adopt Rust".into());
+        let dec = Event::new(
+            "tj-ad",
+            EventType::Decision,
+            Author::Agent,
+            Source::Chat,
+            "Adopt Rust".into(),
+        );
         db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
         db::index_event(&conn, &dec).unwrap();
 
         let pack = assemble(&conn, "tj-ad", PackMode::Full).unwrap();
-        assert!(pack.text.contains("## Active decisions"), "missing section: {}", pack.text);
-        assert!(pack.text.contains("Adopt Rust"), "decision text missing: {}", pack.text);
+        assert!(
+            pack.text.contains("## Active decisions"),
+            "missing section: {}",
+            pack.text
+        );
+        assert!(
+            pack.text.contains("Adopt Rust"),
+            "decision text missing: {}",
+            pack.text
+        );
     }
 
     #[test]
@@ -489,12 +663,24 @@ mod tests {
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
 
-        let mut open_e = Event::new("tj-l", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-l",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Lifecycle"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
 
-        let close_e = Event::new("tj-l", EventType::Close, Author::User, Source::Cli, "done".into());
+        let close_e = Event::new(
+            "tj-l",
+            EventType::Close,
+            Author::User,
+            Source::Cli,
+            "done".into(),
+        );
         db::upsert_task_from_event(&conn, &close_e, "feedface").unwrap();
         db::index_event(&conn, &close_e).unwrap();
 
@@ -513,14 +699,28 @@ mod tests {
         let d = TempDir::new().unwrap();
         let conn = db::open(d.path().join("s.sqlite")).unwrap();
 
-        let mut open_e = Event::new("tj-h", EventType::Open, Author::User, Source::Cli, "x".into());
+        let mut open_e = Event::new(
+            "tj-h",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
         open_e.meta = serde_json::json!({"title": "Header test"});
         db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         db::index_event(&conn, &open_e).unwrap();
 
         let pack = assemble(&conn, "tj-h", PackMode::Compact).unwrap();
-        assert!(pack.text.contains("# Header test"), "header missing: {}", pack.text);
-        assert!(pack.text.contains("status: open"), "status missing: {}", pack.text);
+        assert!(
+            pack.text.contains("# Header test"),
+            "header missing: {}",
+            pack.text
+        );
+        assert!(
+            pack.text.contains("status: open"),
+            "status missing: {}",
+            pack.text
+        );
         assert_eq!(pack.metadata.source_event_count, 1);
         assert!(!pack.metadata.cache_hit);
     }

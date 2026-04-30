@@ -1739,6 +1739,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "task-journal-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "assert_fs",
+ "chrono",
+ "clap",
+ "predicates",
+ "rusqlite",
+ "serde_json",
+ "task-journal-core",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
+name = "task-journal-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "directories",
+ "dunce",
+ "mockito",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "ulid",
+ "ureq",
+]
+
+[[package]]
+name = "task-journal-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmcp",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "task-journal-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1814,61 +1869,6 @@ checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
 dependencies = [
  "displaydoc",
  "zerovec",
-]
-
-[[package]]
-name = "tj-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "assert_fs",
- "chrono",
- "clap",
- "predicates",
- "rusqlite",
- "serde_json",
- "tj-core",
- "tracing",
- "tracing-subscriber",
- "ulid",
-]
-
-[[package]]
-name = "tj-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "directories",
- "dunce",
- "mockito",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "ulid",
- "ureq",
-]
-
-[[package]]
-name = "tj-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rmcp",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "tj-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ulid",
 ]
 
 [[package]]

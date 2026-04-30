@@ -11,6 +11,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT"
+authors = ["Mher Shahinyan"]
+repository = "https://github.com/shahinyanm/claude-memory"
+homepage = "https://github.com/shahinyanm/claude-memory"
+keywords = ["task-journal", "ai-coding", "mcp", "memory", "agent"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 anyhow = "1"

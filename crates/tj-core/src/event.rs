@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -20,27 +20,53 @@ pub enum EventType {
 
 impl EventType {
     pub const ALL: &'static [Self] = &[
-        Self::Open, Self::Hypothesis, Self::Finding, Self::Evidence,
-        Self::Decision, Self::Rejection, Self::Constraint, Self::Correction,
-        Self::Reopen, Self::Supersede, Self::Close, Self::Redirect,
+        Self::Open,
+        Self::Hypothesis,
+        Self::Finding,
+        Self::Evidence,
+        Self::Decision,
+        Self::Rejection,
+        Self::Constraint,
+        Self::Correction,
+        Self::Reopen,
+        Self::Supersede,
+        Self::Close,
+        Self::Redirect,
     ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Author { User, Agent, Classifier, Hook }
+pub enum Author {
+    User,
+    Agent,
+    Classifier,
+    Hook,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Source { Chat, Hook, Manual, Cli }
+pub enum Source {
+    Chat,
+    Hook,
+    Manual,
+    Cli,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum EventStatus { Confirmed, Suggested }
+pub enum EventStatus {
+    Confirmed,
+    Suggested,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum EvidenceStrength { Weak, Medium, Strong }
+pub enum EvidenceStrength {
+    Weak,
+    Medium,
+    Strong,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Refs {
@@ -128,21 +154,45 @@ mod tests {
 
     #[test]
     fn author_source_status_strength_serialize_snake_case() {
-        assert_eq!(serde_json::to_string(&Author::Classifier).unwrap(), "\"classifier\"");
+        assert_eq!(
+            serde_json::to_string(&Author::Classifier).unwrap(),
+            "\"classifier\""
+        );
         assert_eq!(serde_json::to_string(&Source::Hook).unwrap(), "\"hook\"");
-        assert_eq!(serde_json::to_string(&EventStatus::Suggested).unwrap(), "\"suggested\"");
-        assert_eq!(serde_json::to_string(&EvidenceStrength::Strong).unwrap(), "\"strong\"");
+        assert_eq!(
+            serde_json::to_string(&EventStatus::Suggested).unwrap(),
+            "\"suggested\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvidenceStrength::Strong).unwrap(),
+            "\"strong\""
+        );
     }
 
     #[test]
     fn event_new_assigns_ulid_and_now() {
-        let a = Event::new("tj-1", EventType::Open, Author::User, Source::Manual, "first".into());
-        let b = Event::new("tj-1", EventType::Open, Author::User, Source::Manual, "second".into());
+        let a = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Manual,
+            "first".into(),
+        );
+        let b = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Manual,
+            "second".into(),
+        );
         assert_ne!(a.event_id, b.event_id);
         assert_eq!(a.event_id.len(), 26);
         // ULID = 48-bit timestamp (10 base32 chars) + 80-bit random (16 base32 chars).
         // Random portion is independent per call, so only the timestamp prefix is monotonic.
-        assert!(a.event_id[..10] <= b.event_id[..10], "ULID timestamp prefix must be monotonic");
+        assert!(
+            a.event_id[..10] <= b.event_id[..10],
+            "ULID timestamp prefix must be monotonic"
+        );
         assert_eq!(a.schema_version, "1.0");
         assert_eq!(a.status, EventStatus::Confirmed);
         chrono::DateTime::parse_from_rfc3339(&a.timestamp).expect("RFC3339");

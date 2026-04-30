@@ -1,15 +1,22 @@
 [package]
-name = "tj-mcp"
+name = "task-journal-mcp"
+description = "MCP server for task-journal: exposes task_pack, task_create, event_add, task_close, task_search to Claude Code and other MCP-compatible agents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "task-journal-mcp"
 path = "src/main.rs"
 
 [dependencies]
-tj-core = { path = "../tj-core" }
+tj-core = { package = "task-journal-core", version = "0.1.0", path = "../tj-core" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

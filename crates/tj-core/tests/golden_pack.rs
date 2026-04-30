@@ -1,10 +1,10 @@
 //! Curated event sequences → expected pack output. Updates require
 //! deliberate review (these protect the user-facing contract).
 
+use tempfile::TempDir;
 use tj_core::db;
 use tj_core::event::{Author, Event, EventType, EvidenceStrength, Source};
 use tj_core::pack::{assemble, PackMode};
-use tempfile::TempDir;
 
 #[test]
 fn fixture_a_compact_pack_for_simple_task() {
@@ -29,15 +29,45 @@ fn fixture_a_compact_pack_for_simple_task() {
 
 fn build_fixture_a() -> Vec<Event> {
     let mut events = Vec::new();
-    let mut open_e = Event::new("tj-fa", EventType::Open, Author::User, Source::Cli, "Add OAuth login".into());
+    let mut open_e = Event::new(
+        "tj-fa",
+        EventType::Open,
+        Author::User,
+        Source::Cli,
+        "Add OAuth login".into(),
+    );
     open_e.meta = serde_json::json!({"title": "Add OAuth login"});
     events.push(open_e);
-    events.push(Event::new("tj-fa", EventType::Hypothesis, Author::Agent, Source::Chat, "PKCE vs implicit grant".into()));
-    let mut ev = Event::new("tj-fa", EventType::Evidence, Author::Agent, Source::Chat, "OAuth 2.1 deprecates implicit".into());
+    events.push(Event::new(
+        "tj-fa",
+        EventType::Hypothesis,
+        Author::Agent,
+        Source::Chat,
+        "PKCE vs implicit grant".into(),
+    ));
+    let mut ev = Event::new(
+        "tj-fa",
+        EventType::Evidence,
+        Author::Agent,
+        Source::Chat,
+        "OAuth 2.1 deprecates implicit".into(),
+    );
     ev.evidence_strength = Some(EvidenceStrength::Strong);
     events.push(ev);
-    events.push(Event::new("tj-fa", EventType::Decision, Author::Agent, Source::Chat, "Adopt PKCE flow".into()));
-    events.push(Event::new("tj-fa", EventType::Rejection, Author::Agent, Source::Chat, "Implicit grant: deprecated, no refresh".into()));
+    events.push(Event::new(
+        "tj-fa",
+        EventType::Decision,
+        Author::Agent,
+        Source::Chat,
+        "Adopt PKCE flow".into(),
+    ));
+    events.push(Event::new(
+        "tj-fa",
+        EventType::Rejection,
+        Author::Agent,
+        Source::Chat,
+        "Implicit grant: deprecated, no refresh".into(),
+    ));
     events
 }
 
@@ -81,33 +111,108 @@ fn fixture_b_full_pack_with_supersede_and_correction() {
 
 fn build_fixture_b() -> Vec<Event> {
     let mut events = Vec::new();
-    let mut open_e = Event::new("tj-fb", EventType::Open, Author::User, Source::Cli, "Stack choice".into());
+    let mut open_e = Event::new(
+        "tj-fb",
+        EventType::Open,
+        Author::User,
+        Source::Cli,
+        "Stack choice".into(),
+    );
     open_e.meta = serde_json::json!({"title": "Stack choice for journal"});
     events.push(open_e);
-    events.push(Event::new("tj-fb", EventType::Hypothesis, Author::Agent, Source::Chat, "TS vs Rust".into()));
-    events.push(Event::new("tj-fb", EventType::Constraint, Author::User, Source::Chat, "Single static binary".into()));
-    let mut ev1 = Event::new("tj-fb", EventType::Evidence, Author::Agent, Source::Chat, "Hook startup 380ms node, 12ms rust".into());
+    events.push(Event::new(
+        "tj-fb",
+        EventType::Hypothesis,
+        Author::Agent,
+        Source::Chat,
+        "TS vs Rust".into(),
+    ));
+    events.push(Event::new(
+        "tj-fb",
+        EventType::Constraint,
+        Author::User,
+        Source::Chat,
+        "Single static binary".into(),
+    ));
+    let mut ev1 = Event::new(
+        "tj-fb",
+        EventType::Evidence,
+        Author::Agent,
+        Source::Chat,
+        "Hook startup 380ms node, 12ms rust".into(),
+    );
     ev1.evidence_strength = Some(EvidenceStrength::Strong);
     events.push(ev1);
-    let ts_dec = Event::new("tj-fb", EventType::Decision, Author::Agent, Source::Chat, "Adopt TypeScript".into());
+    let ts_dec = Event::new(
+        "tj-fb",
+        EventType::Decision,
+        Author::Agent,
+        Source::Chat,
+        "Adopt TypeScript".into(),
+    );
     let ts_dec_id = ts_dec.event_id.clone();
     events.push(ts_dec);
-    let mut sup = Event::new("tj-fb", EventType::Supersede, Author::Agent, Source::Chat, "TS decision replaced".into());
+    let mut sup = Event::new(
+        "tj-fb",
+        EventType::Supersede,
+        Author::Agent,
+        Source::Chat,
+        "TS decision replaced".into(),
+    );
     sup.supersedes = Some(ts_dec_id);
     events.push(sup);
-    events.push(Event::new("tj-fb", EventType::Decision, Author::Agent, Source::Chat, "Adopt Rust".into()));
-    events.push(Event::new("tj-fb", EventType::Rejection, Author::Agent, Source::Chat, "TypeScript: loses single-binary distribution".into()));
-    let mistake = Event::new("tj-fb", EventType::Finding, Author::Classifier, Source::Hook, "Migration looks complete (was wrong)".into());
+    events.push(Event::new(
+        "tj-fb",
+        EventType::Decision,
+        Author::Agent,
+        Source::Chat,
+        "Adopt Rust".into(),
+    ));
+    events.push(Event::new(
+        "tj-fb",
+        EventType::Rejection,
+        Author::Agent,
+        Source::Chat,
+        "TypeScript: loses single-binary distribution".into(),
+    ));
+    let mistake = Event::new(
+        "tj-fb",
+        EventType::Finding,
+        Author::Classifier,
+        Source::Hook,
+        "Migration looks complete (was wrong)".into(),
+    );
     let mistake_id = mistake.event_id.clone();
     events.push(mistake);
-    let mut corr = Event::new("tj-fb", EventType::Correction, Author::User, Source::Cli, "Migration was NOT complete; reverted finding".into());
+    let mut corr = Event::new(
+        "tj-fb",
+        EventType::Correction,
+        Author::User,
+        Source::Cli,
+        "Migration was NOT complete; reverted finding".into(),
+    );
     corr.corrects = Some(mistake_id);
     events.push(corr);
-    events.push(Event::new("tj-fb", EventType::Finding, Author::Agent, Source::Chat, "Migration completed for real after fix".into()));
-    events.push(Event::new("tj-fb", EventType::Close, Author::User, Source::Cli, "Done".into()));
+    events.push(Event::new(
+        "tj-fb",
+        EventType::Finding,
+        Author::Agent,
+        Source::Chat,
+        "Migration completed for real after fix".into(),
+    ));
+    events.push(Event::new(
+        "tj-fb",
+        EventType::Close,
+        Author::User,
+        Source::Cli,
+        "Done".into(),
+    ));
     events
 }
 
 fn insta_assert_contains(haystack: &str, needle: &str) {
-    assert!(haystack.contains(needle), "missing {needle:?} in:\n{haystack}");
+    assert!(
+        haystack.contains(needle),
+        "missing {needle:?} in:\n{haystack}"
+    );
 }

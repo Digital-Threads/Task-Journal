@@ -105,7 +105,9 @@ use std::io::BufRead;
 
 pub fn list_all_projects(state_dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
     let dir = state_dir.as_ref();
-    if !dir.exists() { return Ok(vec![]); }
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -132,9 +134,11 @@ pub fn rebuild_state(
     let mut count = 0;
     for (i, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("read line {i}"))?;
-        if line.trim().is_empty() { continue; }
-        let event: Event = serde_json::from_str(&line)
-            .with_context(|| format!("parse line {i}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Event =
+            serde_json::from_str(&line).with_context(|| format!("parse line {i}"))?;
         upsert_task_from_event(&tx, &event, project_hash)?;
         index_event(&tx, &event)?;
         count += 1;
@@ -188,8 +192,15 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     }
 
     if event.event_type == EventType::Evidence {
-        let strength_str = event.evidence_strength
-            .map(|s| serde_json::to_value(s).unwrap().as_str().unwrap().to_string())
+        let strength_str = event
+            .evidence_strength
+            .map(|s| {
+                serde_json::to_value(s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .unwrap_or_else(|| "medium".into());
         conn.execute(
             "INSERT OR REPLACE INTO evidence(evidence_id, task_id, text, strength)
@@ -209,13 +220,13 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
 
 pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     if let Some(parent) = path.as_ref().parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create dir {parent:?}"))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create dir {parent:?}"))?;
     }
-    let conn = Connection::open(&path)
-        .with_context(|| format!("open SQLite at {:?}", path.as_ref()))?;
+    let conn =
+        Connection::open(&path).with_context(|| format!("open SQLite at {:?}", path.as_ref()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-    conn.execute_batch(MIGRATION_001).context("apply migration 001")?;
+    conn.execute_batch(MIGRATION_001)
+        .context("apply migration 001")?;
     Ok(conn)
 }
 
@@ -239,9 +250,17 @@ mod tests {
             .unwrap();
 
         for required in [
-            "decisions", "events_index", "evidence", "task_pack_cache", "tasks", "search_fts"
+            "decisions",
+            "events_index",
+            "evidence",
+            "task_pack_cache",
+            "tasks",
+            "search_fts",
         ] {
-            assert!(names.iter().any(|n| n == required), "missing table {required}, have {names:?}");
+            assert!(
+                names.iter().any(|n| n == required),
+                "missing table {required}, have {names:?}"
+            );
         }
     }
 
@@ -258,27 +277,34 @@ mod tests {
         let d = TempDir::new().unwrap();
         let conn = open(d.path().join("s.sqlite")).unwrap();
         let mut open_e = crate::event::Event::new(
-            "tj-e", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+            "tj-e",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "x".into(),
         );
         open_e.meta = serde_json::json!({"title": "T"});
         upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         index_event(&conn, &open_e).unwrap();
 
         let mut ev = crate::event::Event::new(
-            "tj-e", crate::event::EventType::Evidence,
-            crate::event::Author::Agent, crate::event::Source::Chat,
-            "Hook startup measured at 12ms".into()
+            "tj-e",
+            crate::event::EventType::Evidence,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Hook startup measured at 12ms".into(),
         );
         ev.evidence_strength = Some(crate::event::EvidenceStrength::Strong);
         upsert_task_from_event(&conn, &ev, "feedface").unwrap();
         index_event(&conn, &ev).unwrap();
 
-        let (text, strength): (String, String) = conn.query_row(
-            "SELECT text, strength FROM evidence WHERE task_id=?1",
-            rusqlite::params!["tj-e"],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (text, strength): (String, String) = conn
+            .query_row(
+                "SELECT text, strength FROM evidence WHERE task_id=?1",
+                rusqlite::params!["tj-e"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert!(text.contains("12ms"));
         assert_eq!(strength, "strong");
     }
@@ -288,35 +314,44 @@ mod tests {
         let d = TempDir::new().unwrap();
         let conn = open(d.path().join("s.sqlite")).unwrap();
         let mut open_e = crate::event::Event::new(
-            "tj-s", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+            "tj-s",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "x".into(),
         );
         open_e.meta = serde_json::json!({"title": "T"});
         upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         index_event(&conn, &open_e).unwrap();
 
         let dec = crate::event::Event::new(
-            "tj-s", crate::event::EventType::Decision,
-            crate::event::Author::Agent, crate::event::Source::Chat,
-            "Use TS".into()
+            "tj-s",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Use TS".into(),
         );
         upsert_task_from_event(&conn, &dec, "feedface").unwrap();
         index_event(&conn, &dec).unwrap();
 
         let mut sup = crate::event::Event::new(
-            "tj-s", crate::event::EventType::Supersede,
-            crate::event::Author::Agent, crate::event::Source::Chat,
-            "Replaced by Rust decision".into()
+            "tj-s",
+            crate::event::EventType::Supersede,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Replaced by Rust decision".into(),
         );
         sup.supersedes = Some(dec.event_id.clone());
         upsert_task_from_event(&conn, &sup, "feedface").unwrap();
         index_event(&conn, &sup).unwrap();
 
-        let (status, by): (String, Option<String>) = conn.query_row(
-            "SELECT status, superseded_by FROM decisions WHERE decision_id=?1",
-            rusqlite::params![dec.event_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (status, by): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by FROM decisions WHERE decision_id=?1",
+                rusqlite::params![dec.event_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(status, "superseded");
         assert_eq!(by.as_deref(), Some(sup.event_id.as_str()));
     }
@@ -327,26 +362,33 @@ mod tests {
         let conn = open(d.path().join("s.sqlite")).unwrap();
 
         let mut open_e = crate::event::Event::new(
-            "tj-d", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+            "tj-d",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "x".into(),
         );
         open_e.meta = serde_json::json!({"title": "T"});
         upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
         index_event(&conn, &open_e).unwrap();
 
         let dec = crate::event::Event::new(
-            "tj-d", crate::event::EventType::Decision,
-            crate::event::Author::Agent, crate::event::Source::Chat,
-            "Adopt Rust".into()
+            "tj-d",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Adopt Rust".into(),
         );
         upsert_task_from_event(&conn, &dec, "feedface").unwrap();
         index_event(&conn, &dec).unwrap();
 
-        let (id, text, status): (String, String, String) = conn.query_row(
-            "SELECT decision_id, text, status FROM decisions WHERE task_id=?1",
-            rusqlite::params!["tj-d"],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+        let (id, text, status): (String, String, String) = conn
+            .query_row(
+                "SELECT decision_id, text, status FROM decisions WHERE task_id=?1",
+                rusqlite::params!["tj-d"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(id, dec.event_id);
         assert_eq!(text, "Adopt Rust");
         assert_eq!(status, "active");
@@ -357,8 +399,11 @@ mod tests {
         let d = TempDir::new().unwrap();
         let conn = open(d.path().join("s.sqlite")).unwrap();
         let mut open_e = crate::event::Event::new(
-            "tj-id", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+            "tj-id",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "x".into(),
         );
         open_e.meta = serde_json::json!({"title": "Idempotent"});
         upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
@@ -368,10 +413,13 @@ mod tests {
         index_event(&conn, &open_e).unwrap();
         index_event(&conn, &open_e).unwrap();
 
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM search_fts WHERE event_id=?1",
-            rusqlite::params![open_e.event_id], |r| r.get(0),
-        ).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM search_fts WHERE event_id=?1",
+                rusqlite::params![open_e.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 1, "search_fts must hold exactly one row per event_id");
     }
 
@@ -399,15 +447,19 @@ mod tests {
 
         let mut f = std::fs::File::create(&events_path).unwrap();
         let mut e1 = crate::event::Event::new(
-            "tj-9", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli,
-            "x".into()
+            "tj-9",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "x".into(),
         );
         e1.meta = serde_json::json!({"title": "Nine"});
         let e2 = crate::event::Event::new(
-            "tj-9", crate::event::EventType::Decision,
-            crate::event::Author::Agent, crate::event::Source::Chat,
-            "Adopt Rust".into()
+            "tj-9",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Adopt Rust".into(),
         );
         writeln!(f, "{}", serde_json::to_string(&e1).unwrap()).unwrap();
         writeln!(f, "{}", serde_json::to_string(&e2).unwrap()).unwrap();
@@ -417,9 +469,13 @@ mod tests {
         let n = rebuild_state(&conn, &events_path, "deadbeefdeadbeef").unwrap();
         assert_eq!(n, 2);
 
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM events_index", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events_index", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 2);
     }
 
@@ -428,32 +484,39 @@ mod tests {
         let d = TempDir::new().unwrap();
         let conn = open(d.path().join("s.sqlite")).unwrap();
         let mut open_e = crate::event::Event::new(
-            "tj-1", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli,
-            "Title".into()
+            "tj-1",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "Title".into(),
         );
         open_e.meta = serde_json::json!({"title": "Title"});
         upsert_task_from_event(&conn, &open_e, "deadbeefdeadbeef").unwrap();
         index_event(&conn, &open_e).unwrap();
 
         let mut decision = crate::event::Event::new(
-            "tj-1", crate::event::EventType::Decision,
-            crate::event::Author::Agent, crate::event::Source::Chat,
-            "Adopt Rust".into()
+            "tj-1",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Adopt Rust".into(),
         );
         decision.confidence = Some(0.92);
         upsert_task_from_event(&conn, &decision, "deadbeefdeadbeef").unwrap();
         index_event(&conn, &decision).unwrap();
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
-            rusqlite::params!["tj-1"], |r| r.get(0)
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
+                rusqlite::params!["tj-1"],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2);
 
-        let mut stmt = conn.prepare(
-            "SELECT event_id FROM search_fts WHERE search_fts MATCH ?1"
-        ).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT event_id FROM search_fts WHERE search_fts MATCH ?1")
+            .unwrap();
         let hits: Vec<String> = stmt
             .query_map(rusqlite::params!["Rust"], |r| {
                 let s: String = r.get(0)?;
@@ -472,19 +535,23 @@ mod tests {
         let conn = open(d.path().join("s.sqlite")).unwrap();
 
         let mut e = crate::event::Event::new(
-            "tj-7f3a", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli,
-            "Add OAuth".into()
+            "tj-7f3a",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "Add OAuth".into(),
         );
         e.meta = serde_json::json!({ "title": "Add OAuth login" });
 
         upsert_task_from_event(&conn, &e, "abcd1234abcd1234").unwrap();
 
-        let (id, title, status): (String, String, String) = conn.query_row(
-            "SELECT task_id, title, status FROM tasks WHERE task_id = ?1",
-            ["tj-7f3a"],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+        let (id, title, status): (String, String, String) = conn
+            .query_row(
+                "SELECT task_id, title, status FROM tasks WHERE task_id = ?1",
+                ["tj-7f3a"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
 
         assert_eq!(id, "tj-7f3a");
         assert_eq!(title, "Add OAuth login");
