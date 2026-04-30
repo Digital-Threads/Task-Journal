@@ -166,6 +166,17 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         }
     }
 
+    if event.event_type == EventType::Evidence {
+        let strength_str = event.evidence_strength
+            .map(|s| serde_json::to_value(s).unwrap().as_str().unwrap().to_string())
+            .unwrap_or_else(|| "medium".into());
+        conn.execute(
+            "INSERT OR REPLACE INTO evidence(evidence_id, task_id, text, strength)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![event.event_id, event.task_id, event.text, strength_str],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -213,6 +224,36 @@ mod tests {
         let p = d.path().join("state.sqlite");
         let _ = open(&p).unwrap();
         let _ = open(&p).unwrap();
+    }
+
+    #[test]
+    fn index_event_projects_evidence() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = crate::event::Event::new(
+            "tj-e", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+        );
+        open_e.meta = serde_json::json!({"title": "T"});
+        upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        index_event(&conn, &open_e).unwrap();
+
+        let mut ev = crate::event::Event::new(
+            "tj-e", crate::event::EventType::Evidence,
+            crate::event::Author::Agent, crate::event::Source::Chat,
+            "Hook startup measured at 12ms".into()
+        );
+        ev.evidence_strength = Some(crate::event::EvidenceStrength::Strong);
+        upsert_task_from_event(&conn, &ev, "feedface").unwrap();
+        index_event(&conn, &ev).unwrap();
+
+        let (text, strength): (String, String) = conn.query_row(
+            "SELECT text, strength FROM evidence WHERE task_id=?1",
+            rusqlite::params!["tj-e"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(text.contains("12ms"));
+        assert_eq!(strength, "strong");
     }
 
     #[test]
