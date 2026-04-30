@@ -19,6 +19,7 @@ pub struct PackMetadata {
     pub generated_at: String,
     pub source_event_count: usize,
     pub cache_hit: bool,
+    pub truncated: bool,
 }
 
 use anyhow::Context;
@@ -151,6 +152,8 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ).ok();
     if let Some((cached_text, cached_at, cached_count)) = cached {
+        // Detect truncation by re-checking for the marker.
+        let was_truncated = cached_text.contains("_(truncated to fit pack budget)_");
         return Ok(TaskPack {
             task_id: task_id.to_string(),
             mode,
@@ -160,6 +163,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
                 generated_at: cached_at,
                 source_event_count: cached_count as usize,
                 cache_hit: true,
+                truncated: was_truncated,
             },
         });
     }
@@ -188,9 +192,21 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     let recent_limit = match mode { PackMode::Compact => 3, PackMode::Full => 10 };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
+    // Token-budget truncation: cap pack size so it always fits an LLM context window.
+    const FULL_BUDGET: usize = 10 * 1024;
+    const COMPACT_BUDGET: usize = 2 * 1024;
+    const TRUNC_MARKER: &str = "\n\n_(truncated to fit pack budget)_\n";
+    let budget = match mode { PackMode::Full => FULL_BUDGET, PackMode::Compact => COMPACT_BUDGET };
+    let truncated = text.len() > budget;
+    if truncated {
+        let cutoff = text[..budget].rfind('\n').unwrap_or(budget);
+        text.truncate(cutoff);
+        text.push_str(TRUNC_MARKER);
+    }
+
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    // Write-through cache: store the pack so the next call hits.
+    // Write-through cache.
     conn.execute(
         "INSERT OR REPLACE INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -206,6 +222,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
             generated_at,
             source_event_count: event_count,
             cache_hit: false,
+            truncated,
         },
     })
 }
@@ -288,6 +305,30 @@ mod tests {
         assert!(!pack.text.contains("Lifecycle"), "compact should omit Lifecycle: {}", pack.text);
         assert!(!pack.text.contains("Rejected"), "compact should omit Rejected: {}", pack.text);
         assert!(!pack.text.contains("Evidence"), "compact should omit Evidence: {}", pack.text);
+    }
+
+    #[test]
+    fn full_mode_truncates_when_exceeding_budget() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-big", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Big"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+        for i in 0..100 {
+            let ev = Event::new("tj-big", EventType::Evidence, Author::Agent, Source::Chat,
+                format!("Evidence #{i}: {}", "lorem ipsum ".repeat(50)));
+            db::upsert_task_from_event(&conn, &ev, "feedface").unwrap();
+            db::index_event(&conn, &ev).unwrap();
+        }
+        let pack = assemble(&conn, "tj-big", PackMode::Full).unwrap();
+        assert!(pack.text.len() <= 12 * 1024, "pack must stay under ~12KB; got {} bytes", pack.text.len());
+        assert!(pack.metadata.truncated, "metadata.truncated must be true");
+        assert!(pack.text.contains("truncated to fit pack budget"));
     }
 
     #[test]
