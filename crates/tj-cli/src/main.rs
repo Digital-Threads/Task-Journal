@@ -63,6 +63,24 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Hook entry point: ingest a chat chunk through the classifier.
+    IngestHook {
+        /// Hook kind: UserPromptSubmit | PostToolUse | Stop | SessionStart.
+        #[arg(long)]
+        kind: String,
+        /// The chat chunk text.
+        #[arg(long)]
+        text: String,
+        /// (test/dev) override: bypass classifier and force this event type.
+        #[arg(long)]
+        mock_event_type: Option<String>,
+        /// (test/dev) override: target task id.
+        #[arg(long)]
+        mock_task_id: Option<String>,
+        /// (test/dev) override: confidence value.
+        #[arg(long)]
+        mock_confidence: Option<f64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,6 +215,34 @@ fn main() -> Result<()> {
             writer.flush_durable()?;
             println!("{}", event.event_id);
         }
+        Commands::IngestHook { kind: _, text, mock_event_type, mock_task_id, mock_confidence } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            std::fs::create_dir_all(events_path.parent().unwrap())?;
+
+            // Drain any pending entries first (Task 10 fills the real-classifier branch).
+            drain_pending(&events_path, mock_event_type.as_deref(), mock_task_id.as_deref(), mock_confidence)?;
+
+            let (etype, task_id, confidence) = if let (Some(t), Some(tid)) = (mock_event_type.as_deref(), mock_task_id.as_deref()) {
+                (parse_event_type(t)?, tid.to_string(), mock_confidence.unwrap_or(1.0))
+            } else {
+                anyhow::bail!("real classifier wiring lit up in Task 9");
+            };
+
+            let mut event = tj_core::event::Event::new(
+                &task_id, etype,
+                tj_core::event::Author::Classifier, tj_core::event::Source::Hook,
+                text,
+            );
+            event.confidence = Some(confidence);
+            event.status = tj_core::classifier::decide_status(confidence);
+
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+            println!("{}", event.event_id);
+        }
         Commands::Search { query, limit } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -216,6 +262,40 @@ fn main() -> Result<()> {
                 .collect::<Result<_, _>>()?;
             for id in ids { println!("{id}"); }
         }
+    }
+    Ok(())
+}
+
+fn drain_pending(
+    events_path: &std::path::Path,
+    mock_etype: Option<&str>,
+    mock_tid: Option<&str>,
+    mock_conf: Option<f64>,
+) -> anyhow::Result<()> {
+    let pending_dir = events_path.parent().unwrap().parent().unwrap().join("pending");
+    if !pending_dir.exists() { return Ok(()); }
+
+    for entry in std::fs::read_dir(&pending_dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+
+        let body = std::fs::read_to_string(entry.path())?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if !text.is_empty() {
+            if let (Some(t), Some(tid)) = (mock_etype, mock_tid) {
+                let mut event = tj_core::event::Event::new(
+                    tid, parse_event_type(t)?,
+                    tj_core::event::Author::Classifier, tj_core::event::Source::Hook, text,
+                );
+                event.confidence = mock_conf;
+                event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
+                let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+            }
+        }
+        std::fs::remove_file(entry.path())?;
     }
     Ok(())
 }

@@ -118,6 +118,36 @@ fn e2e_create_event_close_pack_search() {
 }
 
 #[test]
+fn ingest_hook_with_mock_writes_classified_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Mock target"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--kind", "Stop",
+            "--text", "We decided to adopt Rust.",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.95",
+        ])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("We decided to adopt Rust.").and(contains("[decision]")));
+}
+
+#[test]
 fn create_back_to_back_yields_distinct_task_ids() {
     let dir = assert_fs::TempDir::new().unwrap();
 
