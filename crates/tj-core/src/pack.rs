@@ -24,6 +24,27 @@ pub struct PackMetadata {
 use anyhow::Context;
 use rusqlite::Connection;
 
+fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
+    let mut out = String::from("## Evidence\n");
+    let mut stmt = conn.prepare(
+        "SELECT text, strength FROM evidence WHERE task_id=?1 ORDER BY evidence_id ASC"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| {
+        let t: String = r.get(0)?;
+        let s: String = r.get(1)?;
+        Ok((t, s))
+    })?;
+    let mut count = 0;
+    for row in rows {
+        let (t, s) = row?;
+        out.push_str(&format!("- {t} ({s})\n"));
+        count += 1;
+    }
+    if count == 0 { out.push_str("- (none)\n"); }
+    out.push('\n');
+    Ok(out)
+}
+
 fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Rejected\n");
     let mut id_stmt = conn.prepare(
@@ -112,6 +133,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     text.push_str(&render_lifecycle(conn, task_id)?);
     text.push_str(&render_active_decisions(conn, task_id)?);
     text.push_str(&render_rejected(conn, task_id)?);
+    text.push_str(&render_evidence(conn, task_id)?);
 
     Ok(TaskPack {
         task_id: task_id.to_string(),
@@ -134,6 +156,31 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn pack_renders_evidence_section() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-ev", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Ev"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let mut ev = Event::new("tj-ev", EventType::Evidence, Author::Agent, Source::Chat,
+            "Hook startup at 12ms vs 380ms node".into());
+        ev.evidence_strength = Some(EvidenceStrength::Strong);
+        db::upsert_task_from_event(&conn, &ev, "feedface").unwrap();
+        db::index_event(&conn, &ev).unwrap();
+
+        let pack = assemble(&conn, "tj-ev", PackMode::Full).unwrap();
+        assert!(pack.text.contains("## Evidence"));
+        assert!(pack.text.contains("12ms"));
+        assert!(pack.text.contains("(strong)"));
     }
 
     #[test]
