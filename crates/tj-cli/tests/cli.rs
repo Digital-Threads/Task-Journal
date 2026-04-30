@@ -4,6 +4,25 @@ use predicates::prelude::*;
 use predicates::str::contains;
 
 #[test]
+fn pack_command_prints_markdown_for_existing_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Pack me"])
+            .assert().success()
+            .get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("# Pack me"));
+}
+
+#[test]
 fn create_back_to_back_yields_distinct_task_ids() {
     let dir = assert_fs::TempDir::new().unwrap();
 

@@ -25,6 +25,14 @@ enum Commands {
     },
     /// Rebuild SQLite state from the JSONL log.
     RebuildState,
+    /// Render and print the resume pack for a task.
+    Pack {
+        /// Task id (e.g. tj-7f3a).
+        task_id: String,
+        /// Output mode: compact|full.
+        #[arg(long, default_value = "compact")]
+        mode: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -90,6 +98,24 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Pack { task_id, mode } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+            }
+            let pmode = match mode.as_str() {
+                "compact" => tj_core::pack::PackMode::Compact,
+                "full" => tj_core::pack::PackMode::Full,
+                other => anyhow::bail!("unknown mode: {other}"),
+            };
+            let pack = tj_core::pack::assemble(&conn, &task_id, pmode)?;
+            print!("{}", pack.text);
+        }
         Commands::RebuildState => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
