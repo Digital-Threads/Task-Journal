@@ -69,7 +69,7 @@ jobs:
           Compress-Archive -Path "$bin/task-journal.exe","$bin/task-journal-mcp.exe" -DestinationPath "dist/task-journal-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: task-journal-${{ matrix.target }}
           path: dist/*
