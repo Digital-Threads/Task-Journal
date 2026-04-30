@@ -148,6 +148,15 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         "INSERT INTO search_fts(task_id, event_id, text, type) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![event.task_id, event.event_id, event.text, type_str],
     )?;
+
+    if event.event_type == EventType::Decision {
+        conn.execute(
+            "INSERT OR REPLACE INTO decisions(decision_id, task_id, text, status)
+             VALUES (?1, ?2, ?3, 'active')",
+            rusqlite::params![event.event_id, event.task_id, event.text],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -195,6 +204,37 @@ mod tests {
         let p = d.path().join("state.sqlite");
         let _ = open(&p).unwrap();
         let _ = open(&p).unwrap();
+    }
+
+    #[test]
+    fn index_event_projects_decision_to_decisions_table() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        let mut open_e = crate::event::Event::new(
+            "tj-d", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+        );
+        open_e.meta = serde_json::json!({"title": "T"});
+        upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        index_event(&conn, &open_e).unwrap();
+
+        let dec = crate::event::Event::new(
+            "tj-d", crate::event::EventType::Decision,
+            crate::event::Author::Agent, crate::event::Source::Chat,
+            "Adopt Rust".into()
+        );
+        upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        index_event(&conn, &dec).unwrap();
+
+        let (id, text, status): (String, String, String) = conn.query_row(
+            "SELECT decision_id, text, status FROM decisions WHERE task_id=?1",
+            rusqlite::params!["tj-d"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(id, dec.event_id);
+        assert_eq!(text, "Adopt Rust");
+        assert_eq!(status, "active");
     }
 
     #[test]
