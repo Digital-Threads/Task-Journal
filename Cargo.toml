@@ -29,7 +29,7 @@ ulid = { version = "1", features = ["serde"] }
 sha2 = "0.10"
 dunce = "1"
 directories = "5"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
