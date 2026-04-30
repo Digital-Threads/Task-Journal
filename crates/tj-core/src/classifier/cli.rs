@@ -87,10 +87,13 @@ impl Classifier for ClaudeCliClassifier {
     }
 }
 
-#[cfg(test)]
+// Tests use a `#!/bin/bash` shim to fake the `claude` CLI; gating to Unix
+// so Windows clippy/build doesn't see the imports/helper as unused.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::event::EventType;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Build a fake `claude` script that prints a canned `--output-format json` envelope.
     /// Returns the path so we can point ClaudeCliClassifier at it.
@@ -99,17 +102,12 @@ mod tests {
         let script = format!("#!/bin/bash\ncat <<'EOF'\n{envelope}\nEOF\n");
         std::fs::write(&path, script).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
+        perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         path
     }
 
     #[test]
-    #[cfg(unix)]
     fn classifier_parses_cli_envelope_and_returns_classified_output() {
         let dir = tempfile::TempDir::new().unwrap();
 
@@ -142,7 +140,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn classifier_surfaces_not_logged_in_with_friendly_hint() {
         let dir = tempfile::TempDir::new().unwrap();
         let envelope = serde_json::json!({
