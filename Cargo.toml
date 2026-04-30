@@ -35,7 +35,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 
 # Test deps
 assert_fs = "1"
