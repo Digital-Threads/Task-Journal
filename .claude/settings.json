@@ -1,25 +1,89 @@
 {
   "hooks": {
-    "PreCompact": [
+    "PostToolUse": [
       {
+        "matcher": "Bash",
         "hooks": [
           {
-            "command": "bd prime",
-            "type": "command"
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-post-bash"
           }
-        ],
-        "matcher": ""
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-post-task"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-read"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-edit"
+          }
+        ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-edit"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-pre-bash"
+          }
+        ]
+      },
+      {
+        "matcher": "Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-pre-grep"
+          }
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-pre-task"
+          }
+        ]
       }
     ],
     "SessionStart": [
       {
         "hooks": [
           {
-            "command": "bd prime",
-            "type": "command"
+            "type": "command",
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-session-start"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ]
   }
