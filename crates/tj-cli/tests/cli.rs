@@ -67,6 +67,35 @@ fn close_command_marks_task_closed_in_pack() {
 }
 
 #[test]
+fn search_all_projects_finds_match_in_other_project_hash() {
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    for hash in ["aaaa1111aaaa1111", "bbbb2222bbbb2222"] {
+        let db_path = state.join(format!("{hash}.sqlite"));
+        let conn = tj_core::db::open(&db_path).unwrap();
+        let mut e = tj_core::event::Event::new(
+            format!("tj-{}", &hash[..6]),
+            tj_core::event::EventType::Open,
+            tj_core::event::Author::User,
+            tj_core::event::Source::Cli,
+            format!("Marker {hash}"),
+        );
+        e.meta = serde_json::json!({"title": format!("Title {hash}")});
+        tj_core::db::upsert_task_from_event(&conn, &e, hash).unwrap();
+        tj_core::db::index_event(&conn, &e).unwrap();
+    }
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "Marker", "--all-projects"])
+        .assert().success()
+        .stdout(contains("aaaa1111").and(contains("bbbb2222")));
+}
+
+#[test]
 fn search_command_finds_task_by_event_text() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(

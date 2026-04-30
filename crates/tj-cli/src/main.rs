@@ -62,6 +62,9 @@ enum Commands {
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Search across all projects on this machine, not just the cwd one.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// Append a correction event referencing an earlier event_id.
     EventCorrect {
@@ -339,24 +342,51 @@ fn main() -> Result<()> {
             writer.flush_durable()?;
             println!("{}", event.event_id);
         }
-        Commands::Search { query, limit } => {
-            let cwd = std::env::current_dir()?;
-            let project_hash = tj_core::project_hash::from_path(&cwd)?;
-            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+        Commands::Search { query, limit, all_projects } => {
+            if all_projects {
+                let state_dir = tj_core::paths::state_dir()?;
+                let hashes = tj_core::db::list_all_projects(&state_dir)?;
+                for hash in hashes {
+                    let path = state_dir.join(format!("{hash}.sqlite"));
+                    let conn = match rusqlite::Connection::open(&path) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let mut stmt = match conn.prepare(
+                        "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let rows = match stmt.query_map(
+                        rusqlite::params![&query, limit as i64],
+                        |r| r.get::<_, String>(0),
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    for id in rows.flatten() {
+                        println!("{hash}\t{id}");
+                    }
+                }
+            } else {
+                let cwd = std::env::current_dir()?;
+                let project_hash = tj_core::project_hash::from_path(&cwd)?;
+                let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+                let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
 
-            let conn = tj_core::db::open(&state_path)?;
-            if events_path.exists() {
-                tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                let conn = tj_core::db::open(&state_path)?;
+                if events_path.exists() {
+                    tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                }
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
+                )?;
+                let ids: Vec<String> = stmt
+                    .query_map(rusqlite::params![query, limit as i64], |r| r.get::<_, String>(0))?
+                    .collect::<Result<_, _>>()?;
+                for id in ids { println!("{id}"); }
             }
-
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
-            )?;
-            let ids: Vec<String> = stmt
-                .query_map(rusqlite::params![query, limit as i64], |r| r.get::<_, String>(0))?
-                .collect::<Result<_, _>>()?;
-            for id in ids { println!("{id}"); }
         }
     }
     Ok(())
