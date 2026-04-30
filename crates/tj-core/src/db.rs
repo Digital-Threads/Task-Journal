@@ -157,6 +157,15 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         )?;
     }
 
+    if event.event_type == EventType::Supersede {
+        if let Some(target) = &event.supersedes {
+            conn.execute(
+                "UPDATE decisions SET status='superseded', superseded_by=?1 WHERE decision_id=?2",
+                rusqlite::params![event.event_id, target],
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -204,6 +213,44 @@ mod tests {
         let p = d.path().join("state.sqlite");
         let _ = open(&p).unwrap();
         let _ = open(&p).unwrap();
+    }
+
+    #[test]
+    fn supersede_event_marks_decision_superseded() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = crate::event::Event::new(
+            "tj-s", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+        );
+        open_e.meta = serde_json::json!({"title": "T"});
+        upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        index_event(&conn, &open_e).unwrap();
+
+        let dec = crate::event::Event::new(
+            "tj-s", crate::event::EventType::Decision,
+            crate::event::Author::Agent, crate::event::Source::Chat,
+            "Use TS".into()
+        );
+        upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        index_event(&conn, &dec).unwrap();
+
+        let mut sup = crate::event::Event::new(
+            "tj-s", crate::event::EventType::Supersede,
+            crate::event::Author::Agent, crate::event::Source::Chat,
+            "Replaced by Rust decision".into()
+        );
+        sup.supersedes = Some(dec.event_id.clone());
+        upsert_task_from_event(&conn, &sup, "feedface").unwrap();
+        index_event(&conn, &sup).unwrap();
+
+        let (status, by): (String, Option<String>) = conn.query_row(
+            "SELECT status, superseded_by FROM decisions WHERE decision_id=?1",
+            rusqlite::params![dec.event_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(status, "superseded");
+        assert_eq!(by.as_deref(), Some(sup.event_id.as_str()));
     }
 
     #[test]
