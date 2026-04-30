@@ -50,7 +50,7 @@ cargo publish -p task-journal-mcp
 
 ### 4. Проверь что вышло
 
-- GitHub Releases страница: https://github.com/shahinyanm/claude-memory/releases — должен быть `v0.1.1` с 4 артефактами.
+- GitHub Releases страница: https://github.com/Digital-Threads/Task-Journal/releases — должен быть `v0.1.1` с 4 артефактами.
 - crates.io: https://crates.io/crates/task-journal-core (и cli, mcp) — должна появиться версия v0.1.1.
 
 ### 5. Обновить README
@@ -58,7 +58,7 @@ cargo publish -p task-journal-mcp
 Если первая публикация — добавить badge'и:
 
 ```markdown
-[![CI](https://github.com/shahinyanm/claude-memory/workflows/CI/badge.svg)](https://github.com/shahinyanm/claude-memory/actions/workflows/ci.yml)
+[![CI](https://github.com/Digital-Threads/Task-Journal/workflows/CI/badge.svg)](https://github.com/Digital-Threads/Task-Journal/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/task-journal-cli.svg)](https://crates.io/crates/task-journal-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ```

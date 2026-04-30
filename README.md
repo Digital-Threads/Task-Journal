@@ -1,6 +1,6 @@
 # Task Journal
 
-[![CI](https://github.com/shahinyanm/claude-memory/workflows/CI/badge.svg)](https://github.com/shahinyanm/claude-memory/actions/workflows/ci.yml)
+[![CI](https://github.com/Digital-Threads/Task-Journal/workflows/CI/badge.svg)](https://github.com/Digital-Threads/Task-Journal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Append-only journal for AI-coding tasks. Captures the *reasoning chain* — goals, hypotheses, decisions, rejections, evidence — and renders a compact resume pack on demand so an agent can pick up a 2-week-old task with full context.
@@ -19,13 +19,13 @@ cargo install task-journal-cli task-journal-mcp
 
 **Option 2 — pre-built binary**
 
-Download the right archive for your OS/arch from [GitHub Releases](https://github.com/shahinyanm/claude-memory/releases), unpack, put `task-journal` and `task-journal-mcp` somewhere in your `$PATH`.
+Download the right archive for your OS/arch from [GitHub Releases](https://github.com/Digital-Threads/Task-Journal/releases), unpack, put `task-journal` and `task-journal-mcp` somewhere in your `$PATH`.
 
 **Option 3 — build from source**
 
 ```bash
-git clone https://github.com/shahinyanm/claude-memory
-cd claude-memory
+git clone https://github.com/Digital-Threads/Task-Journal
+cd Task-Journal
 cargo install --path crates/tj-cli --path crates/tj-mcp
 ```
 
@@ -70,17 +70,18 @@ Sample output:
 
 ### Path A — Plugin (recommended)
 
-Adds slash-commands like `/task-journal:create` and `/task-journal:pack`, plus declarative hooks for auto-capture, plus the MCP server, all in one install.
+Adds slash-commands like `/task-journal:create` and `/task-journal:pack`, plus the MCP server, all in one install.
+
+From your shell:
 
 ```bash
-# In Claude Code (the in-chat slash):
-/plugin install /path/to/this/repo/plugin
-
-# OR (if you have a marketplace):
-/plugin install task-journal@<your-marketplace>
+claude plugin marketplace add https://github.com/Digital-Threads/Task-Journal
+claude plugin install task-journal@claude-memory
 ```
 
-Six slash-commands become available: `/task-journal:create`, `:event`, `:pack`, `:search`, `:close`, `:stats`.
+(Or for a local checkout: `claude plugin marketplace add /path/to/Task-Journal`.)
+
+Restart Claude Code. Six slash-commands become available: `/task-journal:create`, `:event`, `:pack`, `:search`, `:close`, `:stats`.
 
 ### Path B — Plain MCP (no plugin)
 
