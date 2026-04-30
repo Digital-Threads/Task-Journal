@@ -24,6 +24,30 @@ pub struct PackMetadata {
 use anyhow::Context;
 use rusqlite::Connection;
 
+fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
+    let mut out = String::from("## Rejected\n");
+    let mut id_stmt = conn.prepare(
+        "SELECT event_id FROM events_index
+         WHERE task_id=?1 AND type='rejection'
+         ORDER BY timestamp ASC"
+    )?;
+    let mut text_stmt = conn.prepare(
+        "SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1"
+    )?;
+    let event_ids: Vec<String> = id_stmt
+        .query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    let mut count = 0;
+    for eid in event_ids {
+        let text: String = text_stmt.query_row(rusqlite::params![eid], |r| r.get(0))?;
+        out.push_str(&format!("- {text}\n"));
+        count += 1;
+    }
+    if count == 0 { out.push_str("- (none)\n"); }
+    out.push('\n');
+    Ok(out)
+}
+
 fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Active decisions\n");
     let mut stmt = conn.prepare(
@@ -87,6 +111,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     let mut text = format!("# {title}  [status: {status}]\n\n");
     text.push_str(&render_lifecycle(conn, task_id)?);
     text.push_str(&render_active_decisions(conn, task_id)?);
+    text.push_str(&render_rejected(conn, task_id)?);
 
     Ok(TaskPack {
         task_id: task_id.to_string(),
@@ -109,6 +134,29 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn pack_renders_rejected_options() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-r", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Rej"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let rej = Event::new("tj-r", EventType::Rejection, Author::Agent, Source::Chat,
+            "TypeScript: loses single-binary distribution".into());
+        db::upsert_task_from_event(&conn, &rej, "feedface").unwrap();
+        db::index_event(&conn, &rej).unwrap();
+
+        let pack = assemble(&conn, "tj-r", PackMode::Full).unwrap();
+        assert!(pack.text.contains("## Rejected"));
+        assert!(pack.text.contains("TypeScript"));
     }
 
     #[test]
