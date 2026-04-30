@@ -94,14 +94,14 @@ enum Commands {
         /// The chat chunk text.
         #[arg(long)]
         text: String,
-        /// (test/dev) override: bypass classifier and force this event type.
-        #[arg(long)]
+        /// Test/dev override: bypass classifier and force this event type. Hidden from --help.
+        #[arg(long, hide = true)]
         mock_event_type: Option<String>,
-        /// (test/dev) override: target task id.
-        #[arg(long)]
+        /// Test/dev override: target task id. Hidden from --help.
+        #[arg(long, hide = true)]
         mock_task_id: Option<String>,
-        /// (test/dev) override: confidence value.
-        #[arg(long)]
+        /// Test/dev override: confidence value. Hidden from --help.
+        #[arg(long, hide = true)]
         mock_confidence: Option<f64>,
     },
 }
@@ -277,7 +277,10 @@ fn main() -> Result<()> {
             if uninstall {
                 hooks_obj.remove("hooks");
             } else {
-                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\"";
+                // Wrap with `|| true` so a failed classifier (network down, rate limit,
+                // missing API key) NEVER breaks Claude Code. Failures land in pending/
+                // and replay on next ingest.
+                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\" || true";
                 let entries = serde_json::json!({
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],

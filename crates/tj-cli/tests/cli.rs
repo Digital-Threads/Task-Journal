@@ -213,6 +213,20 @@ fn event_correct_links_to_corrected_event() {
 }
 
 #[test]
+fn install_hooks_command_uses_no_fail_pattern() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+    let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    assert!(
+        s.contains("|| true"),
+        "hook command must end with || true so a failed classifier doesn't break Claude Code: {s}"
+    );
+}
+
+#[test]
 fn install_hooks_writes_to_settings_json() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal").unwrap()
@@ -470,6 +484,19 @@ fn rebuild_state_creates_sqlite_with_one_task() {
         }
     }
     assert_eq!(found, 1);
+}
+
+#[test]
+fn ingest_hook_help_hides_mock_flags() {
+    Command::cargo_bin("task-journal").unwrap()
+        .args(["ingest-hook", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--mock-event-type").not())
+        .stdout(contains("--mock-task-id").not())
+        .stdout(contains("--mock-confidence").not())
+        .stdout(contains("--kind"))
+        .stdout(contains("--text"));
 }
 
 #[test]
