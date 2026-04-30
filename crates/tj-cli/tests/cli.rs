@@ -118,6 +118,87 @@ fn e2e_create_event_close_pack_search() {
 }
 
 #[test]
+fn event_correct_links_to_corrected_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Correct me"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    let bad = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["event", &task_id, "--type", "finding", "--text", "Migration done (wrong)"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event-correct",
+            "--corrects", &bad,
+            "--task", &task_id,
+            "--text", "Migration was NOT done; finding was wrong",
+        ])
+        .assert().success();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert().success()
+        .stdout(contains("Migration was NOT done").and(contains("[correction]")));
+}
+
+#[test]
+fn install_hooks_writes_to_settings_json() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+
+    let settings_path = dir.path().join(".claude").join("settings.json");
+    assert!(settings_path.exists());
+    let content = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(content.contains("UserPromptSubmit"));
+    assert!(content.contains("PostToolUse"));
+    assert!(content.contains("task-journal ingest-hook"));
+}
+
+#[test]
+fn install_hooks_is_idempotent_and_uninstall_works() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("settings.json"),
+        serde_json::json!({"theme": "dark"}).to_string()).unwrap();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+
+    let after_install = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(after_install.contains("\"theme\":\"dark\"") || after_install.contains("\"theme\": \"dark\""), "must preserve unrelated keys");
+    assert!(after_install.contains("UserPromptSubmit"));
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--uninstall"])
+        .assert().success();
+
+    let after_uninstall = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(after_uninstall.contains("\"theme\":\"dark\"") || after_uninstall.contains("\"theme\": \"dark\""), "must still preserve theme");
+    assert!(!after_uninstall.contains("UserPromptSubmit"));
+}
+
+#[test]
 fn ingest_hook_drains_pending_queue_via_mock() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(

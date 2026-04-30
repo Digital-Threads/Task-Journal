@@ -63,6 +63,24 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Append a correction event referencing an earlier event_id.
+    EventCorrect {
+        #[arg(long)]
+        corrects: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Install Claude Code hooks that ingest events into the task journal.
+    InstallHooks {
+        /// Scope: user (~/.claude/settings.json) or project (./.claude/settings.json).
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Remove our hook entries instead of installing.
+        #[arg(long)]
+        uninstall: bool,
+    },
     /// Hook entry point: ingest a chat chunk through the classifier.
     IngestHook {
         /// Hook kind: UserPromptSubmit | PostToolUse | Stop | SessionStart.
@@ -214,6 +232,56 @@ fn main() -> Result<()> {
             writer.append(&event)?;
             writer.flush_durable()?;
             println!("{}", event.event_id);
+        }
+        Commands::EventCorrect { corrects, task, text } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            std::fs::create_dir_all(events_path.parent().unwrap())?;
+
+            let mut event = tj_core::event::Event::new(
+                &task, tj_core::event::EventType::Correction,
+                tj_core::event::Author::User, tj_core::event::Source::Cli,
+                text,
+            );
+            event.corrects = Some(corrects);
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+            println!("{}", event.event_id);
+        }
+        Commands::InstallHooks { scope, uninstall } => {
+            let settings_path = match scope.as_str() {
+                "user" => {
+                    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+                    std::path::PathBuf::from(home).join(".claude").join("settings.json")
+                }
+                "project" => std::env::current_dir()?.join(".claude").join("settings.json"),
+                other => anyhow::bail!("unknown scope: {other}"),
+            };
+            if let Some(p) = settings_path.parent() { std::fs::create_dir_all(p)?; }
+
+            let mut current: serde_json::Value = if settings_path.exists() {
+                serde_json::from_str(&std::fs::read_to_string(&settings_path)?)
+                    .unwrap_or_else(|_| serde_json::json!({}))
+            } else {
+                serde_json::json!({})
+            };
+
+            let hooks_obj = current.as_object_mut().ok_or_else(|| anyhow::anyhow!("settings is not a JSON object"))?;
+            if uninstall {
+                hooks_obj.remove("hooks");
+            } else {
+                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\"";
+                let entries = serde_json::json!({
+                    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                    "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                    "Stop":            [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                });
+                hooks_obj.insert("hooks".into(), entries);
+            }
+            std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
+            println!("{}", settings_path.display());
         }
         Commands::IngestHook { kind: _, text, mock_event_type, mock_task_id, mock_confidence } => {
             let cwd = std::env::current_dir()?;
