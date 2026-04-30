@@ -1,15 +1,7 @@
 {
   "mcpServers": {
     "task-journal": {
-      "command": "wsl",
-      "args": [
-        "-d",
-        "Ubuntu",
-        "--",
-        "bash",
-        "-lc",
-        "task-journal-mcp"
-      ]
+      "command": "task-journal-mcp"
     }
   }
 }

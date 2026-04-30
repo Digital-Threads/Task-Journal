@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "wsl -d Ubuntu -- bash -lc 'task-journal ingest-hook --kind=UserPromptSubmit --text=\"$CLAUDE_HOOK_TEXT\" || true'",
+            "command": "task-journal ingest-hook --kind=UserPromptSubmit --text=\"$CLAUDE_HOOK_TEXT\" || true",
             "timeout": 5
           }
         ]
@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "wsl -d Ubuntu -- bash -lc 'task-journal ingest-hook --kind=PostToolUse --text=\"$CLAUDE_HOOK_TEXT\" || true'",
+            "command": "task-journal ingest-hook --kind=PostToolUse --text=\"$CLAUDE_HOOK_TEXT\" || true",
             "timeout": 5
           }
         ]
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "wsl -d Ubuntu -- bash -lc 'task-journal ingest-hook --kind=Stop --text=\"$CLAUDE_HOOK_TEXT\" || true'",
+            "command": "task-journal ingest-hook --kind=Stop --text=\"$CLAUDE_HOOK_TEXT\" || true",
             "timeout": 5
           }
         ]

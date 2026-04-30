@@ -118,17 +118,11 @@ To wipe entire journal: `rm -rf <data-dir>`.
 | `ANTHROPIC_API_KEY env var not set` | Hook runs with same env as Claude Code; export the key in your shell rc file |
 | `pending/` growing | Real classifier is failing; inspect `<data-dir>/pending/*.json` for last error |
 
-## Troubleshooting on WSL
+## Troubleshooting
 
-If you're on Windows running WSL, the binary lives in WSL's `~/.cargo/bin/`. Make sure your Claude Code Settings hook command uses the WSL invocation:
-
-```json
-{
-  "hooks": {
-    "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
-      "command": "wsl -d Ubuntu -- bash -lc 'task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\" || true'" }] }]
-  }
-}
-```
-
-(or just install Claude Code inside WSL).
+| Symptom | Fix |
+|---------|-----|
+| `task-journal-mcp: command not found` | Не сделал `cargo install`, либо `~/.cargo/bin` не в PATH. Проверь `which task-journal-mcp`. |
+| Plugin виден, но MCP tools не подцепились | Перезапусти Claude Code полностью (закрыть, открыть). |
+| Hook ничего не пишет в `events/` | `ANTHROPIC_API_KEY` не выставлен — экспортируй в `~/.bashrc`. |
+| Pack возвращает "task not found" | Сначала `task-journal create`, потом `pack` — порядок важен. Или после нескольких ингестов запусти `task-journal rebuild-state`. |
