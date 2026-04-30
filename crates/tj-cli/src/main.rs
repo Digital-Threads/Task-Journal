@@ -62,6 +62,9 @@ enum Commands {
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Search across all projects on this machine, not just the cwd one.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// Append a correction event referencing an earlier event_id.
     EventCorrect {
@@ -81,6 +84,8 @@ enum Commands {
         #[arg(long)]
         uninstall: bool,
     },
+    /// Show local classifier and journal statistics.
+    Stats,
     /// Hook entry point: ingest a chat chunk through the classifier.
     IngestHook {
         /// Hook kind: UserPromptSubmit | PostToolUse | Stop | SessionStart.
@@ -89,14 +94,14 @@ enum Commands {
         /// The chat chunk text.
         #[arg(long)]
         text: String,
-        /// (test/dev) override: bypass classifier and force this event type.
-        #[arg(long)]
+        /// Test/dev override: bypass classifier and force this event type. Hidden from --help.
+        #[arg(long, hide = true)]
         mock_event_type: Option<String>,
-        /// (test/dev) override: target task id.
-        #[arg(long)]
+        /// Test/dev override: target task id. Hidden from --help.
+        #[arg(long, hide = true)]
         mock_task_id: Option<String>,
-        /// (test/dev) override: confidence value.
-        #[arg(long)]
+        /// Test/dev override: confidence value. Hidden from --help.
+        #[arg(long, hide = true)]
         mock_confidence: Option<f64>,
     },
 }
@@ -272,7 +277,10 @@ fn main() -> Result<()> {
             if uninstall {
                 hooks_obj.remove("hooks");
             } else {
-                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\"";
+                // Wrap with `|| true` so a failed classifier (network down, rate limit,
+                // missing API key) NEVER breaks Claude Code. Failures land in pending/
+                // and replay on next ingest.
+                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\" || true";
                 let entries = serde_json::json!({
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
@@ -282,6 +290,40 @@ fn main() -> Result<()> {
             }
             std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
             println!("{}", settings_path.display());
+        }
+        Commands::Stats => {
+            let metrics_dir = tj_core::paths::metrics_dir()?;
+            let mut total = 0usize;
+            let mut confirmed = 0usize;
+            let mut suggested = 0usize;
+            let mut errors = 0usize;
+            if metrics_dir.exists() {
+                for entry in std::fs::read_dir(&metrics_dir)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                    let body = std::fs::read_to_string(&path)?;
+                    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                        total += 1;
+                        let v: serde_json::Value = match serde_json::from_str(line) {
+                            Ok(v) => v,
+                            Err(_) => { errors += 1; continue; }
+                        };
+                        match v.get("status").and_then(|s| s.as_str()) {
+                            Some("confirmed") => confirmed += 1,
+                            Some("suggested") => suggested += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            println!("classified: {total}");
+            println!("  confirmed: {confirmed}");
+            println!("  suggested: {suggested}");
+            println!("  parse errors: {errors}");
+            if total > 0 {
+                let ratio = confirmed as f64 / total as f64 * 100.0;
+                println!("  confirmed ratio: {ratio:.1}%");
+            }
         }
         Commands::IngestHook { kind: _, text, mock_event_type, mock_task_id, mock_confidence } => {
             let cwd = std::env::current_dir()?;
@@ -337,26 +379,74 @@ fn main() -> Result<()> {
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
+
+            // Append telemetry. Errors here MUST NOT fail the hook (best-effort).
+            let metrics_path = tj_core::paths::metrics_dir()?
+                .join(format!("{project_hash}.jsonl"));
+            let etype_str = serde_json::to_value(&etype)?
+                .as_str().unwrap_or("?").to_string();
+            let status_str = serde_json::to_value(&event.status)?
+                .as_str().unwrap_or("?").to_string();
+            let _ = tj_core::classifier::telemetry::append(
+                &metrics_path,
+                &tj_core::classifier::telemetry::TelemetryRecord {
+                    timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    project_hash: project_hash.clone(),
+                    task_id_guess: Some(task_id.clone()),
+                    event_type: etype_str,
+                    confidence,
+                    status: status_str,
+                    error: None,
+                },
+            );
+
             println!("{}", event.event_id);
         }
-        Commands::Search { query, limit } => {
-            let cwd = std::env::current_dir()?;
-            let project_hash = tj_core::project_hash::from_path(&cwd)?;
-            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+        Commands::Search { query, limit, all_projects } => {
+            if all_projects {
+                let state_dir = tj_core::paths::state_dir()?;
+                let hashes = tj_core::db::list_all_projects(&state_dir)?;
+                for hash in hashes {
+                    let path = state_dir.join(format!("{hash}.sqlite"));
+                    let conn = match rusqlite::Connection::open(&path) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let mut stmt = match conn.prepare(
+                        "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let rows = match stmt.query_map(
+                        rusqlite::params![&query, limit as i64],
+                        |r| r.get::<_, String>(0),
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    for id in rows.flatten() {
+                        println!("{hash}\t{id}");
+                    }
+                }
+            } else {
+                let cwd = std::env::current_dir()?;
+                let project_hash = tj_core::project_hash::from_path(&cwd)?;
+                let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+                let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
 
-            let conn = tj_core::db::open(&state_path)?;
-            if events_path.exists() {
-                tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                let conn = tj_core::db::open(&state_path)?;
+                if events_path.exists() {
+                    tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                }
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
+                )?;
+                let ids: Vec<String> = stmt
+                    .query_map(rusqlite::params![query, limit as i64], |r| r.get::<_, String>(0))?
+                    .collect::<Result<_, _>>()?;
+                for id in ids { println!("{id}"); }
             }
-
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
-            )?;
-            let ids: Vec<String> = stmt
-                .query_map(rusqlite::params![query, limit as i64], |r| r.get::<_, String>(0))?
-                .collect::<Result<_, _>>()?;
-            for id in ids { println!("{id}"); }
         }
     }
     Ok(())

@@ -67,6 +67,35 @@ fn close_command_marks_task_closed_in_pack() {
 }
 
 #[test]
+fn search_all_projects_finds_match_in_other_project_hash() {
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    for hash in ["aaaa1111aaaa1111", "bbbb2222bbbb2222"] {
+        let db_path = state.join(format!("{hash}.sqlite"));
+        let conn = tj_core::db::open(&db_path).unwrap();
+        let mut e = tj_core::event::Event::new(
+            format!("tj-{}", &hash[..6]),
+            tj_core::event::EventType::Open,
+            tj_core::event::Author::User,
+            tj_core::event::Source::Cli,
+            format!("Marker {hash}"),
+        );
+        e.meta = serde_json::json!({"title": format!("Title {hash}")});
+        tj_core::db::upsert_task_from_event(&conn, &e, hash).unwrap();
+        tj_core::db::index_event(&conn, &e).unwrap();
+    }
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "Marker", "--all-projects"])
+        .assert().success()
+        .stdout(contains("aaaa1111").and(contains("bbbb2222")));
+}
+
+#[test]
 fn search_command_finds_task_by_event_text() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
@@ -184,6 +213,20 @@ fn event_correct_links_to_corrected_event() {
 }
 
 #[test]
+fn install_hooks_command_uses_no_fail_pattern() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal").unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert().success();
+    let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    assert!(
+        s.contains("|| true"),
+        "hook command must end with || true so a failed classifier doesn't break Claude Code: {s}"
+    );
+}
+
+#[test]
 fn install_hooks_writes_to_settings_json() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal").unwrap()
@@ -264,6 +307,59 @@ fn ingest_hook_drains_pending_queue_via_mock() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
         .collect();
     assert_eq!(remaining.len(), 0, "pending queue must be empty after successful ingest");
+}
+
+#[test]
+fn stats_command_shows_classifier_counts() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let metrics = dir.path().join("task-journal").join("metrics");
+    std::fs::create_dir_all(&metrics).unwrap();
+    let body = vec![
+        r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"decision","confidence":0.95,"status":"confirmed","error":null}"#,
+        r#"{"timestamp":"2026-04-30T00:00:00Z","project_hash":"feedface","task_id_guess":"tj-x","event_type":"finding","confidence":0.65,"status":"suggested","error":null}"#,
+    ].join("\n");
+    std::fs::write(metrics.join("feedface.jsonl"), body).unwrap();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["stats"])
+        .assert().success()
+        .stdout(contains("classified: 2")
+            .and(contains("confirmed: 1"))
+            .and(contains("suggested: 1")));
+}
+
+#[test]
+fn ingest_hook_writes_telemetry_record() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Tel"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook", "--kind", "Stop", "--text", "decided to use Rust",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.92",
+        ])
+        .assert().success();
+
+    let metrics_dir = dir.path().join("task-journal").join("metrics");
+    let mut total_lines = 0;
+    if metrics_dir.exists() {
+        for entry in std::fs::read_dir(&metrics_dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                total_lines += std::fs::read_to_string(&p).unwrap().lines().count();
+            }
+        }
+    }
+    assert!(total_lines >= 1, "expected at least one telemetry line, got {total_lines}");
 }
 
 #[test]
@@ -388,6 +484,19 @@ fn rebuild_state_creates_sqlite_with_one_task() {
         }
     }
     assert_eq!(found, 1);
+}
+
+#[test]
+fn ingest_hook_help_hides_mock_flags() {
+    Command::cargo_bin("task-journal").unwrap()
+        .args(["ingest-hook", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--mock-event-type").not())
+        .stdout(contains("--mock-task-id").not())
+        .stdout(contains("--mock-confidence").not())
+        .stdout(contains("--kind"))
+        .stdout(contains("--text"));
 }
 
 #[test]

@@ -103,6 +103,22 @@ pub fn upsert_task_from_event(
 
 use std::io::BufRead;
 
+pub fn list_all_projects(state_dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
+    let dir = state_dir.as_ref();
+    if !dir.exists() { return Ok(vec![]); }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sqlite") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn rebuild_state(
     conn: &Connection,
     jsonl_path: impl AsRef<Path>,
@@ -357,6 +373,21 @@ mod tests {
             rusqlite::params![open_e.event_id], |r| r.get(0),
         ).unwrap();
         assert_eq!(n, 1, "search_fts must hold exactly one row per event_id");
+    }
+
+    #[test]
+    fn list_all_projects_returns_hashes_from_state_dir() {
+        use std::fs::File;
+        let d = TempDir::new().unwrap();
+        let state_dir = d.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        File::create(state_dir.join("aaaa1111aaaa1111.sqlite")).unwrap();
+        File::create(state_dir.join("bbbb2222bbbb2222.sqlite")).unwrap();
+        File::create(state_dir.join("not-a-project.txt")).unwrap();
+
+        let mut hashes = list_all_projects(&state_dir).unwrap();
+        hashes.sort();
+        assert_eq!(hashes, vec!["aaaa1111aaaa1111", "bbbb2222bbbb2222"]);
     }
 
     #[test]
