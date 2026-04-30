@@ -47,7 +47,10 @@ fn main() -> Result<()> {
             let events_path = events_dir.join(format!("{project_hash}.jsonl"));
             std::fs::create_dir_all(&events_dir)?;
 
-            let task_id = format!("tj-{}", &ulid::Ulid::new().to_string()[..6].to_lowercase());
+            // ULID layout: chars 0-9 = timestamp (48b), 10-25 = random (80b).
+            // Taking from random portion to avoid same-prefix collisions for tasks
+            // created within ~12 days (which would happen with [..6]).
+            let task_id = format!("tj-{}", &ulid::Ulid::new().to_string()[10..16].to_lowercase());
             let mut event = tj_core::event::Event::new(
                 task_id.clone(),
                 tj_core::event::EventType::Open,

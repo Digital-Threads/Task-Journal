@@ -4,6 +4,23 @@ use predicates::prelude::*;
 use predicates::str::contains;
 
 #[test]
+fn create_back_to_back_yields_distinct_task_ids() {
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    let ids: Vec<String> = (0..5).map(|_| {
+        let out = Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Same title"])
+            .assert().success()
+            .get_output().stdout.clone();
+        String::from_utf8(out).unwrap().trim().to_string()
+    }).collect();
+
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 5, "task ids must be unique, got: {ids:?}");
+}
+
+#[test]
 fn create_writes_open_event_to_jsonl() {
     let dir = assert_fs::TempDir::new().unwrap();
 

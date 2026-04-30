@@ -125,7 +125,9 @@ impl TaskJournalServer {
         Parameters(p): Parameters<TaskCreateParams>,
     ) -> Json<TaskCreateResult> {
         Json(TaskCreateResult {
-            task_id: format!("tj-stub-{}", &ulid::Ulid::new().to_string()[..6].to_lowercase()),
+            // ULID chars 10-15 are random (chars 0-9 are timestamp, would collide
+            // for tasks within 12 days). See tj-cli for the canonical comment.
+            task_id: format!("tj-stub-{}", &ulid::Ulid::new().to_string()[10..16].to_lowercase()),
             title: p.title,
             stub: true,
         })
