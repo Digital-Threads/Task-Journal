@@ -152,10 +152,14 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     )?;
 
     let mut text = format!("# {title}  [status: {status}]\n\n");
-    text.push_str(&render_lifecycle(conn, task_id)?);
+    if matches!(mode, PackMode::Full) {
+        text.push_str(&render_lifecycle(conn, task_id)?);
+    }
     text.push_str(&render_active_decisions(conn, task_id)?);
-    text.push_str(&render_rejected(conn, task_id)?);
-    text.push_str(&render_evidence(conn, task_id)?);
+    if matches!(mode, PackMode::Full) {
+        text.push_str(&render_rejected(conn, task_id)?);
+        text.push_str(&render_evidence(conn, task_id)?);
+    }
     let recent_limit = match mode { PackMode::Compact => 3, PackMode::Full => 10 };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
@@ -180,6 +184,31 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn compact_mode_omits_optional_sections() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-cm", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Compact"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+        let dec = Event::new("tj-cm", EventType::Decision, Author::Agent, Source::Chat, "D1".into());
+        db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        db::index_event(&conn, &dec).unwrap();
+
+        let pack = assemble(&conn, "tj-cm", PackMode::Compact).unwrap();
+        assert!(pack.text.contains("# Compact"));
+        assert!(pack.text.contains("Active decisions"));
+        assert!(pack.text.contains("Recent events"));
+        assert!(!pack.text.contains("Lifecycle"), "compact should omit Lifecycle: {}", pack.text);
+        assert!(!pack.text.contains("Rejected"), "compact should omit Rejected: {}", pack.text);
+        assert!(!pack.text.contains("Evidence"), "compact should omit Evidence: {}", pack.text);
     }
 
     #[test]
