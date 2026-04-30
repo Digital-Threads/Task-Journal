@@ -9,8 +9,15 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: ["minor", "patch"]
+    # Только minor/patch автоматически. Major bumps часто breaking — делаем руками.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: monthly
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
