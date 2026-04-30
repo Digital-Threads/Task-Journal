@@ -17,6 +17,7 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 ulid = { workspace = true }
 rusqlite = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 assert_fs = { workspace = true }

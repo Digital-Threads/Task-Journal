@@ -118,6 +118,42 @@ fn e2e_create_event_close_pack_search() {
 }
 
 #[test]
+fn ingest_hook_drains_pending_queue_via_mock() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal").unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Drain"])
+            .assert().success().get_output().stdout.clone()
+    ).unwrap().trim().to_string();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("01stuck.json"), serde_json::json!({
+        "text": "We decided to adopt PKCE flow.",
+        "queued_at": "2026-04-30T00:00:00Z"
+    }).to_string()).unwrap();
+
+    Command::cargo_bin("task-journal").unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--kind", "Stop",
+            "--text", "Live chunk",
+            "--mock-event-type", "decision",
+            "--mock-task-id", &task_id,
+            "--mock-confidence", "0.95",
+        ])
+        .assert().success();
+
+    let remaining: Vec<_> = std::fs::read_dir(&pending).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+        .collect();
+    assert_eq!(remaining.len(), 0, "pending queue must be empty after successful ingest");
+}
+
+#[test]
 fn ingest_hook_with_mock_writes_classified_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(

@@ -227,7 +227,35 @@ fn main() -> Result<()> {
             let (etype, task_id, confidence) = if let (Some(t), Some(tid)) = (mock_event_type.as_deref(), mock_task_id.as_deref()) {
                 (parse_event_type(t)?, tid.to_string(), mock_confidence.unwrap_or(1.0))
             } else {
-                anyhow::bail!("real classifier wiring lit up in Task 9");
+                let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                if events_path.exists() {
+                    tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                }
+                let recent = recent_task_contexts(&conn, 5)?;
+                if recent.is_empty() {
+                    return Ok(());
+                }
+
+                use tj_core::classifier::Classifier;
+                let classifier = tj_core::classifier::http::AnthropicClassifier::from_env()?;
+                let input = tj_core::classifier::ClassifyInput {
+                    text: text.clone(),
+                    author_hint: "assistant".into(),
+                    recent_tasks: recent,
+                };
+                let out = match classifier.classify(&input) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        persist_pending(&events_path, &text, &e.to_string())?;
+                        return Ok(());
+                    }
+                };
+
+                let Some(tid) = out.task_id_guess else {
+                    return Ok(());
+                };
+                (out.event_type, tid, out.confidence)
             };
 
             let mut event = tj_core::event::Event::new(
@@ -263,6 +291,42 @@ fn main() -> Result<()> {
             for id in ids { println!("{id}"); }
         }
     }
+    Ok(())
+}
+
+fn recent_task_contexts(conn: &rusqlite::Connection, limit: usize) -> anyhow::Result<Vec<tj_core::classifier::TaskContext>> {
+    let mut stmt = conn.prepare(
+        "SELECT task_id, title FROM tasks WHERE status='open' ORDER BY last_event_at DESC LIMIT ?1"
+    )?;
+    let task_rows: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![limit as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    let mut out = Vec::with_capacity(task_rows.len());
+    for (task_id, title) in task_rows {
+        let mut e_stmt = conn.prepare(
+            "SELECT ei.type, sf.text FROM events_index ei
+             LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+             WHERE ei.task_id=?1 ORDER BY ei.timestamp DESC LIMIT 3"
+        )?;
+        let last_events: Vec<String> = e_stmt
+            .query_map(rusqlite::params![task_id], |r| {
+                let ty: String = r.get(0)?;
+                let txt: Option<String> = r.get(1)?;
+                Ok(format!("[{ty}] {}", txt.unwrap_or_default().chars().take(80).collect::<String>()))
+            })?
+            .collect::<Result<_, _>>()?;
+        out.push(tj_core::classifier::TaskContext { task_id, title, last_events });
+    }
+    Ok(out)
+}
+
+fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyhow::Result<()> {
+    let pending_dir = events_path.parent().unwrap().parent().unwrap().join("pending");
+    std::fs::create_dir_all(&pending_dir)?;
+    let id = ulid::Ulid::new().to_string();
+    let payload = serde_json::json!({"text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
+    std::fs::write(pending_dir.join(format!("{id}.json")), serde_json::to_string_pretty(&payload)?)?;
     Ok(())
 }
 
