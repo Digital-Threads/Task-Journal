@@ -27,20 +27,22 @@ use rusqlite::Connection;
 fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyhow::Result<String> {
     let mut out = format!("## Recent events (last {limit})\n");
     let mut stmt = conn.prepare(
-        "SELECT ei.timestamp, ei.type, sf.text FROM events_index ei
+        "SELECT ei.timestamp, ei.type, ei.status, sf.text FROM events_index ei
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
          WHERE ei.task_id=?1 ORDER BY ei.timestamp DESC LIMIT ?2"
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id, limit as i64], |r| {
         let ts: String = r.get(0)?;
         let ty: String = r.get(1)?;
-        let txt: Option<String> = r.get(2)?;
-        Ok((ts, ty, txt.unwrap_or_default()))
+        let st: String = r.get(2)?;
+        let txt: Option<String> = r.get(3)?;
+        Ok((ts, ty, st, txt.unwrap_or_default()))
     })?;
     for row in rows {
-        let (ts, ty, txt) = row?;
+        let (ts, ty, st, txt) = row?;
         let one_line = txt.lines().next().unwrap_or("").chars().take(120).collect::<String>();
-        out.push_str(&format!("- {ts} [{ty}] {one_line}\n"));
+        let marker = if st == "suggested" { " [?]" } else { "" };
+        out.push_str(&format!("- {ts} [{ty}]{marker} {one_line}\n"));
     }
     out.push('\n');
     Ok(out)
@@ -286,6 +288,33 @@ mod tests {
         assert!(!pack.text.contains("Lifecycle"), "compact should omit Lifecycle: {}", pack.text);
         assert!(!pack.text.contains("Rejected"), "compact should omit Rejected: {}", pack.text);
         assert!(!pack.text.contains("Evidence"), "compact should omit Evidence: {}", pack.text);
+    }
+
+    #[test]
+    fn suggested_events_get_question_mark_marker_in_pack() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new("tj-q", EventType::Open, Author::User, Source::Cli, "x".into());
+        open_e.meta = serde_json::json!({"title": "Q"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let mut suggested = Event::new("tj-q", EventType::Decision, Author::Classifier, Source::Hook, "Adopt Rust".into());
+        suggested.status = EventStatus::Suggested;
+        db::upsert_task_from_event(&conn, &suggested, "feedface").unwrap();
+        db::index_event(&conn, &suggested).unwrap();
+
+        let pack = assemble(&conn, "tj-q", PackMode::Full).unwrap();
+        let recent_pos = pack.text.find("## Recent events").unwrap();
+        let recent_section = &pack.text[recent_pos..];
+        assert!(
+            recent_section.contains("[?]"),
+            "suggested event must show [?] marker in Recent events:\n{recent_section}"
+        );
     }
 
     #[test]
