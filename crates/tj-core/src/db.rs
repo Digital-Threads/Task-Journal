@@ -144,6 +144,11 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
             event.timestamp, event.confidence, status_str
         ],
     )?;
+    // search_fts has no PK; clear then insert to keep idempotent across rebuild_state replays.
+    conn.execute(
+        "DELETE FROM search_fts WHERE event_id=?1",
+        rusqlite::params![event.event_id],
+    )?;
     conn.execute(
         "INSERT INTO search_fts(task_id, event_id, text, type) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![event.task_id, event.event_id, event.text, type_str],
@@ -329,6 +334,29 @@ mod tests {
         assert_eq!(id, dec.event_id);
         assert_eq!(text, "Adopt Rust");
         assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn index_event_is_idempotent_no_search_fts_duplicates() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = crate::event::Event::new(
+            "tj-id", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli, "x".into()
+        );
+        open_e.meta = serde_json::json!({"title": "Idempotent"});
+        upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+
+        // Index three times — simulates rebuild_state replays.
+        index_event(&conn, &open_e).unwrap();
+        index_event(&conn, &open_e).unwrap();
+        index_event(&conn, &open_e).unwrap();
+
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM search_fts WHERE event_id=?1",
+            rusqlite::params![open_e.event_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 1, "search_fts must hold exactly one row per event_id");
     }
 
     #[test]
