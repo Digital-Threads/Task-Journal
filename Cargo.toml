@@ -28,7 +28,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 sha2 = "0.10"
 dunce = "1"
-directories = "5"
+directories = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 clap = { version = "4", features = ["derive"] }
