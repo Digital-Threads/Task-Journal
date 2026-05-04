@@ -1,18 +1,31 @@
 {
-  "name": "claude-memory",
-  "description": "Task Journal plugin: append-only reasoning chain memory for AI-coding tasks",
+  "name": "task-journal",
   "owner": {
-    "name": "Mher Shahinyan"
+    "name": "Digital-Threads",
+    "email": "shahinyanm@gmail.com"
+  },
+  "metadata": {
+    "description": "Task Journal — append-only reasoning chain memory for AI-coding tasks",
+    "version": "0.1.1"
   },
   "plugins": [
     {
       "name": "task-journal",
-      "description": "Append-only journal of AI-coding task reasoning chains. Captures hypotheses, decisions, rejections, evidence — and renders compact resume packs so an agent can pick up a 2-week-old task with full context.",
-      "version": "0.1.0",
       "source": "./plugin",
+      "description": "Append-only journal of AI-coding task reasoning chains. Captures hypotheses, decisions, rejections, evidence — renders compact resume packs so an agent can pick up a 2-week-old task with full context.",
+      "version": "0.1.1",
       "author": {
-        "name": "Mher Shahinyan"
-      }
+        "name": "Digital-Threads"
+      },
+      "category": "development",
+      "keywords": [
+        "mcp",
+        "task-journal",
+        "memory",
+        "ai-coding",
+        "reasoning",
+        "context-recovery"
+      ]
     }
   ]
 }
