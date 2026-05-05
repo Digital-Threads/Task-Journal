@@ -10,6 +10,37 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
+/// MCP instructions delivered to every Claude Code session where this plugin is installed.
+/// This is the primary mechanism for self-contained plugin behavior — no manual CLAUDE.md edits needed.
+const MCP_INSTRUCTIONS: &str = r#"Task Journal — reasoning chain memory for AI coding sessions.
+
+MANDATORY WORKFLOW — follow for EVERY coding session:
+
+1. SESSION START → task_search for recent open tasks → task_pack to resume, OR task_create for new work
+2. EVERY significant discovery → event_add(event_type="finding")
+3. EVERY decision made → event_add(event_type="decision")
+4. EVERY rejected approach → event_add(event_type="rejection")
+5. EVERY hypothesis formed → event_add(event_type="hypothesis")
+6. TEST RESULTS → event_add(event_type="evidence")
+7. WRONG hypothesis corrected → event_add(event_type="correction", corrects=<event_id>)
+8. TASK DONE → task_close with reason and outcome
+
+EVENT TYPE GUIDE — choose correctly:
+• hypothesis = "I think" / "maybe" / "could be" → UNVERIFIED theory
+• finding = "I see" / "the code shows" / "confirmed" → VERIFIED by reading code/logs
+• evidence = ran a test/experiment that PROVES something
+• decision = committed choice ("We'll use X because Y")
+• rejection = explicitly rejected approach ("Tried X but won't work because Y")
+• constraint = external limitation discovered ("API rate limit is 100/min")
+• correction = corrects earlier event (set corrects field)
+
+KEY RULES:
+• One task = one logical objective. Don't create a new task every turn.
+• Always close tasks when done. Don't leave them open.
+• Log rejections — wrong paths prevent repeated mistakes.
+• Append-only — never edit events, write corrections instead.
+"#;
+
 #[derive(Clone, Default)]
 pub struct TaskJournalServer;
 
@@ -323,6 +354,7 @@ impl ServerHandler for TaskJournalServer {
             capabilities: rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
+            instructions: Some(MCP_INSTRUCTIONS.into()),
             ..Default::default()
         }
     }

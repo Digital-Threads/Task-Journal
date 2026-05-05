@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "task-journal ingest-hook --kind=PostToolUse --text=\"$TOOL_OUTPUT\" --backend=cli 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "task-journal ingest-hook --kind=Stop --text=\"Session ended\" --backend=cli 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

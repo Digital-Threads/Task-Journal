@@ -1,6 +1,6 @@
 {
   "name": "task-journal",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Append-only journal of AI-coding task reasoning chains: hypotheses, decisions, rejections, evidence. Renders compact resume packs so an agent can pick up a 2-week-old task with full context.",
   "author": {
     "name": "Mher Shahinyan"
@@ -17,5 +17,6 @@
     "task-journal": {
       "command": "task-journal-mcp"
     }
-  }
+  },
+  "skills": "./skills/"
 }

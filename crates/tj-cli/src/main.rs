@@ -372,7 +372,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::IngestHook {
-            kind: _,
+            kind,
             text,
             backend,
             mock_event_type,
@@ -392,60 +392,88 @@ fn main() -> Result<()> {
                 mock_confidence,
             )?;
 
-            let (etype, task_id, confidence) = if let (Some(t), Some(tid)) =
-                (mock_event_type.as_deref(), mock_task_id.as_deref())
-            {
-                (
-                    parse_event_type(t)?,
-                    tid.to_string(),
-                    mock_confidence.unwrap_or(1.0),
-                )
+            // Derive author_hint from hook kind: user prompts → "user", everything else → "assistant"
+            let author_hint = if kind.contains("UserPrompt") {
+                "user"
             } else {
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                if events_path.exists() {
-                    tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
-                }
-                let recent = recent_task_contexts(&conn, 5)?;
-                if recent.is_empty() {
-                    return Ok(());
-                }
+                "assistant"
+            };
 
-                use tj_core::classifier::Classifier;
-                let classifier: Box<dyn Classifier> = match backend.as_str() {
-                    "cli" => Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default()),
-                    "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
-                    other => anyhow::bail!("unknown backend: {other} (expected `cli` or `api`)"),
-                };
-                let input = tj_core::classifier::ClassifyInput {
-                    text: text.clone(),
-                    author_hint: "assistant".into(),
-                    recent_tasks: recent,
-                };
-                let out = match classifier.classify(&input) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        persist_pending(&events_path, &text, &e.to_string())?;
+            let (etype, task_id, confidence, evidence_strength, suggested_text) =
+                if let (Some(t), Some(tid)) =
+                    (mock_event_type.as_deref(), mock_task_id.as_deref())
+                {
+                    (
+                        parse_event_type(t)?,
+                        tid.to_string(),
+                        mock_confidence.unwrap_or(1.0),
+                        None,
+                        None,
+                    )
+                } else {
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    if events_path.exists() {
+                        tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                    }
+                    let recent = recent_task_contexts(&conn, 5)?;
+                    if recent.is_empty() {
+                        // No active tasks — nothing to classify against. Skip silently.
                         return Ok(());
                     }
+
+                    use tj_core::classifier::Classifier;
+                    let classifier: Box<dyn Classifier> = match backend.as_str() {
+                        "cli" => {
+                            Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default())
+                        }
+                        "api" => {
+                            Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?)
+                        }
+                        other => {
+                            anyhow::bail!("unknown backend: {other} (expected `cli` or `api`)")
+                        }
+                    };
+                    let input = tj_core::classifier::ClassifyInput {
+                        text: text.clone(),
+                        author_hint: author_hint.into(),
+                        recent_tasks: recent,
+                    };
+                    let out = match classifier.classify(&input) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            persist_pending(&events_path, &text, &e.to_string())?;
+                            return Ok(());
+                        }
+                    };
+
+                    let Some(tid) = out.task_id_guess else {
+                        return Ok(());
+                    };
+                    (
+                        out.event_type,
+                        tid,
+                        out.confidence,
+                        out.evidence_strength,
+                        Some(out.suggested_text),
+                    )
                 };
 
-                let Some(tid) = out.task_id_guess else {
-                    return Ok(());
-                };
-                (out.event_type, tid, out.confidence)
-            };
+            // Use classifier's suggested_text if available (it's more concise and specific),
+            // fall back to raw hook text for mock/manual events.
+            let event_text = suggested_text.unwrap_or(text);
 
             let mut event = tj_core::event::Event::new(
                 &task_id,
                 etype,
                 tj_core::event::Author::Classifier,
                 tj_core::event::Source::Hook,
-                text,
+                event_text,
             );
             event.confidence = Some(confidence);
             event.status = tj_core::classifier::decide_status(confidence);
+            event.evidence_strength = evidence_strength;
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;

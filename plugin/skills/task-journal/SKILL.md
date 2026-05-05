@@ -1,63 +1,73 @@
 ---
 name: task-journal
-description: Use when the user mentions tracking AI-coding tasks, recovering context for old tasks, recording decisions/findings/evidence with a reasoning chain, or asks "what was I working on?". Suggests appropriate task-journal MCP tools and explains the event lifecycle.
+description: |
+  MANDATORY for every coding session. Use task-journal to track ALL tasks, bugs, and investigations.
+  Create a task at the start, log every significant discovery/decision/error, close when done.
+  This is NOT optional — without it, context is lost between sessions and compactions.
+  Triggers: beginning of work, significant finding, decision made, hypothesis formed, error found,
+  test results obtained, task completed, "what was I working on?", "remind me about X".
 ---
 
 # Task Journal — Reasoning Chain Memory
 
-The `task-journal` plugin captures the **logical chain** of an AI-coding task: hypotheses, decisions, rejections, evidence — not just the final code. Two weeks later, `task_pack` returns a Markdown summary that lets the agent (or you) pick up the task with full context restored.
+**MANDATORY WORKFLOW — follow without exceptions:**
 
-## When to suggest task-journal tools
+1. **Start any task/bug/investigation** → `task_create` with descriptive title
+2. **Every significant discovery** → `event_add` with appropriate type (see below)
+3. **Every decision or rejection** → `event_add` (decision/rejection)
+4. **Test results, QA outcomes** → `event_add` with `event_type=evidence`
+5. **Wrong hypothesis corrected** → `event_add` with `event_type=correction` + `corrects=<event_id>`
+6. **Task done** → `task_close` with reason and outcome
 
-| User says... | Suggest |
-|--------------|---------|
-| "Remind me about task X", "what was I working on for X?" | `task_pack` (or `/task-journal:pack`) |
-| "Find the task where I decided about Y" | `task_search` (or `/task-journal:search`) |
-| "I just decided to use X", "we're going with X" | `event_add` with `event_type=decision` |
-| "I'm gonna try X", "what if we used X?" | `event_add` with `event_type=hypothesis` |
-| "Tests show X", "benchmark says X" | `event_add` with `event_type=evidence` |
-| "We can't do X because Y" | `event_add` with `event_type=rejection` |
-| "Wait, the previous claim was wrong" | `event_add` with `event_type=correction` (set `corrects` to the bad event_id) |
-| "Let me start a new task: X" | `task_create` (or `/task-journal:create`) |
-| "Done with X, shipped" | `task_close` (or `/task-journal:close`) |
+## Event type guide — choose the RIGHT one
 
-## Event types (12 total)
+| Situation | Type | Example |
+|-----------|------|---------|
+| "I think the bug might be in X" | `hypothesis` | Unverified theory, needs checking |
+| "The code shows X does Y at line Z" | `finding` | Verified fact from reading code/logs |
+| "Tests pass", "QA verified on staging" | `evidence` | Proof something works or fails |
+| "We'll use approach X because Y" | `decision` | Committed choice |
+| "Tried X but it won't work because Y" | `rejection` | Explicitly rejected approach |
+| "API rate limit is 100/min" | `constraint` | External limitation discovered |
+| "Actually, previous finding was wrong" | `correction` | Corrects earlier event (set `corrects` field) |
+| "Done, PR merged, verified" | `close` | Task completed |
 
-`open`, `hypothesis`, `finding`, `evidence`, `decision`, `rejection`, `constraint`, `correction`, `reopen`, `supersede`, `close`, `redirect`
+**Key distinctions:**
+- `hypothesis` = "I think" / "maybe" / "could be" → NOT yet verified
+- `finding` = "I see" / "the code shows" / "confirmed" → verified by reading code/logs
+- `evidence` = ran a test/experiment that PROVES something (set `evidence_strength`: weak/medium/strong)
+- `decision` ≠ `hypothesis`: decision = committed; hypothesis = exploring
 
 ## Tools available
 
 The plugin's MCP server exposes 5 tools:
 
-- `task_pack(task_id, mode)` — return Markdown resume pack. `mode` is `compact` (~1-2KB, just essentials) or `full` (~5-10KB, all sections).
+- `task_pack(task_id, mode)` — return Markdown resume pack. `mode`: `compact` (~2KB) or `full` (~10KB).
 - `task_create(title, initial_context?)` — open new task, returns `task_id` like `tj-x9rz1f`.
 - `event_add(task_id, event_type, text, corrects?, supersedes?)` — append event.
 - `task_close(task_id, reason, outcome?)` — close task with reason.
 - `task_search(query)` — FTS5 search current project's events; returns task_ids.
 
+## When to use task_pack
+
+| User says... | Action |
+|--------------|--------|
+| "Remind me about task X", "what was I working on?" | `task_pack` |
+| "Find the task where I decided about Y" | `task_search` → `task_pack` |
+| Session start on existing project | `task_search` for recent open tasks → `task_pack` |
+
 ## Key invariants
 
-- **Append-only**: events are never edited. To fix a misclassification, write a `correction` event linking back via `corrects: <event_id>`.
-- **Confidence-aware**: events from the auto-classifier have a `confidence` field. Below 0.85 → `status=suggested`, rendered with `[?]` marker in `task_pack`. The user is supposed to see these and confirm/correct.
-- **Markdown out**: `task_pack.text` is the primary product output. Inject it into the agent's context to restore reasoning state.
+- **Append-only**: events are never edited. To fix a mistake, write a `correction` event with `corrects: <event_id>`.
+- **One task = one logical objective**: don't create a new task every turn. Events accumulate under one task.
+- **Always close**: when a task is done, call `task_close`. Don't leave tasks open.
+- **Log rejections**: wrong paths are as valuable as correct ones — they prevent repeated mistakes.
 
-## Anti-patterns
+## Auto-capture
 
-- Don't call `task_create` every turn. One task = one logical objective; events accumulate under it.
-- Don't paste raw `task_pack` JSON wrapper to the user — render the `text` field as Markdown.
-- Don't write rejection without a paired decision earlier (or a clear "we considered X but…" framing).
+Hooks are installed via `task-journal install-hooks --scope user`. They use `claude -p --model haiku` (your Pro/Max subscription, no API key needed) to auto-classify chat chunks into events. Manual recording via MCP tools always works as a complement.
 
 ## Storage
 
-Events live at `$XDG_DATA_HOME/task-journal/events/<project_hash>.jsonl` (Linux/WSL) or platform-equivalent. SQLite cache in `state/<hash>.sqlite` is rebuildable from JSONL via `task-journal rebuild-state`.
-
-## Auto-capture (optional, requires Anthropic API key)
-
-This plugin does **not** auto-classify chat chunks by default. The optional auto-capture pipeline (UserPromptSubmit/PostToolUse/Stop hooks → Claude Haiku classifier) requires a separate `ANTHROPIC_API_KEY` from console.anthropic.com — **not** the same as a Claude Code Pro/Max subscription. To enable later:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-task-journal install-hooks --scope user
-```
-
-Without auto-capture the user records events manually via slash commands or MCP tools.
+Events: `$XDG_DATA_HOME/task-journal/events/<project_hash>.jsonl`
+State: `state/<hash>.sqlite` (rebuildable via `task-journal rebuild-state`)
