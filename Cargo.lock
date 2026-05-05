@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "task-journal-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "task-journal-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "task-journal-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "rmcp",
