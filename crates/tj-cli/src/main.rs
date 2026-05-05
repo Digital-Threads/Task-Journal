@@ -86,6 +86,19 @@ enum Commands {
     },
     /// Show local classifier and journal statistics.
     Stats,
+    /// Import task-journal events from existing Claude Code session history.
+    /// Parses JSONL session files and creates tasks retroactively.
+    Backfill {
+        /// Dry run: show what would be imported without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Limit to N most recent sessions (default: all).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Project path override (default: current directory).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Hook entry point: ingest a chat chunk through the classifier.
     IngestHook {
         /// Hook kind: UserPromptSubmit | PostToolUse | Stop | SessionStart.
@@ -558,6 +571,159 @@ fn main() -> Result<()> {
                 for id in ids {
                     println!("{id}");
                 }
+            }
+        }
+        Commands::Backfill {
+            dry_run,
+            limit,
+            project,
+        } => {
+            use tj_core::session::{discovery, extractor, parser};
+
+            let project_path = match project {
+                Some(p) => std::path::PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+
+            let project_hash = tj_core::project_hash::from_path(&project_path)?;
+            let events_dir = tj_core::paths::events_dir()?;
+            let events_path = events_dir.join(format!("{project_hash}.jsonl"));
+
+            // Find the Claude Code project directory for this path.
+            let proj_dir = discovery::find_project_dir(&project_path)?;
+            let proj_dir = match proj_dir {
+                Some(d) => d,
+                None => {
+                    eprintln!(
+                        "No Claude Code sessions found for: {}",
+                        project_path.display()
+                    );
+                    eprintln!(
+                        "Looked in: {}",
+                        discovery::projects_dir()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "?".into())
+                    );
+                    return Ok(());
+                }
+            };
+
+            // List available sessions.
+            let mut sessions = discovery::list_sessions(&proj_dir)?;
+            if let Some(max) = limit {
+                sessions.truncate(max);
+            }
+
+            if sessions.is_empty() {
+                eprintln!("No session JSONL files found in: {}", proj_dir.display());
+                return Ok(());
+            }
+
+            eprintln!(
+                "Found {} session(s) for {}",
+                sessions.len(),
+                project_path.display()
+            );
+
+            // Check which sessions are already imported (idempotent).
+            let already_imported = if events_path.exists() {
+                let content = std::fs::read_to_string(&events_path).unwrap_or_default();
+                sessions
+                    .iter()
+                    .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+                    .filter(|sid| content.contains(sid))
+                    .collect::<std::collections::HashSet<_>>()
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            let mut total_tasks = 0;
+            let mut total_events = 0;
+
+            for session_path in &sessions {
+                let session_id = session_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+
+                if already_imported.contains(&session_id) {
+                    eprintln!("  ⊘ {} — already imported, skipping", &session_id[..8.min(session_id.len())]);
+                    continue;
+                }
+
+                // Parse the session JSONL.
+                let parsed = match parser::parse_session(session_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "  ✗ {} — parse error: {}",
+                            &session_id[..8.min(session_id.len())],
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                // Extract events.
+                let task = match extractor::extract_from_session(&parsed) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!(
+                            "  ⊘ {} — too small ({} msgs), skipping",
+                            &session_id[..8.min(session_id.len())],
+                            parsed.user_message_count()
+                        );
+                        continue;
+                    }
+                };
+
+                if dry_run {
+                    eprintln!(
+                        "  ▸ {} → task {} \"{}\" ({} events)",
+                        &session_id[..8.min(session_id.len())],
+                        task.task_id,
+                        task.title.chars().take(60).collect::<String>(),
+                        task.events.len()
+                    );
+                    for ev in &task.events {
+                        let etype = serde_json::to_value(ev.event_type)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| "?".into());
+                        eprintln!(
+                            "      {:12} {}",
+                            etype,
+                            ev.text.chars().take(80).collect::<String>()
+                        );
+                    }
+                } else {
+                    // Write events to JSONL.
+                    std::fs::create_dir_all(&events_dir)?;
+                    let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                    for event in &task.events {
+                        writer.append(event)?;
+                    }
+                    writer.flush_durable()?;
+
+                    eprintln!(
+                        "  ✓ {} → {} \"{}\" ({} events)",
+                        &session_id[..8.min(session_id.len())],
+                        task.task_id,
+                        task.title.chars().take(60).collect::<String>(),
+                        task.events.len()
+                    );
+                }
+
+                total_tasks += 1;
+                total_events += task.events.len();
+            }
+
+            if dry_run {
+                eprintln!("\nDry run: would create {total_tasks} task(s) with {total_events} event(s).");
+                eprintln!("Run without --dry-run to import.");
+            } else {
+                eprintln!("\nImported {total_tasks} task(s) with {total_events} event(s).");
             }
         }
     }

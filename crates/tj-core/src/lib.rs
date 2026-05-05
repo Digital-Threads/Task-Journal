@@ -8,4 +8,5 @@ pub mod event;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;
+pub mod session;
 pub mod storage;
