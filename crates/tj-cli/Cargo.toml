@@ -25,6 +25,8 @@ serde_json = { workspace = true }
 ulid = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 
 [dev-dependencies]
 assert_fs = { workspace = true }

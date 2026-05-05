@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "task-journal", version, about = "Task Journal CLI", long_about = None)]
 struct Cli {
@@ -86,6 +88,13 @@ enum Commands {
     },
     /// Show local classifier and journal statistics.
     Stats,
+    /// Interactive TUI: browse sessions and read chats.
+    #[command(alias = "tui")]
+    Ui {
+        /// Project path override (default: current directory).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Import task-journal events from existing Claude Code session history.
     /// Parses JSONL session files and creates tasks retroactively.
     Backfill {
@@ -572,6 +581,18 @@ fn main() -> Result<()> {
                     println!("{id}");
                 }
             }
+        }
+        Commands::Ui { project } => {
+            let project_path = match project {
+                Some(p) => std::path::PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            let mut app = tui::app::App::new(&project_path)?;
+            if app.session_list.sessions.is_empty() {
+                eprintln!("No Claude Code sessions found for: {}", project_path.display());
+                return Ok(());
+            }
+            app.run()?;
         }
         Commands::Backfill {
             dry_run,
