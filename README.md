@@ -209,6 +209,10 @@ Smoke test scripts are available in `.beads/hooks/`:
 .beads/hooks/p4-demo.sh          # P4 polish smoke
 ```
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## License
 
 MIT
