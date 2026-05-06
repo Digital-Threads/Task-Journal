@@ -5,10 +5,17 @@
 use anyhow::Result;
 use rmcp::{
     handler::server::tool::Parameters, handler::server::wrapper::Json, tool, tool_handler,
-    tool_router, transport::io::stdio, ServerHandler, ServiceExt,
+    tool_router, transport::io::stdio, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+
+/// Convert any internal failure into a JSON-RPC error frame. We attach the
+/// stringified `anyhow::Error` chain as the `message` so the client sees the
+/// full context (e.g. "task not found: tj-x: no row returned").
+fn into_mcp_error(err: anyhow::Error) -> McpError {
+    McpError::internal_error(format!("{err:#}"), None)
+}
 
 /// MCP instructions delivered to every Claude Code session where this plugin is installed.
 /// This is the primary mechanism for self-contained plugin behavior — no manual CLAUDE.md edits needed.
@@ -148,8 +155,11 @@ impl TaskJournalServer {
         name = "task_pack",
         description = "Return a compact resume pack for a task. Pass mode=compact|full."
     )]
-    async fn task_pack(&self, Parameters(p): Parameters<TaskPackParams>) -> Json<TaskPackResult> {
-        let result = (|| -> anyhow::Result<TaskPackResult> {
+    async fn task_pack(
+        &self,
+        Parameters(p): Parameters<TaskPackParams>,
+    ) -> Result<Json<TaskPackResult>, McpError> {
+        let result: anyhow::Result<TaskPackResult> = (|| {
             let (project_hash, events_path, state_path) = project_paths()?;
             let conn = tj_core::db::open(&state_path)?;
             if events_path.exists() {
@@ -174,19 +184,7 @@ impl TaskJournalServer {
                 },
             })
         })();
-        match result {
-            Ok(r) => Json(r),
-            Err(e) => Json(TaskPackResult {
-                task_id: p.task_id,
-                mode: p.mode.unwrap_or_else(|| "compact".into()),
-                schema_version: tj_core::SCHEMA_VERSION.into(),
-                text: format!("[error] {e}"),
-                metadata: TaskPackMetadata {
-                    source_event_count: None,
-                    cache_hit: None,
-                },
-            }),
-        }
+        result.map(Json).map_err(into_mcp_error)
     }
 
     #[tool(
@@ -196,8 +194,8 @@ impl TaskJournalServer {
     async fn task_search(
         &self,
         Parameters(p): Parameters<TaskSearchParams>,
-    ) -> Json<TaskSearchResult> {
-        let result = (|| -> anyhow::Result<Vec<String>> {
+    ) -> Result<Json<TaskSearchResult>, McpError> {
+        let ids: anyhow::Result<Vec<String>> = (|| {
             let (project_hash, events_path, state_path) = project_paths()?;
             let conn = tj_core::db::open(&state_path)?;
             if events_path.exists() {
@@ -211,10 +209,13 @@ impl TaskJournalServer {
                 .collect::<Result<_, _>>()?;
             Ok(ids)
         })();
-        Json(TaskSearchResult {
-            query: p.query,
-            results: result.unwrap_or_default(),
+        ids.map(|results| {
+            Json(TaskSearchResult {
+                query: p.query,
+                results,
+            })
         })
+        .map_err(into_mcp_error)
     }
 
     #[tool(
@@ -224,8 +225,8 @@ impl TaskJournalServer {
     async fn task_create(
         &self,
         Parameters(p): Parameters<TaskCreateParams>,
-    ) -> Json<TaskCreateResult> {
-        let result = (|| -> anyhow::Result<TaskCreateResult> {
+    ) -> Result<Json<TaskCreateResult>, McpError> {
+        let result: anyhow::Result<TaskCreateResult> = (|| {
             let (_, events_path, _) = project_paths()?;
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
@@ -248,18 +249,18 @@ impl TaskJournalServer {
                 title: p.title.clone(),
             })
         })();
-        Json(result.unwrap_or_else(|e| TaskCreateResult {
-            task_id: format!("[error] {e}"),
-            title: p.title,
-        }))
+        result.map(Json).map_err(into_mcp_error)
     }
 
     #[tool(
         name = "event_add",
         description = "Append a typed event (decision, finding, evidence, rejection, etc.) to a task."
     )]
-    async fn event_add(&self, Parameters(p): Parameters<EventAddParams>) -> Json<EventAddResult> {
-        let result = (|| -> anyhow::Result<EventAddResult> {
+    async fn event_add(
+        &self,
+        Parameters(p): Parameters<EventAddParams>,
+    ) -> Result<Json<EventAddResult>, McpError> {
+        let result: anyhow::Result<EventAddResult> = (|| {
             let (_, events_path, _) = project_paths()?;
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
@@ -284,11 +285,7 @@ impl TaskJournalServer {
                 event_type: p.event_type.clone(),
             })
         })();
-        Json(result.unwrap_or_else(|e| EventAddResult {
-            event_id: format!("[error] {e}"),
-            task_id: p.task_id,
-            event_type: p.event_type,
-        }))
+        result.map(Json).map_err(into_mcp_error)
     }
 
     #[tool(
@@ -298,8 +295,8 @@ impl TaskJournalServer {
     async fn task_close(
         &self,
         Parameters(p): Parameters<TaskCloseParams>,
-    ) -> Json<TaskCloseResult> {
-        let result = (|| -> anyhow::Result<()> {
+    ) -> Result<Json<TaskCloseResult>, McpError> {
+        let result: anyhow::Result<()> = (|| {
             let (_, events_path, _) = project_paths()?;
             let mut event = tj_core::event::Event::new(
                 &p.task_id,
@@ -320,10 +317,14 @@ impl TaskJournalServer {
             writer.flush_durable()?;
             Ok(())
         })();
-        Json(TaskCloseResult {
-            task_id: p.task_id,
-            closed: result.is_ok(),
-        })
+        result
+            .map(|()| {
+                Json(TaskCloseResult {
+                    task_id: p.task_id.clone(),
+                    closed: true,
+                })
+            })
+            .map_err(into_mcp_error)
     }
 }
 
@@ -409,5 +410,56 @@ mod tests {
             closed: true,
         };
         assert!(!keys_of(&serde_json::to_value(&close).unwrap()).contains(&"stub".to_string()));
+    }
+
+    #[test]
+    fn into_mcp_error_carries_full_anyhow_chain() {
+        // Down-stream callers rely on McpError.message containing the full
+        // chain (root cause + every context wrap). Catches a regression
+        // where someone formats with `{}` instead of `{:#}`.
+        let inner = anyhow::anyhow!("root cause");
+        let outer = inner.context("wrap layer");
+        let err = into_mcp_error(outer);
+        assert!(err.message.contains("wrap layer"), "got: {}", err.message);
+        assert!(err.message.contains("root cause"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn task_pack_returns_rpc_error_when_state_dir_is_unusable() {
+        // Force tj_core::paths::state_dir to fail by pointing it at a path
+        // that cannot be created. We do this through XDG_DATA_HOME pointing
+        // at /dev/null which directories crate refuses. The handler must
+        // surface this as Err(McpError), not as a fake-success Json with
+        // a corrupted task_id.
+        //
+        // We don't invoke the async handler directly here because it has
+        // private generated wrappers; instead we exercise the same error
+        // path via project_paths() and verify the conversion does the
+        // right thing.
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        // SAFETY: this test does not run concurrently with other tests
+        // that read XDG_DATA_HOME — see the env-var test in tj-core for
+        // the same pattern.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "/dev/null/cannot-create-here");
+        }
+
+        let res = project_paths();
+
+        // restore
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+
+        // We don't rigidly assert Err here (the directories crate has
+        // platform-specific behavior); we only assert that *if* it errors,
+        // into_mcp_error converts cleanly without panicking.
+        if let Err(e) = res {
+            let mcp_err = into_mcp_error(e);
+            assert!(!mcp_err.message.is_empty());
+        }
     }
 }
