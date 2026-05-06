@@ -62,3 +62,16 @@ jobs:
 
       - name: cargo test (MSRV)
         run: cargo test --workspace --all-targets
+
+  audit:
+    name: cargo-audit (security advisories)
+    runs-on: ubuntu-latest
+    # Non-blocking on first land: an open advisory in a transitive dep should
+    # surface as a CI annotation but not red-light unrelated changes. Flip
+    # continue-on-error to false once the baseline is clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
