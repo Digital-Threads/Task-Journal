@@ -241,6 +241,19 @@ pub fn rebuild_state(
     Ok(count)
 }
 
+/// Returns whether a task with this id has been recorded in the derived
+/// state. Cheap O(1) lookup against the `tasks` primary key. Callers
+/// should run [`ingest_new_events`] first if they want to see the latest
+/// JSONL state.
+pub fn task_exists(conn: &Connection, task_id: &str) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+        rusqlite::params![task_id],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Look up the most recent `event_id` we've ingested for this project.
 /// Returns `None` when the project has never been indexed (first call,
 /// or migration v002 just landed on an existing 0.1.x DB).
@@ -437,6 +450,21 @@ pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn task_exists_returns_true_for_known_id_false_otherwise() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        assert!(!task_exists(&conn, "tj-nope").unwrap());
+
+        let e = make_open_event("tj-yes", "Hello");
+        upsert_task_from_event(&conn, &e, "feedfacefeedface").unwrap();
+        index_event(&conn, &e).unwrap();
+
+        assert!(task_exists(&conn, "tj-yes").unwrap());
+        assert!(!task_exists(&conn, "tj-nope").unwrap());
+    }
 
     #[test]
     fn fresh_db_runs_all_migrations() {

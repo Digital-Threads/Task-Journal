@@ -297,7 +297,17 @@ impl TaskJournalServer {
         Parameters(p): Parameters<TaskCloseParams>,
     ) -> Result<Json<TaskCloseResult>, McpError> {
         let result: anyhow::Result<()> = (|| {
-            let (_, events_path, _) = project_paths()?;
+            let (project_hash, events_path, state_path) = project_paths()?;
+
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if !tj_core::db::task_exists(&conn, &p.task_id)? {
+                anyhow::bail!("task not found: {}", p.task_id);
+            }
+            drop(conn);
+
             let mut event = tj_core::event::Event::new(
                 &p.task_id,
                 tj_core::event::EventType::Close,

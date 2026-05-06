@@ -105,6 +105,18 @@ fn close_command_marks_task_closed_in_pack() {
 }
 
 #[test]
+fn close_unknown_task_id_returns_error() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", "tj-doesnotexist", "--reason", "shipped"])
+        .assert()
+        .failure()
+        .stderr(contains("task not found: tj-doesnotexist"));
+}
+
+#[test]
 fn search_all_projects_finds_match_in_other_project_hash() {
     let dir = assert_fs::TempDir::new().unwrap();
 

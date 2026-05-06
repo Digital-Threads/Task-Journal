@@ -273,6 +273,18 @@ fn main() -> Result<()> {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+
+            // Catch up the index then assert the task is real before we
+            // append a close event for an id that never existed.
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if !tj_core::db::task_exists(&conn, &task_id)? {
+                anyhow::bail!("task not found: {task_id}");
+            }
+            drop(conn);
 
             let mut event = tj_core::event::Event::new(
                 &task_id,
