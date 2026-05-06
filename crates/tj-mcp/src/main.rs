@@ -61,7 +61,6 @@ pub struct TaskPackResult {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskPackMetadata {
-    pub stub: bool,
     pub source_event_count: Option<usize>,
     pub cache_hit: Option<bool>,
 }
@@ -76,7 +75,6 @@ pub struct TaskSearchParams {
 pub struct TaskSearchResult {
     pub query: String,
     pub results: Vec<String>,
-    pub stub: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -88,7 +86,6 @@ pub struct TaskCreateParams {
 pub struct TaskCreateResult {
     pub task_id: String,
     pub title: String,
-    pub stub: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -104,7 +101,6 @@ pub struct EventAddResult {
     pub event_id: String,
     pub task_id: String,
     pub event_type: String,
-    pub stub: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -117,7 +113,6 @@ pub struct TaskCloseParams {
 pub struct TaskCloseResult {
     pub task_id: String,
     pub closed: bool,
-    pub stub: bool,
 }
 
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
@@ -174,7 +169,6 @@ impl TaskJournalServer {
                 schema_version: pack.schema_version,
                 text: pack.text,
                 metadata: TaskPackMetadata {
-                    stub: false,
                     source_event_count: Some(pack.metadata.source_event_count),
                     cache_hit: Some(pack.metadata.cache_hit),
                 },
@@ -188,7 +182,6 @@ impl TaskJournalServer {
                 schema_version: tj_core::SCHEMA_VERSION.into(),
                 text: format!("[error] {e}"),
                 metadata: TaskPackMetadata {
-                    stub: false,
                     source_event_count: None,
                     cache_hit: None,
                 },
@@ -221,7 +214,6 @@ impl TaskJournalServer {
         Json(TaskSearchResult {
             query: p.query,
             results: result.unwrap_or_default(),
-            stub: false,
         })
     }
 
@@ -254,13 +246,11 @@ impl TaskJournalServer {
             Ok(TaskCreateResult {
                 task_id,
                 title: p.title.clone(),
-                stub: false,
             })
         })();
         Json(result.unwrap_or_else(|e| TaskCreateResult {
             task_id: format!("[error] {e}"),
             title: p.title,
-            stub: false,
         }))
     }
 
@@ -292,14 +282,12 @@ impl TaskJournalServer {
                 event_id: event.event_id,
                 task_id: p.task_id.clone(),
                 event_type: p.event_type.clone(),
-                stub: false,
             })
         })();
         Json(result.unwrap_or_else(|e| EventAddResult {
             event_id: format!("[error] {e}"),
             task_id: p.task_id,
             event_type: p.event_type,
-            stub: false,
         }))
     }
 
@@ -335,7 +323,6 @@ impl TaskJournalServer {
         Json(TaskCloseResult {
             task_id: p.task_id,
             closed: result.is_ok(),
-            stub: false,
         })
     }
 }
@@ -368,4 +355,59 @@ async fn main() -> Result<()> {
     let (stdin, stdout) = stdio();
     server.serve((stdin, stdout)).await?.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys_of(v: &serde_json::Value) -> Vec<String> {
+        v.as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn no_response_serializes_a_stub_field() {
+        // Vestigial stub:bool from Phase 1 stubs has been removed from all
+        // five MCP result types. Guard against re-introduction.
+        let pack = TaskPackResult {
+            task_id: "tj-x".into(),
+            mode: "compact".into(),
+            schema_version: tj_core::SCHEMA_VERSION.into(),
+            text: String::new(),
+            metadata: TaskPackMetadata {
+                source_event_count: None,
+                cache_hit: None,
+            },
+        };
+        let pack_v = serde_json::to_value(&pack).unwrap();
+        assert!(!keys_of(&pack_v).contains(&"stub".to_string()));
+        assert!(!keys_of(&pack_v["metadata"]).contains(&"stub".to_string()));
+
+        let search = TaskSearchResult {
+            query: "q".into(),
+            results: vec![],
+        };
+        assert!(!keys_of(&serde_json::to_value(&search).unwrap()).contains(&"stub".to_string()));
+
+        let create = TaskCreateResult {
+            task_id: "tj-x".into(),
+            title: "t".into(),
+        };
+        assert!(!keys_of(&serde_json::to_value(&create).unwrap()).contains(&"stub".to_string()));
+
+        let event = EventAddResult {
+            event_id: "e".into(),
+            task_id: "tj-x".into(),
+            event_type: "decision".into(),
+        };
+        assert!(!keys_of(&serde_json::to_value(&event).unwrap()).contains(&"stub".to_string()));
+
+        let close = TaskCloseResult {
+            task_id: "tj-x".into(),
+            closed: true,
+        };
+        assert!(!keys_of(&serde_json::to_value(&close).unwrap()).contains(&"stub".to_string()));
+    }
 }
