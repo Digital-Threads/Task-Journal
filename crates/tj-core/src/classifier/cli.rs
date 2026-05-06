@@ -14,17 +14,22 @@ use serde::Deserialize;
 ///
 /// Configuration:
 /// - `command`: program name (default `"claude"`); override for tests/dev.
-/// - `model`: model alias passed via `--model` (default `"haiku"`; cheaper than the user's session model).
+/// - `model`: model alias passed via `--model`. Overridable via the
+///   `TJ_CLASSIFIER_MODEL` env var; falls back to `DEFAULT_MODEL` (haiku —
+///   cheaper than the user's session model).
 pub struct ClaudeCliClassifier {
     pub command: String,
     pub model: String,
 }
 
+/// Default model when `TJ_CLASSIFIER_MODEL` is not set.
+pub const DEFAULT_MODEL: &str = "haiku";
+
 impl Default for ClaudeCliClassifier {
     fn default() -> Self {
         Self {
             command: "claude".into(),
-            model: "haiku".into(),
+            model: std::env::var("TJ_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
         }
     }
 }

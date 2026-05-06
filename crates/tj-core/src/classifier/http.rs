@@ -10,6 +10,9 @@ use std::time::Duration;
 /// hook would still hang the chat turn.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Default model when `TJ_CLASSIFIER_MODEL` is not set.
+pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
+
 pub struct AnthropicClassifier {
     pub api_key: String,
     pub model: String,
@@ -21,9 +24,10 @@ impl AnthropicClassifier {
     pub fn from_env() -> anyhow::Result<Self> {
         let api_key =
             std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY env var not set")?;
+        let model = std::env::var("TJ_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
         Ok(Self {
             api_key,
-            model: "claude-haiku-4-5-20251001".into(),
+            model,
             base_url: "https://api.anthropic.com".into(),
             timeout: DEFAULT_TIMEOUT,
         })

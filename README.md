@@ -140,6 +140,13 @@ The classifier (powered by `claude -p` with your Pro/Max subscription, or the An
 
 Hook commands are wrapped with `|| true` so classifier failures (network down, rate limit) never break Claude Code. Failed classifications are queued in `pending/` and retried on the next ingest.
 
+### Configuration
+
+| Env var | Effect | Default |
+|---------|--------|---------|
+| `TJ_CLASSIFIER_MODEL` | Model alias passed to `claude -p` (subscription backend) or to the Anthropic API. | `haiku` (CLI) / `claude-haiku-4-5-20251001` (API) |
+| `ANTHROPIC_API_KEY`   | Required for the `--backend=api` HTTP classifier. | _unset_ |
+
 ## Event Types
 
 | Type | Meaning |
