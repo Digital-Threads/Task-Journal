@@ -185,7 +185,7 @@ impl TaskJournalServer {
             Err(e) => Json(TaskPackResult {
                 task_id: p.task_id,
                 mode: p.mode.unwrap_or_else(|| "compact".into()),
-                schema_version: "1.0".into(),
+                schema_version: tj_core::SCHEMA_VERSION.into(),
                 text: format!("[error] {e}"),
                 metadata: TaskPackMetadata {
                     stub: false,

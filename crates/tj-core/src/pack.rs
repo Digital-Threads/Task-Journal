@@ -176,7 +176,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         return Ok(TaskPack {
             task_id: task_id.to_string(),
             mode,
-            schema_version: "1.0".into(),
+            schema_version: crate::SCHEMA_VERSION.into(),
             text: cached_text,
             metadata: PackMetadata {
                 generated_at: cached_at,
@@ -243,7 +243,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     Ok(TaskPack {
         task_id: task_id.to_string(),
         mode,
-        schema_version: "1.0".into(),
+        schema_version: crate::SCHEMA_VERSION.into(),
         text,
         metadata: PackMetadata {
             generated_at,

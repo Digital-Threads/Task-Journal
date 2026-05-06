@@ -114,7 +114,7 @@ impl Event {
     ) -> Self {
         Event {
             event_id: ulid::Ulid::new().to_string(),
-            schema_version: "1.0".to_string(),
+            schema_version: crate::SCHEMA_VERSION.to_string(),
             task_id: task_id.into(),
             event_type,
             timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
