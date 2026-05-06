@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-rc.1] - 2026-05-06
+
+> **Release candidate.** Major version bump because the MCP error
+> contract changed shape (see _BREAKING_ below). After dogfooding
+> for a week the matching `0.2.0` will be cut without further code
+> changes.
+
+### BREAKING
+
+- **MCP error contract.** Tool handlers (`task_pack`, `task_search`,
+  `task_create`, `event_add`, `task_close`) no longer mask failures
+  as success-typed JSON with `task_id = "[error] msg"`. They now
+  return JSON-RPC error frames (rmcp `ErrorData`) carrying the full
+  `anyhow` chain in the `message` field. Any client that was parsing
+  `"[error]"` out of the result must switch to detecting the rpc
+  error envelope first.
+
+### Added
+- `tj_core::db::ingest_new_events` — incremental indexing that reads
+  only the JSONL tail since the last marker. Two safe fallbacks to
+  full `rebuild_state`: no marker yet, or marker missing in file.
+- `tj_core::db::task_exists` — O(1) lookup against `tasks` PK.
+- Migration v002: `index_state(project_hash, last_indexed_event_id,
+  updated_at)` table, plus a forward-only migrations registry tracked
+  in `schema_migrations(version, applied_at)`.
+- MCP `--project-dir <PATH>` argument — overrides the cwd-derived
+  project hash. Path is canonicalized at startup.
+- `criterion` benchmarks for `rebuild_state`, `pack_assemble_cold`,
+  and FTS `search` at 1k and 10k events. CI `benches-compile` job
+  guards the harness.
+- New regression tests:
+  `fresh_db_runs_all_migrations`, `apply_migrations_is_idempotent_
+  across_reopens`, `task_exists_returns_true_for_known_id_false_
+  otherwise`, `ingest_new_events_picks_up_only_new_lines`,
+  `ingest_new_events_falls_back_to_full_rebuild_when_marker_vanishes`,
+  `rebuild_state_and_ingest_new_events_produce_same_state`,
+  `pack_cache_hits_after_incremental_ingest_with_no_new_events`,
+  `into_mcp_error_carries_full_anyhow_chain`,
+  `resolve_project_paths_uses_provided_dir_for_hash`,
+  `cli_parses_project_dir_argument`,
+  `run_blocking_executes_two_tasks_concurrently`,
+  `close_unknown_task_id_returns_error` (CLI integration).
+
+### Changed
+- Every MCP tool handler now offloads its synchronous I/O to the
+  tokio blocking pool via `tokio::task::spawn_blocking`. Concurrent
+  client requests no longer serialise behind one slow operation.
+- `rebuild_state` writes the `last_indexed_event_id` marker on
+  completion so subsequent `ingest_new_events` calls can pick up
+  from the tail.
+- CLI `Close` and MCP `task_close` validate that `task_id` exists
+  in the `tasks` table before appending a close event. Closing an
+  unknown id used to silently succeed; now it returns an error
+  (CLI: non-zero exit + stderr; MCP: rpc error frame).
+- Workspace version `0.1.3` → `0.2.0-rc.1`.
+
+### Performance
+- `task_pack`, `task_search`, and the auto-capture hook used to
+  re-read the entire JSONL log on every invocation through
+  `rebuild_state`. They now use `ingest_new_events` and only
+  process events newer than the last marker. The pack-cache, which
+  was wiped on every `index_event` call during full rebuild, is now
+  reused naturally — a no-op ingest yields `cache_hit: true` on the
+  next `assemble`.
+
 ## [0.1.4] - 2026-05-06
 
 Backwards-compatible hardening release. No breaking changes to the CLI flags
@@ -128,7 +193,8 @@ Initial release on crates.io.
 - `task-journal-mcp`: MCP server exposing `task_create`, `event_add`,
   `task_pack`, `task_search`, `task_close`.
 
-[Unreleased]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/Digital-Threads/Task-Journal/compare/v0.2.0-rc.1...HEAD
+[0.2.0-rc.1]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.4...v0.2.0-rc.1
 [0.1.4]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.1...v0.1.2

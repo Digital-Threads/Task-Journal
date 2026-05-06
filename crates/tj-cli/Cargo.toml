@@ -16,7 +16,7 @@ name = "task-journal"
 path = "src/main.rs"
 
 [dependencies]
-tj-core = { package = "task-journal-core", version = "0.1.3", path = "../tj-core" }
+tj-core = { package = "task-journal-core", version = "0.2.0-rc.1", path = "../tj-core" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
