@@ -137,8 +137,20 @@ pub fn rebuild_state(
         if line.trim().is_empty() {
             continue;
         }
-        let event: Event =
-            serde_json::from_str(&line).with_context(|| format!("parse line {i}"))?;
+        // Malformed JSONL lines are skipped with a warning so that one bad
+        // event cannot abort an otherwise-recoverable rebuild. SQL errors
+        // still propagate — those indicate schema/integrity problems.
+        let event: Event = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    line_number = i + 1,
+                    error = %err,
+                    "skipping malformed JSONL line in rebuild_state"
+                );
+                continue;
+            }
+        };
         upsert_task_from_event(&tx, &event, project_hash)?;
         index_event(&tx, &event)?;
         count += 1;
@@ -436,6 +448,55 @@ mod tests {
         let mut hashes = list_all_projects(&state_dir).unwrap();
         hashes.sort();
         assert_eq!(hashes, vec!["aaaa1111aaaa1111", "bbbb2222bbbb2222"]);
+    }
+
+    #[test]
+    fn rebuild_state_skips_malformed_jsonl_lines() {
+        use std::io::Write;
+        let d = TempDir::new().unwrap();
+        let events_path = d.path().join("events.jsonl");
+        let db_path = d.path().join("s.sqlite");
+
+        let mut f = std::fs::File::create(&events_path).unwrap();
+
+        let mut e1 = crate::event::Event::new(
+            "tj-skip",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "x".into(),
+        );
+        e1.meta = serde_json::json!({"title": "Skip test"});
+        writeln!(f, "{}", serde_json::to_string(&e1).unwrap()).unwrap();
+
+        // Garbage that is not even JSON.
+        writeln!(f, "this is not a json event line").unwrap();
+
+        // Valid JSON but not a valid Event (missing required fields).
+        writeln!(f, "{{\"foo\": 1}}").unwrap();
+
+        let e3 = crate::event::Event::new(
+            "tj-skip",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Adopt Rust".into(),
+        );
+        writeln!(f, "{}", serde_json::to_string(&e3).unwrap()).unwrap();
+        drop(f);
+
+        let conn = open(&db_path).unwrap();
+        let n = rebuild_state(&conn, &events_path, "deadbeefdeadbeef")
+            .expect("rebuild_state must succeed despite malformed lines");
+        assert_eq!(
+            n, 2,
+            "expected 2 valid events indexed (2 malformed skipped)"
+        );
+
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events_index", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(indexed, 2);
     }
 
     #[test]

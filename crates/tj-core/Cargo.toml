@@ -28,6 +28,7 @@ dunce = { workspace = true }
 directories = { workspace = true }
 rusqlite = { workspace = true }
 ureq = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
