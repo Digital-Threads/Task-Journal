@@ -237,10 +237,7 @@ impl TaskJournalServer {
             let (_, events_path, _) = project_paths()?;
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
-            let task_id = format!(
-                "tj-{}",
-                &ulid::Ulid::new().to_string()[10..16].to_lowercase()
-            );
+            let task_id = tj_core::new_task_id();
             let mut event = tj_core::event::Event::new(
                 task_id.clone(),
                 tj_core::event::EventType::Open,

@@ -7,6 +7,46 @@
 /// envelope. Single source of truth across the workspace — never inline.
 pub const SCHEMA_VERSION: &str = "1.0";
 
+/// Build a fresh task identifier of the form `tj-<10 lowercase base32>`.
+///
+/// 50 bits of entropy from the ULID random suffix → birthday-collision
+/// threshold ≈ 33 million tasks per project. The previous 6-char form
+/// only gave ~4096; old IDs remain valid since storage keys are strings.
+pub fn new_task_id() -> String {
+    format!(
+        "tj-{}",
+        &ulid::Ulid::new().to_string()[10..20].to_lowercase()
+    )
+}
+
+#[cfg(test)]
+mod task_id_tests {
+    use super::new_task_id;
+    use std::collections::HashSet;
+
+    #[test]
+    fn new_task_id_has_expected_shape() {
+        let id = new_task_id();
+        assert!(id.starts_with("tj-"), "{id}");
+        assert_eq!(id.len(), 13, "{id}");
+        assert!(
+            id[3..]
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "{id}"
+        );
+    }
+
+    #[test]
+    fn new_task_id_unique_over_ten_thousand() {
+        let mut seen = HashSet::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let id = new_task_id();
+            assert!(seen.insert(id.clone()), "collision: {id}");
+        }
+    }
+}
+
 pub mod classifier;
 pub mod db;
 pub mod event;

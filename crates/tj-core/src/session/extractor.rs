@@ -23,10 +23,7 @@ pub fn extract_from_session(session: &ParsedSession) -> Option<ExtractedTask> {
         return None;
     }
 
-    let task_id = format!(
-        "tj-{}",
-        &ulid::Ulid::new().to_string()[10..16].to_lowercase()
-    );
+    let task_id = crate::new_task_id();
 
     // Derive title from first user message or summary.
     let title = derive_title(session);
