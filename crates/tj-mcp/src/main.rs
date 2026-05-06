@@ -39,6 +39,21 @@ fn into_mcp_error(err: anyhow::Error) -> McpError {
     McpError::internal_error(format!("{err:#}"), None)
 }
 
+/// Run synchronous I/O on the tokio blocking pool. Without this, every tool
+/// handler would do SQLite + JSONL work directly on the executor thread
+/// and a slow operation in one tool would stall every other concurrent
+/// request — defeats the point of using an async runtime at all.
+async fn run_blocking<T, F>(f: F) -> Result<T, McpError>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let join_result = tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| McpError::internal_error(format!("blocking task panicked: {e}"), None))?;
+    join_result.map_err(into_mcp_error)
+}
+
 /// MCP instructions delivered to every Claude Code session where this plugin is installed.
 /// This is the primary mechanism for self-contained plugin behavior — no manual CLAUDE.md edits needed.
 const MCP_INSTRUCTIONS: &str = r#"Task Journal — reasoning chain memory for AI coding sessions.
@@ -190,7 +205,7 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskPackParams>,
     ) -> Result<Json<TaskPackResult>, McpError> {
-        let result: anyhow::Result<TaskPackResult> = (|| {
+        run_blocking(move || {
             let (project_hash, events_path, state_path) = project_paths()?;
             let conn = tj_core::db::open(&state_path)?;
             if events_path.exists() {
@@ -214,8 +229,9 @@ impl TaskJournalServer {
                     cache_hit: Some(pack.metadata.cache_hit),
                 },
             })
-        })();
-        result.map(Json).map_err(into_mcp_error)
+        })
+        .await
+        .map(Json)
     }
 
     #[tool(
@@ -226,7 +242,8 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskSearchParams>,
     ) -> Result<Json<TaskSearchResult>, McpError> {
-        let ids: anyhow::Result<Vec<String>> = (|| {
+        let query = p.query.clone();
+        let results = run_blocking(move || {
             let (project_hash, events_path, state_path) = project_paths()?;
             let conn = tj_core::db::open(&state_path)?;
             if events_path.exists() {
@@ -239,14 +256,9 @@ impl TaskJournalServer {
                 .query_map(rusqlite::params![p.query], |r| r.get::<_, String>(0))?
                 .collect::<Result<_, _>>()?;
             Ok(ids)
-        })();
-        ids.map(|results| {
-            Json(TaskSearchResult {
-                query: p.query,
-                results,
-            })
         })
-        .map_err(into_mcp_error)
+        .await?;
+        Ok(Json(TaskSearchResult { query, results }))
     }
 
     #[tool(
@@ -257,7 +269,7 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskCreateParams>,
     ) -> Result<Json<TaskCreateResult>, McpError> {
-        let result: anyhow::Result<TaskCreateResult> = (|| {
+        run_blocking(move || {
             let (_, events_path, _) = project_paths()?;
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
@@ -279,8 +291,9 @@ impl TaskJournalServer {
                 task_id,
                 title: p.title.clone(),
             })
-        })();
-        result.map(Json).map_err(into_mcp_error)
+        })
+        .await
+        .map(Json)
     }
 
     #[tool(
@@ -291,7 +304,7 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<EventAddParams>,
     ) -> Result<Json<EventAddResult>, McpError> {
-        let result: anyhow::Result<EventAddResult> = (|| {
+        run_blocking(move || {
             let (_, events_path, _) = project_paths()?;
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
@@ -315,8 +328,9 @@ impl TaskJournalServer {
                 task_id: p.task_id.clone(),
                 event_type: p.event_type.clone(),
             })
-        })();
-        result.map(Json).map_err(into_mcp_error)
+        })
+        .await
+        .map(Json)
     }
 
     #[tool(
@@ -327,7 +341,8 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskCloseParams>,
     ) -> Result<Json<TaskCloseResult>, McpError> {
-        let result: anyhow::Result<()> = (|| {
+        let task_id = p.task_id.clone();
+        run_blocking(move || {
             let (project_hash, events_path, state_path) = project_paths()?;
 
             let conn = tj_core::db::open(&state_path)?;
@@ -357,15 +372,12 @@ impl TaskJournalServer {
             writer.append(&event)?;
             writer.flush_durable()?;
             Ok(())
-        })();
-        result
-            .map(|()| {
-                Json(TaskCloseResult {
-                    task_id: p.task_id.clone(),
-                    closed: true,
-                })
-            })
-            .map_err(into_mcp_error)
+        })
+        .await?;
+        Ok(Json(TaskCloseResult {
+            task_id,
+            closed: true,
+        }))
     }
 }
 
@@ -480,6 +492,36 @@ mod tests {
 
         let (hash_a_again, _, _) = resolve_project_paths(&a).unwrap();
         assert_eq!(hash_a, hash_a_again);
+    }
+
+    #[tokio::test]
+    async fn run_blocking_executes_two_tasks_concurrently() {
+        use std::time::{Duration, Instant};
+
+        // Two tasks each sleep ~200ms. If run_blocking handed work to the
+        // tokio blocking pool they overlap (~200ms wall-clock). If we ever
+        // regress to running the closure inline on the executor thread,
+        // tokio::join! still wakes both futures but only one progresses at
+        // a time and total wall-clock approaches 400ms.
+        let start = Instant::now();
+        let (a, b) = tokio::join!(
+            run_blocking(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok::<_, anyhow::Error>(1u32)
+            }),
+            run_blocking(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok::<_, anyhow::Error>(2u32)
+            }),
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(a.unwrap(), 1);
+        assert_eq!(b.unwrap(), 2);
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "blocking tasks must overlap on the blocking pool — got {elapsed:?}"
+        );
     }
 
     #[test]
