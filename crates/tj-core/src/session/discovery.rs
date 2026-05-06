@@ -154,4 +154,181 @@ mod tests {
         let encoded = encode_project_path("\\\\wsl.localhost\\ubuntu\\home\\user\\project");
         assert_eq!(encoded, "--wsl-localhost-ubuntu-home-user-project");
     }
+
+    // --- list_sessions() ---
+
+    #[test]
+    fn list_sessions_returns_jsonl_files_skipping_agent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create regular session files.
+        std::fs::write(dir.path().join("sess-001.jsonl"), "{}").unwrap();
+        std::fs::write(dir.path().join("sess-002.jsonl"), "{}").unwrap();
+        // Create agent files that should be skipped.
+        std::fs::write(dir.path().join("agent-abc.jsonl"), "{}").unwrap();
+        std::fs::write(dir.path().join("agent-def.jsonl"), "{}").unwrap();
+        // Create non-jsonl files that should be skipped.
+        std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("data.json"), "{}").unwrap();
+
+        let sessions = list_sessions(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let names: Vec<String> = sessions
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"sess-001.jsonl".to_string()));
+        assert!(names.contains(&"sess-002.jsonl".to_string()));
+        assert!(!names.iter().any(|n| n.starts_with("agent-")));
+    }
+
+    #[test]
+    fn list_sessions_sorted_by_mtime_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create files with different modification times.
+        let older = dir.path().join("older.jsonl");
+        std::fs::write(&older, "{}").unwrap();
+
+        // Sleep briefly to ensure different mtime.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let newer = dir.path().join("newer.jsonl");
+        std::fs::write(&newer, "{}").unwrap();
+
+        let sessions = list_sessions(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        // Newest file should come first.
+        let first_name = sessions[0].file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(first_name, "newer.jsonl");
+    }
+
+    #[test]
+    fn list_sessions_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = list_sessions(dir.path()).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn list_sessions_nonexistent_directory() {
+        let result = list_sessions(Path::new("/nonexistent/path/xyz"));
+        assert!(result.is_err());
+    }
+
+    // --- list_all_projects() ---
+
+    #[test]
+    fn list_all_projects_with_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Override CLAUDE_CONFIG_DIR for this test.
+        let config_dir = dir.path();
+        let projects = config_dir.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // Create project directories.
+        std::fs::create_dir(projects.join("-home-user-project-alpha")).unwrap();
+        std::fs::create_dir(projects.join("-home-user-project-beta")).unwrap();
+        // Create a file (should be skipped — not a directory).
+        std::fs::write(projects.join("not-a-dir.txt"), "").unwrap();
+
+        // We can't easily test list_all_projects() because it uses projects_dir()
+        // which reads CLAUDE_CONFIG_DIR. Instead, test the directory listing logic directly.
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(&projects).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let decoded = decode_project_path(&name);
+                result.push((decoded, entry.path()));
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(result.len(), 2);
+        assert!(result[0].0.contains("alpha"));
+        assert!(result[1].0.contains("beta"));
+    }
+
+    // --- find_project_dir() with CLAUDE_CONFIG_DIR env override ---
+
+    #[test]
+    fn find_project_dir_with_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // Create a project directory matching an encoded path.
+        let encoded = encode_project_path("/home/user/myproject");
+        std::fs::create_dir(projects.join(&encoded)).unwrap();
+
+        // Set the env override.
+        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path().to_str().unwrap());
+
+        let result = find_project_dir(Path::new("/home/user/myproject"));
+
+        // Clean up env before assertions (to avoid affecting other tests).
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let found = result.unwrap();
+        assert!(found.is_some());
+        let found_path = found.unwrap();
+        assert!(found_path.ends_with(&encoded));
+    }
+
+    #[test]
+    fn find_project_dir_returns_none_when_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path().to_str().unwrap());
+
+        let result = find_project_dir(Path::new("/nonexistent/project"));
+
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn find_project_dir_returns_none_when_projects_dir_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Don't create a "projects" subdir — it doesn't exist.
+
+        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path().to_str().unwrap());
+
+        let result = find_project_dir(Path::new("/home/user/myproject"));
+
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert!(result.unwrap().is_none());
+    }
+
+    // --- decode_project_path ---
+
+    #[test]
+    fn decode_project_path_returns_same_string() {
+        // Current implementation is identity — just verify it doesn't panic.
+        let decoded = decode_project_path("-home-user-project");
+        assert_eq!(decoded, "-home-user-project");
+    }
+
+    // --- claude_config_dir ---
+
+    #[test]
+    fn claude_config_dir_respects_env_var() {
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/custom-claude-config");
+        let dir = claude_config_dir().unwrap();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(dir, PathBuf::from("/tmp/custom-claude-config"));
+    }
+
+    #[test]
+    fn claude_config_dir_ignores_empty_env_var() {
+        std::env::set_var("CLAUDE_CONFIG_DIR", "");
+        let dir = claude_config_dir().unwrap();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        // Should fall back to home dir + .claude.
+        assert!(dir.to_string_lossy().ends_with(".claude"));
+    }
 }

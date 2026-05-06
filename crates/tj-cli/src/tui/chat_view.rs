@@ -220,7 +220,7 @@ impl ChatView {
             Span::raw(" page  "),
             Span::styled("Home/End", Style::default().fg(Color::Yellow)),
             Span::raw(" top/bottom  "),
-            Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
+            Span::styled("Backspace/Esc/q", Style::default().fg(Color::Yellow)),
             Span::raw(" back"),
         ]);
         let block = Paragraph::new(help)
@@ -291,5 +291,207 @@ fn format_ts(ts: &str) -> String {
         ts[11..19].to_string()
     } else {
         ts.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- word_wrap() tests ---
+
+    #[test]
+    fn word_wrap_empty_text() {
+        let result = word_wrap("", 40);
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn word_wrap_single_word_longer_than_width() {
+        let result = word_wrap("superlongwordthatexceedswidth", 10);
+        // Word cannot be broken, so it stays on its own line.
+        assert_eq!(result, vec!["superlongwordthatexceedswidth"]);
+    }
+
+    #[test]
+    fn word_wrap_normal_wrapping() {
+        let result = word_wrap("hello world foo bar", 11);
+        assert_eq!(result, vec!["hello world", "foo bar"]);
+    }
+
+    #[test]
+    fn word_wrap_exact_fit() {
+        let result = word_wrap("hello world", 11);
+        assert_eq!(result, vec!["hello world"]);
+    }
+
+    #[test]
+    fn word_wrap_one_char_over() {
+        let result = word_wrap("hello world", 10);
+        assert_eq!(result, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn word_wrap_zero_width() {
+        let result = word_wrap("hello world", 0);
+        // Zero width returns original text as-is.
+        assert_eq!(result, vec!["hello world"]);
+    }
+
+    #[test]
+    fn word_wrap_multiple_spaces_collapsed() {
+        // split_whitespace collapses multiple spaces.
+        let result = word_wrap("hello   world", 40);
+        assert_eq!(result, vec!["hello world"]);
+    }
+
+    #[test]
+    fn word_wrap_only_whitespace() {
+        let result = word_wrap("   ", 40);
+        // split_whitespace yields nothing, so we get a single empty string.
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn word_wrap_many_short_words() {
+        let result = word_wrap("a b c d e f g h i j", 5);
+        assert_eq!(result, vec!["a b c", "d e f", "g h i", "j"]);
+    }
+
+    // --- strip_xml_tags() tests ---
+
+    #[test]
+    fn strip_xml_tags_simple() {
+        assert_eq!(strip_xml_tags("<b>bold</b>"), "bold");
+    }
+
+    #[test]
+    fn strip_xml_tags_nested() {
+        assert_eq!(strip_xml_tags("<div><span>inner</span></div>"), "inner");
+    }
+
+    #[test]
+    fn strip_xml_tags_no_tags_passthrough() {
+        assert_eq!(strip_xml_tags("no tags here"), "no tags here");
+    }
+
+    #[test]
+    fn strip_xml_tags_only_tags_empty_result() {
+        assert_eq!(strip_xml_tags("<tag></tag>"), "");
+    }
+
+    #[test]
+    fn strip_xml_tags_self_closing() {
+        assert_eq!(strip_xml_tags("before<br/>after"), "beforeafter");
+    }
+
+    #[test]
+    fn strip_xml_tags_command_message() {
+        let input = "<command-name>brainstorm</command-name><command-message>Design the new auth system</command-message>";
+        let result = strip_xml_tags(input);
+        assert_eq!(result, "brainstormDesign the new auth system");
+    }
+
+    #[test]
+    fn strip_xml_tags_mixed_content() {
+        assert_eq!(
+            strip_xml_tags("Hello <b>world</b>, how are <i>you</i>?"),
+            "Hello world, how are you?"
+        );
+    }
+
+    // --- truncate() tests ---
+
+    #[test]
+    fn truncate_short_text() {
+        assert_eq!(truncate("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_cuts_with_ellipsis() {
+        let result = truncate("hello world", 5);
+        assert_eq!(result, "hello…");
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8_cyrillic() {
+        // "Привет" = 6 chars, 12 bytes (each Cyrillic char is 2 bytes).
+        let text = "Привет мир";
+        let result = truncate(text, 8);
+        // 8 bytes = 4 cyrillic chars "Прив"
+        assert!(result.ends_with('…'));
+        assert!(result.starts_with("Прив"));
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8_emoji() {
+        // Emoji is 4 bytes, so truncating at 3 bytes should back up to 0.
+        let text = "\u{1F600}hello";
+        let result = truncate(text, 3);
+        // Can't fit the emoji (4 bytes), backs up to 0.
+        assert_eq!(result, "…");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn truncate_single_ascii_char() {
+        assert_eq!(truncate("x", 1), "x");
+        assert_eq!(truncate("xy", 1), "x…");
+    }
+
+    // --- format_ts() tests ---
+
+    #[test]
+    fn format_ts_valid_rfc3339() {
+        let result = format_ts("2026-01-15T14:30:45Z");
+        assert_eq!(result, "14:30:45");
+    }
+
+    #[test]
+    fn format_ts_valid_rfc3339_with_offset() {
+        let result = format_ts("2026-01-15T14:30:45+04:00");
+        assert_eq!(result, "14:30:45");
+    }
+
+    #[test]
+    fn format_ts_valid_rfc3339_with_millis() {
+        let result = format_ts("2026-01-15T14:30:45.123Z");
+        assert_eq!(result, "14:30:45");
+    }
+
+    #[test]
+    fn format_ts_invalid_but_long_enough() {
+        // Not valid RFC3339 but >= 19 chars: extracts chars 11..19.
+        let result = format_ts("2026-01-15 14:30:45 extra");
+        assert_eq!(result, "14:30:45");
+    }
+
+    #[test]
+    fn format_ts_short_string() {
+        let result = format_ts("short");
+        assert_eq!(result, "short");
+    }
+
+    #[test]
+    fn format_ts_empty_string() {
+        let result = format_ts("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn format_ts_exactly_19_chars() {
+        let result = format_ts("2026-01-15T14:30:45");
+        // Not valid RFC3339 (missing timezone), so falls to the length check.
+        // 19 chars >= 19, extracts [11..19] = "14:30:45"
+        assert_eq!(result, "14:30:45");
     }
 }

@@ -288,4 +288,437 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].0, "Read");
     }
+
+    // --- parse_session() with tempfile ---
+
+    #[test]
+    fn parse_session_with_valid_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc123.jsonl");
+        let lines = vec![
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hello"}}"#,
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"text","text":"hi there"}]}}"#,
+            r#"{"type":"summary","summary":"This session was about greeting.","timestamp":"2026-01-01T00:00:02Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.session_id, "abc123");
+        assert_eq!(session.entries.len(), 3);
+        assert_eq!(session.first_timestamp.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(session.last_timestamp.as_deref(), Some("2026-01-01T00:00:02Z"));
+    }
+
+    #[test]
+    fn parse_session_skips_empty_and_malformed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let lines = vec![
+            "",
+            "not-json-at-all",
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"valid"}}"#,
+            "   ",
+            r#"{"type":"unknown_type","data":"ignored"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let session = parse_session(&path).unwrap();
+        // Only the valid user entry should be kept; unknown types are SessionEntry::Other and filtered out.
+        assert_eq!(session.entries.len(), 1);
+    }
+
+    #[test]
+    fn parse_session_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert!(session.entries.is_empty());
+        assert!(session.first_timestamp.is_none());
+        assert!(session.last_timestamp.is_none());
+    }
+
+    #[test]
+    fn parse_session_nonexistent_file() {
+        let result = parse_session(std::path::Path::new("/nonexistent/path.jsonl"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_session_session_id_from_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("my-session-id.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.session_id, "my-session-id");
+    }
+
+    // --- ParsedSession::first_user_text() edge cases ---
+
+    #[test]
+    fn first_user_text_returns_none_when_no_users() {
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![
+                SessionEntry::Assistant(AssistantEntry {
+                    uuid: "a1".into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    session_id: None,
+                    message: Some(AssistantMessage {
+                        content: vec![ContentBlock::Text { text: "hello".into() }],
+                        model: None,
+                        stop_reason: None,
+                    }),
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert!(session.first_user_text().is_none());
+    }
+
+    #[test]
+    fn first_user_text_skips_empty_messages() {
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![
+                SessionEntry::User(UserEntry {
+                    uuid: "u1".into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    session_id: None,
+                    message: Some(UserMessage {
+                        content: serde_json::json!("   "),
+                    }),
+                    cwd: None,
+                }),
+                SessionEntry::User(UserEntry {
+                    uuid: "u2".into(),
+                    timestamp: "2026-01-01T00:00:01Z".into(),
+                    session_id: None,
+                    message: Some(UserMessage {
+                        content: serde_json::json!("actual text"),
+                    }),
+                    cwd: None,
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert_eq!(session.first_user_text().unwrap(), "actual text");
+    }
+
+    #[test]
+    fn first_user_text_with_xml_tagged_content() {
+        // first_user_text does NOT strip XML tags — it returns raw text.
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![
+                SessionEntry::User(UserEntry {
+                    uuid: "u1".into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    session_id: None,
+                    message: Some(UserMessage {
+                        content: serde_json::json!("<command-name>init</command-name> Setup project"),
+                    }),
+                    cwd: None,
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        let text = session.first_user_text().unwrap();
+        assert!(text.contains("<command-name>"));
+        assert!(text.contains("Setup project"));
+    }
+
+    #[test]
+    fn first_user_text_no_message() {
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![
+                SessionEntry::User(UserEntry {
+                    uuid: "u1".into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert!(session.first_user_text().is_none());
+    }
+
+    // --- ParsedSession::summary() ---
+
+    #[test]
+    fn summary_returns_none_when_no_summary_entry() {
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![
+                SessionEntry::User(UserEntry {
+                    uuid: "u1".into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert!(session.summary().is_none());
+    }
+
+    #[test]
+    fn summary_returns_first_summary_text() {
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![
+                SessionEntry::Summary(SummaryEntry {
+                    summary: "Worked on tests".into(),
+                    timestamp: Some("2026-01-01T00:00:00Z".into()),
+                }),
+                SessionEntry::Summary(SummaryEntry {
+                    summary: "Second summary ignored".into(),
+                    timestamp: None,
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert_eq!(session.summary().unwrap(), "Worked on tests");
+    }
+
+    // --- user_message_count / assistant_message_count ---
+
+    #[test]
+    fn message_counts() {
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![
+                SessionEntry::User(UserEntry {
+                    uuid: "u1".into(),
+                    timestamp: "t".into(),
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                }),
+                SessionEntry::User(UserEntry {
+                    uuid: "u2".into(),
+                    timestamp: "t".into(),
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                }),
+                SessionEntry::Assistant(AssistantEntry {
+                    uuid: "a1".into(),
+                    timestamp: "t".into(),
+                    session_id: None,
+                    message: None,
+                }),
+                SessionEntry::Summary(SummaryEntry {
+                    summary: "s".into(),
+                    timestamp: None,
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert_eq!(session.user_message_count(), 2);
+        assert_eq!(session.assistant_message_count(), 1);
+    }
+
+    #[test]
+    fn message_counts_empty_session() {
+        let session = ParsedSession {
+            session_id: "s1".into(),
+            file_path: "/tmp/s1.jsonl".into(),
+            entries: vec![],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert_eq!(session.user_message_count(), 0);
+        assert_eq!(session.assistant_message_count(), 0);
+    }
+
+    // --- extract_user_text() edge cases ---
+
+    #[test]
+    fn extract_user_text_null_content() {
+        let entry = UserEntry {
+            uuid: "u1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(UserMessage {
+                content: serde_json::Value::Null,
+            }),
+            cwd: None,
+        };
+        assert!(extract_user_text(&entry).is_none());
+    }
+
+    #[test]
+    fn extract_user_text_empty_array() {
+        let entry = UserEntry {
+            uuid: "u1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(UserMessage {
+                content: serde_json::json!([]),
+            }),
+            cwd: None,
+        };
+        assert!(extract_user_text(&entry).is_none());
+    }
+
+    #[test]
+    fn extract_user_text_array_no_text_blocks() {
+        let entry = UserEntry {
+            uuid: "u1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(UserMessage {
+                content: serde_json::json!([{"type": "image", "url": "http://example.com/img.png"}]),
+            }),
+            cwd: None,
+        };
+        assert!(extract_user_text(&entry).is_none());
+    }
+
+    #[test]
+    fn extract_user_text_multiple_text_blocks_joined() {
+        let entry = UserEntry {
+            uuid: "u1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(UserMessage {
+                content: serde_json::json!([
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"}
+                ]),
+            }),
+            cwd: None,
+        };
+        assert_eq!(extract_user_text(&entry).unwrap(), "first\nsecond");
+    }
+
+    // --- extract_assistant_texts() edge cases ---
+
+    #[test]
+    fn extract_assistant_texts_no_message() {
+        let entry = AssistantEntry {
+            uuid: "a1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: None,
+        };
+        assert!(extract_assistant_texts(&entry).is_empty());
+    }
+
+    #[test]
+    fn extract_assistant_texts_filters_out_thinking_and_tool_result() {
+        let entry = AssistantEntry {
+            uuid: "a1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(AssistantMessage {
+                content: vec![
+                    ContentBlock::Thinking { thinking: Some("internal thought".into()) },
+                    ContentBlock::Text { text: "visible text".into() },
+                    ContentBlock::ToolResult { content: serde_json::json!("result data") },
+                    ContentBlock::ToolUse { name: "Read".into(), input: serde_json::json!({}) },
+                    ContentBlock::Text { text: "more text".into() },
+                ],
+                model: None,
+                stop_reason: None,
+            }),
+        };
+        let texts = extract_assistant_texts(&entry);
+        assert_eq!(texts, vec!["visible text", "more text"]);
+    }
+
+    #[test]
+    fn extract_assistant_texts_empty_content() {
+        let entry = AssistantEntry {
+            uuid: "a1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(AssistantMessage {
+                content: vec![],
+                model: None,
+                stop_reason: None,
+            }),
+        };
+        assert!(extract_assistant_texts(&entry).is_empty());
+    }
+
+    // --- extract_tool_uses() filtering ---
+
+    #[test]
+    fn extract_tool_uses_no_message() {
+        let entry = AssistantEntry {
+            uuid: "a1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: None,
+        };
+        assert!(extract_tool_uses(&entry).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_uses_only_returns_tool_use_blocks() {
+        let entry = AssistantEntry {
+            uuid: "a1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(AssistantMessage {
+                content: vec![
+                    ContentBlock::Text { text: "Let me help".into() },
+                    ContentBlock::ToolUse { name: "Write".into(), input: serde_json::json!({"file_path": "/tmp/a"}) },
+                    ContentBlock::Thinking { thinking: None },
+                    ContentBlock::ToolUse { name: "Bash".into(), input: serde_json::json!({"command": "ls"}) },
+                    ContentBlock::ToolResult { content: serde_json::json!(null) },
+                ],
+                model: None,
+                stop_reason: None,
+            }),
+        };
+        let tools = extract_tool_uses(&entry);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].0, "Write");
+        assert_eq!(tools[1].0, "Bash");
+    }
+
+    #[test]
+    fn extract_tool_uses_preserves_input() {
+        let entry = AssistantEntry {
+            uuid: "a1".into(),
+            timestamp: "t".into(),
+            session_id: None,
+            message: Some(AssistantMessage {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        name: "Edit".into(),
+                        input: serde_json::json!({"file_path": "/src/main.rs", "old_string": "foo", "new_string": "bar"}),
+                    },
+                ],
+                model: None,
+                stop_reason: None,
+            }),
+        };
+        let tools = extract_tool_uses(&entry);
+        assert_eq!(tools[0].1["file_path"], "/src/main.rs");
+        assert_eq!(tools[0].1["old_string"], "foo");
+    }
 }

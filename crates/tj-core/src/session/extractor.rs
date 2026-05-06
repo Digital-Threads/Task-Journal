@@ -400,4 +400,369 @@ mod tests {
         let ev = classify_text_heuristic("tj-test", "OK, done.", "2026-01-01T00:00:00Z");
         assert!(ev.is_none());
     }
+
+    // --- extract_from_session() integration tests ---
+
+    fn make_user_entry(uuid: &str, ts: &str, text: &str) -> SessionEntry {
+        SessionEntry::User(UserEntry {
+            uuid: uuid.into(),
+            timestamp: ts.into(),
+            session_id: None,
+            message: Some(UserMessage {
+                content: serde_json::json!(text),
+            }),
+            cwd: None,
+        })
+    }
+
+    fn make_assistant_entry(uuid: &str, ts: &str, blocks: Vec<ContentBlock>) -> SessionEntry {
+        SessionEntry::Assistant(AssistantEntry {
+            uuid: uuid.into(),
+            timestamp: ts.into(),
+            session_id: None,
+            message: Some(AssistantMessage {
+                content: blocks,
+                model: Some("claude-opus-4-20250514".into()),
+                stop_reason: Some("end_turn".into()),
+            }),
+        })
+    }
+
+    #[test]
+    fn extract_from_session_produces_open_and_close_events() {
+        let session = ParsedSession {
+            session_id: "test-session-123".into(),
+            file_path: "/tmp/test-session-123.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "2026-01-01T00:00:00Z", "Please fix the login bug"),
+                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
+                    ContentBlock::Text { text: "I'll look into the login issue.".into() },
+                ]),
+                make_user_entry("u2", "2026-01-01T00:00:02Z", "Thanks, looks good"),
+                make_assistant_entry("a2", "2026-01-01T00:00:03Z", vec![
+                    ContentBlock::Text { text: "The fix is complete.".into() },
+                ]),
+            ],
+            first_timestamp: Some("2026-01-01T00:00:00Z".into()),
+            last_timestamp: Some("2026-01-01T00:00:03Z".into()),
+        };
+
+        let task = extract_from_session(&session).unwrap();
+        assert!(task.task_id.starts_with("tj-"));
+        assert!(!task.title.is_empty());
+        assert_eq!(task.session_id, "test-session-123");
+
+        // First event should be Open.
+        assert_eq!(task.events[0].event_type, EventType::Open);
+        assert_eq!(task.events[0].timestamp, "2026-01-01T00:00:00Z");
+
+        // Last event should be Close.
+        let last = task.events.last().unwrap();
+        assert_eq!(last.event_type, EventType::Close);
+        assert_eq!(last.timestamp, "2026-01-01T00:00:03Z");
+        assert!(last.text.contains("user messages"));
+    }
+
+    #[test]
+    fn extract_from_session_skips_sessions_with_fewer_than_2_user_messages() {
+        let session = ParsedSession {
+            session_id: "short-session".into(),
+            file_path: "/tmp/short.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "2026-01-01T00:00:00Z", "Hello"),
+                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
+                    ContentBlock::Text { text: "Hi!".into() },
+                ]),
+            ],
+            first_timestamp: Some("2026-01-01T00:00:00Z".into()),
+            last_timestamp: Some("2026-01-01T00:00:01Z".into()),
+        };
+
+        assert!(extract_from_session(&session).is_none());
+    }
+
+    #[test]
+    fn extract_from_session_skips_zero_user_messages() {
+        let session = ParsedSession {
+            session_id: "empty-session".into(),
+            file_path: "/tmp/empty.jsonl".into(),
+            entries: vec![],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+
+        assert!(extract_from_session(&session).is_none());
+    }
+
+    #[test]
+    fn extract_from_session_tracks_file_modifications() {
+        let session = ParsedSession {
+            session_id: "file-mod-session".into(),
+            file_path: "/tmp/fm.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "2026-01-01T00:00:00Z", "Update the config file"),
+                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
+                    ContentBlock::ToolUse {
+                        name: "Write".into(),
+                        input: serde_json::json!({"file_path": "/home/user/project/src/config.rs"}),
+                    },
+                ]),
+                make_user_entry("u2", "2026-01-01T00:00:02Z", "Also update main.rs"),
+                make_assistant_entry("a2", "2026-01-01T00:00:03Z", vec![
+                    ContentBlock::ToolUse {
+                        name: "Edit".into(),
+                        input: serde_json::json!({"file_path": "/home/user/project/src/main.rs", "old_string": "a", "new_string": "b"}),
+                    },
+                ]),
+            ],
+            first_timestamp: Some("2026-01-01T00:00:00Z".into()),
+            last_timestamp: Some("2026-01-01T00:00:03Z".into()),
+        };
+
+        let task = extract_from_session(&session).unwrap();
+        // Should have a Finding event with file modifications.
+        let finding = task.events.iter().find(|e| e.event_type == EventType::Finding);
+        assert!(finding.is_some());
+        let finding = finding.unwrap();
+        assert!(finding.text.contains("2 files"));
+        assert!(finding.refs.files.contains(&"src/config.rs".to_string()));
+        assert!(finding.refs.files.contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_from_session_detects_test_commands() {
+        let session = ParsedSession {
+            session_id: "test-cmd-session".into(),
+            file_path: "/tmp/tc.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "2026-01-01T00:00:00Z", "Run the tests"),
+                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
+                    ContentBlock::ToolUse {
+                        name: "Bash".into(),
+                        input: serde_json::json!({"command": "cargo test --workspace"}),
+                    },
+                ]),
+                make_user_entry("u2", "2026-01-01T00:00:02Z", "Good"),
+            ],
+            first_timestamp: Some("2026-01-01T00:00:00Z".into()),
+            last_timestamp: Some("2026-01-01T00:00:02Z".into()),
+        };
+
+        let task = extract_from_session(&session).unwrap();
+        let evidence = task.events.iter().find(|e| e.event_type == EventType::Evidence);
+        assert!(evidence.is_some());
+        assert!(evidence.unwrap().text.contains("cargo test"));
+    }
+
+    #[test]
+    fn extract_from_session_detects_git_commit() {
+        let session = ParsedSession {
+            session_id: "git-commit-session".into(),
+            file_path: "/tmp/gc.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "2026-01-01T00:00:00Z", "Commit the changes"),
+                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
+                    ContentBlock::ToolUse {
+                        name: "Bash".into(),
+                        input: serde_json::json!({"command": "git commit -m 'fix: resolve login bug'"}),
+                    },
+                ]),
+                make_user_entry("u2", "2026-01-01T00:00:02Z", "Push it"),
+            ],
+            first_timestamp: Some("2026-01-01T00:00:00Z".into()),
+            last_timestamp: Some("2026-01-01T00:00:02Z".into()),
+        };
+
+        let task = extract_from_session(&session).unwrap();
+        let evidence_events: Vec<_> = task.events.iter()
+            .filter(|e| e.event_type == EventType::Evidence)
+            .collect();
+        let commit_ev = evidence_events.iter().find(|e| e.text.contains("Git commit"));
+        assert!(commit_ev.is_some());
+        assert_eq!(commit_ev.unwrap().evidence_strength, Some(EvidenceStrength::Strong));
+    }
+
+    // --- strip_xml_tags() ---
+
+    #[test]
+    fn strip_xml_tags_removes_simple_tags() {
+        assert_eq!(strip_xml_tags("<b>hello</b>"), "hello");
+    }
+
+    #[test]
+    fn strip_xml_tags_removes_nested_tags() {
+        assert_eq!(strip_xml_tags("<div><span>text</span></div>"), "text");
+    }
+
+    #[test]
+    fn strip_xml_tags_no_tags() {
+        assert_eq!(strip_xml_tags("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_xml_tags_only_tags() {
+        assert_eq!(strip_xml_tags("<tag></tag>"), "");
+    }
+
+    #[test]
+    fn strip_xml_tags_with_attributes() {
+        assert_eq!(strip_xml_tags("<command-name foo=\"bar\">init</command-name>"), "init");
+    }
+
+    #[test]
+    fn strip_xml_tags_preserves_angle_bracket_text_between_tags() {
+        assert_eq!(strip_xml_tags("a < b and c > d"), "a  d");
+        // Note: the simple char-by-char parser treats `<` as tag start.
+    }
+
+    // --- derive_title() ---
+
+    #[test]
+    fn derive_title_from_summary() {
+        let session = ParsedSession {
+            session_id: "abcdefghij".into(),
+            file_path: "/tmp/s.jsonl".into(),
+            entries: vec![
+                SessionEntry::Summary(SummaryEntry {
+                    summary: "Fixed authentication bug in login flow".into(),
+                    timestamp: None,
+                }),
+                make_user_entry("u1", "t", "some user text that is long enough"),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert_eq!(derive_title(&session), "Fixed authentication bug in login flow");
+    }
+
+    #[test]
+    fn derive_title_from_user_text() {
+        let session = ParsedSession {
+            session_id: "abcdefghij".into(),
+            file_path: "/tmp/s.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "t", "Please implement the new caching layer"),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert_eq!(derive_title(&session), "Please implement the new caching layer");
+    }
+
+    #[test]
+    fn derive_title_skips_short_user_text() {
+        let session = ParsedSession {
+            session_id: "abcdefghij".into(),
+            file_path: "/tmp/s.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "t", "/init"),
+                make_user_entry("u2", "t", "Implement the feature for user profiles"),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        // "/init" is only 5 chars, should be skipped. Second message (stripped of XML) should be used.
+        let title = derive_title(&session);
+        assert!(title.contains("Implement the feature"));
+    }
+
+    #[test]
+    fn derive_title_fallback_to_session_id() {
+        let session = ParsedSession {
+            session_id: "abcdefghij".into(),
+            file_path: "/tmp/s.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "t", "hi"),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        let title = derive_title(&session);
+        assert!(title.starts_with("Session "));
+        assert!(title.contains("abcdefgh"));
+    }
+
+    #[test]
+    fn derive_title_strips_xml_from_summary() {
+        let session = ParsedSession {
+            session_id: "abcdefghij".into(),
+            file_path: "/tmp/s.jsonl".into(),
+            entries: vec![
+                SessionEntry::Summary(SummaryEntry {
+                    summary: "<task>Fix the <b>critical</b> bug</task>".into(),
+                    timestamp: None,
+                }),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        let title = derive_title(&session);
+        assert_eq!(title, "Fix the critical bug");
+    }
+
+    // --- classify_text_heuristic() additional tests ---
+
+    #[test]
+    fn test_classify_constraint() {
+        let ev = classify_text_heuristic(
+            "tj-test",
+            "The API has a rate limit of 100 requests per minute, so we need to implement throttling.",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(ev.is_some());
+        assert_eq!(ev.unwrap().event_type, EventType::Constraint);
+    }
+
+    #[test]
+    fn test_classify_no_match_returns_none() {
+        let ev = classify_text_heuristic(
+            "tj-test",
+            "I have successfully implemented the feature and all tests are passing. The code is clean and well-organized.",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(ev.is_none());
+    }
+
+    // --- Additional is_test_command tests ---
+
+    #[test]
+    fn test_is_test_command_additional() {
+        assert!(is_test_command("jest --coverage"));
+        assert!(is_test_command("vitest run"));
+        assert!(is_test_command("go test ./..."));
+        assert!(is_test_command("make test"));
+        assert!(is_test_command("phpunit tests/Unit"));
+        assert!(is_test_command("echo 'cargo test'"));  // matches because it contains "cargo test"
+        assert!(!is_test_command("ls -la"));
+    }
+
+    // --- shorten_path additional tests ---
+
+    #[test]
+    fn test_shorten_path_windows_separators() {
+        assert_eq!(shorten_path("C:\\Users\\user\\project\\src\\main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn test_shorten_path_two_components() {
+        assert_eq!(shorten_path("src/main.rs"), "src/main.rs");
+    }
+
+    // --- truncate edge cases ---
+
+    #[test]
+    fn test_truncate_multibyte_utf8() {
+        // Russian text: each char is 2 bytes.
+        let text = "Привет мир";
+        let truncated = truncate(text, 6);
+        // 6 bytes = 3 cyrillic chars ("При")
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.starts_with("При"));
+    }
+
+    #[test]
+    fn test_truncate_exact_boundary() {
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello!", 5), "hello…");
+    }
 }

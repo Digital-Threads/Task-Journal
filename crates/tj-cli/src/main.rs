@@ -108,6 +108,18 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Export tasks as Markdown or JSON to stdout.
+    Export {
+        /// Output format: md, json.
+        #[arg(long, default_value = "md")]
+        format: String,
+        /// Export specific task by ID (default: all open tasks).
+        #[arg(long)]
+        task: Option<String>,
+        /// Project path override.
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Hook entry point: ingest a chat chunk through the classifier.
     IngestHook {
         /// Hook kind: UserPromptSubmit | PostToolUse | Stop | SessionStart.
@@ -526,6 +538,109 @@ fn main() -> Result<()> {
             );
 
             println!("{}", event.event_id);
+        }
+        Commands::Export {
+            format,
+            task,
+            project,
+        } => {
+            let cwd = match project {
+                Some(p) => std::path::PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+
+            if !events_path.exists() {
+                anyhow::bail!("no events file at {events_path:?}");
+            }
+
+            let body = std::fs::read_to_string(&events_path)?;
+            let all_events: Vec<tj_core::event::Event> = body
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()?;
+
+            // Filter to specific task if requested.
+            let events: Vec<&tj_core::event::Event> = if let Some(ref tid) = task {
+                all_events.iter().filter(|e| e.task_id == *tid).collect()
+            } else {
+                all_events.iter().collect()
+            };
+
+            if events.is_empty() {
+                if let Some(tid) = task {
+                    anyhow::bail!("no events found for task {tid}");
+                } else {
+                    anyhow::bail!("no events in project");
+                }
+            }
+
+            match format.as_str() {
+                "json" => {
+                    let json = serde_json::to_string_pretty(&events)?;
+                    println!("{json}");
+                }
+                "md" => {
+                    println!("# Task Journal Export\n");
+
+                    // Group events by task_id.
+                    let mut tasks: std::collections::BTreeMap<
+                        String,
+                        Vec<&tj_core::event::Event>,
+                    > = std::collections::BTreeMap::new();
+                    for e in &events {
+                        tasks.entry(e.task_id.clone()).or_default().push(e);
+                    }
+
+                    for (task_id, task_events) in &tasks {
+                        // Derive title from the first open event's meta, or text.
+                        let title = task_events
+                            .iter()
+                            .find(|e| e.event_type == tj_core::event::EventType::Open)
+                            .and_then(|e| {
+                                e.meta
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                                    .or_else(|| Some(e.text.clone()))
+                            })
+                            .unwrap_or_else(|| "(untitled)".into());
+
+                        // Determine status: closed if last event is close, else open.
+                        let status = if task_events
+                            .last()
+                            .map(|e| e.event_type == tj_core::event::EventType::Close)
+                            .unwrap_or(false)
+                        {
+                            "closed"
+                        } else {
+                            "open"
+                        };
+
+                        // Created timestamp from first event.
+                        let created = task_events
+                            .first()
+                            .map(|e| e.timestamp.as_str())
+                            .unwrap_or("?");
+
+                        println!("## [{task_id}] {title}");
+                        println!("**Status**: {status}  ");
+                        println!("**Created**: {created}\n");
+                        println!("### Timeline");
+                        for e in task_events {
+                            let etype = serde_json::to_value(e.event_type)
+                                .ok()
+                                .and_then(|v| v.as_str().map(String::from))
+                                .unwrap_or_else(|| "?".into());
+                            println!("- **[{}] {}**: {}", e.timestamp, etype, e.text);
+                        }
+                        println!();
+                    }
+                }
+                other => anyhow::bail!("unknown format: {other} (expected `md` or `json`)"),
+            }
         }
         Commands::Search {
             query,

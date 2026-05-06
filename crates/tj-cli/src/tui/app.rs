@@ -43,9 +43,11 @@ impl App {
             }
         }
 
+        let project_str = project_path.to_string_lossy().into_owned();
+
         Ok(App {
             screen: Screen::List,
-            session_list: SessionList::new(items),
+            session_list: SessionList::new(items, project_str),
             chat_view: None,
             should_quit: false,
         })
@@ -102,9 +104,38 @@ impl App {
     }
 
     fn handle_list_input(&mut self, key: KeyCode) {
+        // When in filter/search mode, intercept keys for the search input.
+        if self.session_list.filter_mode {
+            match key {
+                KeyCode::Esc => {
+                    self.session_list.clear_filter();
+                }
+                KeyCode::Enter => {
+                    self.session_list.accept_filter();
+                }
+                KeyCode::Backspace => {
+                    self.session_list.filter_pop();
+                }
+                KeyCode::Char(ch) => {
+                    self.session_list.filter_push(ch);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Normal list navigation mode.
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
-                self.should_quit = true;
+                // If a filter is active but we're not in filter_mode, clear it first.
+                if !self.session_list.filter_text.is_empty() {
+                    self.session_list.clear_filter();
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            KeyCode::Char('/') => {
+                self.session_list.enter_filter_mode();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.session_list.previous();
@@ -129,7 +160,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(idx) = self.session_list.selected {
+                if let Some(idx) = self.session_list.selected_session_index() {
                     let session = &self.session_list.sessions[idx];
                     self.chat_view = Some(ChatView::from_session(session));
                     self.screen = Screen::Chat;
