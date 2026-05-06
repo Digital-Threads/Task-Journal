@@ -2,13 +2,35 @@
 //!
 //! Phase 2 wires real implementations into all 5 tools, calling tj-core.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use clap::Parser;
 use rmcp::{
     handler::server::tool::Parameters, handler::server::wrapper::Json, tool, tool_handler,
     tool_router, transport::io::stdio, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Optional override for the project directory used by every tool handler.
+/// `None` (the default) means "use the current working directory at the time
+/// the tool is invoked", which preserves 0.1.x behaviour. Set once from the
+/// CLI parser and never mutated again.
+static PROJECT_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+#[derive(Parser)]
+#[command(
+    name = "task-journal-mcp",
+    version,
+    about = "MCP server for task-journal"
+)]
+struct Cli {
+    /// Override the project directory used to resolve event/state paths.
+    /// Defaults to the current working directory when omitted.
+    #[arg(long, value_name = "PATH")]
+    project_dir: Option<PathBuf>,
+}
 
 /// Convert any internal failure into a JSON-RPC error frame. We attach the
 /// stringified `anyhow::Error` chain as the `message` so the client sees the
@@ -141,12 +163,21 @@ fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
     })
 }
 
-fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
-    let cwd = std::env::current_dir()?;
-    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+fn resolve_project_paths(
+    dir: &std::path::Path,
+) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
+    let project_hash = tj_core::project_hash::from_path(dir)?;
     let events = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
     let state = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
     Ok((project_hash, events, state))
+}
+
+fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
+    let dir = match PROJECT_DIR_OVERRIDE.get() {
+        Some(p) => p.clone(),
+        None => std::env::current_dir()?,
+    };
+    resolve_project_paths(&dir)
 }
 
 #[tool_router]
@@ -362,6 +393,15 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let cli = Cli::parse();
+    if let Some(dir) = cli.project_dir {
+        let resolved = std::fs::canonicalize(&dir)
+            .with_context(|| format!("--project-dir not accessible: {dir:?}"))?;
+        PROJECT_DIR_OVERRIDE
+            .set(resolved)
+            .map_err(|_| anyhow::anyhow!("PROJECT_DIR_OVERRIDE already set"))?;
+    }
+
     let server = TaskJournalServer;
     let (stdin, stdout) = stdio();
     server.serve((stdin, stdout)).await?.waiting().await?;
@@ -420,6 +460,38 @@ mod tests {
             closed: true,
         };
         assert!(!keys_of(&serde_json::to_value(&close).unwrap()).contains(&"stub".to_string()));
+    }
+
+    #[test]
+    fn resolve_project_paths_uses_provided_dir_for_hash() {
+        // Two distinct dirs must give two distinct project_hash values, and
+        // the same dir must always give the same hash. This is the contract
+        // that --project-dir relies on: any path on disk maps to a stable,
+        // unique data location.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("beta");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let (hash_a, _, _) = resolve_project_paths(&a).unwrap();
+        let (hash_b, _, _) = resolve_project_paths(&b).unwrap();
+        assert_ne!(hash_a, hash_b);
+
+        let (hash_a_again, _, _) = resolve_project_paths(&a).unwrap();
+        assert_eq!(hash_a, hash_a_again);
+    }
+
+    #[test]
+    fn cli_parses_project_dir_argument() {
+        // Smoke test: `task-journal-mcp --project-dir /tmp/foo` parses and
+        // populates the field. We do not actually launch the server here —
+        // that needs a real stdio peer.
+        let cli = Cli::try_parse_from(["task-journal-mcp", "--project-dir", "/tmp/foo"]).unwrap();
+        assert_eq!(cli.project_dir, Some(std::path::PathBuf::from("/tmp/foo")));
+
+        let cli = Cli::try_parse_from(["task-journal-mcp"]).unwrap();
+        assert!(cli.project_dir.is_none());
     }
 
     #[test]

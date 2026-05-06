@@ -2038,12 +2038,14 @@ name = "task-journal-mcp"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "clap",
  "rmcp",
  "rusqlite",
  "schemars",
  "serde",
  "serde_json",
  "task-journal-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
