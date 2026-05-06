@@ -1,6 +1,15 @@
 use anyhow::Context;
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::Path;
+
+/// One forward-only schema migration. Migrations are applied in `version`
+/// order; each is recorded in `schema_migrations` so re-running `open()`
+/// is idempotent.
+struct Migration {
+    version: i64,
+    sql: &'static str,
+}
 
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
@@ -56,6 +65,56 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   type
 );
 "#;
+
+/// All schema migrations in version order. Append new entries here; never
+/// edit a published migration's `sql` — write a new one instead.
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    sql: MIGRATION_001,
+}];
+
+fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version    INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )",
+    )
+    .context("create schema_migrations table")?;
+
+    let applied: HashSet<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_migrations")
+            .context("select applied versions")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .context("iterate schema_migrations")?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()
+            .context("collect applied versions")?
+    };
+
+    for migration in MIGRATIONS {
+        if applied.contains(&migration.version) {
+            continue;
+        }
+        conn.execute_batch(migration.sql)
+            .with_context(|| format!("apply schema migration v{:03}", migration.version))?;
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![
+                migration.version,
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "record schema migration v{:03} as applied",
+                migration.version
+            )
+        })?;
+    }
+    Ok(())
+}
 
 use crate::event::{Event, EventType};
 
@@ -237,8 +296,7 @@ pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     let conn =
         Connection::open(&path).with_context(|| format!("open SQLite at {:?}", path.as_ref()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-    conn.execute_batch(MIGRATION_001)
-        .context("apply migration 001")?;
+    apply_migrations(&conn).context("apply schema migrations")?;
     Ok(conn)
 }
 
@@ -246,6 +304,44 @@ pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn fresh_db_runs_all_migrations() {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("state.sqlite");
+        let conn = open(&p).unwrap();
+
+        let applied: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            applied,
+            (1..=MIGRATIONS.len() as i64).collect::<Vec<_>>(),
+            "every declared migration must be recorded"
+        );
+    }
+
+    #[test]
+    fn apply_migrations_is_idempotent_across_reopens() {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("state.sqlite");
+        let _ = open(&p).unwrap();
+        let _ = open(&p).unwrap();
+
+        let count: i64 = open(&p)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count,
+            MIGRATIONS.len() as i64,
+            "schema_migrations must contain exactly one row per declared migration after repeated opens"
+        );
+    }
 
     #[test]
     fn open_creates_all_tables() {
