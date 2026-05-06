@@ -305,6 +305,64 @@ mod tests {
     }
 
     #[test]
+    fn pack_cache_hits_after_incremental_ingest_with_no_new_events() {
+        // Reproduces the MCP hot loop: client calls task_pack(X), the server
+        // runs ingest_new_events (which now reads only the JSONL tail), then
+        // calls assemble(X). After B2 the second call must hit the cache —
+        // before B2, full rebuild_state replayed every event through index_
+        // event() which DELETEd the cache row, so we always missed.
+        use crate::db;
+        use crate::event::*;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let project = "cafef00dcafef00d";
+
+        let mut open_e = Event::new(
+            "tj-cmcp",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
+        open_e.meta = serde_json::json!({"title": "Cached"});
+        let dec = Event::new(
+            "tj-cmcp",
+            EventType::Decision,
+            Author::Agent,
+            Source::Chat,
+            "Adopt Rust".into(),
+        );
+
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&open_e).unwrap()).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&dec).unwrap()).unwrap();
+        drop(f);
+
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+
+        // First MCP call: ingest, then pack.
+        db::ingest_new_events(&conn, &jsonl, project).unwrap();
+        let first = assemble(&conn, "tj-cmcp", PackMode::Compact).unwrap();
+        assert!(
+            !first.metadata.cache_hit,
+            "first assemble must populate cache"
+        );
+
+        // Second MCP call: ingest again (zero new events in JSONL), then pack.
+        let n_new = db::ingest_new_events(&conn, &jsonl, project).unwrap();
+        assert_eq!(n_new, 0, "no new events should be ingested");
+        let second = assemble(&conn, "tj-cmcp", PackMode::Compact).unwrap();
+        assert!(
+            second.metadata.cache_hit,
+            "repeat assemble after a no-op ingest must hit the cache"
+        );
+        assert_eq!(first.text, second.text);
+    }
+
+    #[test]
     fn pack_cache_returns_cached_text_on_second_call() {
         use crate::db;
         use crate::event::*;
