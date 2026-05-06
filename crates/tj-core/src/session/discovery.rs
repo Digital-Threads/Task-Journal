@@ -94,7 +94,7 @@ pub fn list_sessions(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     }
 
     // Sort newest first.
-    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.1));
     Ok(sessions.into_iter().map(|(p, _)| p).collect())
 }
 
@@ -198,7 +198,11 @@ mod tests {
         let sessions = list_sessions(dir.path()).unwrap();
         assert_eq!(sessions.len(), 2);
         // Newest file should come first.
-        let first_name = sessions[0].file_name().unwrap().to_string_lossy().to_string();
+        let first_name = sessions[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert_eq!(first_name, "newer.jsonl");
     }
 

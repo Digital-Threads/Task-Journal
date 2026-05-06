@@ -49,7 +49,8 @@ pub fn extract_from_session(session: &ParsedSession) -> Option<ExtractedTask> {
     if let Some(ref ts) = session.first_timestamp {
         open_event.timestamp = ts.clone();
     }
-    open_event.meta = serde_json::json!({"title": title, "backfill": true, "session_id": session.session_id});
+    open_event.meta =
+        serde_json::json!({"title": title, "backfill": true, "session_id": session.session_id});
     events.push(open_event);
 
     // 2. Walk through entries and extract meaningful events.
@@ -132,7 +133,13 @@ pub fn extract_from_session(session: &ParsedSession) -> Option<ExtractedTask> {
             files_modified.len(),
             files_modified.join(", ")
         );
-        let mut ev = Event::new(&task_id, EventType::Finding, Author::Agent, Source::Cli, summary);
+        let mut ev = Event::new(
+            &task_id,
+            EventType::Finding,
+            Author::Agent,
+            Source::Cli,
+            summary,
+        );
         if let Some(ref ts) = session.last_timestamp {
             ev.timestamp = ts.clone();
         }
@@ -185,7 +192,10 @@ fn derive_title(session: &ParsedSession) -> String {
         if let SessionEntry::User(u) = entry {
             if let Some(text) = extract_user_text(u) {
                 let clean = strip_xml_tags(&text);
-                let first_line = clean.lines().find(|l| !l.trim().is_empty()).unwrap_or(&clean);
+                let first_line = clean
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or(&clean);
                 let trimmed = first_line.trim();
                 // Skip empty or very short titles (likely slash commands).
                 if trimmed.len() > 5 {
@@ -195,7 +205,10 @@ fn derive_title(session: &ParsedSession) -> String {
         }
     }
 
-    format!("Session {}", &session.session_id[..8.min(session.session_id.len())])
+    format!(
+        "Session {}",
+        &session.session_id[..8.min(session.session_id.len())]
+    )
 }
 
 /// Strip XML/HTML-like tags from text (e.g. <command-message>, <command-name>).
@@ -363,7 +376,10 @@ mod tests {
 
     #[test]
     fn test_shorten_path() {
-        assert_eq!(shorten_path("/home/user/project/src/main.rs"), "src/main.rs");
+        assert_eq!(
+            shorten_path("/home/user/project/src/main.rs"),
+            "src/main.rs"
+        );
         assert_eq!(shorten_path("main.rs"), "main.rs");
     }
 
@@ -435,13 +451,21 @@ mod tests {
             file_path: "/tmp/test-session-123.jsonl".into(),
             entries: vec![
                 make_user_entry("u1", "2026-01-01T00:00:00Z", "Please fix the login bug"),
-                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
-                    ContentBlock::Text { text: "I'll look into the login issue.".into() },
-                ]),
+                make_assistant_entry(
+                    "a1",
+                    "2026-01-01T00:00:01Z",
+                    vec![ContentBlock::Text {
+                        text: "I'll look into the login issue.".into(),
+                    }],
+                ),
                 make_user_entry("u2", "2026-01-01T00:00:02Z", "Thanks, looks good"),
-                make_assistant_entry("a2", "2026-01-01T00:00:03Z", vec![
-                    ContentBlock::Text { text: "The fix is complete.".into() },
-                ]),
+                make_assistant_entry(
+                    "a2",
+                    "2026-01-01T00:00:03Z",
+                    vec![ContentBlock::Text {
+                        text: "The fix is complete.".into(),
+                    }],
+                ),
             ],
             first_timestamp: Some("2026-01-01T00:00:00Z".into()),
             last_timestamp: Some("2026-01-01T00:00:03Z".into()),
@@ -470,9 +494,11 @@ mod tests {
             file_path: "/tmp/short.jsonl".into(),
             entries: vec![
                 make_user_entry("u1", "2026-01-01T00:00:00Z", "Hello"),
-                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
-                    ContentBlock::Text { text: "Hi!".into() },
-                ]),
+                make_assistant_entry(
+                    "a1",
+                    "2026-01-01T00:00:01Z",
+                    vec![ContentBlock::Text { text: "Hi!".into() }],
+                ),
             ],
             first_timestamp: Some("2026-01-01T00:00:00Z".into()),
             last_timestamp: Some("2026-01-01T00:00:01Z".into()),
@@ -501,19 +527,23 @@ mod tests {
             file_path: "/tmp/fm.jsonl".into(),
             entries: vec![
                 make_user_entry("u1", "2026-01-01T00:00:00Z", "Update the config file"),
-                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
-                    ContentBlock::ToolUse {
+                make_assistant_entry(
+                    "a1",
+                    "2026-01-01T00:00:01Z",
+                    vec![ContentBlock::ToolUse {
                         name: "Write".into(),
                         input: serde_json::json!({"file_path": "/home/user/project/src/config.rs"}),
-                    },
-                ]),
+                    }],
+                ),
                 make_user_entry("u2", "2026-01-01T00:00:02Z", "Also update main.rs"),
-                make_assistant_entry("a2", "2026-01-01T00:00:03Z", vec![
-                    ContentBlock::ToolUse {
+                make_assistant_entry(
+                    "a2",
+                    "2026-01-01T00:00:03Z",
+                    vec![ContentBlock::ToolUse {
                         name: "Edit".into(),
                         input: serde_json::json!({"file_path": "/home/user/project/src/main.rs", "old_string": "a", "new_string": "b"}),
-                    },
-                ]),
+                    }],
+                ),
             ],
             first_timestamp: Some("2026-01-01T00:00:00Z".into()),
             last_timestamp: Some("2026-01-01T00:00:03Z".into()),
@@ -521,7 +551,10 @@ mod tests {
 
         let task = extract_from_session(&session).unwrap();
         // Should have a Finding event with file modifications.
-        let finding = task.events.iter().find(|e| e.event_type == EventType::Finding);
+        let finding = task
+            .events
+            .iter()
+            .find(|e| e.event_type == EventType::Finding);
         assert!(finding.is_some());
         let finding = finding.unwrap();
         assert!(finding.text.contains("2 files"));
@@ -536,12 +569,14 @@ mod tests {
             file_path: "/tmp/tc.jsonl".into(),
             entries: vec![
                 make_user_entry("u1", "2026-01-01T00:00:00Z", "Run the tests"),
-                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
-                    ContentBlock::ToolUse {
+                make_assistant_entry(
+                    "a1",
+                    "2026-01-01T00:00:01Z",
+                    vec![ContentBlock::ToolUse {
                         name: "Bash".into(),
                         input: serde_json::json!({"command": "cargo test --workspace"}),
-                    },
-                ]),
+                    }],
+                ),
                 make_user_entry("u2", "2026-01-01T00:00:02Z", "Good"),
             ],
             first_timestamp: Some("2026-01-01T00:00:00Z".into()),
@@ -549,7 +584,10 @@ mod tests {
         };
 
         let task = extract_from_session(&session).unwrap();
-        let evidence = task.events.iter().find(|e| e.event_type == EventType::Evidence);
+        let evidence = task
+            .events
+            .iter()
+            .find(|e| e.event_type == EventType::Evidence);
         assert!(evidence.is_some());
         assert!(evidence.unwrap().text.contains("cargo test"));
     }
@@ -561,12 +599,14 @@ mod tests {
             file_path: "/tmp/gc.jsonl".into(),
             entries: vec![
                 make_user_entry("u1", "2026-01-01T00:00:00Z", "Commit the changes"),
-                make_assistant_entry("a1", "2026-01-01T00:00:01Z", vec![
-                    ContentBlock::ToolUse {
+                make_assistant_entry(
+                    "a1",
+                    "2026-01-01T00:00:01Z",
+                    vec![ContentBlock::ToolUse {
                         name: "Bash".into(),
                         input: serde_json::json!({"command": "git commit -m 'fix: resolve login bug'"}),
-                    },
-                ]),
+                    }],
+                ),
                 make_user_entry("u2", "2026-01-01T00:00:02Z", "Push it"),
             ],
             first_timestamp: Some("2026-01-01T00:00:00Z".into()),
@@ -574,12 +614,19 @@ mod tests {
         };
 
         let task = extract_from_session(&session).unwrap();
-        let evidence_events: Vec<_> = task.events.iter()
+        let evidence_events: Vec<_> = task
+            .events
+            .iter()
             .filter(|e| e.event_type == EventType::Evidence)
             .collect();
-        let commit_ev = evidence_events.iter().find(|e| e.text.contains("Git commit"));
+        let commit_ev = evidence_events
+            .iter()
+            .find(|e| e.text.contains("Git commit"));
         assert!(commit_ev.is_some());
-        assert_eq!(commit_ev.unwrap().evidence_strength, Some(EvidenceStrength::Strong));
+        assert_eq!(
+            commit_ev.unwrap().evidence_strength,
+            Some(EvidenceStrength::Strong)
+        );
     }
 
     // --- strip_xml_tags() ---
@@ -606,7 +653,10 @@ mod tests {
 
     #[test]
     fn strip_xml_tags_with_attributes() {
-        assert_eq!(strip_xml_tags("<command-name foo=\"bar\">init</command-name>"), "init");
+        assert_eq!(
+            strip_xml_tags("<command-name foo=\"bar\">init</command-name>"),
+            "init"
+        );
     }
 
     #[test]
@@ -632,7 +682,10 @@ mod tests {
             first_timestamp: None,
             last_timestamp: None,
         };
-        assert_eq!(derive_title(&session), "Fixed authentication bug in login flow");
+        assert_eq!(
+            derive_title(&session),
+            "Fixed authentication bug in login flow"
+        );
     }
 
     #[test]
@@ -640,13 +693,18 @@ mod tests {
         let session = ParsedSession {
             session_id: "abcdefghij".into(),
             file_path: "/tmp/s.jsonl".into(),
-            entries: vec![
-                make_user_entry("u1", "t", "Please implement the new caching layer"),
-            ],
+            entries: vec![make_user_entry(
+                "u1",
+                "t",
+                "Please implement the new caching layer",
+            )],
             first_timestamp: None,
             last_timestamp: None,
         };
-        assert_eq!(derive_title(&session), "Please implement the new caching layer");
+        assert_eq!(
+            derive_title(&session),
+            "Please implement the new caching layer"
+        );
     }
 
     #[test]
@@ -671,9 +729,7 @@ mod tests {
         let session = ParsedSession {
             session_id: "abcdefghij".into(),
             file_path: "/tmp/s.jsonl".into(),
-            entries: vec![
-                make_user_entry("u1", "t", "hi"),
-            ],
+            entries: vec![make_user_entry("u1", "t", "hi")],
             first_timestamp: None,
             last_timestamp: None,
         };
@@ -687,12 +743,10 @@ mod tests {
         let session = ParsedSession {
             session_id: "abcdefghij".into(),
             file_path: "/tmp/s.jsonl".into(),
-            entries: vec![
-                SessionEntry::Summary(SummaryEntry {
-                    summary: "<task>Fix the <b>critical</b> bug</task>".into(),
-                    timestamp: None,
-                }),
-            ],
+            entries: vec![SessionEntry::Summary(SummaryEntry {
+                summary: "<task>Fix the <b>critical</b> bug</task>".into(),
+                timestamp: None,
+            })],
             first_timestamp: None,
             last_timestamp: None,
         };
@@ -732,7 +786,7 @@ mod tests {
         assert!(is_test_command("go test ./..."));
         assert!(is_test_command("make test"));
         assert!(is_test_command("phpunit tests/Unit"));
-        assert!(is_test_command("echo 'cargo test'"));  // matches because it contains "cargo test"
+        assert!(is_test_command("echo 'cargo test'")); // matches because it contains "cargo test"
         assert!(!is_test_command("ls -la"));
     }
 
@@ -740,7 +794,10 @@ mod tests {
 
     #[test]
     fn test_shorten_path_windows_separators() {
-        assert_eq!(shorten_path("C:\\Users\\user\\project\\src\\main.rs"), "src/main.rs");
+        assert_eq!(
+            shorten_path("C:\\Users\\user\\project\\src\\main.rs"),
+            "src/main.rs"
+        );
     }
 
     #[test]

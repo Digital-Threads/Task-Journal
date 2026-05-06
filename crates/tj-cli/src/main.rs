@@ -434,8 +434,7 @@ fn main() -> Result<()> {
             };
 
             let (etype, task_id, confidence, evidence_strength, suggested_text) =
-                if let (Some(t), Some(tid)) =
-                    (mock_event_type.as_deref(), mock_task_id.as_deref())
+                if let (Some(t), Some(tid)) = (mock_event_type.as_deref(), mock_task_id.as_deref())
                 {
                     (
                         parse_event_type(t)?,
@@ -459,9 +458,7 @@ fn main() -> Result<()> {
 
                     use tj_core::classifier::Classifier;
                     let classifier: Box<dyn Classifier> = match backend.as_str() {
-                        "cli" => {
-                            Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default())
-                        }
+                        "cli" => Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default()),
                         "api" => {
                             Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?)
                         }
@@ -586,10 +583,8 @@ fn main() -> Result<()> {
                     println!("# Task Journal Export\n");
 
                     // Group events by task_id.
-                    let mut tasks: std::collections::BTreeMap<
-                        String,
-                        Vec<&tj_core::event::Event>,
-                    > = std::collections::BTreeMap::new();
+                    let mut tasks: std::collections::BTreeMap<String, Vec<&tj_core::event::Event>> =
+                        std::collections::BTreeMap::new();
                     for e in &events {
                         tasks.entry(e.task_id.clone()).or_default().push(e);
                     }
@@ -704,7 +699,10 @@ fn main() -> Result<()> {
             };
             let mut app = tui::app::App::new(&project_path)?;
             if app.session_list.sessions.is_empty() {
-                eprintln!("No Claude Code sessions found for: {}", project_path.display());
+                eprintln!(
+                    "No Claude Code sessions found for: {}",
+                    project_path.display()
+                );
                 return Ok(());
             }
             app.run()?;
@@ -784,7 +782,10 @@ fn main() -> Result<()> {
                     .to_string();
 
                 if already_imported.contains(&session_id) {
-                    eprintln!("  ⊘ {} — already imported, skipping", &session_id[..8.min(session_id.len())]);
+                    eprintln!(
+                        "  ⊘ {} — already imported, skipping",
+                        &session_id[..8.min(session_id.len())]
+                    );
                     continue;
                 }
 
@@ -856,7 +857,9 @@ fn main() -> Result<()> {
             }
 
             if dry_run {
-                eprintln!("\nDry run: would create {total_tasks} task(s) with {total_events} event(s).");
+                eprintln!(
+                    "\nDry run: would create {total_tasks} task(s) with {total_events} event(s)."
+                );
                 eprintln!("Run without --dry-run to import.");
             } else {
                 eprintln!("\nImported {total_tasks} task(s) with {total_events} event(s).");

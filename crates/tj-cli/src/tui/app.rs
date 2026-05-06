@@ -71,13 +71,11 @@ impl App {
 
     fn main_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
-            terminal.draw(|frame| {
-                match &self.screen {
-                    Screen::List => self.session_list.render(frame),
-                    Screen::Chat => {
-                        if let Some(ref cv) = self.chat_view {
-                            cv.render(frame);
-                        }
+            terminal.draw(|frame| match &self.screen {
+                Screen::List => self.session_list.render(frame),
+                Screen::Chat => {
+                    if let Some(ref cv) = self.chat_view {
+                        cv.render(frame);
                     }
                 }
             })?;
@@ -85,7 +83,9 @@ impl App {
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     // Global: Ctrl+C or q quits.
-                    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
                         self.should_quit = true;
                     }
 
