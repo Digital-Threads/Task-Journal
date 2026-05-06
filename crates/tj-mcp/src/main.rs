@@ -153,7 +153,7 @@ impl TaskJournalServer {
             let (project_hash, events_path, state_path) = project_paths()?;
             let conn = tj_core::db::open(&state_path)?;
             if events_path.exists() {
-                tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             }
             let pmode = match p.mode.as_deref() {
                 Some("full") => tj_core::pack::PackMode::Full,
@@ -201,7 +201,7 @@ impl TaskJournalServer {
             let (project_hash, events_path, state_path) = project_paths()?;
             let conn = tj_core::db::open(&state_path)?;
             if events_path.exists() {
-                tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             }
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT 50",

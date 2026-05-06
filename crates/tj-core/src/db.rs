@@ -66,12 +66,30 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 );
 "#;
 
+/// Tracks how far we've ingested the JSONL log per project so subsequent
+/// `ingest_new_events` calls can read only the tail rather than rescanning
+/// the entire file. `last_indexed_event_id` is the `event_id` of the most
+/// recent event written to `events_index`.
+const MIGRATION_002: &str = r#"
+CREATE TABLE IF NOT EXISTS index_state (
+  project_hash          TEXT PRIMARY KEY,
+  last_indexed_event_id TEXT NOT NULL,
+  updated_at            TEXT NOT NULL
+);
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: MIGRATION_001,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: MIGRATION_001,
+    },
+    Migration {
+        version: 2,
+        sql: MIGRATION_002,
+    },
+];
 
 fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
@@ -191,6 +209,7 @@ pub fn rebuild_state(
 
     let tx = conn.unchecked_transaction()?;
     let mut count = 0;
+    let mut last_event_id: Option<String> = None;
     for (i, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("read line {i}"))?;
         if line.trim().is_empty() {
@@ -212,7 +231,121 @@ pub fn rebuild_state(
         };
         upsert_task_from_event(&tx, &event, project_hash)?;
         index_event(&tx, &event)?;
+        last_event_id = Some(event.event_id.clone());
         count += 1;
+    }
+    if let Some(eid) = last_event_id.as_deref() {
+        record_last_indexed(&tx, project_hash, eid)?;
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
+/// Look up the most recent `event_id` we've ingested for this project.
+/// Returns `None` when the project has never been indexed (first call,
+/// or migration v002 just landed on an existing 0.1.x DB).
+fn last_indexed_event_id(conn: &Connection, project_hash: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt =
+        conn.prepare("SELECT last_indexed_event_id FROM index_state WHERE project_hash = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![project_hash])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get::<_, String>(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn record_last_indexed(
+    conn: &Connection,
+    project_hash: &str,
+    event_id: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO index_state(project_hash, last_indexed_event_id, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(project_hash) DO UPDATE SET
+             last_indexed_event_id = excluded.last_indexed_event_id,
+             updated_at = excluded.updated_at",
+        rusqlite::params![
+            project_hash,
+            event_id,
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read only the tail of the JSONL log since the last call. The cheap path
+/// for hot loops (every MCP tool invocation): scan to the marker, ingest
+/// the rest, update the marker.
+///
+/// Falls back to a full [`rebuild_state`] in two cases:
+/// - No marker yet for this project (first call after migration v002 or
+///   on a brand-new install).
+/// - The stored marker is not present in the JSONL (corrupted / truncated
+///   file). A `tracing::warn!` is emitted so the operator notices.
+pub fn ingest_new_events(
+    conn: &Connection,
+    jsonl_path: impl AsRef<Path>,
+    project_hash: &str,
+) -> anyhow::Result<usize> {
+    let marker = match last_indexed_event_id(conn, project_hash)? {
+        Some(id) => id,
+        None => return rebuild_state(conn, jsonl_path, project_hash),
+    };
+
+    let f = std::fs::File::open(&jsonl_path)
+        .with_context(|| format!("open {:?}", jsonl_path.as_ref()))?;
+    let reader = std::io::BufReader::new(f);
+
+    // First pass: confirm the marker still exists in the file. If it does
+    // not, the JSONL has been rewritten under us — we can't trust the
+    // marker, so we fall back to a full rebuild.
+    let tx = conn.unchecked_transaction()?;
+    let mut found_marker = false;
+    let mut count = 0;
+    let mut last_event_id: Option<String> = None;
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("read line {i}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Event = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    line_number = i + 1,
+                    error = %err,
+                    "skipping malformed JSONL line in ingest_new_events"
+                );
+                continue;
+            }
+        };
+        if !found_marker {
+            if event.event_id == marker {
+                found_marker = true;
+            }
+            continue;
+        }
+        upsert_task_from_event(&tx, &event, project_hash)?;
+        index_event(&tx, &event)?;
+        last_event_id = Some(event.event_id.clone());
+        count += 1;
+    }
+
+    if !found_marker {
+        // Discard the (empty) tx and rebuild from scratch.
+        drop(tx);
+        tracing::warn!(
+            project_hash = project_hash,
+            marker = marker.as_str(),
+            "last_indexed_event_id not found in JSONL — falling back to full rebuild"
+        );
+        return rebuild_state(conn, jsonl_path, project_hash);
+    }
+
+    if let Some(eid) = last_event_id.as_deref() {
+        record_last_indexed(&tx, project_hash, eid)?;
     }
     tx.commit()?;
     Ok(count)
@@ -544,6 +677,138 @@ mod tests {
         let mut hashes = list_all_projects(&state_dir).unwrap();
         hashes.sort();
         assert_eq!(hashes, vec!["aaaa1111aaaa1111", "bbbb2222bbbb2222"]);
+    }
+
+    fn write_event_line(f: &mut std::fs::File, e: &crate::event::Event) {
+        use std::io::Write;
+        writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+    }
+
+    fn make_open_event(task_id: &str, title: &str) -> crate::event::Event {
+        let mut e = crate::event::Event::new(
+            task_id,
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "x".into(),
+        );
+        e.meta = serde_json::json!({"title": title});
+        e
+    }
+
+    #[test]
+    fn ingest_new_events_picks_up_only_new_lines() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let project = "deadbeefdeadbeef";
+
+        let e1 = make_open_event("tj-i1", "first");
+        let e2 = make_open_event("tj-i2", "second");
+        let e3 = make_open_event("tj-i3", "third");
+
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &e1);
+        write_event_line(&mut f, &e2);
+        write_event_line(&mut f, &e3);
+        drop(f);
+
+        // First pass — no marker yet, falls back to a full rebuild.
+        let conn = open(&db).unwrap();
+        let n_first = ingest_new_events(&conn, &jsonl, project).unwrap();
+        assert_eq!(n_first, 3);
+
+        // Append two more events.
+        let e4 = make_open_event("tj-i4", "fourth");
+        let e5 = make_open_event("tj-i5", "fifth");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jsonl)
+            .unwrap();
+        write_event_line(&mut f, &e4);
+        write_event_line(&mut f, &e5);
+        drop(f);
+
+        // Second pass — marker = e3, only e4 + e5 must be processed.
+        let n_second = ingest_new_events(&conn, &jsonl, project).unwrap();
+        assert_eq!(n_second, 2, "incremental ingest must read only the tail");
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events_index", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 5);
+
+        let marker: String = conn
+            .query_row(
+                "SELECT last_indexed_event_id FROM index_state WHERE project_hash=?1",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, e5.event_id);
+    }
+
+    #[test]
+    fn ingest_new_events_falls_back_to_full_rebuild_when_marker_vanishes() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let project = "feedfacefeedface";
+
+        let e1 = make_open_event("tj-r1", "first");
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &e1);
+        drop(f);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, project).unwrap();
+
+        // Replace the file entirely so the marker (e1.event_id) no longer
+        // appears anywhere — simulates corruption / hand-edit.
+        let e2 = make_open_event("tj-r2", "after-corruption");
+        let e3 = make_open_event("tj-r3", "after-corruption-2");
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &e2);
+        write_event_line(&mut f, &e3);
+        drop(f);
+
+        let n = ingest_new_events(&conn, &jsonl, project).unwrap();
+        assert_eq!(n, 2, "missing marker must trigger full rebuild");
+    }
+
+    #[test]
+    fn rebuild_state_and_ingest_new_events_produce_same_state() {
+        let d = TempDir::new().unwrap();
+        let jsonl_a = d.path().join("a.jsonl");
+        let jsonl_b = d.path().join("b.jsonl");
+        let db_a = d.path().join("a.sqlite");
+        let db_b = d.path().join("b.sqlite");
+
+        let events: Vec<_> = (0..5)
+            .map(|i| make_open_event(&format!("tj-eq{i}"), &format!("title {i}")))
+            .collect();
+        for path in [&jsonl_a, &jsonl_b] {
+            let mut f = std::fs::File::create(path).unwrap();
+            for e in &events {
+                write_event_line(&mut f, e);
+            }
+        }
+
+        let conn_a = open(&db_a).unwrap();
+        let n_a = rebuild_state(&conn_a, &jsonl_a, "abcd1234abcd1234").unwrap();
+
+        let conn_b = open(&db_b).unwrap();
+        let n_b = ingest_new_events(&conn_b, &jsonl_b, "abcd1234abcd1234").unwrap();
+
+        assert_eq!(n_a, n_b);
+        assert_eq!(n_a, 5);
+
+        for table in ["tasks", "events_index"] {
+            let q = format!("SELECT COUNT(*) FROM {table}");
+            let cnt_a: i64 = conn_a.query_row(&q, [], |r| r.get(0)).unwrap();
+            let cnt_b: i64 = conn_b.query_row(&q, [], |r| r.get(0)).unwrap();
+            assert_eq!(cnt_a, cnt_b, "row count mismatch in {table}");
+        }
     }
 
     #[test]

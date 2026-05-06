@@ -217,7 +217,7 @@ fn main() -> Result<()> {
 
             let conn = tj_core::db::open(&state_path)?;
             if events_path.exists() {
-                tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             }
             let pmode = match mode.as_str() {
                 "compact" => tj_core::pack::PackMode::Compact,
@@ -442,7 +442,7 @@ fn main() -> Result<()> {
                         tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                     let conn = tj_core::db::open(&state_path)?;
                     if events_path.exists() {
-                        tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     }
                     let recent = recent_task_contexts(&conn, 5)?;
                     if recent.is_empty() {
@@ -671,7 +671,7 @@ fn main() -> Result<()> {
 
                 let conn = tj_core::db::open(&state_path)?;
                 if events_path.exists() {
-                    tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 }
                 let mut stmt = conn.prepare(
                     "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2",
