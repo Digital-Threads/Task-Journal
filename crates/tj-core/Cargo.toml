@@ -29,6 +29,7 @@ directories = { workspace = true }
 rusqlite = { workspace = true }
 ureq = { workspace = true }
 tracing = { workspace = true }
+fd-lock = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
