@@ -88,8 +88,17 @@ impl Classifier for ClaudeCliClassifier {
         }
 
         let stdout = String::from_utf8(output.stdout).context("claude -p stdout not UTF-8")?;
-        let cli_result: CliResult = serde_json::from_str(stdout.trim())
-            .with_context(|| format!("parse claude -p JSON envelope; got: {}", stdout.trim()))?;
+        // Wrappers like `aimux run` prepend status lines to stdout
+        // (e.g. "Auto-sync: 0 created, 0 repaired, 1 conflicts\n").
+        // claude's JSON envelope is always a single object, so we
+        // anchor the parse at the first `{` and ignore any prelude.
+        let envelope = stdout
+            .find('{')
+            .map(|i| &stdout[i..])
+            .unwrap_or(stdout.as_str())
+            .trim();
+        let cli_result: CliResult = serde_json::from_str(envelope)
+            .with_context(|| format!("parse claude -p JSON envelope; got: {envelope}"))?;
 
         if cli_result.is_error {
             return Err(anyhow!(
@@ -156,6 +165,65 @@ mod tests {
     // returns "batch file arguments are invalid" for any arg with `"` etc.
     // Real `claude` is a native binary, so production is unaffected; this
     // is purely a test-fake limitation. Skip the affected tests on Windows.
+    /// Build a fake_claude that prepends a wrapper-style status line
+    /// before the JSON envelope (mimics `aimux run`'s "Auto-sync: …" output).
+    #[cfg(unix)]
+    fn fake_claude_with_prelude(
+        dir: &std::path::Path,
+        prelude: &str,
+        envelope: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let json_path = dir.join("fake-claude-output.json");
+        std::fs::write(&json_path, envelope).unwrap();
+        let path = dir.join("fake-claude-prelude.sh");
+        let script = format!(
+            "#!/bin/sh\necho '{}'\ncat \"{}\"\n",
+            prelude,
+            json_path.to_string_lossy()
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classifier_strips_wrapper_prelude_before_envelope() {
+        // Reproduces aimux's "Auto-sync: 0 created, 0 repaired, 1 conflicts"
+        // line that appears before claude's JSON envelope. The parser
+        // must anchor at the first `{` so the prelude is ignored.
+        let dir = tempfile::TempDir::new().unwrap();
+        let inner = r#"{"event_type":"finding","task_id_guess":"tj-x","confidence":0.9,"evidence_strength":null,"suggested_text":"ok"}"#;
+        let envelope = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": inner,
+        });
+        let fake = fake_claude_with_prelude(
+            dir.path(),
+            "Auto-sync: 0 created, 0 repaired, 1 conflicts",
+            &envelope.to_string(),
+        );
+
+        let c = ClaudeCliClassifier {
+            command: fake.to_string_lossy().to_string(),
+            model: "haiku".into(),
+        };
+        let out = c
+            .classify(&ClassifyInput {
+                text: "x".into(),
+                author_hint: "user".into(),
+                recent_tasks: vec![],
+            })
+            .unwrap();
+        assert_eq!(out.event_type, EventType::Finding);
+        assert_eq!(out.task_id_guess.as_deref(), Some("tj-x"));
+    }
+
     #[test]
     #[cfg_attr(
         windows,

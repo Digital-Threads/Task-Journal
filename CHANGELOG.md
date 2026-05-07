@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-05-07
+
+### Fixed
+- Classifier now strips wrapper prelude lines from claude's stdout
+  before parsing the JSON envelope. `aimux run` (and similar
+  orchestrators) prepend "Auto-sync: 0 created, 0 repaired, …"-style
+  status lines, which made `serde_json::from_str` choke on the first
+  character. We now anchor the parse at the first `{`. One unit test
+  (`classifier_strips_wrapper_prelude_before_envelope`) covers the
+  shape end-to-end with a fake script that emits a prelude before
+  the envelope.
+
 ## [0.2.9] - 2026-05-07
 
 Critical fix: classifier path now works for users on Claude Pro/Max
