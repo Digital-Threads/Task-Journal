@@ -35,10 +35,27 @@ pub struct ChatView {
 impl ChatView {
     pub fn from_session(session: &ParsedSession) -> Self {
         let mut messages = Vec::new();
+        // Collapse tool-only assistant messages. When the assistant
+        // emits N consecutive turns of pure tool_use without any
+        // commentary, we accumulate the tool names and attach them to
+        // the *next* assistant message that does have text (or, if the
+        // session ends mid-tool-storm, surface a single collapsed
+        // entry so the activity is not invisible).
+        let mut pending_tools: Vec<String> = Vec::new();
+        let mut last_tool_ts: Option<String> = None;
 
         for entry in &session.entries {
             match entry {
                 SessionEntry::User(u) => {
+                    if !pending_tools.is_empty() {
+                        let count = pending_tools.len();
+                        messages.push(ChatMessage {
+                            role: Role::Assistant,
+                            text: format!("({count} tool call(s) — no commentary)"),
+                            timestamp: last_tool_ts.take().unwrap_or_default(),
+                            tools: std::mem::take(&mut pending_tools),
+                        });
+                    }
                     if let Some(text) = extract_user_text(u) {
                         let clean = strip_xml_tags(&text);
                         if !clean.trim().is_empty() {
@@ -55,24 +72,42 @@ impl ChatView {
                     let texts = extract_assistant_texts(a);
                     let tools = extract_tool_uses(a);
                     let tool_names: Vec<String> = tools.iter().map(|(n, _)| n.clone()).collect();
-
                     let combined = texts.join("\n");
-                    if !combined.trim().is_empty() || !tool_names.is_empty() {
-                        let display_text = if combined.trim().is_empty() {
-                            format!("[{} tool call(s)]", tool_names.len())
-                        } else {
-                            combined
-                        };
+
+                    if combined.trim().is_empty() {
+                        // Tool-only turn: accumulate, do not render yet.
+                        if !tool_names.is_empty() {
+                            pending_tools.extend(tool_names);
+                            last_tool_ts = Some(format_ts(&a.timestamp));
+                        }
+                    } else {
+                        // Text turn: flush accumulated tools onto this
+                        // message together with its own.
+                        let mut all_tools = std::mem::take(&mut pending_tools);
+                        last_tool_ts = None;
+                        all_tools.extend(tool_names);
                         messages.push(ChatMessage {
                             role: Role::Assistant,
-                            text: display_text,
+                            text: combined,
                             timestamp: format_ts(&a.timestamp),
-                            tools: tool_names,
+                            tools: all_tools,
                         });
                     }
                 }
                 _ => {}
             }
+        }
+        // Trailing tool-only burst: surface as one collapsed entry so
+        // it's visible the assistant did work, but without polluting
+        // the timeline with empty turns.
+        if !pending_tools.is_empty() {
+            let count = pending_tools.len();
+            messages.push(ChatMessage {
+                role: Role::Assistant,
+                text: format!("({count} tool call(s) — no commentary)"),
+                timestamp: last_tool_ts.unwrap_or_default(),
+                tools: pending_tools,
+            });
         }
 
         let title = if let Some(first) = session.first_user_text() {

@@ -13,9 +13,12 @@ use serde::Deserialize;
 /// Backend that invokes `claude -p` via subprocess.
 ///
 /// Configuration:
-/// - `command`: program name (default `"claude"`); override for tests/dev.
-/// - `model`: model alias passed via `--model`. Overridable via the
-///   `TJ_CLASSIFIER_MODEL` env var; falls back to `DEFAULT_MODEL` (haiku —
+/// - `command`: full command line that produces `claude` invocation;
+///   default `"claude"`. May contain spaces to wrap the binary in a
+///   workspace orchestrator like `aimux run dt claude` or a Nix
+///   shell. Override via `TJ_CLASSIFIER_CLI` env var.
+/// - `model`: model alias passed via `--model`. Overridable via
+///   `TJ_CLASSIFIER_MODEL`; falls back to `DEFAULT_MODEL` (haiku —
 ///   cheaper than the user's session model).
 pub struct ClaudeCliClassifier {
     pub command: String,
@@ -28,7 +31,7 @@ pub const DEFAULT_MODEL: &str = "haiku";
 impl Default for ClaudeCliClassifier {
     fn default() -> Self {
         Self {
-            command: "claude".into(),
+            command: std::env::var("TJ_CLASSIFIER_CLI").unwrap_or_else(|_| "claude".into()),
             model: std::env::var("TJ_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
         }
     }
@@ -45,7 +48,17 @@ impl Classifier for ClaudeCliClassifier {
     fn classify(&self, input: &ClassifyInput) -> anyhow::Result<ClassifyOutput> {
         let prompt = crate::classifier::prompt::build(input);
 
-        let output = std::process::Command::new(&self.command)
+        // Split command on whitespace so users can wrap the binary
+        // in a workspace orchestrator: `aimux run dt claude`,
+        // `nix run nixpkgs#claude --`, etc.
+        let mut parts = self.command.split_whitespace();
+        let program = parts
+            .next()
+            .ok_or_else(|| anyhow!("TJ_CLASSIFIER_CLI is empty"))?;
+        let base_args: Vec<&str> = parts.collect();
+
+        let output = std::process::Command::new(program)
+            .args(&base_args)
             .args([
                 "-p",
                 "--model",
@@ -187,5 +200,65 @@ mod tests {
             .to_string();
         assert!(err.contains("Not logged in"));
         assert!(err.contains("claude /login"));
+    }
+
+    #[test]
+    fn classifier_command_with_spaces_runs_wrapper_then_target() {
+        // Simulates `aimux run dt claude` style wrappers: a launcher
+        // script that ignores its first argv, then forwards everything
+        // else to the real fake-claude. We verify TJ_CLASSIFIER_CLI
+        // splitting works end-to-end.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let inner = r#"{"event_type":"finding","task_id_guess":null,"confidence":0.9,"evidence_strength":null,"suggested_text":"x"}"#;
+        let envelope = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": inner,
+        });
+        let real_fake = fake_claude(dir.path(), &envelope.to_string());
+
+        // Wrapper script that takes a "profile" arg and delegates.
+        #[cfg(unix)]
+        let wrapper = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join("fake-aimux.sh");
+            // shellcheck-clean: we intentionally drop $1 (profile name)
+            // and forward $2..$N to the real fake.
+            let script = format!(
+                "#!/bin/sh\nshift\nshift\nshift\nexec \"{}\" \"$@\"\n",
+                real_fake.to_string_lossy()
+            );
+            std::fs::write(&path, script).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        };
+        #[cfg(windows)]
+        let wrapper = {
+            let path = dir.path().join("fake-aimux.cmd");
+            // Drop %1 %2 %3 (run dt claude) and pass the rest.
+            let script = format!(
+                "@echo off\r\ncall \"{}\" %4 %5 %6 %7 %8 %9\r\n",
+                real_fake.to_string_lossy()
+            );
+            std::fs::write(&path, script).unwrap();
+            path
+        };
+
+        let c = ClaudeCliClassifier {
+            command: format!("{} run dt claude", wrapper.to_string_lossy()),
+            model: "haiku".into(),
+        };
+        let out = c
+            .classify(&ClassifyInput {
+                text: "x".into(),
+                author_hint: "user".into(),
+                recent_tasks: vec![],
+            })
+            .unwrap();
+        assert_eq!(out.event_type, EventType::Finding);
     }
 }

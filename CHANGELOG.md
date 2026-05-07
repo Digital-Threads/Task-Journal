@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-05-07
+
+Hotfix: support workspace-orchestrator wrappers (aimux, nix-shell, etc).
+
+### Added
+- `TJ_CLASSIFIER_CLI` env var. The CLI classifier (`--backend=cli`)
+  now splits this on whitespace and uses it as the program + base
+  arguments before appending the classifier-specific flags. Lets users
+  with `aimux`, `direnv`, `nix run` and similar wrappers pass through
+  to their actual `claude` binary without symlinks or PATH gymnastics:
+  ```bash
+  export TJ_CLASSIFIER_CLI="aimux run dt claude"
+  ```
+  When unset, defaults to the bare `claude` (previous behavior).
+
+### Fixed
+- Auto-capture hooks were silently failing for users on managed Claude
+  Code installations where the `claude` binary is not directly on PATH
+  but accessed via a wrapper. The `TJ_CLASSIFIER_CLI` override resolves
+  this without requiring binary changes to install-hooks.
+
 ## [0.2.3] - 2026-05-07
 
 Hotfix release. Re-release of the 0.2.2 fixes plus CI repair —
