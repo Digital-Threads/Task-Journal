@@ -725,13 +725,20 @@ enum Commands {
         force: bool,
     },
     /// Hook entry point: ingest a chat chunk through the classifier.
+    ///
+    /// When `--kind` and `--text` are both omitted, reads the Claude Code
+    /// hook payload as JSON from stdin (the actual production wiring).
+    /// `--kind` / `--text` remain for tests and ad-hoc use.
     IngestHook {
         /// Hook kind: UserPromptSubmit | PostToolUse | Stop | SessionStart.
+        /// If omitted, derived from stdin JSON (`hook_event_name`).
         #[arg(long)]
-        kind: String,
-        /// The chat chunk text.
+        kind: Option<String>,
+        /// The chat chunk text. If omitted, derived from stdin JSON
+        /// (`prompt` for UserPromptSubmit, synthesized from
+        /// tool_name+input+response for PostToolUse, etc.).
         #[arg(long)]
-        text: String,
+        text: Option<String>,
         /// Classifier backend: "cli" uses `claude -p` (free with your Pro/Max
         /// subscription) or "api" uses Anthropic API (requires `ANTHROPIC_API_KEY`).
         /// Default: cli.
@@ -1046,7 +1053,12 @@ fn main() -> Result<()> {
                 // and replay on next ingest.
                 // Default to subscription-based classifier (`claude -p`).
                 // Power users with API key can run install-hooks --backend=api below.
-                let cmd = "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\" --backend=cli || true";
+                // Claude Code pipes the hook payload as JSON on stdin; the
+                // `--kind` / `--text` flags from earlier templates pointed
+                // at env vars Claude Code never sets and therefore always
+                // fed the classifier empty text. Stdin-only is the correct
+                // wiring (see claude-memory-rsw).
+                let cmd = "task-journal ingest-hook --backend=cli || true";
                 let entries = serde_json::json!({
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
@@ -1174,6 +1186,17 @@ fn main() -> Result<()> {
             mock_task_id,
             mock_confidence,
         } => {
+            // Resolve (kind, text) source: explicit args win; otherwise
+            // read the Claude Code hook payload from stdin. The earlier
+            // settings.json template interpolated `$CLAUDE_HOOK_NAME` /
+            // `$CLAUDE_HOOK_TEXT` env vars that Claude Code does NOT set,
+            // so production was always called with empty text and every
+            // event ended up rejected — see claude-memory-rsw.
+            let (kind, text) = match (kind, text) {
+                (Some(k), Some(t)) => (k, t),
+                _ => parse_hook_stdin()?,
+            };
+
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -1809,6 +1832,70 @@ fn drain_pending(
         std::fs::remove_file(entry.path())?;
     }
     Ok(())
+}
+
+/// Read a Claude Code hook payload from stdin and project it down to
+/// the (kind, text) pair the rest of `ingest-hook` operates on.
+///
+/// Claude Code passes hook input as a JSON object on stdin. The fields
+/// we care about (per the public hooks spec):
+///
+/// - common: `hook_event_name`
+/// - UserPromptSubmit: `prompt`
+/// - PreToolUse / PostToolUse: `tool_name`, `tool_input`, `tool_response`
+/// - Stop / SessionStart: nothing extra worth ingesting (SessionStart
+///   takes a separate fast path further up)
+///
+/// If stdin is empty (someone runs the command interactively without
+/// piping), we silently return ("Stop", "") so the hook becomes a no-op
+/// instead of erroring — matches the `|| true` safety net in the
+/// installed hook command.
+fn parse_hook_stdin() -> anyhow::Result<(String, String)> {
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .context("read hook payload from stdin")?;
+    let buf = buf.trim();
+    if buf.is_empty() {
+        return Ok(("Stop".into(), String::new()));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(buf).with_context(|| format!("parse hook payload JSON: {buf}"))?;
+
+    let kind = v
+        .get("hook_event_name")
+        .and_then(|s| s.as_str())
+        .unwrap_or("Stop")
+        .to_string();
+
+    let text = match kind.as_str() {
+        "UserPromptSubmit" => v
+            .get("prompt")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "PreToolUse" | "PostToolUse" => {
+            let tool = v
+                .get("tool_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("tool");
+            let input = v
+                .get("tool_input")
+                .map(|x| x.to_string())
+                .unwrap_or_default();
+            let response = v
+                .get("tool_response")
+                .map(|x| x.to_string())
+                .unwrap_or_default();
+            if response.is_empty() {
+                format!("{tool}: {input}")
+            } else {
+                format!("{tool}: {input} → {response}")
+            }
+        }
+        _ => String::new(),
+    };
+
+    Ok((kind, text))
 }
 
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {

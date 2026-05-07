@@ -1237,6 +1237,141 @@ fn ingest_hook_session_start_with_no_open_tasks_emits_no_context() {
 }
 
 #[test]
+fn ingest_hook_reads_user_prompt_submit_payload_from_stdin() {
+    // Real Claude Code passes hook input as JSON over stdin, NOT via env
+    // vars. Without this, every captured event has empty text and the
+    // classifier rejects it. Regression for claude-memory-rsw.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Stdin host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-1",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "We adopted Rust for the journal."
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.95",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("We adopted Rust for the journal"));
+}
+
+#[test]
+fn ingest_hook_reads_post_tool_use_payload_from_stdin() {
+    // PostToolUse payloads have no `prompt` field — content lives in
+    // `tool_name` / `tool_input` / `tool_response`. The stdin parser must
+    // synthesize text from those.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Tool host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-2",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "cargo test" },
+        "tool_response": { "output": "all 222 tests pass" }
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "evidence",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Bash").and(contains("cargo test")));
+}
+
+#[test]
+fn install_hooks_writes_command_without_bogus_env_var_interpolation() {
+    // The old install-hooks emitted $CLAUDE_HOOK_NAME / $CLAUDE_HOOK_TEXT,
+    // neither of which Claude Code actually populates. The current command
+    // must rely on stdin instead.
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert()
+        .success();
+    let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    assert!(
+        !s.contains("$CLAUDE_HOOK_NAME") && !s.contains("$CLAUDE_HOOK_TEXT"),
+        "install-hooks must not interpolate non-existent env vars: {s}"
+    );
+}
+
+#[test]
 fn ingest_hook_with_mock_writes_classified_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(

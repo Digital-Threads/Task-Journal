@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-05-07
+
+Critical fix: hooks now actually carry content end-to-end. Without
+this release, every captured event reached the classifier with empty
+text, queued in `pending/`, and never got classified.
+
+### Fixed
+- `ingest-hook` now reads the Claude Code hook payload as JSON from
+  stdin (the documented wiring) instead of relying on `$CLAUDE_HOOK_NAME`
+  / `$CLAUDE_HOOK_TEXT` env vars that Claude Code never set. Per
+  hook kind:
+  - `UserPromptSubmit` → `prompt`
+  - `PreToolUse` / `PostToolUse` → synthesized from `tool_name`,
+    `tool_input`, and (when present) `tool_response`
+  - `Stop` / `SessionStart` → empty (SessionStart already short-
+    circuits to its resume-pack path).
+  `--kind` / `--text` remain accepted as CLI overrides for tests and
+  ad-hoc use; they take precedence when both are passed.
+- `install-hooks` now writes `task-journal ingest-hook --backend=cli
+  || true` — the bogus env-var interpolation is gone. Closes
+  claude-memory-rsw.
+
 ## [0.2.7] - 2026-05-07
 
 ### Fixed
