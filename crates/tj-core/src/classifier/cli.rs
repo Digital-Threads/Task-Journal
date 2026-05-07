@@ -150,7 +150,10 @@ mod tests {
     // Real `claude` is a native binary, so production is unaffected; this
     // is purely a test-fake limitation. Skip the affected tests on Windows.
     #[test]
-    #[cfg_attr(windows, ignore = "fake-claude.cmd cannot accept argv with quotes (BatBadBut)")]
+    #[cfg_attr(
+        windows,
+        ignore = "fake-claude.cmd cannot accept argv with quotes (BatBadBut)"
+    )]
     fn classifier_parses_cli_envelope_and_returns_classified_output() {
         let dir = tempfile::TempDir::new().unwrap();
 
@@ -183,7 +186,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "fake-claude.cmd cannot accept argv with quotes (BatBadBut)")]
+    #[cfg_attr(
+        windows,
+        ignore = "fake-claude.cmd cannot accept argv with quotes (BatBadBut)"
+    )]
     fn classifier_surfaces_not_logged_in_with_friendly_hint() {
         let dir = tempfile::TempDir::new().unwrap();
         let envelope = serde_json::json!({
@@ -216,7 +222,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "fake-claude.cmd cannot accept argv with quotes (BatBadBut)")]
+    #[cfg_attr(
+        windows,
+        ignore = "fake-claude.cmd cannot accept argv with quotes (BatBadBut)"
+    )]
     fn classifier_command_with_spaces_runs_wrapper_then_target() {
         // Simulates `aimux run dt claude` style wrappers: a launcher
         // script that ignores its first argv, then forwards everything
