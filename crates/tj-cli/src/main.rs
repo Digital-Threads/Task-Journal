@@ -999,6 +999,11 @@ fn main() -> Result<()> {
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "Stop":            [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                    // SessionStart drives the auto resume-pack injection:
+                    // ingest-hook short-circuits on this kind, queries open
+                    // tasks for the current project, and emits the
+                    // additionalContext envelope Claude Code expects.
+                    "SessionStart":    [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                 });
                 hooks_obj.insert("hooks".into(), entries);
 
@@ -1103,6 +1108,47 @@ fn main() -> Result<()> {
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
             std::fs::create_dir_all(events_path.parent().unwrap())?;
+
+            // SessionStart: emit a JSON envelope with compact resume-packs of
+            // open tasks so Claude Code injects them into its system context
+            // automatically. This is the load-bearing UX for "the journal
+            // remembers" — without it, users would have to call task_pack
+            // manually each session. Empty stdout when no open tasks → no
+            // injection, keeps system prompt clean for fresh projects.
+            if kind == "SessionStart" {
+                // Skip early on a clean machine: nothing to surface, and we
+                // don't want SessionStart to spawn empty SQLite files in
+                // every project Claude Code is opened in.
+                if !events_path.exists() {
+                    return Ok(());
+                }
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                let recent = recent_task_contexts(&conn, 3)?;
+                if recent.is_empty() {
+                    return Ok(());
+                }
+                let mut bundle = String::new();
+                for tc in &recent {
+                    let pack = tj_core::pack::assemble(
+                        &conn,
+                        &tc.task_id,
+                        tj_core::pack::PackMode::Compact,
+                    )?;
+                    bundle.push_str(&pack.text);
+                    bundle.push_str("\n\n");
+                }
+                let envelope = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": bundle.trim_end(),
+                    }
+                });
+                println!("{}", serde_json::to_string(&envelope)?);
+                return Ok(());
+            }
 
             // Drain any pending entries first (Task 10 fills the real-classifier branch).
             drain_pending(

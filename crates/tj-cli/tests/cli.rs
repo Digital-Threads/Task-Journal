@@ -800,6 +800,10 @@ fn install_hooks_writes_to_settings_json() {
     assert!(content.contains("UserPromptSubmit"));
     assert!(content.contains("PostToolUse"));
     assert!(content.contains("task-journal ingest-hook"));
+    assert!(
+        content.contains("SessionStart"),
+        "install-hooks must wire SessionStart so resume-pack injection works"
+    );
 }
 
 #[test]
@@ -1075,6 +1079,96 @@ fn ingest_hook_writes_telemetry_record() {
     assert!(
         total_lines >= 1,
         "expected at least one telemetry line, got {total_lines}"
+    );
+}
+
+#[test]
+fn ingest_hook_session_start_emits_resume_pack_json() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Wire SessionStart pack"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt Rust for the journal.",
+        ])
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+
+    let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or_else(|e| {
+        panic!("SessionStart hook stdout must be JSON; got: {body:?}; err: {e}")
+    });
+    let hso = v
+        .get("hookSpecificOutput")
+        .expect("hookSpecificOutput key missing");
+    assert_eq!(
+        hso.get("hookEventName").and_then(|s| s.as_str()),
+        Some("SessionStart"),
+        "wrong hookEventName: {body}"
+    );
+    let ctx = hso
+        .get("additionalContext")
+        .and_then(|s| s.as_str())
+        .expect("additionalContext key missing");
+    assert!(
+        ctx.contains("Wire SessionStart pack"),
+        "additionalContext must include task title: {ctx}"
+    );
+    assert!(
+        ctx.contains("Adopt Rust"),
+        "additionalContext must include event text: {ctx}"
+    );
+}
+
+#[test]
+fn ingest_hook_session_start_with_no_open_tasks_emits_no_context() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    // Empty stdout is the documented signal to Claude Code that no
+    // additionalContext should be injected — we don't want to pollute
+    // the system prompt with an empty pack on fresh projects.
+    assert!(
+        body.trim().is_empty(),
+        "SessionStart with no open tasks must emit nothing, got: {body:?}"
     );
 }
 
