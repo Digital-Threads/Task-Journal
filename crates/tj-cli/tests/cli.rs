@@ -136,6 +136,86 @@ fn doctor_json_output_is_parseable_and_lists_paths() {
 }
 
 #[test]
+fn migrate_project_round_trips_data_to_new_path() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+
+    // Create a task with the cwd = proj_a.
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj_a.path())
+            .args(["create", "Migration round-trip"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Migrate the data to proj_b.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Pack from proj_b finds the same task.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Migration round-trip"));
+}
+
+#[test]
+fn migrate_project_refuses_overwrite_without_force() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+
+    // Both projects have data: create a task in each.
+    for proj in [&proj_a, &proj_b] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Conflicting"])
+            .assert()
+            .success();
+    }
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("destination already exists"));
+}
+
+#[test]
 fn close_unknown_task_id_returns_error() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")

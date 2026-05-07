@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -96,6 +96,94 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     let r = std::fs::write(&probe, b"ok").is_ok();
     let _ = std::fs::remove_file(&probe);
     r
+}
+
+/// Move all on-disk data for one project_hash to another. Used by the
+/// `migrate-project` subcommand when a project's directory has been
+/// moved on disk and the canonical-path hash no longer matches.
+fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool) -> Result<()> {
+    let from_hash = tj_core::project_hash::from_path(from)
+        .with_context(|| format!("compute project_hash for --from {from:?}"))?;
+    let to_hash = tj_core::project_hash::from_path(to)
+        .with_context(|| format!("compute project_hash for --to {to:?}"))?;
+
+    if from_hash == to_hash {
+        anyhow::bail!(
+            "--from and --to resolve to the same project_hash ({from_hash}) — nothing to migrate"
+        );
+    }
+
+    let events_dir = tj_core::paths::events_dir()?;
+    let state_dir = tj_core::paths::state_dir()?;
+    let metrics_dir = tj_core::paths::metrics_dir()?;
+
+    // (source, destination) tuples to attempt to rename.
+    let pairs = [
+        (
+            events_dir.join(format!("{from_hash}.jsonl")),
+            events_dir.join(format!("{to_hash}.jsonl")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.sqlite")),
+            state_dir.join(format!("{to_hash}.sqlite")),
+        ),
+        (
+            metrics_dir.join(format!("{from_hash}.jsonl")),
+            metrics_dir.join(format!("{to_hash}.jsonl")),
+        ),
+    ];
+
+    // Pre-flight: refuse overwrite of any destination unless --force.
+    if !force {
+        for (_src, dst) in &pairs {
+            if dst.exists() {
+                anyhow::bail!(
+                    "destination already exists: {} — pass --force to overwrite",
+                    dst.display()
+                );
+            }
+        }
+    }
+
+    let mut moved: Vec<String> = Vec::new();
+    for (src, dst) in &pairs {
+        if !src.exists() {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if dst.exists() && force {
+            std::fs::remove_file(dst).with_context(|| format!("remove existing {dst:?}"))?;
+        }
+        std::fs::rename(src, dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
+        moved.push(dst.display().to_string());
+    }
+
+    // Re-key the project_hash columns inside the (now renamed) SQLite.
+    let new_state_path = state_dir.join(format!("{to_hash}.sqlite"));
+    if new_state_path.exists() {
+        let conn = tj_core::db::open(&new_state_path)?;
+        conn.execute(
+            "UPDATE tasks SET project_hash = ?1 WHERE project_hash = ?2",
+            rusqlite::params![to_hash, from_hash],
+        )?;
+        conn.execute(
+            "UPDATE index_state SET project_hash = ?1 WHERE project_hash = ?2",
+            rusqlite::params![to_hash, from_hash],
+        )?;
+    }
+
+    if moved.is_empty() {
+        println!("no on-disk data found for project_hash {from_hash} — nothing to migrate");
+    } else {
+        println!("migrated {} file(s):", moved.len());
+        for path in moved {
+            println!("  {path}");
+        }
+        println!("  project_hash {from_hash} -> {to_hash}");
+    }
+    Ok(())
 }
 
 fn run_doctor() -> Result<DoctorReport> {
@@ -299,6 +387,20 @@ enum Commands {
         /// Emit a machine-readable JSON report instead of human text.
         #[arg(long)]
         json: bool,
+    },
+    /// Re-key on-disk data when a project moved on disk. The project_hash
+    /// is derived from the canonical path, so a moved project orphans its
+    /// own data; this command renames the JSONL + SQLite + metrics files.
+    MigrateProject {
+        /// Old project path (the data we want to keep).
+        #[arg(long, value_name = "PATH")]
+        from: PathBuf,
+        /// New project path (where the project lives now).
+        #[arg(long, value_name = "PATH")]
+        to: PathBuf,
+        /// Overwrite the destination if data already exists for it.
+        #[arg(long)]
+        force: bool,
     },
     /// Hook entry point: ingest a chat chunk through the classifier.
     IngestHook {
@@ -601,6 +703,9 @@ fn main() -> Result<()> {
             if !report.issues.is_empty() {
                 std::process::exit(1);
             }
+        }
+        Commands::MigrateProject { from, to, force } => {
+            run_migrate_project(&from, &to, force)?;
         }
         Commands::IngestHook {
             kind,
