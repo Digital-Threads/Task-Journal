@@ -1068,9 +1068,38 @@ fn main() -> Result<()> {
                 "html" => {
                     print!("{}", render_html_timeline(&events));
                 }
-                other => {
-                    anyhow::bail!("unknown format: {other} (expected `md`, `json`, or `html`)")
+                "sqlite" => {
+                    // Snapshot the derived SQLite state. VACUUM INTO
+                    // produces a clean, defragmented copy at the target
+                    // path; we then shovel its bytes to stdout so the
+                    // user can `> backup.sqlite`.
+                    //
+                    // Always rebuild from JSONL first so the snapshot
+                    // reflects every event ever appended, not just what
+                    // the latest ingest happened to capture.
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
+
+                    let tmp = tempfile::TempDir::new()?;
+                    let out_path = tmp.path().join("export.sqlite");
+                    conn.execute(
+                        "VACUUM INTO ?1",
+                        rusqlite::params![out_path.to_string_lossy().into_owned()],
+                    )?;
+                    drop(conn);
+
+                    let bytes = std::fs::read(&out_path)?;
+                    use std::io::Write;
+                    std::io::stdout()
+                        .lock()
+                        .write_all(&bytes)
+                        .context("write sqlite snapshot to stdout")?;
                 }
+                other => anyhow::bail!(
+                    "unknown format: {other} (expected `md`, `json`, `html`, or `sqlite`)"
+                ),
             }
         }
         Commands::Search {

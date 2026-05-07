@@ -2179,6 +2179,7 @@ dependencies = [
  "serde",
  "serde_json",
  "task-journal-core",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "ulid",

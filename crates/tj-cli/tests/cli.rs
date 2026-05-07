@@ -136,6 +136,100 @@ fn doctor_json_output_is_parseable_and_lists_paths() {
 }
 
 #[test]
+fn export_sqlite_round_trips_through_pack() {
+    // Setup A: write a project + task in xdg_a/proj_a.
+    let xdg_a = assert_fs::TempDir::new().unwrap();
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg_a.path())
+            .current_dir(proj_a.path())
+            .args(["create", "Round-trip via sqlite export"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg_a.path())
+        .current_dir(proj_a.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt sqlite export",
+        ])
+        .assert()
+        .success();
+
+    // Export the SQLite snapshot to a buffer.
+    let snapshot = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg_a.path())
+        .current_dir(proj_a.path())
+        .args(["export", "--format", "sqlite"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(
+        snapshot.starts_with(b"SQLite format 3\0"),
+        "magic bytes missing"
+    );
+
+    // Setup B: a fresh xdg, no JSONL — only the snapshot in state/.
+    let xdg_b = assert_fs::TempDir::new().unwrap();
+    // Project hash derives from the proj path; we keep the same path so
+    // the hash matches what the snapshot was keyed under.
+    let project_hash = {
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg_a.path())
+            .current_dir(proj_a.path())
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap()
+            .stdout;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["state_dir"].as_str().unwrap().to_owned()
+    };
+    // We can't read the project_hash directly, but state_dir/<hash>.sqlite
+    // is the file we're after. Re-derive the destination for xdg_b by
+    // running doctor against xdg_b too — same proj path = same hash.
+    let _ = project_hash;
+    let dest_state_dir = xdg_b.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&dest_state_dir).unwrap();
+    // Pull the source filename (first .sqlite under xdg_a/task-journal/state).
+    let src_state_dir = xdg_a.path().join("task-journal").join("state");
+    let src_file = std::fs::read_dir(&src_state_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("sqlite"))
+        .expect("source sqlite present");
+    let dest_file = dest_state_dir.join(src_file.file_name().unwrap());
+    std::fs::write(&dest_file, &snapshot).unwrap();
+
+    // Pack from the new XDG without a JSONL — assemble must read from the
+    // snapshot SQLite alone.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg_b.path())
+        .current_dir(proj_a.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Adopt sqlite export"));
+}
+
+#[test]
 fn export_html_emits_self_contained_document() {
     let xdg = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
