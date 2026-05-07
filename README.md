@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/task-journal-cli.svg)](https://crates.io/crates/task-journal-cli)
 [![CI](https://github.com/Digital-Threads/Task-Journal/workflows/CI/badge.svg)](https://github.com/Digital-Threads/Task-Journal/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Digital-Threads/Task-Journal/branch/main/graph/badge.svg)](https://codecov.io/gh/Digital-Threads/Task-Journal)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Reasoning chain memory for AI coding sessions.
