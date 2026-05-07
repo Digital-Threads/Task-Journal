@@ -491,6 +491,35 @@ impl ServerHandler for TaskJournalServer {
     }
 }
 
+/// Resolve when the process should shut down: Ctrl-C on every platform,
+/// plus SIGTERM on Unix. Used in `tokio::select!` against the rmcp
+/// `waiting()` loop so the binary exits cleanly instead of being
+/// hard-killed mid-write.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install SIGTERM handler — Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: only Ctrl-C / Ctrl-Break maps to ctrl_c().
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received Ctrl-C");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -509,7 +538,17 @@ async fn main() -> Result<()> {
 
     let server = TaskJournalServer;
     let (stdin, stdout) = stdio();
-    server.serve((stdin, stdout)).await?.waiting().await?;
+    let serving = server.serve((stdin, stdout)).await?;
+
+    tokio::select! {
+        res = serving.waiting() => {
+            res?;
+            tracing::info!("rmcp serve loop exited");
+        }
+        _ = wait_for_shutdown_signal() => {
+            tracing::info!("shutdown signal received — exiting");
+        }
+    }
     Ok(())
 }
 
@@ -615,6 +654,20 @@ mod tests {
             elapsed < Duration::from_millis(350),
             "blocking tasks must overlap on the blocking pool — got {elapsed:?}"
         );
+    }
+
+    /// Compile-time + runtime guarantee that `wait_for_shutdown_signal`
+    /// returns a `Future<Output = ()>` we can drop on the floor without
+    /// it ever resolving — a real signal would resolve it. We assert by
+    /// racing it against an already-ready future and confirming the
+    /// shutdown future was *not* the winner.
+    #[tokio::test]
+    async fn shutdown_signal_does_not_fire_spuriously() {
+        let ready = async {};
+        tokio::select! {
+            _ = wait_for_shutdown_signal() => panic!("shutdown fired with no signal"),
+            _ = ready => { /* expected */ }
+        }
     }
 
     #[test]

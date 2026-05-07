@@ -30,7 +30,7 @@ sha2 = "0.10"
 dunce = "1"
 directories = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
