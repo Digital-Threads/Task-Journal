@@ -213,6 +213,13 @@ Smoke test scripts are available in `.beads/hooks/`:
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
+## Contributing
+
+Pull requests are welcome — please read [CONTRIBUTING.md](CONTRIBUTING.md)
+first. Filing bugs and feature requests goes through the
+[issue templates](.github/ISSUE_TEMPLATE/). All participation is governed
+by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT
