@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-07
+
+Operational maturity release. No breaking changes — additive features
+plus internal perf and observability work.
+
+### Added
+- `task-journal export --format sqlite` — VACUUM-based clean snapshot
+  of the derived state, streamed to stdout for redirection to a backup
+  file.
+- `task-journal pending list` and `task-journal pending retry` —
+  inspect the auto-capture-hook failure queue and re-feed entries
+  through the classifier (mock path wired; real classifier path
+  reuses the existing hook drain). `attempts` counter persisted in
+  each pending JSON; entries rename to `<id>.dead.json` after 3
+  failures.
+- MCP server: structured tracing with `correlation_id` per tool call.
+  Two INFO log lines wrap each invocation (start + ok / err) so a
+  single client request can be greppped across logs.
+- MCP server: graceful Ctrl-C and SIGTERM (Unix only) shutdown via
+  `tokio::select!` between the rmcp serve loop and a new
+  `wait_for_shutdown_signal()` future. Logs which signal arrived.
+- New regression tests:
+  `cached_open_returns_same_arc_for_same_path`,
+  `cached_open_returns_distinct_arcs_for_distinct_paths`,
+  `export_sqlite_round_trips_through_pack`,
+  `pending_list_shows_queued_entries`,
+  `pending_retry_drains_with_mock_classifier`,
+  `pending_retry_marks_dead_after_max_attempts`,
+  `dummy_client_handler_compiles_and_provides_default_info`,
+  `rmcp_call_tool_request_param_round_trips_via_serde`,
+  `new_correlation_id_is_unique_across_thousand_calls`,
+  `traced_tool_transparently_returns_inner_result`,
+  `shutdown_signal_does_not_fire_spuriously`.
+
+### Changed
+- MCP server caches one `Arc<Mutex<rusqlite::Connection>>` per state
+  path for the process lifetime. Eliminates per-call PRAGMA +
+  migration registry replays; small-N tool calls become noticeably
+  cheaper.
+
+### Performance
+- Tool-call overhead at small event counts dropped (Connection cache,
+  D1). Run `cargo bench --workspace` to see the local before/after.
+
+### Internal
+- Added `criterion` benches compile in CI (no behaviour change).
+- Added rmcp `client` feature in dev-deps to enable the future
+  end-to-end MCP roundtrip test once `TaskJournalServer` is
+  extracted to a lib target (tracked in claude-memory-yj1.8).
+- tokio `signal` feature added to workspace deps.
+
 ## [0.2.0-rc.1] - 2026-05-06
 
 > **Release candidate.** Major version bump because the MCP error
@@ -193,7 +244,8 @@ Initial release on crates.io.
 - `task-journal-mcp`: MCP server exposing `task_create`, `event_add`,
   `task_pack`, `task_search`, `task_close`.
 
-[Unreleased]: https://github.com/Digital-Threads/Task-Journal/compare/v0.2.0-rc.1...HEAD
+[Unreleased]: https://github.com/Digital-Threads/Task-Journal/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Digital-Threads/Task-Journal/compare/v0.2.0-rc.1...v0.2.1
 [0.2.0-rc.1]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.4...v0.2.0-rc.1
 [0.1.4]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Digital-Threads/Task-Journal/compare/v0.1.2...v0.1.3
