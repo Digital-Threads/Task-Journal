@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/task-journal-cli.svg)](https://crates.io/crates/task-journal-cli)
 [![CI](https://github.com/Digital-Threads/Task-Journal/workflows/CI/badge.svg)](https://github.com/Digital-Threads/Task-Journal/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Digital-Threads/Task-Journal/branch/main/graph/badge.svg)](https://codecov.io/gh/Digital-Threads/Task-Journal)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Reasoning chain memory for AI coding sessions.
@@ -140,6 +141,13 @@ The classifier (powered by `claude -p` with your Pro/Max subscription, or the An
 
 Hook commands are wrapped with `|| true` so classifier failures (network down, rate limit) never break Claude Code. Failed classifications are queued in `pending/` and retried on the next ingest.
 
+### Configuration
+
+| Env var | Effect | Default |
+|---------|--------|---------|
+| `TJ_CLASSIFIER_MODEL` | Model alias passed to `claude -p` (subscription backend) or to the Anthropic API. | `haiku` (CLI) / `claude-haiku-4-5-20251001` (API) |
+| `ANTHROPIC_API_KEY`   | Required for the `--backend=api` HTTP classifier. | _unset_ |
+
 ## Event Types
 
 | Type | Meaning |
@@ -201,6 +209,17 @@ Smoke test scripts are available in `.beads/hooks/`:
 .beads/hooks/p3-mock-demo.sh     # P3 hooks/classifier mock smoke
 .beads/hooks/p4-demo.sh          # P4 polish smoke
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
+## Contributing
+
+Pull requests are welcome — please read [CONTRIBUTING.md](CONTRIBUTING.md)
+first. Filing bugs and feature requests goes through the
+[issue templates](.github/ISSUE_TEMPLATE/). All participation is governed
+by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

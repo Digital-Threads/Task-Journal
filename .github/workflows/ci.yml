@@ -42,3 +42,74 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: msrv (rust 1.83)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.83
+        uses: dtolnay/rust-toolchain@1.83
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.83
+
+      - name: cargo build (MSRV)
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test (MSRV)
+        run: cargo test --workspace --all-targets
+
+  audit:
+    name: cargo-audit (security advisories)
+    runs-on: ubuntu-latest
+    # Non-blocking on first land: an open advisory in a transitive dep should
+    # surface as a CI annotation but not red-light unrelated changes. Flip
+    # continue-on-error to false once the baseline is clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  benches-compile:
+    name: criterion benches (compile only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: benches
+      - name: cargo bench --no-run
+        run: cargo bench --workspace --no-run
+
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    # Non-blocking on first land — coverage gates make sense once we have
+    # 5+ baselines and a target floor agreed. Flip continue-on-error to
+    # false once that lands.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: cargo llvm-cov (lcov)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

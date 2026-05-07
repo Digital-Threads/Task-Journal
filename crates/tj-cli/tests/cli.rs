@@ -105,6 +105,405 @@ fn close_command_marks_task_closed_in_pack() {
 }
 
 #[test]
+fn doctor_exits_zero_on_fresh_install() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["doctor"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn doctor_json_output_is_parseable_and_lists_paths() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let output = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor --json must be valid JSON");
+
+    assert!(v.get("data_dir").is_some());
+    assert!(v.get("events_dir").is_some());
+    assert!(v.get("state_dir").is_some());
+    assert!(v.get("known_projects").unwrap().is_array());
+    assert!(v.get("issues").unwrap().is_array());
+}
+
+fn write_pending(xdg: &std::path::Path, id: &str, text: &str, attempts: u32) {
+    let dir = xdg.join("task-journal").join("pending");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = serde_json::json!({
+        "text": text,
+        "error": "test injection",
+        "queued_at": "2026-05-07T00:00:00Z",
+        "attempts": attempts,
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&body).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn pending_list_shows_queued_entries() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "tj-pending-1", "I think the cache is racy", 0);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pending", "list"])
+        .assert()
+        .success()
+        .stdout(contains("tj-pending-1"))
+        .stdout(contains("I think the cache is racy"));
+}
+
+#[test]
+fn pending_retry_drains_with_mock_classifier() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    // Seed: real task in JSONL so the classifier-mocked event has a
+    // legitimate task_id to attach to.
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Pending host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    write_pending(
+        xdg.path(),
+        "tj-pending-2",
+        "Adopted Rust for the journal",
+        0,
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "pending",
+            "retry",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.92",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+
+    // pending file removed
+    let pending_file = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("tj-pending-2.json");
+    assert!(!pending_file.exists(), "drained entry must be removed");
+
+    // event landed in JSONL — visible in pack
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Adopted Rust for the journal"));
+}
+
+#[test]
+fn pending_retry_marks_dead_after_max_attempts() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    // Already at attempts=2; one more failure should rename to *.dead.json.
+    write_pending(xdg.path(), "tj-dying", "any text", 2);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        // No --mock-* flags → retry fails → attempts becomes 3 → dead.
+        .args(["pending", "retry"])
+        .assert()
+        .success()
+        .stdout(contains("1 marked dead"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    let live = pending_dir.join("tj-dying.json");
+    let dead = pending_dir.join("tj-dying.dead.json");
+    assert!(!live.exists(), "live file must be gone after dead-rename");
+    assert!(dead.exists(), "dead file must exist: {dead:?}");
+}
+
+#[test]
+fn export_sqlite_round_trips_through_pack() {
+    // Setup A: write a project + task in xdg_a/proj_a.
+    let xdg_a = assert_fs::TempDir::new().unwrap();
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg_a.path())
+            .current_dir(proj_a.path())
+            .args(["create", "Round-trip via sqlite export"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg_a.path())
+        .current_dir(proj_a.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt sqlite export",
+        ])
+        .assert()
+        .success();
+
+    // Export the SQLite snapshot to a buffer.
+    let snapshot = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg_a.path())
+        .current_dir(proj_a.path())
+        .args(["export", "--format", "sqlite"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(
+        snapshot.starts_with(b"SQLite format 3\0"),
+        "magic bytes missing"
+    );
+
+    // Setup B: a fresh xdg, no JSONL — only the snapshot in state/.
+    let xdg_b = assert_fs::TempDir::new().unwrap();
+    // Project hash derives from the proj path; we keep the same path so
+    // the hash matches what the snapshot was keyed under.
+    let project_hash = {
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg_a.path())
+            .current_dir(proj_a.path())
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap()
+            .stdout;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["state_dir"].as_str().unwrap().to_owned()
+    };
+    // We can't read the project_hash directly, but state_dir/<hash>.sqlite
+    // is the file we're after. Re-derive the destination for xdg_b by
+    // running doctor against xdg_b too — same proj path = same hash.
+    let _ = project_hash;
+    let dest_state_dir = xdg_b.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&dest_state_dir).unwrap();
+    // Pull the source filename (first .sqlite under xdg_a/task-journal/state).
+    let src_state_dir = xdg_a.path().join("task-journal").join("state");
+    let src_file = std::fs::read_dir(&src_state_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("sqlite"))
+        .expect("source sqlite present");
+    let dest_file = dest_state_dir.join(src_file.file_name().unwrap());
+    std::fs::write(&dest_file, &snapshot).unwrap();
+
+    // Pack from the new XDG without a JSONL — assemble must read from the
+    // snapshot SQLite alone.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg_b.path())
+        .current_dir(proj_a.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Adopt sqlite export"));
+}
+
+#[test]
+fn export_html_emits_self_contained_document() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "HTML export test"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt Rust",
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["export", "--format", "html", "--task", &task_id])
+        .output()
+        .unwrap();
+    let html = String::from_utf8(output.stdout).unwrap();
+
+    // Self-contained shape.
+    let lower = html.to_lowercase();
+    assert!(
+        lower.starts_with("<!doctype html>"),
+        "html missing doctype: {html}"
+    );
+    assert!(html.contains("HTML export test"), "task title missing");
+    assert!(html.contains("Adopt Rust"), "decision event missing");
+    // No external assets — no http/https URL anywhere.
+    assert!(!html.contains("http://"), "external http url leaked");
+    assert!(!html.contains("https://"), "external https url leaked");
+}
+
+#[test]
+fn migrate_project_round_trips_data_to_new_path() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+
+    // Create a task with the cwd = proj_a.
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj_a.path())
+            .args(["create", "Migration round-trip"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Migrate the data to proj_b.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Pack from proj_b finds the same task.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Migration round-trip"));
+}
+
+#[test]
+fn migrate_project_refuses_overwrite_without_force() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+
+    // Both projects have data: create a task in each.
+    for proj in [&proj_a, &proj_b] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Conflicting"])
+            .assert()
+            .success();
+    }
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("destination already exists"));
+}
+
+#[test]
+fn close_unknown_task_id_returns_error() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", "tj-doesnotexist", "--reason", "shipped"])
+        .assert()
+        .failure()
+        .stderr(contains("task not found: tj-doesnotexist"));
+}
+
+#[test]
 fn search_all_projects_finds_match_in_other_project_hash() {
     let dir = assert_fs::TempDir::new().unwrap();
 

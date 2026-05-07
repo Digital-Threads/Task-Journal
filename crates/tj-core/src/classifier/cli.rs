@@ -14,17 +14,22 @@ use serde::Deserialize;
 ///
 /// Configuration:
 /// - `command`: program name (default `"claude"`); override for tests/dev.
-/// - `model`: model alias passed via `--model` (default `"haiku"`; cheaper than the user's session model).
+/// - `model`: model alias passed via `--model`. Overridable via the
+///   `TJ_CLASSIFIER_MODEL` env var; falls back to `DEFAULT_MODEL` (haiku —
+///   cheaper than the user's session model).
 pub struct ClaudeCliClassifier {
     pub command: String,
     pub model: String,
 }
 
+/// Default model when `TJ_CLASSIFIER_MODEL` is not set.
+pub const DEFAULT_MODEL: &str = "haiku";
+
 impl Default for ClaudeCliClassifier {
     fn default() -> Self {
         Self {
             command: "claude".into(),
-            model: "haiku".into(),
+            model: std::env::var("TJ_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
         }
     }
 }
@@ -87,24 +92,42 @@ impl Classifier for ClaudeCliClassifier {
     }
 }
 
-// Tests use a `#!/bin/bash` shim to fake the `claude` CLI; gating to Unix
-// so Windows clippy/build doesn't see the imports/helper as unused.
-#[cfg(all(test, unix))]
+// Tests use a tiny shell/.cmd shim to fake the `claude` CLI. Cross-platform
+// strategy: write the JSON envelope to a file, then a one-liner script that
+// `cat`s (Unix) or `type`s (Windows) it back. The `type` form sidesteps cmd
+// .exe escaping pain for the JSON payload's quotes.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::EventType;
-    use std::os::unix::fs::PermissionsExt;
 
-    /// Build a fake `claude` script that prints a canned `--output-format json` envelope.
-    /// Returns the path so we can point ClaudeCliClassifier at it.
+    /// Build a fake `claude` shim that prints a canned `--output-format json`
+    /// envelope. Returns the path so we can point ClaudeCliClassifier at it.
     fn fake_claude(dir: &std::path::Path, envelope: &str) -> std::path::PathBuf {
-        let path = dir.join("fake-claude");
-        let script = format!("#!/bin/bash\ncat <<'EOF'\n{envelope}\nEOF\n");
-        std::fs::write(&path, script).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path
+        let json_path = dir.join("fake-claude-output.json");
+        std::fs::write(&json_path, envelope).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("fake-claude.sh");
+            let script = format!("#!/bin/sh\ncat \"{}\"\n", json_path.to_string_lossy());
+            std::fs::write(&path, script).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+        #[cfg(windows)]
+        {
+            let path = dir.join("fake-claude.cmd");
+            // `type "PATH"` outputs file content verbatim; double quotes
+            // handle spaces, and JSON's special chars stay literal because
+            // type does not interpret content as commands.
+            let script = format!("@echo off\r\ntype \"{}\"\r\n", json_path.to_string_lossy());
+            std::fs::write(&path, script).unwrap();
+            path
+        }
     }
 
     #[test]

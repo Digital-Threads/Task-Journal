@@ -16,7 +16,7 @@ name = "task-journal-mcp"
 path = "src/main.rs"
 
 [dependencies]
-tj-core = { package = "task-journal-core", version = "0.1.2", path = "../tj-core" }
+tj-core = { package = "task-journal-core", version = "0.2.1", path = "../tj-core" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -27,6 +27,9 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 ulid = { workspace = true }
 rusqlite = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }
+rmcp = { version = "0.3", features = ["server", "client", "transport-io", "macros", "schemars"] }

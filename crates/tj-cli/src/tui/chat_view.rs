@@ -77,7 +77,10 @@ impl ChatView {
 
         let title = if let Some(first) = session.first_user_text() {
             let clean = strip_xml_tags(&first);
-            let line = clean.lines().find(|l| !l.trim().is_empty()).unwrap_or(&clean);
+            let line = clean
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or(&clean);
             truncate(line.trim(), 60)
         } else {
             format!("Session {}", &session.session_id[..8])
@@ -112,7 +115,7 @@ impl ChatView {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // header
+                Constraint::Length(3), // header
                 Constraint::Min(5),    // chat
                 Constraint::Length(3), // footer
             ])
@@ -124,14 +127,18 @@ impl ChatView {
     }
 
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let title = format!(
-            " {} — {} messages",
-            self.title,
-            self.messages.len()
-        );
+        let title = format!(" {} — {} messages", self.title, self.messages.len());
         let block = Paragraph::new(title)
-            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
         frame.render_widget(block, area);
     }
 
@@ -151,19 +158,23 @@ impl ChatView {
                     format!("─── {role_label} "),
                     Style::default().fg(role_color).add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(&msg.timestamp, Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    &msg.timestamp,
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!(" {}", "─".repeat(width.saturating_sub(role_label.len() + msg.timestamp.len() + 6))),
+                    format!(
+                        " {}",
+                        "─".repeat(
+                            width.saturating_sub(role_label.len() + msg.timestamp.len() + 6)
+                        )
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
 
             // Tool badges.
             if !msg.tools.is_empty() {
-                let tool_text = msg.tools.iter()
+                let tool_text = msg
+                    .tools
+                    .iter()
                     .take(5) // max 5 tools shown
                     .map(|t| format!("[{t}]"))
                     .collect::<Vec<_>>()
@@ -223,8 +234,11 @@ impl ChatView {
             Span::styled("Backspace/Esc/q", Style::default().fg(Color::Yellow)),
             Span::raw(" back"),
         ]);
-        let block = Paragraph::new(help)
-            .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
+        let block = Paragraph::new(help).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         frame.render_widget(block, area);
     }
 }

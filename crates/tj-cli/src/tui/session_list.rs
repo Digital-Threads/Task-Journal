@@ -112,7 +112,8 @@ impl SessionList {
 
     /// Returns the actual session index for the current selection (maps through filter).
     pub fn selected_session_index(&self) -> Option<usize> {
-        self.selected.and_then(|i| self.filtered_indices.get(i).copied())
+        self.selected
+            .and_then(|i| self.filtered_indices.get(i).copied())
     }
 
     pub fn next(&mut self) {
@@ -165,7 +166,7 @@ impl SessionList {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),  // search bar
+                    Constraint::Length(3), // search bar
                     Constraint::Min(5),    // list
                     Constraint::Length(3), // footer/help
                 ])
@@ -178,7 +179,7 @@ impl SessionList {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),  // header
+                    Constraint::Length(3), // header
                     Constraint::Min(5),    // list
                     Constraint::Length(3), // footer/help
                 ])
@@ -206,21 +207,20 @@ impl SessionList {
         let header = Line::from(vec![
             Span::styled(
                 " Task Journal ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("— ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                short_path,
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(short_path, Style::default().fg(Color::White)),
             Span::styled(" — ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                showing,
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(showing, Style::default().fg(Color::Cyan)),
         ]);
-        let block = Paragraph::new(header)
-            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+        let block = Paragraph::new(header).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         frame.render_widget(block, area);
     }
 
@@ -228,23 +228,29 @@ impl SessionList {
         let match_count = format!(
             "{} match{}",
             self.filtered_indices.len(),
-            if self.filtered_indices.len() == 1 { "" } else { "es" }
+            if self.filtered_indices.len() == 1 {
+                ""
+            } else {
+                "es"
+            }
         );
         let search_line = Line::from(vec![
-            Span::styled(" / ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(
-                self.filter_text.clone(),
-                Style::default().fg(Color::White),
+                " / ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(self.filter_text.clone(), Style::default().fg(Color::White)),
             Span::styled("█", Style::default().fg(Color::Yellow)),
             Span::raw("  "),
-            Span::styled(
-                match_count,
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(match_count, Style::default().fg(Color::DarkGray)),
         ]);
-        let block = Paragraph::new(search_line)
-            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::Yellow)));
+        let block = Paragraph::new(search_line).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         frame.render_widget(block, area);
     }
 
@@ -265,18 +271,9 @@ impl SessionList {
                 let id_short = &s.session_id[..8.min(s.session_id.len())];
 
                 let line = Line::from(vec![
-                    Span::styled(
-                        format!("{date} "),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        format!("{id_short} "),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        format!("{msgs:>8} "),
-                        Style::default().fg(Color::Green),
-                    ),
+                    Span::styled(format!("{date} "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{id_short} "), Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{msgs:>8} "), Style::default().fg(Color::Green)),
                     Span::styled(
                         format!("{duration:>6} "),
                         Style::default().fg(Color::DarkGray),
@@ -323,12 +320,18 @@ impl SessionList {
                 Span::raw(" quit"),
             ];
             if !self.filter_text.is_empty() {
-                spans.push(Span::styled("  [filtered]", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    "  [filtered]",
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
             Line::from(spans)
         };
-        let block = Paragraph::new(help)
-            .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
+        let block = Paragraph::new(help).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         frame.render_widget(block, area);
     }
 }
@@ -336,7 +339,10 @@ impl SessionList {
 fn session_title(s: &ParsedSession) -> String {
     if let Some(text) = s.first_user_text() {
         let clean = strip_xml_tags(&text);
-        let line = clean.lines().find(|l| !l.trim().is_empty()).unwrap_or(&clean);
+        let line = clean
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(&clean);
         let trimmed = line.trim();
         if trimmed.len() > 80 {
             format!("{}…", &trimmed[..80])

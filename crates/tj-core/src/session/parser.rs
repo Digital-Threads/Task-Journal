@@ -295,7 +295,7 @@ mod tests {
     fn parse_session_with_valid_jsonl() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("abc123.jsonl");
-        let lines = vec![
+        let lines = [
             r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hello"}}"#,
             r#"{"type":"assistant","uuid":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"text","text":"hi there"}]}}"#,
             r#"{"type":"summary","summary":"This session was about greeting.","timestamp":"2026-01-01T00:00:02Z"}"#,
@@ -305,15 +305,21 @@ mod tests {
         let session = parse_session(&path).unwrap();
         assert_eq!(session.session_id, "abc123");
         assert_eq!(session.entries.len(), 3);
-        assert_eq!(session.first_timestamp.as_deref(), Some("2026-01-01T00:00:00Z"));
-        assert_eq!(session.last_timestamp.as_deref(), Some("2026-01-01T00:00:02Z"));
+        assert_eq!(
+            session.first_timestamp.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            session.last_timestamp.as_deref(),
+            Some("2026-01-01T00:00:02Z")
+        );
     }
 
     #[test]
     fn parse_session_skips_empty_and_malformed_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sess.jsonl");
-        let lines = vec![
+        let lines = [
             "",
             "not-json-at-all",
             r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"valid"}}"#,
@@ -362,18 +368,18 @@ mod tests {
         let session = ParsedSession {
             session_id: "s1".into(),
             file_path: "/tmp/s1.jsonl".into(),
-            entries: vec![
-                SessionEntry::Assistant(AssistantEntry {
-                    uuid: "a1".into(),
-                    timestamp: "2026-01-01T00:00:00Z".into(),
-                    session_id: None,
-                    message: Some(AssistantMessage {
-                        content: vec![ContentBlock::Text { text: "hello".into() }],
-                        model: None,
-                        stop_reason: None,
-                    }),
+            entries: vec![SessionEntry::Assistant(AssistantEntry {
+                uuid: "a1".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                session_id: None,
+                message: Some(AssistantMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "hello".into(),
+                    }],
+                    model: None,
+                    stop_reason: None,
                 }),
-            ],
+            })],
             first_timestamp: None,
             last_timestamp: None,
         };
@@ -417,17 +423,15 @@ mod tests {
         let session = ParsedSession {
             session_id: "s1".into(),
             file_path: "/tmp/s1.jsonl".into(),
-            entries: vec![
-                SessionEntry::User(UserEntry {
-                    uuid: "u1".into(),
-                    timestamp: "2026-01-01T00:00:00Z".into(),
-                    session_id: None,
-                    message: Some(UserMessage {
-                        content: serde_json::json!("<command-name>init</command-name> Setup project"),
-                    }),
-                    cwd: None,
+            entries: vec![SessionEntry::User(UserEntry {
+                uuid: "u1".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                session_id: None,
+                message: Some(UserMessage {
+                    content: serde_json::json!("<command-name>init</command-name> Setup project"),
                 }),
-            ],
+                cwd: None,
+            })],
             first_timestamp: None,
             last_timestamp: None,
         };
@@ -441,15 +445,13 @@ mod tests {
         let session = ParsedSession {
             session_id: "s1".into(),
             file_path: "/tmp/s1.jsonl".into(),
-            entries: vec![
-                SessionEntry::User(UserEntry {
-                    uuid: "u1".into(),
-                    timestamp: "2026-01-01T00:00:00Z".into(),
-                    session_id: None,
-                    message: None,
-                    cwd: None,
-                }),
-            ],
+            entries: vec![SessionEntry::User(UserEntry {
+                uuid: "u1".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                session_id: None,
+                message: None,
+                cwd: None,
+            })],
             first_timestamp: None,
             last_timestamp: None,
         };
@@ -463,15 +465,13 @@ mod tests {
         let session = ParsedSession {
             session_id: "s1".into(),
             file_path: "/tmp/s1.jsonl".into(),
-            entries: vec![
-                SessionEntry::User(UserEntry {
-                    uuid: "u1".into(),
-                    timestamp: "2026-01-01T00:00:00Z".into(),
-                    session_id: None,
-                    message: None,
-                    cwd: None,
-                }),
-            ],
+            entries: vec![SessionEntry::User(UserEntry {
+                uuid: "u1".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                session_id: None,
+                message: None,
+                cwd: None,
+            })],
             first_timestamp: None,
             last_timestamp: None,
         };
@@ -634,11 +634,22 @@ mod tests {
             session_id: None,
             message: Some(AssistantMessage {
                 content: vec![
-                    ContentBlock::Thinking { thinking: Some("internal thought".into()) },
-                    ContentBlock::Text { text: "visible text".into() },
-                    ContentBlock::ToolResult { content: serde_json::json!("result data") },
-                    ContentBlock::ToolUse { name: "Read".into(), input: serde_json::json!({}) },
-                    ContentBlock::Text { text: "more text".into() },
+                    ContentBlock::Thinking {
+                        thinking: Some("internal thought".into()),
+                    },
+                    ContentBlock::Text {
+                        text: "visible text".into(),
+                    },
+                    ContentBlock::ToolResult {
+                        content: serde_json::json!("result data"),
+                    },
+                    ContentBlock::ToolUse {
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    },
+                    ContentBlock::Text {
+                        text: "more text".into(),
+                    },
                 ],
                 model: None,
                 stop_reason: None,
@@ -684,11 +695,21 @@ mod tests {
             session_id: None,
             message: Some(AssistantMessage {
                 content: vec![
-                    ContentBlock::Text { text: "Let me help".into() },
-                    ContentBlock::ToolUse { name: "Write".into(), input: serde_json::json!({"file_path": "/tmp/a"}) },
+                    ContentBlock::Text {
+                        text: "Let me help".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        name: "Write".into(),
+                        input: serde_json::json!({"file_path": "/tmp/a"}),
+                    },
                     ContentBlock::Thinking { thinking: None },
-                    ContentBlock::ToolUse { name: "Bash".into(), input: serde_json::json!({"command": "ls"}) },
-                    ContentBlock::ToolResult { content: serde_json::json!(null) },
+                    ContentBlock::ToolUse {
+                        name: "Bash".into(),
+                        input: serde_json::json!({"command": "ls"}),
+                    },
+                    ContentBlock::ToolResult {
+                        content: serde_json::json!(null),
+                    },
                 ],
                 model: None,
                 stop_reason: None,
@@ -707,12 +728,10 @@ mod tests {
             timestamp: "t".into(),
             session_id: None,
             message: Some(AssistantMessage {
-                content: vec![
-                    ContentBlock::ToolUse {
-                        name: "Edit".into(),
-                        input: serde_json::json!({"file_path": "/src/main.rs", "old_string": "foo", "new_string": "bar"}),
-                    },
-                ],
+                content: vec![ContentBlock::ToolUse {
+                    name: "Edit".into(),
+                    input: serde_json::json!({"file_path": "/src/main.rs", "old_string": "foo", "new_string": "bar"}),
+                }],
                 model: None,
                 stop_reason: None,
             }),
