@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-05-07
+
+DX improvement: ship classifier-wrapper config through `install-hooks` —
+no more manual `bashrc` / `settings.json` edits to use `aimux`, `direnv`,
+`nix run`, etc.
+
+### Added
+- `task-journal install-hooks --classifier-command "<CMD>"` flag.
+  Writes `env.TJ_CLASSIFIER_CLI=<CMD>` into the same `settings.json`
+  that already gets the hook entries. Claude Code reads the `env` block
+  at startup and propagates the variable to hook subprocesses.
+  Example:
+  ```bash
+  task-journal install-hooks --classifier-command "aimux run dt"
+  ```
+  When the flag is omitted, no `env` block is touched — default
+  classifier remains the bare `claude` binary.
+- `--uninstall` now also strips `TJ_CLASSIFIER_CLI` from `env`,
+  preserving any unrelated env keys and dropping the `env` block
+  if it becomes empty.
+
+### Fixed
+- 0.2.4's instructions told users to set `TJ_CLASSIFIER_CLI` via
+  `~/.bashrc`, but Claude Code starts hook subprocesses outside an
+  interactive bash, so the env var was invisible to the classifier
+  and 401s kept piling up in `pending/`. The `--classifier-command`
+  flag closes that loop end-to-end.
+
 ## [0.2.4] - 2026-05-07
 
 Hotfix: support workspace-orchestrator wrappers (aimux, nix-shell, etc).

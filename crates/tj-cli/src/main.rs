@@ -650,6 +650,11 @@ enum Commands {
         /// Remove our hook entries instead of installing.
         #[arg(long)]
         uninstall: bool,
+        /// Override classifier command. Writes env.TJ_CLASSIFIER_CLI into settings.json
+        /// so wrappers (aimux, litellm, etc.) work without manual env setup.
+        /// Default: classifier uses `claude -p`.
+        #[arg(long)]
+        classifier_command: Option<String>,
     },
     /// Show local classifier and journal statistics.
     Stats,
@@ -941,7 +946,11 @@ fn main() -> Result<()> {
             writer.flush_durable()?;
             println!("{}", event.event_id);
         }
-        Commands::InstallHooks { scope, uninstall } => {
+        Commands::InstallHooks {
+            scope,
+            uninstall,
+            classifier_command,
+        } => {
             let settings_path = match scope.as_str() {
                 "user" => {
                     let home =
@@ -971,6 +980,14 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("settings is not a JSON object"))?;
             if uninstall {
                 hooks_obj.remove("hooks");
+                // Remove our env key too — preserve other env entries.
+                if let Some(env) = hooks_obj.get_mut("env").and_then(|v| v.as_object_mut()) {
+                    env.remove("TJ_CLASSIFIER_CLI");
+                    // Drop empty env block to keep settings.json clean.
+                    if env.is_empty() {
+                        hooks_obj.remove("env");
+                    }
+                }
             } else {
                 // Wrap with `|| true` so a failed classifier (network down, rate limit,
                 // missing API key) NEVER breaks Claude Code. Failures land in pending/
@@ -984,6 +1001,23 @@ fn main() -> Result<()> {
                     "Stop":            [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                 });
                 hooks_obj.insert("hooks".into(), entries);
+
+                // Optional: set env.TJ_CLASSIFIER_CLI for users running classifier
+                // through a wrapper (aimux, litellm, etc.). Claude Code reads this
+                // env block and propagates the var to hook subprocesses, so users
+                // don't need to mess with bashrc.
+                if let Some(cmd) = classifier_command {
+                    let env = hooks_obj
+                        .entry("env".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    let env_obj = env
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow::anyhow!("settings.env is not a JSON object"))?;
+                    env_obj.insert(
+                        "TJ_CLASSIFIER_CLI".to_string(),
+                        serde_json::Value::String(cmd),
+                    );
+                }
             }
             std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
             println!("{}", settings_path.display());

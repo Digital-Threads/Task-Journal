@@ -851,6 +851,98 @@ fn install_hooks_is_idempotent_and_uninstall_works() {
 }
 
 #[test]
+fn install_hooks_with_classifier_command_writes_env() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--classifier-command",
+            "aimux run dt",
+        ])
+        .assert()
+        .success();
+    let content = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        v.get("env")
+            .and_then(|e| e.get("TJ_CLASSIFIER_CLI"))
+            .and_then(|s| s.as_str()),
+        Some("aimux run dt"),
+        "env.TJ_CLASSIFIER_CLI must be set: {content}"
+    );
+}
+
+#[test]
+fn install_hooks_without_classifier_command_does_not_set_env() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert()
+        .success();
+    let content = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert!(
+        v.get("env")
+            .and_then(|e| e.get("TJ_CLASSIFIER_CLI"))
+            .is_none(),
+        "TJ_CLASSIFIER_CLI must NOT be present when flag not passed: {content}"
+    );
+}
+
+#[test]
+fn install_hooks_uninstall_removes_classifier_env_but_preserves_others() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::json!({ "env": { "OTHER_KEY": "keep_me" } }).to_string(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--classifier-command",
+            "aimux run dt",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--uninstall"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert!(
+        v.get("env")
+            .and_then(|e| e.get("TJ_CLASSIFIER_CLI"))
+            .is_none(),
+        "TJ_CLASSIFIER_CLI must be removed on uninstall: {after}"
+    );
+    assert_eq!(
+        v.get("env")
+            .and_then(|e| e.get("OTHER_KEY"))
+            .and_then(|s| s.as_str()),
+        Some("keep_me"),
+        "unrelated env keys must be preserved: {after}"
+    );
+}
+
+#[test]
 fn ingest_hook_drains_pending_queue_via_mock() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
