@@ -26,8 +26,15 @@ impl JsonlWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create dir {parent:?}"))?;
         }
+        // `read(true)` is required on Windows: `fd_lock` calls
+        // `LockFileEx` on the underlying handle, which fails with
+        // `os error 5 (Access is denied)` if the file was opened
+        // append-only — the API needs GENERIC_READ access on the
+        // handle. Linux's flock() doesn't care, so the omission was
+        // silent on POSIX. See windows-rs / fd_lock notes.
         let file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("open {path:?} for append"))?;

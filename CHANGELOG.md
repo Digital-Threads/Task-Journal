@@ -34,6 +34,15 @@ no more manual `bashrc` / `settings.json` edits to use `aimux`, `direnv`,
   interactive bash, so the env var was invisible to the classifier
   and 401s kept piling up in `pending/`. The `--classifier-command`
   flag closes that loop end-to-end.
+- CI: pinned `rmcp-macros` to `=0.3.1` so MSRV (Rust 1.83) builds
+  again. `rmcp-macros 0.3.2` requires the `edition2024` Cargo
+  feature, stabilized only in Rust 1.85+. Re-evaluate when MSRV is
+  raised.
+- CI: opened the JSONL append handle with `read(true)` in addition
+  to `append(true)`. `fd_lock`'s `LockFileEx` on Windows requires
+  GENERIC_READ access on the handle; without it tests panicked with
+  `acquire exclusive file lock — Access is denied (os error 5)`.
+  Linux's `flock` was unaffected, so the issue was Windows-only.
 
 ## [0.2.4] - 2026-05-07
 

@@ -22,6 +22,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rmcp = { workspace = true }
+# Pin rmcp-macros to a version compiled with edition 2021 — 0.3.2 requires
+# `edition2024`, stabilized only in Rust 1.85, which breaks our MSRV (1.83).
+# Re-evaluate when MSRV is bumped to ≥1.85.
+rmcp-macros = "=0.3.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
