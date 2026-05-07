@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-07
+
+Hotfix release. No new features.
+
+### Fixed
+- TUI session browser (`task-journal ui`) panicked with `byte index is
+  not a char boundary` when a session's first user message was longer
+  than 80 bytes and contained non-ASCII characters (Cyrillic, CJK,
+  emoji, etc.). Title truncation now slices by Unicode scalars instead
+  of bytes. Same fix applied to the fallback `Session <id>` path for
+  consistency.
+- Added regression tests covering Cyrillic, emoji, and exact-boundary
+  inputs for the new `truncate_with_ellipsis` helper.
+
 ## [0.2.1] - 2026-05-07
 
 Operational maturity release. No breaking changes — additive features

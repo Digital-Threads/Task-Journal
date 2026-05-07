@@ -7,6 +7,7 @@
 //!    - the fixture has at least 30 examples
 //!    - every example has a recognised `expected` event_type
 //!    - the prompt builder always emits the input text into the prompt
+//!
 //!    No model API is called. Deterministic, hermetic.
 //!
 //! 2. **Opt-in real classifier (`TJ_CLASSIFIER_EVAL=on`).** Calls

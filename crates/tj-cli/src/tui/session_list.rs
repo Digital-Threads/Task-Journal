@@ -336,6 +336,16 @@ impl SessionList {
     }
 }
 
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 fn session_title(s: &ParsedSession) -> String {
     if let Some(text) = s.first_user_text() {
         let clean = strip_xml_tags(&text);
@@ -343,14 +353,10 @@ fn session_title(s: &ParsedSession) -> String {
             .lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or(&clean);
-        let trimmed = line.trim();
-        if trimmed.len() > 80 {
-            format!("{}…", &trimmed[..80])
-        } else {
-            trimmed.to_string()
-        }
+        truncate_with_ellipsis(line.trim(), 80)
     } else {
-        format!("Session {}", &s.session_id[..8.min(s.session_id.len())])
+        let head: String = s.session_id.chars().take(8).collect();
+        format!("Session {head}")
     }
 }
 
@@ -420,5 +426,44 @@ fn shorten_path(path: &str) -> String {
         parts.join("/")
     } else {
         parts[parts.len() - 2..].join("/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_with_ellipsis;
+
+    #[test]
+    fn truncate_ascii_under_limit_returns_input_as_is() {
+        assert_eq!(truncate_with_ellipsis("hello", 80), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_over_limit_appends_ellipsis() {
+        let long = "a".repeat(100);
+        let out = truncate_with_ellipsis(&long, 10);
+        assert_eq!(out, format!("{}…", "a".repeat(10)));
+    }
+
+    #[test]
+    fn truncate_cyrillic_does_not_panic_at_char_boundary() {
+        let cyr = "Можешь ли ты проанализировать проект? Мне нужен вот md файл, то есть который описывает, вообще делает этот проект. Все полностью.";
+        let out = truncate_with_ellipsis(cyr, 80);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 81);
+    }
+
+    #[test]
+    fn truncate_emoji_counts_by_chars_not_bytes() {
+        let s = "🦀".repeat(50);
+        let out = truncate_with_ellipsis(&s, 10);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().filter(|c| *c == '🦀').count(), 10);
+    }
+
+    #[test]
+    fn truncate_exact_length_no_ellipsis() {
+        let s: String = (0..80).map(|_| 'x').collect();
+        assert_eq!(truncate_with_ellipsis(&s, 80), s);
     }
 }
