@@ -34,12 +34,18 @@ no more manual `bashrc` / `settings.json` edits to use `aimux`, `direnv`,
   interactive bash, so the env var was invisible to the classifier
   and 401s kept piling up in `pending/`. The `--classifier-command`
   flag closes that loop end-to-end.
-- CI: bumped MSRV from Rust 1.83 to **1.85** (workspace
-  `rust-version` + GitHub Actions toolchain). The ecosystem (`rmcp`,
-  `clap_lex`, etc.) now ships transitive deps that require the
-  `edition2024` Cargo feature, which only stabilized in 1.85.
-  Pinning each one was a losing race; one MSRV bump unblocks them
-  all. 1.85 has been GA since 2025-02 and is widely available.
+- CI: bumped MSRV from Rust 1.83 to **1.88** (workspace
+  `rust-version` + GitHub Actions toolchain). The ecosystem post-
+  2025-02 widely depends on edition2024 (`rmcp`, `clap_lex`) and
+  `darling 0.23` which itself requires 1.88. Pinning each transitive
+  dep was a losing race; one MSRV bump unblocks them all.
+- CI: marked the three `fake_claude`-driven classifier unit tests
+  with `#[cfg_attr(windows, ignore)]`. The shim is a `.cmd` script,
+  and Rust 1.77.2+ refuses to forward argv with quote characters to
+  `.cmd`/`.bat` files because of the BatBadBut CVE
+  (CVE-2024-24576). Real `claude` is a native binary, so the
+  classifier path is exercised in production; this is purely a
+  test-fake limitation on Windows.
 - CI: opened the JSONL append handle with `read(true)` in addition
   to `append(true)`. `fd_lock`'s `LockFileEx` on Windows requires
   GENERIC_READ access on the handle; without it tests panicked with
