@@ -1,7 +1,180 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
+use std::path::PathBuf;
+use std::process::Command as PCommand;
 
 mod tui;
+
+/// Diagnostic snapshot returned by `task-journal doctor`. Fields are
+/// stable enough for scripting against `--json`. `issues` is the empty
+/// list when everything looks healthy.
+#[derive(Serialize)]
+struct DoctorReport {
+    task_journal_version: &'static str,
+    claude_in_path: bool,
+    claude_version: Option<String>,
+    data_dir: PathBuf,
+    events_dir: PathBuf,
+    state_dir: PathBuf,
+    metrics_dir: PathBuf,
+    events_dir_writable: bool,
+    state_dir_writable: bool,
+    metrics_dir_writable: bool,
+    known_projects: Vec<String>,
+    schema_versions_applied: Vec<i64>,
+    issues: Vec<String>,
+}
+
+impl DoctorReport {
+    fn print_human(&self) {
+        println!("task-journal doctor");
+        println!("  version          {}", self.task_journal_version);
+        println!(
+            "  claude binary    {}",
+            if self.claude_in_path {
+                self.claude_version
+                    .clone()
+                    .unwrap_or_else(|| "found (version unknown)".into())
+            } else {
+                "NOT FOUND in PATH".into()
+            }
+        );
+        println!("  data dir         {}", self.data_dir.display());
+        println!(
+            "  events dir       {} ({})",
+            self.events_dir.display(),
+            if self.events_dir_writable {
+                "writable"
+            } else {
+                "NOT writable"
+            }
+        );
+        println!(
+            "  state dir        {} ({})",
+            self.state_dir.display(),
+            if self.state_dir_writable {
+                "writable"
+            } else {
+                "NOT writable"
+            }
+        );
+        println!(
+            "  metrics dir      {} ({})",
+            self.metrics_dir.display(),
+            if self.metrics_dir_writable {
+                "writable"
+            } else {
+                "NOT writable"
+            }
+        );
+        println!("  known projects   {}", self.known_projects.len());
+        if !self.schema_versions_applied.is_empty() {
+            let v: Vec<String> = self
+                .schema_versions_applied
+                .iter()
+                .map(|n| format!("v{n:03}"))
+                .collect();
+            println!("  schema (current) {}", v.join(", "));
+        }
+        if self.issues.is_empty() {
+            println!("\n✓ all checks passed");
+        } else {
+            println!("\n✗ {} issue(s):", self.issues.len());
+            for i in &self.issues {
+                println!("  - {i}");
+            }
+        }
+    }
+}
+
+fn dir_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".tj-doctor-write-probe");
+    let r = std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    r
+}
+
+fn run_doctor() -> Result<DoctorReport> {
+    let mut issues: Vec<String> = Vec::new();
+
+    // 1. claude binary in PATH
+    let claude_check = PCommand::new("claude").arg("--version").output();
+    let (claude_in_path, claude_version) = match claude_check {
+        Ok(out) if out.status.success() => {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (true, Some(v))
+        }
+        Ok(_) | Err(_) => {
+            issues.push(
+                "claude CLI not found on PATH — auto-capture hooks will fall back to API \
+                 backend (set ANTHROPIC_API_KEY) or fail silently"
+                    .into(),
+            );
+            (false, None)
+        }
+    };
+
+    // 2. data dir + sub-dir writability
+    let data_dir = tj_core::paths::data_dir()?;
+    let events_dir = tj_core::paths::events_dir()?;
+    let state_dir = tj_core::paths::state_dir()?;
+    let metrics_dir = tj_core::paths::metrics_dir()?;
+    let events_dir_writable = dir_writable(&events_dir);
+    let state_dir_writable = dir_writable(&state_dir);
+    let metrics_dir_writable = dir_writable(&metrics_dir);
+    if !events_dir_writable {
+        issues.push(format!("events dir not writable: {}", events_dir.display()));
+    }
+    if !state_dir_writable {
+        issues.push(format!("state dir not writable: {}", state_dir.display()));
+    }
+    if !metrics_dir_writable {
+        issues.push(format!(
+            "metrics dir not writable: {}",
+            metrics_dir.display()
+        ));
+    }
+
+    // 3. known projects (from state dir SQLite stems)
+    let known_projects = tj_core::db::list_all_projects(&state_dir).unwrap_or_default();
+
+    // 4. schema versions for the current cwd's project (if any).
+    let schema_versions_applied = (|| -> Result<Vec<i64>> {
+        let cwd = std::env::current_dir()?;
+        let project_hash = tj_core::project_hash::from_path(&cwd)?;
+        let state_path = state_dir.join(format!("{project_hash}.sqlite"));
+        if !state_path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = tj_core::db::open(&state_path)?;
+        let mut stmt = conn.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+        let v: Vec<i64> = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(v)
+    })()
+    .unwrap_or_default();
+
+    Ok(DoctorReport {
+        task_journal_version: env!("CARGO_PKG_VERSION"),
+        claude_in_path,
+        claude_version,
+        data_dir,
+        events_dir,
+        state_dir,
+        metrics_dir,
+        events_dir_writable,
+        state_dir_writable,
+        metrics_dir_writable,
+        known_projects,
+        schema_versions_applied,
+        issues,
+    })
+}
 
 #[derive(Parser)]
 #[command(name = "task-journal", version, about = "Task Journal CLI", long_about = None)]
@@ -119,6 +292,13 @@ enum Commands {
         /// Project path override.
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Self-check the install: claude binary, data dirs, known projects,
+    /// schema migrations. Exits 0 when all checks pass; 1 otherwise.
+    Doctor {
+        /// Emit a machine-readable JSON report instead of human text.
+        #[arg(long)]
+        json: bool,
     },
     /// Hook entry point: ingest a chat chunk through the classifier.
     IngestHook {
@@ -409,6 +589,17 @@ fn main() -> Result<()> {
             if total > 0 {
                 let ratio = confirmed as f64 / total as f64 * 100.0;
                 println!("  confirmed ratio: {ratio:.1}%");
+            }
+        }
+        Commands::Doctor { json } => {
+            let report = run_doctor()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                report.print_human();
+            }
+            if !report.issues.is_empty() {
+                std::process::exit(1);
             }
         }
         Commands::IngestHook {

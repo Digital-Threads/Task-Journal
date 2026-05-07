@@ -21,6 +21,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 ulid = { workspace = true }
 rusqlite = { workspace = true }

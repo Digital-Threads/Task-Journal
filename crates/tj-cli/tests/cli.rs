@@ -105,6 +105,37 @@ fn close_command_marks_task_closed_in_pack() {
 }
 
 #[test]
+fn doctor_exits_zero_on_fresh_install() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["doctor"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn doctor_json_output_is_parseable_and_lists_paths() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let output = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor --json must be valid JSON");
+
+    assert!(v.get("data_dir").is_some());
+    assert!(v.get("events_dir").is_some());
+    assert!(v.get("state_dir").is_some());
+    assert!(v.get("known_projects").unwrap().is_array());
+    assert!(v.get("issues").unwrap().is_array());
+}
+
+#[test]
 fn close_unknown_task_id_returns_error() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
