@@ -23,7 +23,15 @@ struct DoctorReport {
     metrics_dir_writable: bool,
     known_projects: Vec<String>,
     schema_versions_applied: Vec<i64>,
+    /// Hard problems that block normal use (non-writable dirs, broken
+    /// schema, missing files, etc.). A non-empty `issues` list causes
+    /// `task-journal doctor` to exit with code 1.
     issues: Vec<String>,
+    /// Soft observations: install hints, optional dependencies missing,
+    /// configuration suggestions. Always exits 0 even if non-empty —
+    /// these are informational, not errors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
 }
 
 impl DoctorReport {
@@ -76,6 +84,12 @@ impl DoctorReport {
                 .map(|n| format!("v{n:03}"))
                 .collect();
             println!("  schema (current) {}", v.join(", "));
+        }
+        if !self.notes.is_empty() {
+            println!("\nℹ {} note(s):", self.notes.len());
+            for n in &self.notes {
+                println!("  - {n}");
+            }
         }
         if self.issues.is_empty() {
             println!("\n✓ all checks passed");
@@ -475,8 +489,9 @@ fn run_pending_retry(
 
 fn run_doctor() -> Result<DoctorReport> {
     let mut issues: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
 
-    // 1. claude binary in PATH
+    // 1. claude binary in PATH (note, not issue — API backend works without it)
     let claude_check = PCommand::new("claude").arg("--version").output();
     let (claude_in_path, claude_version) = match claude_check {
         Ok(out) if out.status.success() => {
@@ -484,9 +499,10 @@ fn run_doctor() -> Result<DoctorReport> {
             (true, Some(v))
         }
         Ok(_) | Err(_) => {
-            issues.push(
-                "claude CLI not found on PATH — auto-capture hooks will fall back to API \
-                 backend (set ANTHROPIC_API_KEY) or fail silently"
+            notes.push(
+                "claude CLI not on PATH — that's fine if you use the API backend \
+                 (set ANTHROPIC_API_KEY). For the CLI backend (free with Pro/Max), \
+                 install Claude Code from https://claude.com/claude-code"
                     .into(),
             );
             (false, None)
@@ -548,6 +564,7 @@ fn run_doctor() -> Result<DoctorReport> {
         known_projects,
         schema_versions_applied,
         issues,
+        notes,
     })
 }
 

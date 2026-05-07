@@ -16,7 +16,7 @@ name = "task-journal"
 path = "src/main.rs"
 
 [dependencies]
-tj-core = { package = "task-journal-core", version = "0.2.2", path = "../tj-core" }
+tj-core = { package = "task-journal-core", version = "0.2.3", path = "../tj-core" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
@@ -33,5 +33,5 @@ tempfile = { workspace = true }
 [dev-dependencies]
 assert_fs = { workspace = true }
 predicates = { workspace = true }
-assert_cmd = "2"
+assert_cmd = ">=2, <2.2.1"
 rusqlite = { workspace = true }

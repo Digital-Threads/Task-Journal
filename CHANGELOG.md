@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.2] - 2026-05-07
+## [0.2.3] - 2026-05-07
 
-Hotfix release. No new features.
+Hotfix release. Re-release of the 0.2.2 fixes plus CI repair —
+0.2.2 publish was incomplete (only `task-journal-core` reached
+crates.io before MSRV/test failures; `cli`/`mcp` never published).
+0.2.3 is the canonical replacement; `task-journal-core@0.2.2` will be
+yanked.
 
 ### Fixed
 - TUI session browser (`task-journal ui`) panicked with `byte index is
@@ -18,8 +22,20 @@ Hotfix release. No new features.
   emoji, etc.). Title truncation now slices by Unicode scalars instead
   of bytes. Same fix applied to the fallback `Session <id>` path for
   consistency.
-- Added regression tests covering Cyrillic, emoji, and exact-boundary
-  inputs for the new `truncate_with_ellipsis` helper.
+- `task-journal doctor` exited with code 1 when the `claude` CLI was
+  not on PATH. Missing `claude` is normal for users on the API
+  backend (`ANTHROPIC_API_KEY`) — it should be informational, not an
+  error. Doctor now distinguishes hard `issues` (non-zero exit) from
+  soft `notes` (zero exit), and `claude` absence is a note.
+- MSRV CI job failed because `assert_cmd@2.2.1` requires Rust edition
+  2024 (stable in Rust 1.85+) while our MSRV is 1.83. Pinned the dev
+  dependency to `>=2, <2.2.1` to keep MSRV builds green.
+- Lingering `clippy::doc_lazy_continuation` warning in
+  `classifier_eval.rs` test header.
+
+### Added
+- Regression tests for `truncate_with_ellipsis`: ASCII under/over
+  limit, Cyrillic boundary, emoji char-counting, exact-length no-op.
 
 ## [0.2.1] - 2026-05-07
 
