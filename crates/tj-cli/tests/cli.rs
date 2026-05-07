@@ -855,6 +855,70 @@ fn install_hooks_is_idempotent_and_uninstall_works() {
 }
 
 #[test]
+fn install_hooks_uninstall_preserves_third_party_hook_entries() {
+    // Repro for the "uninstall nukes everyone's hooks" bug. The fix
+    // must walk into each event array and filter out ONLY commands
+    // matching task-journal — other plugins (token-pilot in the
+    // wild) keep their entries.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+
+    // Pre-existing settings: task-journal-style entry + a foreign
+    // plugin's hook on the same event.
+    let pre = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        { "type": "command", "command": "task-journal ingest-hook --kind=$CLAUDE_HOOK_NAME --text=\"$CLAUDE_HOOK_TEXT\" --backend=cli || true" },
+                        { "type": "command", "command": "other-plugin do-something" }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        { "type": "command", "command": "third-party-only-hook" }
+                    ]
+                }
+            ]
+        }
+    });
+    std::fs::write(claude_dir.join("settings.json"), pre.to_string()).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--uninstall"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+
+    assert!(
+        !after.contains("task-journal ingest-hook"),
+        "task-journal entry must be gone: {after}"
+    );
+    assert!(
+        after.contains("other-plugin do-something"),
+        "co-located third-party hook must survive: {after}"
+    );
+    assert!(
+        after.contains("third-party-only-hook"),
+        "PostToolUse with no task-journal entry must be untouched: {after}"
+    );
+    // The hooks block itself stays; other plugins' kinds remain.
+    assert!(
+        v.get("hooks").is_some(),
+        "hooks block must still exist: {after}"
+    );
+}
+
+#[test]
 fn install_hooks_with_classifier_command_writes_env() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")

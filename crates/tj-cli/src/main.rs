@@ -985,7 +985,53 @@ fn main() -> Result<()> {
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("settings is not a JSON object"))?;
             if uninstall {
-                hooks_obj.remove("hooks");
+                // Surgical removal: walk the `hooks` block, drop only
+                // entries whose command contains "task-journal ingest-hook"
+                // — leaves co-located third-party plugin hooks (token-pilot
+                // etc.) intact. Old behavior `remove("hooks")` nuked
+                // everyone's hooks; this is the bxl-bug fix.
+                if let Some(hooks_block) =
+                    hooks_obj.get_mut("hooks").and_then(|v| v.as_object_mut())
+                {
+                    let kinds: Vec<String> = hooks_block.keys().cloned().collect();
+                    for kind in kinds {
+                        let Some(arr) = hooks_block.get_mut(&kind).and_then(|v| v.as_array_mut())
+                        else {
+                            continue;
+                        };
+                        // Each entry is { matcher, hooks: [{type, command}, ...] }.
+                        // Filter the inner array; keep only non-task-journal commands.
+                        for entry in arr.iter_mut() {
+                            let Some(inner) = entry.get_mut("hooks").and_then(|v| v.as_array_mut())
+                            else {
+                                continue;
+                            };
+                            inner.retain(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|c| !c.contains("task-journal ingest-hook"))
+                                    .unwrap_or(true)
+                            });
+                        }
+                        // Drop matcher entries with empty inner arrays.
+                        arr.retain(|entry| {
+                            entry
+                                .get("hooks")
+                                .and_then(|v| v.as_array())
+                                .map(|a| !a.is_empty())
+                                .unwrap_or(true)
+                        });
+                        // If the whole kind is empty, remove it.
+                        if arr.is_empty() {
+                            hooks_block.remove(&kind);
+                        }
+                    }
+                    // Empty hooks block → remove entirely so settings.json
+                    // stays tidy when we were the only user.
+                    if hooks_block.is_empty() {
+                        hooks_obj.remove("hooks");
+                    }
+                }
                 // Remove our env key too — preserve other env entries.
                 if let Some(env) = hooks_obj.get_mut("env").and_then(|v| v.as_object_mut()) {
                     env.remove("TJ_CLASSIFIER_CLI");

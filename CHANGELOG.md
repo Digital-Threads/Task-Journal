@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-05-07
+
+### Fixed
+- `install-hooks --uninstall` previously called `hooks_obj.remove("hooks")`,
+  which erased every plugin's hook entries — token-pilot, custom user
+  hooks, anything else co-located in `~/.claude/settings.json`. Now
+  the uninstall walks each event kind, filters out only commands
+  containing `task-journal ingest-hook`, and drops empty matchers /
+  empty kinds / the empty hooks block in that order. Third-party
+  hooks survive even when they share a `UserPromptSubmit` matcher
+  with task-journal. Closes claude-memory-bxl.
+
 ## [0.2.6] - 2026-05-07
 
 Three additive features that close the "auto-memory" loop end-to-end:
