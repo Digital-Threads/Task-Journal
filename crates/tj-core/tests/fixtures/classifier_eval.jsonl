@@ -1,0 +1,30 @@
+{"text":"I think the rebuild_state aborts because one bad line panics serde_json","expected":"hypothesis"}
+{"text":"Maybe we should bump task_id length from 6 to 10 chars to dodge collisions","expected":"hypothesis"}
+{"text":"It could be that the BufWriter is holding bytes in user space when fsync is called","expected":"hypothesis"}
+{"text":"Looked at db.rs:133 — rebuild_state opens an unchecked_transaction and aborts on the first parse error","expected":"finding"}
+{"text":"Confirmed in mcp/main.rs:158 — every tool handler calls full rebuild_state, never the incremental path","expected":"finding"}
+{"text":"In storage.rs the JsonlWriter wraps File in fd_lock::RwLock and acquires write() per append","expected":"finding"}
+{"text":"Ran cargo test --workspace: all 193 tests green, no flakes over five runs","expected":"evidence"}
+{"text":"Bench result: rebuild_state_10k_events median 820ms, ingest_new_events 38ms — 21x faster","expected":"evidence"}
+{"text":"Reproduced the corruption: two parallel hooks racing on the same JSONL on Windows produced 7 torn lines","expected":"evidence"}
+{"text":"Going with fd-lock for the file lock — single API across Linux/macOS/Windows, well-maintained","expected":"decision"}
+{"text":"We will return Result<Json<T>, McpError> from every tool handler instead of the success-typed envelope","expected":"decision"}
+{"text":"Picked criterion 0.5 over divan because we already have it in transitive deps via mockito","expected":"decision"}
+{"text":"Tried adding rwlock around index_event but it deadlocks with the open transaction — won't work","expected":"rejection"}
+{"text":"Considered storing last_event_id in a JSON sidecar but it makes the pack-cache invalidation race-prone","expected":"rejection"}
+{"text":"Anthropic API rate limit on the haiku tier is 1000 RPM per organisation","expected":"constraint"}
+{"text":"NTFS does not give us POSIX append-atomicity for writes larger than ~512 bytes","expected":"constraint"}
+{"text":"Actually the 'last_indexed_event_id is in index_state' claim was wrong — there's no row until first ingest","expected":"correction"}
+{"text":"Correction on the earlier finding: pack-cache is invalidated per task_id, not globally","expected":"correction"}
+{"text":"PR merged. Released 0.1.4 to crates.io. Closing this task","expected":"close"}
+{"text":"Shipped — task-journal doctor now runs on all three OS","expected":"close"}
+{"text":"Reopening — turns out the migration is missing on existing 0.1.x DBs after upgrade","expected":"reopen"}
+{"text":"This task is folded into the bigger 'v0.2.0 epic' work; closing in favour of that","expected":"supersede"}
+{"text":"This belongs under the OAuth task, not the data-storage one","expected":"redirect"}
+{"text":"Maybe the problem is FTS5 not being a regular index; could be slow at 100k events","expected":"hypothesis"}
+{"text":"Checked the metrics directory: only one project_hash present, no orphans","expected":"finding"}
+{"text":"e2e: ran full pipeline 50 times, p99 < 200ms, p50 < 50ms","expected":"evidence"}
+{"text":"Decision: incremental indexing reads only events since last_indexed_event_id, falls back to full rebuild on missing marker","expected":"decision"}
+{"text":"Won't take the rusqlite multithreaded feature — adds a c-bindgen rebuild for no real win","expected":"rejection"}
+{"text":"On Windows GitHub runners cmd.exe is required to launch .cmd shims, no PowerShell fallback","expected":"constraint"}
+{"text":"Earlier I said BufWriter was needed for perf — that was wrong, perf delta is unmeasurable for this workload","expected":"correction"}
