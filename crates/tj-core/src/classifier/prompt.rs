@@ -50,6 +50,25 @@ pub fn build(input: &ClassifyInput) -> String {
          - hypothesis vs finding: hypothesis = \"I think\"/\"maybe\"/\"could be\"; finding = \"I see\"/\"the code shows\"/\"confirmed that\"\n\
          - finding vs evidence: finding = discovered a fact; evidence = ran a test/experiment that PROVES something\n\
          - decision vs hypothesis: decision = committed choice; hypothesis = exploring an option\n\n\
+         ## Examples\n\
+         The dashed lines separate Input (assistant or user chunk) from Output (the JSON you must produce). Use them as anchors for the boundary calls above.\n\n\
+         Input: \"I think the timeout is happening because the Anthropic SDK keeps the socket open after the read.\"\n\
+         Output: {{\"event_type\":\"hypothesis\",\"task_id_guess\":null,\"confidence\":0.88,\"evidence_strength\":null,\"suggested_text\":\"Possible cause: SDK keeps socket open after read.\"}}\n\
+         ---\n\
+         Input: \"Confirmed: in src/classifier/http.rs:62 the ureq Request has no .timeout() — that's why the call hangs.\"\n\
+         Output: {{\"event_type\":\"finding\",\"task_id_guess\":null,\"confidence\":0.93,\"evidence_strength\":null,\"suggested_text\":\"http.rs:62 builds the ureq Request without .timeout().\"}}\n\
+         ---\n\
+         Input: \"Read pack.rs end-to-end: assemble() always invalidates task_pack_cache before checking it, so the cache is never reused.\"\n\
+         Output: {{\"event_type\":\"finding\",\"task_id_guess\":null,\"confidence\":0.92,\"evidence_strength\":null,\"suggested_text\":\"pack.rs assemble() invalidates task_pack_cache before reading it; cache never reused.\"}}\n\
+         ---\n\
+         Input: \"Ran cargo bench: pack_assemble_cold_10k drops from 820ms to 41ms after the index_state change. 20x faster.\"\n\
+         Output: {{\"event_type\":\"evidence\",\"task_id_guess\":null,\"confidence\":0.95,\"evidence_strength\":\"strong\",\"suggested_text\":\"cargo bench: pack_assemble_cold_10k 820ms -> 41ms (20x) after index_state.\"}}\n\
+         ---\n\
+         Input: \"Maybe we should use rmcp's Result<CallToolResult, McpError> instead of Json<T>.\"\n\
+         Output: {{\"event_type\":\"hypothesis\",\"task_id_guess\":null,\"confidence\":0.82,\"evidence_strength\":null,\"suggested_text\":\"Consider Result<CallToolResult, McpError> in place of Json<T>.\"}}\n\
+         ---\n\
+         Input: \"Going with fd-lock for the Windows file lock — single API across platforms, well-maintained, simpler than rolling our own with rustix.\"\n\
+         Output: {{\"event_type\":\"decision\",\"task_id_guess\":null,\"confidence\":0.94,\"evidence_strength\":null,\"suggested_text\":\"Use fd-lock crate for cross-platform JSONL file lock.\"}}\n\n\
          Active tasks (top candidates):\n{recent}\n\n\
          New {author} chunk:\n{text}\n\n\
          Decide:\n\
@@ -107,6 +126,29 @@ mod tests {
             p.len() < 64 * 1024,
             "prompt must stay under 64KB; got {}",
             p.len()
+        );
+    }
+
+    #[test]
+    fn prompt_contains_few_shot_examples() {
+        let input = ClassifyInput {
+            text: "anything".into(),
+            author_hint: "assistant".into(),
+            recent_tasks: vec![],
+        };
+        let p = build(&input);
+        assert!(p.contains("## Examples"), "Examples section missing");
+        // Six worked Input/Output pairs — count Input: occurrences.
+        let count = p.matches("Input: ").count();
+        assert!(
+            count >= 6,
+            "expected at least 6 few-shot examples, got {count}"
+        );
+        // Each example must show its expected JSON shape.
+        let json_count = p.matches("Output: {").count();
+        assert!(
+            json_count >= 6,
+            "expected at least 6 example outputs, got {json_count}"
         );
     }
 
