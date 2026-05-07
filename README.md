@@ -37,6 +37,30 @@ cd Task-Journal
 cargo install --path crates/tj-cli --path crates/tj-mcp
 ```
 
+## Updating
+
+If you installed via the Claude Code marketplace, run these inside Claude Code:
+
+```
+/plugin marketplace update task-journal
+/plugin update task-journal@task-journal
+```
+
+Then refresh the Rust binaries (the plugin doesn't bundle them — they live on crates.io):
+
+```bash
+cargo install task-journal-cli task-journal-mcp --force
+```
+
+Restart Claude Code so the new MCP server is picked up, and verify:
+
+```bash
+task-journal --version       # 0.2.1
+task-journal-mcp --version   # 0.2.1
+```
+
+If you installed from source, `git pull && cargo install --path crates/tj-cli --path crates/tj-mcp --force` does the same thing.
+
 ## Quick Start
 
 ```bash
