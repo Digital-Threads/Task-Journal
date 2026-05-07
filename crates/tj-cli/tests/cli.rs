@@ -1237,6 +1237,67 @@ fn ingest_hook_session_start_with_no_open_tasks_emits_no_context() {
 }
 
 #[test]
+fn ingest_hook_short_circuits_when_in_classifier_env_set() {
+    // Recursion guard: classifier sets TJ_IN_CLASSIFIER=1 before
+    // spawning claude. The nested claude re-fires our hooks; without
+    // this guard, ingest-hook would re-enter the classifier path
+    // ad infinitum. With the guard, it returns silently and no event
+    // is written.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Recursion guard host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_IN_CLASSIFIER", "1")
+        .args([
+            "ingest-hook",
+            "--kind",
+            "UserPromptSubmit",
+            "--text",
+            "should not be ingested",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.99",
+        ])
+        .assert()
+        .success();
+
+    // The pack must NOT contain the hook text — guard kicked in
+    // before the mock branch could write.
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("should not be ingested"),
+        "TJ_IN_CLASSIFIER must short-circuit before any write: {body}"
+    );
+}
+
+#[test]
 fn ingest_hook_reads_user_prompt_submit_payload_from_stdin() {
     // Real Claude Code passes hook input as JSON over stdin, NOT via env
     // vars. Without this, every captured event has empty text and the

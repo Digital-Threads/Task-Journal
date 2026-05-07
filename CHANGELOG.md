@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-05-07
+
+Critical fix: classifier path now works for users on Claude Pro/Max
+subscription (the majority of Claude Code users). v0.2.8 still
+shipped `--bare` to the inner `claude -p` invocation; that flag
+silently bypasses `~/.claude/.credentials.json` and demands
+`ANTHROPIC_API_KEY`. With only a subscription, every classification
+returned "Not logged in".
+
+### Fixed
+- `ClaudeCliClassifier` no longer passes `--bare`. Hook recursion
+  (the original reason for `--bare`) is now broken via an explicit
+  env-var sentinel: the classifier sets `TJ_IN_CLASSIFIER=1` on the
+  child process, and `ingest-hook` returns immediately when it sees
+  that env. One regression test (`ingest_hook_short_circuits_when_in_
+  classifier_env_set`) covers the guard. Closes claude-memory-0kk.
+
+### Notes
+- Without `--bare`, the inner `claude -p` loads the user's
+  `CLAUDE.md`, skills, and hooks. That increases the prompt-cache
+  cost the first time per 5-minute window. The classifier prompt is
+  explicit about the JSON-only output contract, so model compliance
+  is preserved; subsequent calls within the cache TTL hit the
+  prompt cache and stay cheap.
+
 ## [0.2.8] - 2026-05-07
 
 Critical fix: hooks now actually carry content end-to-end. Without

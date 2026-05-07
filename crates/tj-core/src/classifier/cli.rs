@@ -57,6 +57,13 @@ impl Classifier for ClaudeCliClassifier {
             .ok_or_else(|| anyhow!("TJ_CLASSIFIER_CLI is empty"))?;
         let base_args: Vec<&str> = parts.collect();
 
+        // `--bare` would skip hooks/CLAUDE.md/skills (cheap + non-recursive),
+        // but it ALSO bypasses the subscription credentials file and only
+        // works with ANTHROPIC_API_KEY — see claude-memory-0kk. Most users
+        // pay through Claude Pro/Max, so we drop --bare and gate recursion
+        // explicitly with the TJ_IN_CLASSIFIER env var: ingest-hook checks
+        // it on entry and short-circuits, breaking the loop without
+        // touching auth.
         let output = std::process::Command::new(program)
             .args(&base_args)
             .args([
@@ -65,9 +72,9 @@ impl Classifier for ClaudeCliClassifier {
                 &self.model,
                 "--output-format",
                 "json",
-                "--bare", // skip hooks/skills/CLAUDE.md to avoid recursion + speed up
                 &prompt,
             ])
+            .env("TJ_IN_CLASSIFIER", "1")
             .output()
             .with_context(|| format!("spawn `{}` for classification", self.command))?;
 

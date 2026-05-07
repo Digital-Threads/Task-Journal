@@ -1186,6 +1186,19 @@ fn main() -> Result<()> {
             mock_task_id,
             mock_confidence,
         } => {
+            // Recursion guard. The classifier spawns `claude -p` to do
+            // the actual work; that nested claude invocation re-reads
+            // ~/.claude/settings.json and would re-fire our hooks,
+            // recursively calling ingest-hook → classifier → claude → …
+            // Until v0.2.8 we relied on `--bare` to suppress the hooks
+            // on the inner invocation, but --bare doesn't work with
+            // subscription auth (claude-memory-0kk), so the classifier
+            // now sets TJ_IN_CLASSIFIER=1 in the child env and we bail
+            // here when we see it.
+            if std::env::var("TJ_IN_CLASSIFIER").is_ok() {
+                return Ok(());
+            }
+
             // Resolve (kind, text) source: explicit args win; otherwise
             // read the Claude Code hook payload from stdin. The earlier
             // settings.json template interpolated `$CLAUDE_HOOK_NAME` /
