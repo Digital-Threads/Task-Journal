@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.5] - 2026-05-07
+## [0.2.6] - 2026-05-07
+
+Three additive features that close the "auto-memory" loop end-to-end:
+the journal can now (1) surface itself at session start, (2) seed
+itself from existing Claude Code history at install time, and (3)
+recognize a project regardless of which subdir you launch from.
+
+### Added
+- **SessionStart resume-pack injection**. `task-journal ingest-hook
+  --kind=SessionStart` now opens the project's journal, renders the
+  three most-recent open tasks in compact mode, and writes a
+  `hookSpecificOutput.additionalContext` envelope to stdout. Claude
+  Code merges that into the system prompt so a new session starts
+  with the journal's state already in context — no manual
+  `task_pack` call needed. Empty stdout when there are no open
+  tasks, so fresh projects don't get noise.
+  `install-hooks` automatically wires the `SessionStart` event
+  alongside the existing three.
+- **`install-hooks --backfill`**. After writing the hook entries,
+  re-execs `task-journal backfill` against the current directory so
+  first-time users get an auto-populated journal from their existing
+  Claude Code history. Onboarding becomes one command.
+- **Project-root normalization in `project_hash`**. `repo/`,
+  `repo/src/`, and `repo/src/foo/bar/` now hash to the same project
+  by walking up to the first `.git` (file or directory, so worktrees
+  work) or `.task-journal/` marker. Without this, opening Claude
+  Code in a subdir gave an empty journal and silently broke
+  continuity. `.task-journal/` is the explicit override for
+  intentional sub-projects.
 
 DX improvement: ship classifier-wrapper config through `install-hooks` —
 no more manual `bashrc` / `settings.json` edits to use `aimux`, `direnv`,

@@ -655,6 +655,11 @@ enum Commands {
         /// Default: classifier uses `claude -p`.
         #[arg(long)]
         classifier_command: Option<String>,
+        /// After installing hooks, retro-import existing Claude Code session
+        /// history for the current project. Equivalent to running
+        /// `task-journal backfill` afterwards. Onboarding shortcut.
+        #[arg(long)]
+        backfill: bool,
     },
     /// Show local classifier and journal statistics.
     Stats,
@@ -950,6 +955,7 @@ fn main() -> Result<()> {
             scope,
             uninstall,
             classifier_command,
+            backfill,
         } => {
             let settings_path = match scope.as_str() {
                 "user" => {
@@ -1026,6 +1032,24 @@ fn main() -> Result<()> {
             }
             std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
             println!("{}", settings_path.display());
+
+            // Onboarding convenience: retro-import existing Claude Code history
+            // so the journal isn't empty on day one. Always operates on the
+            // current working directory; install-hooks scope is independent.
+            // We re-exec ourselves rather than refactoring the (~150-line)
+            // backfill body — keeps the pipe simple and the output identical
+            // to a manual `task-journal backfill`.
+            if !uninstall && backfill {
+                let exe =
+                    std::env::current_exe().context("locate task-journal binary for backfill")?;
+                let status = std::process::Command::new(&exe)
+                    .arg("backfill")
+                    .status()
+                    .with_context(|| format!("spawn `{} backfill`", exe.display()))?;
+                if !status.success() {
+                    eprintln!("backfill exited with {status}");
+                }
+            }
         }
         Commands::Stats => {
             let metrics_dir = tj_core::paths::metrics_dir()?;
