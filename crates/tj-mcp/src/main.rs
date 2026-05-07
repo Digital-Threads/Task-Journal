@@ -41,6 +41,40 @@ fn into_mcp_error(err: anyhow::Error) -> McpError {
     McpError::internal_error(format!("{err:#}"), None)
 }
 
+/// Stable, low-cost correlation token for one tool invocation. ULID gives
+/// us 26 lexicographic characters with embedded timestamp ordering and a
+/// random suffix — tools do not need millisecond uniqueness, but the
+/// timestamp makes log scrubbing easier than a pure-random UUID.
+fn new_correlation_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
+/// Wrap one tool handler with structured tracing. Emits one INFO line at
+/// entry (with the correlation id and tool name) and one INFO line at
+/// exit (with elapsed ms and ok/err). Callers grep on `correlation_id=`
+/// to follow a single client request across logs.
+async fn traced_tool<T, Fut>(tool: &'static str, fut: Fut) -> Result<T, McpError>
+where
+    Fut: std::future::Future<Output = Result<T, McpError>>,
+{
+    let correlation_id = new_correlation_id();
+    let started_at = std::time::Instant::now();
+    tracing::info!(tool, %correlation_id, "tool_call start");
+    let result = fut.await;
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::info!(tool, %correlation_id, elapsed_ms, "tool_call ok"),
+        Err(e) => tracing::warn!(
+            tool,
+            %correlation_id,
+            elapsed_ms,
+            error = %e.message,
+            "tool_call err"
+        ),
+    }
+    result
+}
+
 /// Run synchronous I/O on the tokio blocking pool. Without this, every tool
 /// handler would do SQLite + JSONL work directly on the executor thread
 /// and a slow operation in one tool would stall every other concurrent
@@ -239,36 +273,39 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskPackParams>,
     ) -> Result<Json<TaskPackResult>, McpError> {
-        run_blocking(move || {
-            let (project_hash, events_path, state_path) = project_paths()?;
-            let conn_arc = cached_open(&state_path)?;
-            let conn = conn_arc
-                .lock()
-                .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
-            if events_path.exists() {
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-            }
-            let pmode = match p.mode.as_deref() {
-                Some("full") => tj_core::pack::PackMode::Full,
-                _ => tj_core::pack::PackMode::Compact,
-            };
-            let pack = tj_core::pack::assemble(&conn, &p.task_id, pmode)?;
-            Ok(TaskPackResult {
-                task_id: pack.task_id,
-                mode: match pack.mode {
-                    tj_core::pack::PackMode::Compact => "compact".into(),
-                    tj_core::pack::PackMode::Full => "full".into(),
-                },
-                schema_version: pack.schema_version,
-                text: pack.text,
-                metadata: TaskPackMetadata {
-                    source_event_count: Some(pack.metadata.source_event_count),
-                    cache_hit: Some(pack.metadata.cache_hit),
-                },
+        traced_tool("task_pack", async move {
+            run_blocking(move || {
+                let (project_hash, events_path, state_path) = project_paths()?;
+                let conn_arc = cached_open(&state_path)?;
+                let conn = conn_arc
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                if events_path.exists() {
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                }
+                let pmode = match p.mode.as_deref() {
+                    Some("full") => tj_core::pack::PackMode::Full,
+                    _ => tj_core::pack::PackMode::Compact,
+                };
+                let pack = tj_core::pack::assemble(&conn, &p.task_id, pmode)?;
+                Ok(TaskPackResult {
+                    task_id: pack.task_id,
+                    mode: match pack.mode {
+                        tj_core::pack::PackMode::Compact => "compact".into(),
+                        tj_core::pack::PackMode::Full => "full".into(),
+                    },
+                    schema_version: pack.schema_version,
+                    text: pack.text,
+                    metadata: TaskPackMetadata {
+                        source_event_count: Some(pack.metadata.source_event_count),
+                        cache_hit: Some(pack.metadata.cache_hit),
+                    },
+                })
             })
+            .await
+            .map(Json)
         })
         .await
-        .map(Json)
     }
 
     #[tool(
@@ -279,26 +316,29 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskSearchParams>,
     ) -> Result<Json<TaskSearchResult>, McpError> {
-        let query = p.query.clone();
-        let results = run_blocking(move || {
-            let (project_hash, events_path, state_path) = project_paths()?;
-            let conn_arc = cached_open(&state_path)?;
-            let conn = conn_arc
-                .lock()
-                .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
-            if events_path.exists() {
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-            }
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT 50",
-            )?;
-            let ids: Vec<String> = stmt
-                .query_map(rusqlite::params![p.query], |r| r.get::<_, String>(0))?
-                .collect::<Result<_, _>>()?;
-            Ok(ids)
+        traced_tool("task_search", async move {
+            let query = p.query.clone();
+            let results = run_blocking(move || {
+                let (project_hash, events_path, state_path) = project_paths()?;
+                let conn_arc = cached_open(&state_path)?;
+                let conn = conn_arc
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                if events_path.exists() {
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                }
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT 50",
+                )?;
+                let ids: Vec<String> = stmt
+                    .query_map(rusqlite::params![p.query], |r| r.get::<_, String>(0))?
+                    .collect::<Result<_, _>>()?;
+                Ok(ids)
+            })
+            .await?;
+            Ok(Json(TaskSearchResult { query, results }))
         })
-        .await?;
-        Ok(Json(TaskSearchResult { query, results }))
+        .await
     }
 
     #[tool(
@@ -309,31 +349,34 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskCreateParams>,
     ) -> Result<Json<TaskCreateResult>, McpError> {
-        run_blocking(move || {
-            let (_, events_path, _) = project_paths()?;
-            std::fs::create_dir_all(events_path.parent().unwrap())?;
+        traced_tool("task_create", async move {
+            run_blocking(move || {
+                let (_, events_path, _) = project_paths()?;
+                std::fs::create_dir_all(events_path.parent().unwrap())?;
 
-            let task_id = tj_core::new_task_id();
-            let mut event = tj_core::event::Event::new(
-                task_id.clone(),
-                tj_core::event::EventType::Open,
-                tj_core::event::Author::Agent,
-                tj_core::event::Source::Chat,
-                p.initial_context.clone().unwrap_or_else(|| p.title.clone()),
-            );
-            event.meta = serde_json::json!({"title": p.title.clone()});
+                let task_id = tj_core::new_task_id();
+                let mut event = tj_core::event::Event::new(
+                    task_id.clone(),
+                    tj_core::event::EventType::Open,
+                    tj_core::event::Author::Agent,
+                    tj_core::event::Source::Chat,
+                    p.initial_context.clone().unwrap_or_else(|| p.title.clone()),
+                );
+                event.meta = serde_json::json!({"title": p.title.clone()});
 
-            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
-            writer.append(&event)?;
-            writer.flush_durable()?;
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
 
-            Ok(TaskCreateResult {
-                task_id,
-                title: p.title.clone(),
+                Ok(TaskCreateResult {
+                    task_id,
+                    title: p.title.clone(),
+                })
             })
+            .await
+            .map(Json)
         })
         .await
-        .map(Json)
     }
 
     #[tool(
@@ -344,33 +387,36 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<EventAddParams>,
     ) -> Result<Json<EventAddResult>, McpError> {
-        run_blocking(move || {
-            let (_, events_path, _) = project_paths()?;
-            std::fs::create_dir_all(events_path.parent().unwrap())?;
+        traced_tool("event_add", async move {
+            run_blocking(move || {
+                let (_, events_path, _) = project_paths()?;
+                std::fs::create_dir_all(events_path.parent().unwrap())?;
 
-            let event_type = parse_event_type(&p.event_type)?;
-            let mut event = tj_core::event::Event::new(
-                &p.task_id,
-                event_type,
-                tj_core::event::Author::Agent,
-                tj_core::event::Source::Chat,
-                p.text.clone(),
-            );
-            event.corrects = p.corrects.clone();
-            event.supersedes = p.supersedes.clone();
+                let event_type = parse_event_type(&p.event_type)?;
+                let mut event = tj_core::event::Event::new(
+                    &p.task_id,
+                    event_type,
+                    tj_core::event::Author::Agent,
+                    tj_core::event::Source::Chat,
+                    p.text.clone(),
+                );
+                event.corrects = p.corrects.clone();
+                event.supersedes = p.supersedes.clone();
 
-            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
-            writer.append(&event)?;
-            writer.flush_durable()?;
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
 
-            Ok(EventAddResult {
-                event_id: event.event_id,
-                task_id: p.task_id.clone(),
-                event_type: p.event_type.clone(),
+                Ok(EventAddResult {
+                    event_id: event.event_id,
+                    task_id: p.task_id.clone(),
+                    event_type: p.event_type.clone(),
+                })
             })
+            .await
+            .map(Json)
         })
         .await
-        .map(Json)
     }
 
     #[tool(
@@ -381,47 +427,50 @@ impl TaskJournalServer {
         &self,
         Parameters(p): Parameters<TaskCloseParams>,
     ) -> Result<Json<TaskCloseResult>, McpError> {
-        let task_id = p.task_id.clone();
-        run_blocking(move || {
-            let (project_hash, events_path, state_path) = project_paths()?;
+        traced_tool("task_close", async move {
+            let task_id = p.task_id.clone();
+            run_blocking(move || {
+                let (project_hash, events_path, state_path) = project_paths()?;
 
-            let conn_arc = cached_open(&state_path)?;
-            {
-                let conn = conn_arc
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
-                if events_path.exists() {
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                let conn_arc = cached_open(&state_path)?;
+                {
+                    let conn = conn_arc
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                    if events_path.exists() {
+                        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                    }
+                    if !tj_core::db::task_exists(&conn, &p.task_id)? {
+                        anyhow::bail!("task not found: {}", p.task_id);
+                    }
+                } // release the connection lock before doing the JSONL append
+
+                let mut event = tj_core::event::Event::new(
+                    &p.task_id,
+                    tj_core::event::EventType::Close,
+                    tj_core::event::Author::Agent,
+                    tj_core::event::Source::Chat,
+                    p.reason.clone(),
+                );
+                let mut meta = serde_json::Map::new();
+                meta.insert("reason".into(), serde_json::Value::String(p.reason.clone()));
+                if let Some(o) = &p.outcome {
+                    meta.insert("outcome".into(), serde_json::Value::String(o.clone()));
                 }
-                if !tj_core::db::task_exists(&conn, &p.task_id)? {
-                    anyhow::bail!("task not found: {}", p.task_id);
-                }
-            } // release the connection lock before doing the JSONL append
+                event.meta = serde_json::Value::Object(meta);
 
-            let mut event = tj_core::event::Event::new(
-                &p.task_id,
-                tj_core::event::EventType::Close,
-                tj_core::event::Author::Agent,
-                tj_core::event::Source::Chat,
-                p.reason.clone(),
-            );
-            let mut meta = serde_json::Map::new();
-            meta.insert("reason".into(), serde_json::Value::String(p.reason.clone()));
-            if let Some(o) = &p.outcome {
-                meta.insert("outcome".into(), serde_json::Value::String(o.clone()));
-            }
-            event.meta = serde_json::Value::Object(meta);
-
-            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
-            writer.append(&event)?;
-            writer.flush_durable()?;
-            Ok(())
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+                Ok(())
+            })
+            .await?;
+            Ok(Json(TaskCloseResult {
+                task_id,
+                closed: true,
+            }))
         })
-        .await?;
-        Ok(Json(TaskCloseResult {
-            task_id,
-            closed: true,
-        }))
+        .await
     }
 }
 
@@ -566,6 +615,34 @@ mod tests {
             elapsed < Duration::from_millis(350),
             "blocking tasks must overlap on the blocking pool — got {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn new_correlation_id_is_unique_across_thousand_calls() {
+        let mut seen = std::collections::HashSet::with_capacity(1000);
+        for _ in 0..1_000 {
+            assert!(
+                seen.insert(new_correlation_id()),
+                "correlation id collision in 1k calls"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn traced_tool_transparently_returns_inner_result() {
+        // Success path: the wrapper must propagate the Ok value.
+        let ok = traced_tool::<i32, _>("test_ok", async { Ok(42) })
+            .await
+            .unwrap();
+        assert_eq!(ok, 42);
+
+        // Error path: the wrapper must propagate Err untouched.
+        let err = traced_tool::<i32, _>("test_err", async {
+            Err(McpError::internal_error("boom".to_string(), None))
+        })
+        .await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().message, "boom");
     }
 
     #[test]
