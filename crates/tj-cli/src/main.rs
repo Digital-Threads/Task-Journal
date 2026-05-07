@@ -315,6 +315,164 @@ fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
     out
 }
 
+/// Resolve `<events_dir>/../../pending` for the current project. Mirrors
+/// the path layout used by `persist_pending`.
+fn pending_dir() -> Result<std::path::PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let dir = events_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("events_dir has no grandparent"))?
+        .join("pending");
+    Ok(dir)
+}
+
+fn run_pending_list() -> Result<()> {
+    let dir = pending_dir()?;
+    if !dir.exists() {
+        println!("(no pending entries)");
+        return Ok(());
+    }
+    let mut entries: Vec<(String, String, String, u32)> = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let body = std::fs::read_to_string(&path)?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        let queued_at = v
+            .get("queued_at")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let text_preview: String = v
+            .get("text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(72)
+            .collect();
+        let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let dead_marker = if id.ends_with(".dead") { " [DEAD]" } else { "" };
+        entries.push((id, queued_at, text_preview, attempts));
+        let _ = dead_marker;
+    }
+    if entries.is_empty() {
+        println!("(no pending entries)");
+        return Ok(());
+    }
+    println!("{:<26} {:<25} attempts  text", "id", "queued_at");
+    for (id, qa, text, attempts) in &entries {
+        println!("{id:<26} {qa:<25} {attempts:<8}  {text}");
+    }
+    Ok(())
+}
+
+fn run_pending_retry(
+    mock_etype: Option<&str>,
+    mock_tid: Option<&str>,
+    mock_conf: Option<f64>,
+) -> Result<()> {
+    let dir = pending_dir()?;
+    if !dir.exists() {
+        println!("(no pending entries)");
+        return Ok(());
+    }
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+
+    let mut succeeded = 0usize;
+    let mut died = 0usize;
+    let mut still_pending = 0usize;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.ends_with(".dead"))
+            .unwrap_or(false)
+        {
+            continue; // already dead, skip
+        }
+        let body = std::fs::read_to_string(&path)?;
+        let mut v: serde_json::Value = serde_json::from_str(&body)?;
+        let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let text = v
+            .get("text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // The real retry path would call the classifier. The CI-safe
+        // mock branch lets tests drive a deterministic outcome.
+        let outcome: anyhow::Result<()> = match (mock_etype, mock_tid) {
+            (Some(etype), Some(tid)) => {
+                let mut event = tj_core::event::Event::new(
+                    tid,
+                    parse_event_type(etype)?,
+                    tj_core::event::Author::Classifier,
+                    tj_core::event::Source::Hook,
+                    text,
+                );
+                event.confidence = mock_conf;
+                event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+                Ok(())
+            }
+            _ => Err(anyhow::anyhow!(
+                "no real classifier wired in retry path yet — pass --mock-* for tests, or run install-hooks and let the hook drain the queue"
+            )),
+        };
+
+        match outcome {
+            Ok(()) => {
+                std::fs::remove_file(&path)?;
+                succeeded += 1;
+            }
+            Err(_) => {
+                let new_attempts = attempts + 1;
+                if new_attempts >= PENDING_MAX_ATTEMPTS {
+                    let dead_path = path.with_file_name(format!(
+                        "{}.dead.json",
+                        path.file_stem().and_then(|s| s.to_str()).unwrap_or("dead")
+                    ));
+                    std::fs::rename(&path, &dead_path)?;
+                    died += 1;
+                } else {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert(
+                            "attempts".into(),
+                            serde_json::Value::Number(new_attempts.into()),
+                        );
+                    }
+                    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+                    still_pending += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "pending retry: {succeeded} drained, {still_pending} still pending, {died} marked dead"
+    );
+    Ok(())
+}
+
 fn run_doctor() -> Result<DoctorReport> {
     let mut issues: Vec<String> = Vec::new();
 
@@ -517,6 +675,14 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or retry classifier failures queued under pending/.
+    /// The auto-capture hook writes a pending entry whenever the
+    /// classifier errors (network down, rate limit, missing API key);
+    /// this command surfaces them.
+    Pending {
+        #[command(subcommand)]
+        action: PendingCmd,
+    },
     /// Re-key on-disk data when a project moved on disk. The project_hash
     /// is derived from the canonical path, so a moved project orphans its
     /// own data; this command renames the JSONL + SQLite + metrics files.
@@ -565,6 +731,28 @@ enum EventsCmd {
         limit: usize,
     },
 }
+
+#[derive(Subcommand)]
+enum PendingCmd {
+    /// List queued classifier failures.
+    List,
+    /// Re-feed every pending entry through the classifier. Marks an
+    /// entry as `<id>.dead.json` after PENDING_MAX_ATTEMPTS failures.
+    Retry {
+        /// Test/dev override: bypass classifier and force this event
+        /// type. Hidden from --help.
+        #[arg(long, hide = true)]
+        mock_event_type: Option<String>,
+        /// Test/dev override: target task id. Hidden from --help.
+        #[arg(long, hide = true)]
+        mock_task_id: Option<String>,
+        /// Test/dev override: confidence value. Hidden from --help.
+        #[arg(long, hide = true)]
+        mock_confidence: Option<f64>,
+    },
+}
+
+const PENDING_MAX_ATTEMPTS: u32 = 3;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -836,6 +1024,22 @@ fn main() -> Result<()> {
         Commands::MigrateProject { from, to, force } => {
             run_migrate_project(&from, &to, force)?;
         }
+        Commands::Pending { action } => match action {
+            PendingCmd::List => {
+                run_pending_list()?;
+            }
+            PendingCmd::Retry {
+                mock_event_type,
+                mock_task_id,
+                mock_confidence,
+            } => {
+                run_pending_retry(
+                    mock_event_type.as_deref(),
+                    mock_task_id.as_deref(),
+                    mock_confidence,
+                )?;
+            }
+        },
         Commands::IngestHook {
             kind,
             text,

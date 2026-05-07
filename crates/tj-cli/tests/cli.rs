@@ -135,6 +135,130 @@ fn doctor_json_output_is_parseable_and_lists_paths() {
     assert!(v.get("issues").unwrap().is_array());
 }
 
+fn write_pending(xdg: &std::path::Path, id: &str, text: &str, attempts: u32) {
+    let dir = xdg.join("task-journal").join("pending");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = serde_json::json!({
+        "text": text,
+        "error": "test injection",
+        "queued_at": "2026-05-07T00:00:00Z",
+        "attempts": attempts,
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&body).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn pending_list_shows_queued_entries() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "tj-pending-1", "I think the cache is racy", 0);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pending", "list"])
+        .assert()
+        .success()
+        .stdout(contains("tj-pending-1"))
+        .stdout(contains("I think the cache is racy"));
+}
+
+#[test]
+fn pending_retry_drains_with_mock_classifier() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    // Seed: real task in JSONL so the classifier-mocked event has a
+    // legitimate task_id to attach to.
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Pending host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    write_pending(
+        xdg.path(),
+        "tj-pending-2",
+        "Adopted Rust for the journal",
+        0,
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "pending",
+            "retry",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.92",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+
+    // pending file removed
+    let pending_file = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("tj-pending-2.json");
+    assert!(!pending_file.exists(), "drained entry must be removed");
+
+    // event landed in JSONL — visible in pack
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Adopted Rust for the journal"));
+}
+
+#[test]
+fn pending_retry_marks_dead_after_max_attempts() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    // Already at attempts=2; one more failure should rename to *.dead.json.
+    write_pending(xdg.path(), "tj-dying", "any text", 2);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        // No --mock-* flags → retry fails → attempts becomes 3 → dead.
+        .args(["pending", "retry"])
+        .assert()
+        .success()
+        .stdout(contains("1 marked dead"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    let live = pending_dir.join("tj-dying.json");
+    let dead = pending_dir.join("tj-dying.dead.json");
+    assert!(!live.exists(), "live file must be gone after dead-rename");
+    assert!(dead.exists(), "dead file must exist: {dead:?}");
+}
+
 #[test]
 fn export_sqlite_round_trips_through_pack() {
     // Setup A: write a project + task in xdg_a/proj_a.
