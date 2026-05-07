@@ -8,10 +8,12 @@ use rmcp::{
     handler::server::tool::Parameters, handler::server::wrapper::Json, tool, tool_handler,
     tool_router, transport::io::stdio, ErrorData as McpError, ServerHandler, ServiceExt,
 };
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Optional override for the project directory used by every tool handler.
 /// `None` (the default) means "use the current working directory at the time
@@ -52,6 +54,38 @@ where
         .await
         .map_err(|e| McpError::internal_error(format!("blocking task panicked: {e}"), None))?;
     join_result.map_err(into_mcp_error)
+}
+
+/// Process-wide cache of SQLite connections keyed by state-file path.
+///
+/// Without this, every tool handler called `tj_core::db::open()` which
+/// re-runs PRAGMAs, the migrations registry, and re-creates a new WAL
+/// reader. At small N the open cost dominates the actual work.
+///
+/// Storage layout: an outer `Mutex` guards the map (only briefly, during
+/// insert/lookup), and each entry is `Arc<Mutex<Connection>>` so callers
+/// can hold a connection across a longer transaction without blocking
+/// other projects.
+fn connection_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<Connection>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<Connection>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get or create the cached `Connection` for a SQLite state path. The
+/// returned `Arc<Mutex<...>>` is shared with future callers; the inner
+/// mutex is the lock you actually want to take during a tool call.
+fn cached_open(state_path: &Path) -> anyhow::Result<Arc<Mutex<Connection>>> {
+    let mut cache = connection_cache()
+        .lock()
+        .map_err(|e| anyhow::anyhow!("connection cache poisoned: {e}"))?;
+    if let Some(existing) = cache.get(state_path) {
+        return Ok(existing.clone());
+    }
+    let conn =
+        tj_core::db::open(state_path).with_context(|| format!("open SQLite at {state_path:?}"))?;
+    let arc = Arc::new(Mutex::new(conn));
+    cache.insert(state_path.to_path_buf(), arc.clone());
+    Ok(arc)
 }
 
 /// MCP instructions delivered to every Claude Code session where this plugin is installed.
@@ -207,7 +241,10 @@ impl TaskJournalServer {
     ) -> Result<Json<TaskPackResult>, McpError> {
         run_blocking(move || {
             let (project_hash, events_path, state_path) = project_paths()?;
-            let conn = tj_core::db::open(&state_path)?;
+            let conn_arc = cached_open(&state_path)?;
+            let conn = conn_arc
+                .lock()
+                .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
             if events_path.exists() {
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             }
@@ -245,7 +282,10 @@ impl TaskJournalServer {
         let query = p.query.clone();
         let results = run_blocking(move || {
             let (project_hash, events_path, state_path) = project_paths()?;
-            let conn = tj_core::db::open(&state_path)?;
+            let conn_arc = cached_open(&state_path)?;
+            let conn = conn_arc
+                .lock()
+                .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
             if events_path.exists() {
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             }
@@ -345,14 +385,18 @@ impl TaskJournalServer {
         run_blocking(move || {
             let (project_hash, events_path, state_path) = project_paths()?;
 
-            let conn = tj_core::db::open(&state_path)?;
-            if events_path.exists() {
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-            }
-            if !tj_core::db::task_exists(&conn, &p.task_id)? {
-                anyhow::bail!("task not found: {}", p.task_id);
-            }
-            drop(conn);
+            let conn_arc = cached_open(&state_path)?;
+            {
+                let conn = conn_arc
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                if events_path.exists() {
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                }
+                if !tj_core::db::task_exists(&conn, &p.task_id)? {
+                    anyhow::bail!("task not found: {}", p.task_id);
+                }
+            } // release the connection lock before doing the JSONL append
 
             let mut event = tj_core::event::Event::new(
                 &p.task_id,
@@ -522,6 +566,31 @@ mod tests {
             elapsed < Duration::from_millis(350),
             "blocking tasks must overlap on the blocking pool — got {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn cached_open_returns_same_arc_for_same_path() {
+        // The Arc returned by cached_open() is the same handle on second
+        // call: that's the proof that we are not re-running migrations
+        // / PRAGMA / WAL setup on every tool call.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("d1-cache.sqlite");
+        let a = cached_open(&p).unwrap();
+        let b = cached_open(&p).unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "cached_open must reuse the Arc<Mutex<Connection>>"
+        );
+    }
+
+    #[test]
+    fn cached_open_returns_distinct_arcs_for_distinct_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p1 = dir.path().join("d1-x.sqlite");
+        let p2 = dir.path().join("d1-y.sqlite");
+        let a = cached_open(&p1).unwrap();
+        let b = cached_open(&p2).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
     }
 
     #[test]
