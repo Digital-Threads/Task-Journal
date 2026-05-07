@@ -186,6 +186,135 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
     Ok(())
 }
 
+/// Minimal HTML attribute/text escape. Five characters cover the body of
+/// `text/html` for our use case (no script context, no URL emission).
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+const HTML_TIMELINE_CSS: &str = r#"
+:root { color-scheme: light dark; --fg:#222; --bg:#fafafa; --muted:#666; --accent:#0366d6; }
+@media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#1a1a1a; --muted:#999; --accent:#58a6ff; } }
+* { box-sizing: border-box; }
+body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+       color: var(--fg); background: var(--bg); margin: 0; padding: 1.5rem; }
+header h1 { margin: 0 0 1.5rem; font-size: 1.4rem; }
+article { margin-bottom: 2rem; padding: 1rem 1.25rem; background: rgba(127,127,127,0.07);
+          border-radius: 6px; }
+article h2 { margin: 0; font-size: 1.05rem; font-weight: 600; }
+.tid { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+       color: var(--accent); margin-right: 0.4em; }
+.meta { color: var(--muted); font-size: 0.85rem; margin: 0.25rem 0 0.75rem; }
+ol.timeline { list-style: none; margin: 0; padding-left: 0; }
+ol.timeline li { padding: 0.4rem 0; border-top: 1px solid rgba(127,127,127,0.15); }
+ol.timeline li:first-child { border-top: none; }
+time { font-family: ui-monospace, monospace; color: var(--muted); margin-right: 0.6em; }
+.type { display: inline-block; padding: 0 0.35em; margin-right: 0.4em; border-radius: 3px;
+        font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
+        background: rgba(127,127,127,0.15); }
+.type-decision { background: rgba(3,102,214,0.18); color: var(--accent); }
+.type-rejection { background: rgba(214,3,3,0.18); }
+.type-evidence { background: rgba(40,167,69,0.18); }
+.type-finding { background: rgba(255,166,0,0.20); }
+.suggested::after { content: " ?"; color: var(--muted); }
+"#;
+
+fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
+    use std::collections::BTreeMap;
+
+    let mut tasks: BTreeMap<String, Vec<&tj_core::event::Event>> = BTreeMap::new();
+    for e in events {
+        tasks.entry(e.task_id.clone()).or_default().push(e);
+    }
+
+    let mut out = String::new();
+    out.push_str("<!doctype html>\n");
+    out.push_str("<html lang=\"en\"><head>");
+    out.push_str("<meta charset=\"utf-8\">");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    out.push_str("<title>Task Journal — Export</title>");
+    out.push_str("<style>");
+    out.push_str(HTML_TIMELINE_CSS);
+    out.push_str("</style>");
+    out.push_str("</head><body>");
+    out.push_str("<header><h1>Task Journal — Export</h1></header>");
+    out.push_str("<main>");
+
+    for (task_id, task_events) in &tasks {
+        let title = task_events
+            .iter()
+            .find(|e| e.event_type == tj_core::event::EventType::Open)
+            .and_then(|e| {
+                e.meta
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| Some(e.text.clone()))
+            })
+            .unwrap_or_else(|| "(untitled)".into());
+
+        let closed = task_events
+            .last()
+            .map(|e| e.event_type == tj_core::event::EventType::Close)
+            .unwrap_or(false);
+        let status = if closed { "closed" } else { "open" };
+
+        let created = task_events
+            .first()
+            .map(|e| e.timestamp.as_str())
+            .unwrap_or("?");
+
+        out.push_str("<article>");
+        out.push_str(&format!(
+            "<h2><span class=\"tid\">{}</span>{}</h2>",
+            html_escape(task_id),
+            html_escape(&title)
+        ));
+        out.push_str(&format!(
+            "<p class=\"meta\">status: {} · created: {}</p>",
+            status,
+            html_escape(created)
+        ));
+        out.push_str("<ol class=\"timeline\">");
+        for e in task_events {
+            let etype = serde_json::to_value(e.event_type)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            let suggested_class = if matches!(e.status, tj_core::event::EventStatus::Suggested) {
+                " suggested"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "<li class=\"event{}\"><time>{}</time>\
+                 <span class=\"type type-{}\">{}</span>{}</li>",
+                suggested_class,
+                html_escape(&e.timestamp),
+                html_escape(&etype),
+                html_escape(&etype),
+                html_escape(&e.text)
+            ));
+        }
+        out.push_str("</ol>");
+        out.push_str("</article>");
+    }
+
+    out.push_str("</main></body></html>\n");
+    out
+}
+
 fn run_doctor() -> Result<DoctorReport> {
     let mut issues: Vec<String> = Vec::new();
 
@@ -936,7 +1065,12 @@ fn main() -> Result<()> {
                         println!();
                     }
                 }
-                other => anyhow::bail!("unknown format: {other} (expected `md` or `json`)"),
+                "html" => {
+                    print!("{}", render_html_timeline(&events));
+                }
+                other => {
+                    anyhow::bail!("unknown format: {other} (expected `md`, `json`, or `html`)")
+                }
             }
         }
         Commands::Search {

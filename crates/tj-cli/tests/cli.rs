@@ -136,6 +136,64 @@ fn doctor_json_output_is_parseable_and_lists_paths() {
 }
 
 #[test]
+fn export_html_emits_self_contained_document() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "HTML export test"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt Rust",
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["export", "--format", "html", "--task", &task_id])
+        .output()
+        .unwrap();
+    let html = String::from_utf8(output.stdout).unwrap();
+
+    // Self-contained shape.
+    let lower = html.to_lowercase();
+    assert!(
+        lower.starts_with("<!doctype html>"),
+        "html missing doctype: {html}"
+    );
+    assert!(html.contains("HTML export test"), "task title missing");
+    assert!(html.contains("Adopt Rust"), "decision event missing");
+    // No external assets — no http/https URL anywhere.
+    assert!(!html.contains("http://"), "external http url leaked");
+    assert!(!html.contains("https://"), "external https url leaked");
+}
+
+#[test]
 fn migrate_project_round_trips_data_to_new_path() {
     let xdg = assert_fs::TempDir::new().unwrap();
     let proj_a = assert_fs::TempDir::new().unwrap();
