@@ -34,10 +34,12 @@ no more manual `bashrc` / `settings.json` edits to use `aimux`, `direnv`,
   interactive bash, so the env var was invisible to the classifier
   and 401s kept piling up in `pending/`. The `--classifier-command`
   flag closes that loop end-to-end.
-- CI: pinned `rmcp-macros` to `=0.3.1` so MSRV (Rust 1.83) builds
-  again. `rmcp-macros 0.3.2` requires the `edition2024` Cargo
-  feature, stabilized only in Rust 1.85+. Re-evaluate when MSRV is
-  raised.
+- CI: bumped MSRV from Rust 1.83 to **1.85** (workspace
+  `rust-version` + GitHub Actions toolchain). The ecosystem (`rmcp`,
+  `clap_lex`, etc.) now ships transitive deps that require the
+  `edition2024` Cargo feature, which only stabilized in 1.85.
+  Pinning each one was a losing race; one MSRV bump unblocks them
+  all. 1.85 has been GA since 2025-02 and is widely available.
 - CI: opened the JSONL append handle with `read(true)` in addition
   to `append(true)`. `fd_lock`'s `LockFileEx` on Windows requires
   GENERIC_READ access on the handle; without it tests panicked with

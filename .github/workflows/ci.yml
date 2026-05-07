@@ -44,18 +44,18 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
-    name: msrv (rust 1.83)
+    name: msrv (rust 1.85)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.83
-        uses: dtolnay/rust-toolchain@1.83
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: msrv-1.83
+          key: msrv-1.85
 
       - name: cargo build (MSRV)
         run: cargo build --workspace --all-targets

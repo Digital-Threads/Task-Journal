@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 version = "0.2.5"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 license = "MIT"
 authors = ["Mher Shahinyan"]
 repository = "https://github.com/Digital-Threads/Task-Journal"

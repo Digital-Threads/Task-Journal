@@ -182,7 +182,12 @@ mod tests {
             "type": "result",
             "subtype": "success",
             "is_error": true,
-            "result": "Not logged in · Please run /login",
+            // ASCII-only payload: Windows `type` (used by fake-claude.cmd)
+            // emits via the console code page, which mangles non-ASCII bytes
+            // (U+00B7 etc.) before our UTF-8 decode in `classify`. Real
+            // `claude` always emits UTF-8 directly, so this is a fake-only
+            // concern, not a production behavior change.
+            "result": "Not logged in - Please run /login",
         });
         let fake = fake_claude(dir.path(), &envelope.to_string());
 
