@@ -646,6 +646,23 @@ enum Commands {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// List open tasks with no activity for N+ days. Use to clean up
+    /// tasks that auto-opened, got a few events, then went silent —
+    /// candidates for `task-journal close --outcome-tag abandoned`.
+    Stale {
+        /// Inactivity threshold in days. Default 7.
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
+    /// Garbage-collect the pending classifier queue. Removes entries
+    /// older than N days OR marked dead by retry exhaustion. Run after
+    /// classifier auth was broken for a while and the queue grew
+    /// stale.
+    PendingGc {
+        /// Age threshold in days. Default 7.
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
     /// Set or update the goal of an existing task.
     Goal {
         task_id: String,
@@ -1025,6 +1042,73 @@ fn main() -> Result<()> {
             writer.append(&event)?;
             writer.flush_durable()?;
             println!("{}", event.event_id);
+        }
+        Commands::Stale { days } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            let stale = tj_core::db::stale_tasks(&conn, days)?;
+            if stale.is_empty() {
+                println!("(no stale tasks — all open tasks active within {days} days)");
+            } else {
+                println!("# Stale tasks (idle ≥ {days} days)\n");
+                for t in stale {
+                    println!(
+                        "{}  {} days idle  {}  {}",
+                        t.task_id, t.days_idle, t.last_event_at, t.title
+                    );
+                }
+                println!(
+                    "\nClose abandoned ones with: task-journal close <id> --outcome-tag abandoned --reason <why>"
+                );
+            }
+        }
+        Commands::PendingGc { days } => {
+            let pending_dir = tj_core::paths::events_dir()?
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("events_dir has no parent"))?
+                .join("pending");
+            if !pending_dir.exists() {
+                println!("(no pending dir — nothing to gc)");
+                return Ok(());
+            }
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+            let mut removed = 0usize;
+            for entry in std::fs::read_dir(&pending_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                // Prefer the file's mtime over JSON parsing — pending
+                // payloads include their own queued_at but are not
+                // guaranteed parseable when the classifier corrupted
+                // input mid-stream.
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| {
+                        chrono::DateTime::<chrono::Utc>::from(t)
+                            .signed_duration_since(cutoff)
+                            .num_seconds()
+                            .into()
+                    });
+                if let Some(secs) = mtime {
+                    if secs < 0 && std::fs::remove_file(&path).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+            println!(
+                "removed {} stale pending entries (older than {} days)",
+                removed, days
+            );
         }
         Commands::Reopen { task_id, reason } => {
             // The Reopen event itself flips tasks.status back to open
@@ -2070,27 +2154,29 @@ fn auto_open_task_from_prompt(
         tj_core::db::set_task_goal(conn, &task_id, &goal)?;
     }
 
-    // v0.5.0 Phase C: if the prompt mentions any tracked issue
-    // identifiers (FIN-868, JIRA-123…), search the journal for prior
-    // tasks that referenced the same issue. Auto-link them via the
-    // External column and warn on stderr when the prior is closed —
-    // user can reopen it instead of starting fresh.
+    // v0.5.0 Phase C / v0.6.0: score-based linking. Pull artifacts
+    // from the prompt — ticket ids, commit hashes, file paths — then
+    // ask the journal which prior tasks share enough signal to be a
+    // probable continuation. Anything with score > 0 gets linked via
+    // External; the strongest closed match also triggers a stderr
+    // hint so the user can reopen instead of accumulating duplicates.
     let prompt_arts = tj_core::artifacts::extract(prompt);
-    if !prompt_arts.linked_issues.is_empty() {
-        let related = tj_core::db::find_tasks_by_linked_issues(conn, &prompt_arts.linked_issues)?;
-        for (other_id, status) in related {
-            if other_id == task_id {
+    if !prompt_arts.is_empty() {
+        let related = tj_core::db::find_related_tasks(conn, &prompt_arts)?;
+        let mut warned = false;
+        for r in related.iter().take(5) {
+            if r.task_id == task_id {
                 continue;
             }
-            let _ = tj_core::db::add_task_external(conn, &task_id, &format!("linked:{other_id}"));
-            if status == "closed" {
+            let _ =
+                tj_core::db::add_task_external(conn, &task_id, &format!("linked:{}", r.task_id));
+            if !warned && r.status == "closed" {
                 eprintln!(
-                    "task-journal: prompt references issue(s) {}, which appear in closed task {} — \
-                     run `task-journal reopen {}` if this is a continuation rather than new scope.",
-                    prompt_arts.linked_issues.join(","),
-                    other_id,
-                    other_id
+                    "task-journal: this prompt looks like a continuation of closed task {} \
+                     (score {:.1}) — run `task-journal reopen {}` if it is.",
+                    r.task_id, r.score, r.task_id
                 );
+                warned = true;
             }
         }
     }

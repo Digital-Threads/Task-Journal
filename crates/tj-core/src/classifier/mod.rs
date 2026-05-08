@@ -25,6 +25,14 @@ pub struct ClassifyOutput {
     pub confidence: f64,
     pub evidence_strength: Option<EvidenceStrength>,
     pub suggested_text: String,
+    /// v0.6.0: optional structured artifacts the classifier extracted
+    /// directly. When absent (old protocol or model didn't bother),
+    /// the journal falls back to regex extraction in
+    /// `db::ingest_new_events`. When present, the two sets are merged
+    /// at ingest time so the model can surface artifacts the regex
+    /// would miss (e.g. ticket ids in non-ASCII brackets).
+    #[serde(default)]
+    pub artifacts: Option<crate::artifacts::Artifacts>,
 }
 
 pub trait Classifier: Send + Sync {

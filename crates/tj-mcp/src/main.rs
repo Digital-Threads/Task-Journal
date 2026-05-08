@@ -193,6 +193,11 @@ pub struct TaskSearchResult {
 pub struct TaskCreateParams {
     pub title: String,
     pub initial_context: Option<String>,
+    /// v0.4.0+: explicit goal — what is the user trying to accomplish.
+    /// Renders as the first line of every pack and is the anchor for
+    /// "why was this done?" answers weeks later. Optional only for
+    /// backwards compat; agents should always pass it.
+    pub goal: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskCreateResult {
@@ -220,6 +225,9 @@ pub struct TaskCloseParams {
     pub task_id: String,
     pub reason: String,
     pub outcome: Option<String>,
+    /// v0.4.0+: structured outcome tag — `done`, `abandoned`, or
+    /// `superseded`. Filterable; the free-form text lives in `outcome`.
+    pub outcome_tag: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskCloseResult {
@@ -351,7 +359,7 @@ impl TaskJournalServer {
     ) -> Result<Json<TaskCreateResult>, McpError> {
         traced_tool("task_create", async move {
             run_blocking(move || {
-                let (_, events_path, _) = project_paths()?;
+                let (project_hash, events_path, state_path) = project_paths()?;
                 std::fs::create_dir_all(events_path.parent().unwrap())?;
 
                 let task_id = tj_core::new_task_id();
@@ -367,6 +375,19 @@ impl TaskJournalServer {
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
+
+                // v0.6.0: persist goal column when caller passed --goal /
+                // params.goal. We must ingest into SQLite first so the
+                // task row exists; without ingestion set_task_goal hits
+                // an empty tasks table and silently no-ops.
+                if let Some(goal) = p.goal.as_deref() {
+                    let conn_arc = cached_open(&state_path)?;
+                    let conn = conn_arc
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                    tj_core::db::set_task_goal(&conn, &task_id, goal)?;
+                }
 
                 Ok(TaskCreateResult {
                     task_id,
@@ -443,6 +464,21 @@ impl TaskJournalServer {
                     if !tj_core::db::task_exists(&conn, &p.task_id)? {
                         anyhow::bail!("task not found: {}", p.task_id);
                     }
+                    // v0.6.0: validate outcome_tag enum and persist
+                    // outcome+tag to the task row before writing the
+                    // close event. Same enum + same ordering as the
+                    // CLI close handler — keep them lockstep.
+                    if let Some(tag) = p.outcome_tag.as_deref() {
+                        match tag {
+                            "done" | "abandoned" | "superseded" => {}
+                            other => anyhow::bail!(
+                                "invalid outcome_tag `{other}` (expected: done | abandoned | superseded)"
+                            ),
+                        }
+                    }
+                    if let Some(o) = p.outcome.as_deref() {
+                        tj_core::db::set_task_outcome(&conn, &p.task_id, o, p.outcome_tag.as_deref())?;
+                    }
                 } // release the connection lock before doing the JSONL append
 
                 let mut event = tj_core::event::Event::new(
@@ -456,6 +492,9 @@ impl TaskJournalServer {
                 meta.insert("reason".into(), serde_json::Value::String(p.reason.clone()));
                 if let Some(o) = &p.outcome {
                     meta.insert("outcome".into(), serde_json::Value::String(o.clone()));
+                }
+                if let Some(t) = &p.outcome_tag {
+                    meta.insert("outcome_tag".into(), serde_json::Value::String(t.clone()));
                 }
                 event.meta = serde_json::Value::Object(meta);
 

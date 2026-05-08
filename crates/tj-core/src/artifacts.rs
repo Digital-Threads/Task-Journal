@@ -95,11 +95,13 @@ pub fn extract(text: &str) -> Artifacts {
     );
 
     // File paths — heuristic: path-like tokens with at least one slash
-    // (and an extension) OR a leading ./ . Tight enough to skip prose,
-    // loose enough to catch the common cases (src/foo.rs, ./bar.ts,
+    // (and an extension) OR a leading ./ . Path segments allow a
+    // leading dot so `.docs/specs/auth.md`, `.github/workflows/ci.yml`
+    // etc are captured as artifacts. Tight enough to skip prose, loose
+    // enough to catch the common cases (src/foo.rs, ./bar.ts,
     // crates/tj-core/src/db.rs).
     static_re(
-        r"(?:\./|[A-Za-z0-9_\-]+/)+[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,8}\b",
+        r"(?:\./|\.?[A-Za-z0-9_\-]+/)+[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,8}\b",
         |m| a.files.push(m.to_string()),
         text,
     );
@@ -181,6 +183,16 @@ mod tests {
         let a = extract("edited crates/tj-core/src/db.rs and ./README.md");
         assert!(a.files.contains(&"crates/tj-core/src/db.rs".to_string()));
         assert!(a.files.contains(&"./README.md".to_string()));
+    }
+
+    #[test]
+    fn extracts_dot_prefixed_dirs() {
+        // .docs/specs/*.md, .github/workflows/*.yml — leading-dot dirs
+        // are spec/config holders we want surfaced as artifacts so the
+        // pack ties decisions back to the document that justified them.
+        let a = extract("see .docs/specs/auth.md and .github/workflows/ci.yml");
+        assert!(a.files.contains(&".docs/specs/auth.md".to_string()));
+        assert!(a.files.contains(&".github/workflows/ci.yml".to_string()));
     }
 
     #[test]

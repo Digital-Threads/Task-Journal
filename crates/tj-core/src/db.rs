@@ -384,6 +384,139 @@ pub fn task_metadata(conn: &Connection, task_id: &str) -> anyhow::Result<Option<
     })
 }
 
+/// One row of the stale-task report: an open task whose last event
+/// crossed the inactivity threshold.
+#[derive(Debug, Clone)]
+pub struct StaleTask {
+    pub task_id: String,
+    pub title: String,
+    pub last_event_at: String,
+    pub days_idle: i64,
+}
+
+/// Find open tasks with no event in the last `days` days. Sorted by
+/// idle time descending so the user sees the most ancient first.
+pub fn stale_tasks(conn: &Connection, days: i64) -> anyhow::Result<Vec<StaleTask>> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+    let cutoff_str = cutoff.to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT task_id, title, last_event_at FROM tasks
+         WHERE status = 'open' AND last_event_at < ?1
+         ORDER BY last_event_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![cutoff_str], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let now = chrono::Utc::now();
+    let mut out = Vec::new();
+    for row in rows {
+        let (task_id, title, last_at) = row?;
+        let dt = chrono::DateTime::parse_from_rfc3339(&last_at)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or(now);
+        let days_idle = (now - dt).num_days();
+        out.push(StaleTask {
+            task_id,
+            title,
+            last_event_at: last_at,
+            days_idle,
+        });
+    }
+    Ok(out)
+}
+
+/// Score-weighted relationship between a fresh prompt's artifacts and
+/// every prior task's artifacts. Higher score = stronger continuation
+/// signal. Threshold tuning is the caller's job; v0.6.0 auto-link
+/// keeps anything with score > 0.0.
+#[derive(Debug, Clone)]
+pub struct RelatedTask {
+    pub task_id: String,
+    pub status: String,
+    pub score: f64,
+}
+
+/// Find tasks whose events overlap the given artifacts on any
+/// dimension we have a signal for. Weights:
+///   shared linked_issue → +1.0   (strongest, ticket id is unique)
+///   shared commit_hash  → +0.8   (commits are nearly unique)
+///   shared file path    → +0.3   (files churn across tasks)
+///
+/// The scan reads `events_index.artifacts` (JSON) directly with LIKE
+/// substring matches — JSON1 would be cleaner but keeps the codepath
+/// dependency-free. Returns top hits sorted by score desc; ties keep
+/// the most-recent task first.
+pub fn find_related_tasks(
+    conn: &Connection,
+    arts: &crate::artifacts::Artifacts,
+) -> anyhow::Result<Vec<RelatedTask>> {
+    use std::collections::HashMap;
+    if arts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    let mut last_seen: HashMap<String, String> = HashMap::new();
+
+    let needles: Vec<(String, f64)> = arts
+        .linked_issues
+        .iter()
+        .map(|s| (s.clone(), 1.0))
+        .chain(arts.commit_hashes.iter().map(|s| (s.clone(), 0.8)))
+        .chain(arts.files.iter().map(|s| (s.clone(), 0.3)))
+        .collect();
+
+    for (needle, weight) in needles {
+        let pattern = format!("%\"{}\"%", needle.replace('%', "\\%"));
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT task_id, MAX(timestamp) as ts FROM events_index
+             WHERE artifacts LIKE ?1
+             GROUP BY task_id
+             ORDER BY ts DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, ts) = row?;
+            *scores.entry(id.clone()).or_insert(0.0) += weight;
+            last_seen.insert(id, ts);
+        }
+    }
+
+    let mut out: Vec<RelatedTask> = Vec::with_capacity(scores.len());
+    for (id, score) in scores {
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                rusqlite::params![&id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(status) = status {
+            out.push(RelatedTask {
+                task_id: id,
+                status,
+                score,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ts_a = last_seen.get(&a.task_id).cloned().unwrap_or_default();
+                let ts_b = last_seen.get(&b.task_id).cloned().unwrap_or_default();
+                ts_b.cmp(&ts_a)
+            })
+    });
+    Ok(out)
+}
+
 /// Find tasks (open or closed) whose events reference any of the given
 /// issue identifiers (FIN-868, JIRA-123, INC-7…). Looks at the
 /// per-event `artifacts.linked_issues` column populated on ingest.

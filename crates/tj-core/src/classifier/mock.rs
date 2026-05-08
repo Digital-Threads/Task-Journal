@@ -26,6 +26,7 @@ mod tests {
                 confidence: 0.95,
                 evidence_strength: None,
                 suggested_text: "...".into(),
+                artifacts: None,
             },
         };
         let out = m

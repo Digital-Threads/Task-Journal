@@ -2013,7 +2013,11 @@ fn auto_open_links_to_prior_task_referencing_same_issue() {
         .args(["pack", &new_id, "--mode", "full"])
         .assert()
         .success()
-        .stdout(contains(format!("linked:{}", prior)));
+        // v0.6.0: linked entries surface in their own **Linked** block
+        // instead of mashed into External, with the prior task's
+        // current status annotated next to the id.
+        .stdout(contains("**Linked**:"))
+        .stdout(contains(format!("- {} [closed]", prior)));
 }
 
 #[test]

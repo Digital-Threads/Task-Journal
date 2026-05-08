@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-08
+
+Backlog cleanup: MCP brought in line with CLI, score-based linking,
+TUI/pack split out a Linked block, hygiene commands for stale tasks
+and pending GC, and the classifier protocol got an artifacts field
+ready for richer model output.
+
+### Added — MCP parity
+- `task_create` MCP tool now accepts `goal: Option<String>` and
+  persists it via `set_task_goal` after writing the open event.
+- `task_close` MCP tool now accepts `outcome_tag: Option<String>`
+  validated against `done|abandoned|superseded`. Outcome + tag
+  both go into the tasks table and the close event meta.
+
+### Added — Hygiene CLI commands
+- `task-journal stale [--days 7]` lists open tasks whose last event
+  crossed the inactivity threshold. Sorted by idle time descending.
+  Hint at the bottom suggests close-with-abandoned for the obvious
+  cases.
+- `task-journal pending-gc [--days 7]` deletes pending classifier
+  payloads older than the threshold. Useful after a long classifier
+  outage when the queue stops being recoverable.
+
+### Added — Smarter linking
+- `db::find_related_tasks` scores tasks by overlap on
+  `linked_issue` (1.0), `commit_hash` (0.8), and `file path` (0.3).
+  Replaces the linked-issue-only scan inside auto-open.
+- Pack render splits `linked:tj-xxx` entries into a dedicated
+  `**Linked**:` block with the live status of each pointer (`open`
+  / `closed` / `unknown`). Other external references stay in
+  `**External**`.
+- Artifact extractor now captures dot-prefixed directories
+  (`.docs/specs/auth.md`, `.github/workflows/ci.yml`).
+
+### Added — Classifier protocol
+- `ClassifyOutput.artifacts: Option<Artifacts>` (with `#[serde(default)]`
+  for backwards compat). Field is ready for the next prompt
+  iteration that will instruct the model to return structured
+  artifacts; current behaviour unchanged (regex extraction still
+  the source of truth).
+
+### Tests
+- 1 new unit test for dot-prefixed directory extraction.
+- All previous tests updated for the new External/Linked split.
+
 ## [0.5.0] - 2026-05-08
 
 Auto-everything release. Phase B + C of the v0.5.0 plan land

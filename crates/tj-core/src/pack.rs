@@ -234,7 +234,43 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         text.push_str(&format!("**Outcome**{tag}: {outcome_str}\n"));
     }
     if let Some(ext) = external.as_deref().filter(|s| !s.is_empty()) {
-        text.push_str(&format!("**External**: {ext}\n"));
+        // Split out `linked:tj-xxx` entries so the user sees the
+        // task-graph dimension separately from PRs / commit hashes /
+        // beads-ids. Other refs stay in External; linked entries get
+        // their own block annotated with the live status of each
+        // pointer.
+        let (linked, other): (Vec<_>, Vec<_>) = ext
+            .split(',')
+            .map(|s| s.trim())
+            .partition(|s| s.starts_with("linked:") || s.starts_with("linked: "));
+        if !other.is_empty() {
+            text.push_str(&format!(
+                "**External**: {}\n",
+                other
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if !linked.is_empty() {
+            text.push_str("**Linked**:\n");
+            for entry in linked {
+                let id = entry.trim_start_matches("linked:").trim();
+                let st: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM tasks WHERE task_id = ?1",
+                        rusqlite::params![id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                match st {
+                    Some(s) => text.push_str(&format!("- {id} [{s}]\n")),
+                    None => text.push_str(&format!("- {id} [unknown]\n")),
+                }
+            }
+        }
     }
 
     // v0.5.0 Phase B: artifacts auto-extracted from event text. Render
