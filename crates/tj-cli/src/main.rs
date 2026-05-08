@@ -1396,10 +1396,27 @@ fn main() -> Result<()> {
                     if events_path.exists() {
                         tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     }
-                    let recent = recent_task_contexts(&conn, 5)?;
+                    let mut recent = recent_task_contexts(&conn, 5)?;
                     if recent.is_empty() {
-                        // No active tasks — nothing to classify against. Skip silently.
-                        return Ok(());
+                        // No open tasks. v0.5.0 Phase A: auto-open a new
+                        // task from the user's prompt so subsequent
+                        // events have somewhere to land. Without this
+                        // every fresh session was a black hole — events
+                        // dropped silently because there was nothing to
+                        // classify against. Opt-out via
+                        // TJ_AUTO_OPEN_TASKS=0; only fires for
+                        // UserPromptSubmit (assistant tool calls
+                        // shouldn't conjure tasks).
+                        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+                            .ok()
+                            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                            .unwrap_or(false);
+                        if auto_open_disabled || !kind.contains("UserPrompt") {
+                            return Ok(());
+                        }
+                        let new_task =
+                            auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?;
+                        recent.push(new_task);
                     }
 
                     use tj_core::classifier::Classifier;
@@ -1941,6 +1958,55 @@ fn recent_task_contexts(
         });
     }
     Ok(out)
+}
+
+/// v0.5.0 Phase A: when ingest-hook fires UserPromptSubmit and there
+/// are no open tasks, synthesize one from the prompt itself. Title is
+/// the first line trimmed to 80 chars; goal is the prompt trimmed to
+/// 200 chars. Returns a TaskContext so the classifier has somewhere
+/// to attach the same prompt as the first real event.
+fn auto_open_task_from_prompt(
+    events_path: &std::path::Path,
+    project_hash: &str,
+    conn: &rusqlite::Connection,
+    prompt: &str,
+) -> anyhow::Result<tj_core::classifier::TaskContext> {
+    let cleaned = prompt.trim();
+    // Title: first non-empty line, ≤80 chars. Falls back to "(empty
+    // prompt)" so we never write a NULL title — the classifier and
+    // the TUI both display titles directly.
+    let title: String = cleaned
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(80).collect())
+        .unwrap_or_else(|| "(auto-opened: empty prompt)".to_string());
+    let goal: String = cleaned.chars().take(200).collect();
+
+    let task_id = tj_core::new_task_id();
+    let mut event = tj_core::event::Event::new(
+        task_id.clone(),
+        tj_core::event::EventType::Open,
+        tj_core::event::Author::User,
+        tj_core::event::Source::Cli,
+        title.clone(),
+    );
+    event.meta = serde_json::json!({ "title": title, "auto_opened": true });
+
+    let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+    writer.append(&event)?;
+    writer.flush_durable()?;
+
+    tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
+    if !goal.is_empty() {
+        tj_core::db::set_task_goal(conn, &task_id, &goal)?;
+    }
+
+    Ok(tj_core::classifier::TaskContext {
+        task_id,
+        title,
+        last_events: vec![],
+    })
 }
 
 fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyhow::Result<()> {

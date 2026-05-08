@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-08
+
+v0.5.0 Phase A — auto-create tasks. Removes the manual
+`task-journal create --goal "..."` step. The journal now opens a
+task on demand the first time a UserPromptSubmit fires into an
+empty project, taking the prompt itself as the goal. No prompt is
+ever lost again.
+
+### Added
+- `auto_open_task_from_prompt()` helper in `tj-cli`. Synthesizes a
+  task with `title = first line trimmed to 80 chars`,
+  `goal = prompt trimmed to 200 chars`, then continues the normal
+  classifier pipeline so the same prompt becomes the first event on
+  the task it just opened.
+- `meta.auto_opened: true` flag on synthesized open events so
+  reclassify / analytics can distinguish auto-opened tasks from
+  user-created ones.
+
+### Changed
+- `ingest-hook` previously dropped UserPromptSubmit events when no
+  open task existed. Now it auto-opens unless the assistant tool
+  call is the trigger (PostToolUse / Stop never conjure tasks).
+
+### Configuration
+- `TJ_AUTO_OPEN_TASKS=0` (or `false`) restores the v0.4.0 silent-
+  drop behaviour. Default is ON.
+
+### Phase B/C still pending
+- B (artifacts auto-extract: commit_hash, pr_url, files, linked_issue)
+- C (linked_issue / reopen suggestion when prompt matches a recently
+  closed task)
+
 ## [0.4.0] - 2026-05-08
 
 Task model redesign — Phase 1. A task is now an explicit

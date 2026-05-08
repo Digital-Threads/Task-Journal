@@ -1815,3 +1815,103 @@ fn help_lists_subcommands() {
         .stdout(contains("events"))
         .stdout(contains("rebuild-state"));
 }
+
+#[test]
+fn ingest_hook_auto_opens_task_when_no_open_tasks() {
+    // v0.5.0 Phase A: a UserPromptSubmit hook firing into an empty
+    // project must synthesize a task on the fly, otherwise the prompt
+    // (and every event after it) is dropped silently.
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    // Force the classifier to fail so the rest of the pipeline doesn't
+    // try to spawn `claude -p`. Auto-open happens BEFORE the classifier
+    // call, so the task should still be created.
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-auto",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "implement FIN-868 paygate fee dedup"
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        .args(["ingest-hook", "--backend", "cli"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    // Auto-opened task is now searchable. Pack it and check that the
+    // goal field equals the prompt text — that's the contract.
+    let search_out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "paygate"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(search_out).unwrap();
+    // Search output is task-id-per-line. A non-empty body proves the
+    // auto-opened task was indexed by FTS5 against the prompt text.
+    let task_id = body
+        .lines()
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("tj-"))
+        .unwrap_or_else(|| {
+            panic!("search must surface the auto-opened task by prompt text, got: {body:?}")
+        });
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: implement FIN-868 paygate fee dedup"));
+}
+
+#[test]
+fn ingest_hook_auto_open_disabled_via_env() {
+    // Opt-out path: TJ_AUTO_OPEN_TASKS=0 must restore the v0.4.0
+    // behaviour (drop the prompt silently when no open task exists).
+    let dir = assert_fs::TempDir::new().unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-noop",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "marker_noautoopen_xyz must not appear"
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        .env("TJ_AUTO_OPEN_TASKS", "0")
+        .args(["ingest-hook", "--backend", "cli"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let search_out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "marker_noautoopen_xyz"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(search_out).unwrap();
+    assert!(
+        !body.contains("marker_noautoopen_xyz"),
+        "auto-open must be skipped when TJ_AUTO_OPEN_TASKS=0, got: {body:?}"
+    );
+}
