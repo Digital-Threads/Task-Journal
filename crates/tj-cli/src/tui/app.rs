@@ -35,10 +35,27 @@ impl App {
         };
 
         // Parse session metadata (lightweight — just first user msg + timestamps).
+        // Filter out classifier sessions: every TJ_IN_CLASSIFIER-spawned `claude
+        // -p` invocation creates its own JSONL in ~/.claude/projects/, and they
+        // all start with the same canned prompt. Without this filter the TUI is
+        // drowned in 1-message ghost sessions and real work becomes hard to
+        // find. The marker string is defined inside the classifier prompt — we
+        // match a stable prefix.
+        const CLASSIFIER_PROMPT_PREFIX: &str =
+            "You classify chat chunks for an AI-coding-agent task journal";
         let mut items = Vec::new();
         for path in &sessions {
             match parser::parse_session(path) {
-                Ok(parsed) => items.push(parsed),
+                Ok(parsed) => {
+                    if parsed
+                        .first_user_text()
+                        .map(|t| t.trim_start().starts_with(CLASSIFIER_PROMPT_PREFIX))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    items.push(parsed);
+                }
                 Err(_) => continue,
             }
         }

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-05-08
+
+### Fixed
+- TUI session list (`task-journal ui`) now hides classifier sessions.
+  Each `claude -p` invocation we make for classification creates its
+  own JSONL in `~/.claude/projects/`; without filtering, the TUI was
+  buried under hundreds of one-message ghost sessions all starting
+  with "You classify chat chunks for an AI-coding-agent task journal."
+  We now skip any session whose first user message begins with that
+  marker so only real conversations show up.
+
 ## [0.2.10] - 2026-05-07
 
 ### Fixed
