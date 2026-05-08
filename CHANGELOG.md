@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-08
+
+Three correctness fixes for the auto-capture pipeline. The journal
+was technically working but producing confusing output: events
+attached to the wrong tasks, sessions auto-closed tasks they had no
+business closing, and TUI's compact summary hid the reasoning chain
+the user actually wanted to see.
+
+### Fixed
+- TUI task detail now renders the **Full** pack instead of Compact —
+  every event, decisions, rejections, evidence (including commit
+  hashes), and close lines, in chronological order. Compact's three-
+  line "Active decisions / Recent events" summary made the detail
+  view look empty.
+- Stop hook no longer auto-closes tasks. The Stop hook fires every
+  time a Claude Code session ends, and the classifier was happily
+  emitting `Close` events from those endings. Sessions ending !=
+  task done. Closes are now reserved for explicit
+  `task-journal close <id>` calls.
+- Closed and missing tasks are no longer silently appended to. When
+  the classifier's `task_id_guess` points at a task that doesn't
+  exist or is already closed, the event is routed to `pending/`
+  instead of being attached. Old tasks ("Demo task", "Тест plugin"
+  in our case) stop accumulating events from unrelated work.
+
+### Added
+- `tj_core::db::task_status(&conn, task_id)` helper for the closed-
+  task safeguard above.
+
 ## [0.3.0] - 2026-05-08
 
 ### Changed

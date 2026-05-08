@@ -1326,6 +1326,44 @@ fn main() -> Result<()> {
                     let Some(tid) = out.task_id_guess else {
                         return Ok(());
                     };
+
+                    // Journal-integrity safeguards. The classifier sometimes
+                    // mis-attributes events to old or closed tasks (no fault
+                    // of the model — its prompt only sees recent_tasks). We
+                    // reject three patterns that produce confusing journals:
+                    //
+                    //   1. Stop-hook → Close event. The Stop hook fires at
+                    //      every Claude Code session end. Session ending
+                    //      != task done. Closes happen via explicit
+                    //      `task-journal close <id>` only.
+                    //   2. task_id_guess pointing at a non-existent task —
+                    //      route to pending so the user can decide later.
+                    //   3. task_id_guess pointing at a CLOSED task — same
+                    //      treatment; closed tasks must stay closed.
+                    use tj_core::event::EventType;
+                    if matches!(out.event_type, EventType::Close) && kind == "Stop" {
+                        return Ok(());
+                    }
+                    match tj_core::db::task_status(&conn, &tid)? {
+                        None => {
+                            persist_pending(
+                                &events_path,
+                                &text,
+                                &format!("task_id_guess `{tid}` not found"),
+                            )?;
+                            return Ok(());
+                        }
+                        Some(s) if s == "closed" => {
+                            persist_pending(
+                                &events_path,
+                                &text,
+                                &format!("task_id_guess `{tid}` is closed"),
+                            )?;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+
                     (
                         out.event_type,
                         tid,

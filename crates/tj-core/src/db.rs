@@ -254,6 +254,15 @@ pub fn task_exists(conn: &Connection, task_id: &str) -> anyhow::Result<bool> {
     Ok(count > 0)
 }
 
+/// Status string for an existing task (e.g. "open", "closed"). Returns
+/// `None` when the task is unknown — caller decides whether that's a
+/// hard error or a route-to-pending case.
+pub fn task_status(conn: &Connection, task_id: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT status FROM tasks WHERE task_id = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![task_id])?;
+    Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
+}
+
 /// Look up the most recent `event_id` we've ingested for this project.
 /// Returns `None` when the project has never been indexed (first call,
 /// or migration v002 just landed on an existing 0.1.x DB).

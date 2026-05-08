@@ -230,7 +230,10 @@ impl App {
         let project_hash = tj_core::project_hash::from_path(&cwd)?;
         let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
         let conn = tj_core::db::open(&state_path)?;
-        let pack = tj_core::pack::assemble(&conn, task_id, tj_core::pack::PackMode::Compact)?;
+        // Full mode: show the complete reasoning chain — every event,
+        // decisions, rejections, evidence with commit hashes — instead
+        // of the 3-line Compact summary the CLI default uses.
+        let pack = tj_core::pack::assemble(&conn, task_id, tj_core::pack::PackMode::Full)?;
         Ok(pack.text)
     }
 
