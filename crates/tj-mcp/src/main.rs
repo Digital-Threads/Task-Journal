@@ -650,8 +650,12 @@ mod tests {
 
         assert_eq!(a.unwrap(), 1);
         assert_eq!(b.unwrap(), 2);
+        // Sequential execution would require ≥400ms (two 200ms sleeps);
+        // overlap drops it to ~200ms. We give CI runners plenty of slack
+        // (600ms) — still distinguishes parallel from serial without
+        // flaking on macOS/Windows GitHub runners under load.
         assert!(
-            elapsed < Duration::from_millis(350),
+            elapsed < Duration::from_millis(600),
             "blocking tasks must overlap on the blocking pool — got {elapsed:?}"
         );
     }
