@@ -446,6 +446,49 @@ pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// One row of the task list rendered by the TUI: enough to render the
+/// list view without round-tripping for each task. `event_count` joins
+/// `events_index` so we don't need a second query per row.
+#[derive(Debug, Clone)]
+pub struct TaskRow {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub last_event_at: String,
+    pub event_count: usize,
+}
+
+/// All tasks for a project, ordered with open ones first (by recency)
+/// then closed ones. The TUI list view binds directly to this — there
+/// is no other consumer, so the shape is tuned for that callsite.
+pub fn list_tasks_by_project(
+    conn: &Connection,
+    project_hash: &str,
+) -> anyhow::Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.task_id, t.title, t.status, t.last_event_at,
+                COALESCE(c.cnt, 0) AS event_count
+         FROM tasks t
+         LEFT JOIN (
+             SELECT task_id, COUNT(*) AS cnt FROM events_index GROUP BY task_id
+         ) c ON c.task_id = t.task_id
+         WHERE t.project_hash = ?1
+         ORDER BY (t.status = 'open') DESC, t.last_event_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![project_hash], |r| {
+            Ok(TaskRow {
+                task_id: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                status: r.get::<_, String>(2)?,
+                last_event_at: r.get::<_, String>(3)?,
+                event_count: r.get::<_, i64>(4)? as usize,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

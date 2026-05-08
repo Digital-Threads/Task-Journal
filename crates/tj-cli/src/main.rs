@@ -663,12 +663,18 @@ enum Commands {
     },
     /// Show local classifier and journal statistics.
     Stats,
-    /// Interactive TUI: browse sessions and read chats.
+    /// Interactive TUI: browse the journal's tasks (default) or, with
+    /// `--chats`, the underlying Claude Code chat-session JSONLs.
     #[command(alias = "tui")]
     Ui {
         /// Project path override (default: current directory).
         #[arg(long)]
         project: Option<String>,
+        /// Legacy mode: open the chat-session browser instead of the
+        /// task list. Lets you read raw Claude Code session history
+        /// when the task journal alone isn't enough.
+        #[arg(long)]
+        chats: bool,
     },
     /// Import task-journal events from existing Claude Code session history.
     /// Parses JSONL session files and creates tasks retroactively.
@@ -1564,20 +1570,37 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Ui { project } => {
+        Commands::Ui { project, chats } => {
             let project_path = match project {
                 Some(p) => std::path::PathBuf::from(p),
                 None => std::env::current_dir()?,
             };
-            let mut app = tui::app::App::new(&project_path)?;
-            if app.session_list.sessions.is_empty() {
-                eprintln!(
-                    "No Claude Code sessions found for: {}",
-                    project_path.display()
-                );
-                return Ok(());
+            if chats {
+                // Legacy chat-session browser. Bail early when there's
+                // nothing to show — the old behavior — so users running
+                // `--chats` outside a Claude Code project don't get a
+                // confusing empty TUI.
+                let mut app = tui::app::App::new_chats(&project_path)?;
+                let empty = app
+                    .session_list
+                    .as_ref()
+                    .map(|sl| sl.sessions.is_empty())
+                    .unwrap_or(true);
+                if empty {
+                    eprintln!(
+                        "No Claude Code sessions found for: {}",
+                        project_path.display()
+                    );
+                    return Ok(());
+                }
+                app.run()?;
+            } else {
+                // Default: task journal browser. Empty list is fine —
+                // TaskList renders a helpful "no tasks yet" placeholder
+                // pointing at create / install-hooks --backfill.
+                let mut app = tui::app::App::new(&project_path)?;
+                app.run()?;
             }
-            app.run()?;
         }
         Commands::Backfill {
             dry_run,

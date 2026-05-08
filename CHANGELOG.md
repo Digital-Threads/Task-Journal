@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-08
+
+### Changed
+- **`task-journal ui` now opens the task-journal browser by default,
+  not the chat-session browser.** Surfaces what the journal is *for*
+  — tasks of the current project (open first by recency, then closed)
+  with event count and last-activity timestamps. Enter on a task
+  renders its compact resume-pack inline. The old chat-session
+  browser is still available behind `task-journal ui --chats`. This
+  is a breaking change to UX — bumping minor version (0.3.x) to
+  flag it.
+
+### Added
+- New `tj_core::db::list_tasks_by_project` query and `TaskRow` type
+  feeding the new TUI list view. The query is denormalised (joins
+  `events_index` for `event_count` in a single round-trip) so the
+  TUI doesn't pay per-row overhead on large journals.
+- New TUI screens: `task_list` (the new default) and `task_detail`
+  (renders `pack::assemble(.., Compact)` text scrollably). Both have
+  the same key bindings as the legacy session browser (j/k arrow
+  navigation, Esc back, q quit).
+- `--chats` flag on `task-journal ui` to open the legacy chat-session
+  browser. Same behavior as v0.2.11's default.
+
 ## [0.2.11] - 2026-05-08
 
 ### Fixed
