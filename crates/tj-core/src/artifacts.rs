@@ -106,17 +106,15 @@ pub fn extract(text: &str) -> Artifacts {
         text,
     );
 
-    // Branch names from `git checkout -b <name>` / `git switch -c
-    // <name>` / `branch <name>` blurbs.
-    static_re(
-        r"(?:checkout -b|switch -c|branch)\s+([A-Za-z0-9._/\-]+)",
-        |_full| {},
-        text,
-    );
-    // The closure form above fires on the whole match; capture the
-    // group separately because Regex::captures is what we actually want
-    // here. Done as a second pass to keep the extractor flat.
-    if let Ok(re) = Regex::new(r"(?:checkout -b|switch -c|branch)\s+([A-Za-z0-9._/\-]+)") {
+    // Branch names from explicit git commands. v0.6.1: anchor the
+    // pattern to `git ...` so that prose like "branches: commits, PRs,
+    // files, branches names" does not capture the next word as a
+    // branch. The bare-`branch <name>` form is intentionally dropped —
+    // it caused too many false positives in journal events that
+    // mention the word "branch" without naming one.
+    if let Ok(re) =
+        Regex::new(r"\bgit\s+(?:checkout\s+-b|switch\s+-c|branch)\s+([A-Za-z0-9._/\-]+)")
+    {
         for cap in re.captures_iter(text) {
             if let Some(m) = cap.get(1) {
                 a.branch_names.push(m.as_str().to_string());
@@ -197,10 +195,28 @@ mod tests {
 
     #[test]
     fn extracts_branch_names() {
-        let a = extract("git checkout -b FIN-868-fix-paygate-fee then switch -c hotfix/abc");
+        // v0.6.1: only match explicit `git ...` commands so prose like
+        // "branches: commits, PRs, names" no longer captures "names"
+        // as a branch. Bare `switch -c` without `git ` prefix is also
+        // ignored — keep the pattern conservative.
+        let a = extract("git checkout -b FIN-868-fix-paygate-fee then git switch -c hotfix/abc");
         assert_eq!(
             a.branch_names,
             vec!["FIN-868-fix-paygate-fee", "hotfix/abc"]
+        );
+    }
+
+    #[test]
+    fn does_not_capture_branch_from_prose() {
+        // Journal events mention `branches:` as a list header. The
+        // pre-v0.6.1 extractor captured the next word ("names") as a
+        // branch. The tightened regex requires explicit `git ` prefix.
+        let a =
+            extract("Artifacts groups: commits, PRs, issues, files, branches names listed below");
+        assert!(
+            a.branch_names.is_empty(),
+            "regex must not pick up branches from prose, got: {:?}",
+            a.branch_names
         );
     }
 

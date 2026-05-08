@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-08
+
+Branch-name regex was too greedy and captured the next word after any
+prose mention of "branch". After running `reclassify` against a
+real-session task we saw `branches: names` appear in pack output
+because the meta-text discussed regex categories ("commits, PRs,
+issues, files, branches"). Fix: anchor the pattern to an explicit
+`git ` prefix.
+
+### Fixed
+- `tj_core::artifacts::extract` — the branch capture now requires
+  `\bgit\s+(?:checkout\s+-b|switch\s+-c|branch)\s+...` so bare-prose
+  `branch X` no longer matches.
+
+### Added
+- New unit test `does_not_capture_branch_from_prose` to lock the
+  regression.
+
 ## [0.6.0] - 2026-05-08
 
 Backlog cleanup: MCP brought in line with CLI, score-based linking,

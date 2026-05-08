@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-read"
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.nvm/versions/node/v22.16.0/lib/node_modules/token-pilot/dist/index.js hook-read"
           }
         ]
       },
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-edit"
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.nvm/versions/node/v22.16.0/lib/node_modules/token-pilot/dist/index.js hook-edit"
           }
         ]
       },
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-edit"
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.nvm/versions/node/v22.16.0/lib/node_modules/token-pilot/dist/index.js hook-edit"
           }
         ]
       },
@@ -53,7 +53,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-pre-bash"
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.nvm/versions/node/v22.16.0/lib/node_modules/token-pilot/dist/index.js hook-pre-bash"
           }
         ]
       },
@@ -62,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-pre-grep"
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.nvm/versions/node/v22.16.0/lib/node_modules/token-pilot/dist/index.js hook-pre-grep"
           }
         ]
       },
@@ -71,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.npm/_npx/3c6ec659f659d129/node_modules/token-pilot/dist/index.js hook-pre-task"
+            "command": "/home/shahinyanm/.nvm/versions/node/v22.16.0/bin/node /home/shahinyanm/.nvm/versions/node/v22.16.0/lib/node_modules/token-pilot/dist/index.js hook-pre-task"
           }
         ]
       }
