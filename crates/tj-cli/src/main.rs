@@ -584,6 +584,11 @@ enum Commands {
         /// Optional initial context paragraph.
         #[arg(long)]
         context: Option<String>,
+        /// Optional one-line goal: what is this task trying to achieve?
+        /// Renders prominently in `pack`/TUI; can be filled in later
+        /// with `task-journal goal <id> "<text>"`.
+        #[arg(long)]
+        goal: Option<String>,
     },
     /// Inspect events for a project.
     Events {
@@ -622,6 +627,31 @@ enum Commands {
         task_id: String,
         #[arg(long)]
         reason: Option<String>,
+        /// One-line outcome: what shipped / why we stopped.
+        #[arg(long)]
+        outcome: Option<String>,
+        /// Structured tag for the outcome: `done`, `abandoned`, or
+        /// `superseded`. Free-form text via `--outcome` is the
+        /// primary field; the tag is for filtering / aggregation.
+        #[arg(long)]
+        outcome_tag: Option<String>,
+    },
+    /// Set or update the goal of an existing task.
+    Goal {
+        task_id: String,
+        /// New goal text (one line). Pass an empty string to clear.
+        text: String,
+    },
+    /// Manage external references on a task (beads ids, GitHub PRs,
+    /// JIRA issues — anything that ties this journal entry to work
+    /// outside the journal).
+    External {
+        task_id: String,
+        /// Reference to append, e.g. `beads:claude-memory-rsw`,
+        /// `github:#42`. Append-only; pass multiple times to add
+        /// several references over time.
+        #[arg(long = "add")]
+        add: String,
     },
     /// Full-text search across events (FTS5).
     Search {
@@ -797,7 +827,11 @@ const PENDING_MAX_ATTEMPTS: u32 = 3;
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Create { title, context } => {
+        Commands::Create {
+            title,
+            context,
+            goal,
+        } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_dir = tj_core::paths::events_dir()?;
@@ -817,6 +851,18 @@ fn main() -> Result<()> {
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
+
+            // If --goal was provided, ingest the open event into SQLite
+            // (so the row exists) and write the goal column. Skipping
+            // this when --goal is absent keeps the SQLite hot path
+            // exclusive to ingest-hook / pack callers.
+            if let Some(g) = goal {
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                tj_core::db::set_task_goal(&conn, &task_id, &g)?;
+            }
 
             println!("{}", task_id);
         }
@@ -908,11 +954,28 @@ fn main() -> Result<()> {
             writer.flush_durable()?;
             println!("{}", event.event_id);
         }
-        Commands::Close { task_id, reason } => {
+        Commands::Close {
+            task_id,
+            reason,
+            outcome,
+            outcome_tag,
+        } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
             let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+
+            // Validate the outcome_tag enum so users don't accumulate
+            // arbitrary values in the column. Free-text lives in
+            // `outcome`; the tag is for filter/aggregate.
+            if let Some(tag) = outcome_tag.as_deref() {
+                match tag {
+                    "done" | "abandoned" | "superseded" => {}
+                    other => anyhow::bail!(
+                        "invalid --outcome-tag `{other}` (expected: done | abandoned | superseded)"
+                    ),
+                }
+            }
 
             // Catch up the index then assert the task is real before we
             // append a close event for an id that never existed.
@@ -922,6 +985,13 @@ fn main() -> Result<()> {
             }
             if !tj_core::db::task_exists(&conn, &task_id)? {
                 anyhow::bail!("task not found: {task_id}");
+            }
+            // Persist outcome BEFORE the close event so the cache wipe
+            // inside set_task_outcome doesn't compete with subsequent
+            // assemble calls. Both columns optional — caller can pass
+            // neither and just get the close event.
+            if let Some(o) = outcome.as_deref() {
+                tj_core::db::set_task_outcome(&conn, &task_id, o, outcome_tag.as_deref())?;
             }
             drop(conn);
 
@@ -940,6 +1010,38 @@ fn main() -> Result<()> {
             writer.append(&event)?;
             writer.flush_durable()?;
             println!("{}", event.event_id);
+        }
+        Commands::Goal { task_id, text } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if !tj_core::db::task_exists(&conn, &task_id)? {
+                anyhow::bail!("task not found: {task_id}");
+            }
+            tj_core::db::set_task_goal(&conn, &task_id, &text)?;
+            println!("ok");
+        }
+        Commands::External { task_id, add } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if !tj_core::db::task_exists(&conn, &task_id)? {
+                anyhow::bail!("task not found: {task_id}");
+            }
+            tj_core::db::add_task_external(&conn, &task_id, &add)?;
+            println!("ok");
         }
         Commands::EventCorrect {
             corrects,

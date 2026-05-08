@@ -187,11 +187,27 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         });
     }
 
-    let (title, status): (String, String) = conn
+    let (title, status, goal, outcome, outcome_tag, external): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT title, status FROM tasks WHERE task_id=?1",
+            "SELECT title, status, goal, outcome, outcome_tag, external FROM tasks WHERE task_id=?1",
             rusqlite::params![task_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .with_context(|| format!("task not found: {task_id}"))?;
 
@@ -202,6 +218,26 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     )?;
 
     let mut text = format!("# {title}  [status: {status}]\n\n");
+
+    // v0.4.0 task-as-goal block. Goal renders even when empty so the
+    // shape is consistent and the absence is visible. Outcome only
+    // when closed (avoids "(open)" noise on every active task).
+    // External only when populated.
+    let goal_str = goal.as_deref().unwrap_or("(not set)");
+    text.push_str(&format!("**Goal**: {goal_str}\n"));
+    if status == "closed" {
+        let outcome_str = outcome.as_deref().unwrap_or("(not recorded)");
+        let tag = outcome_tag
+            .as_deref()
+            .map(|t| format!(" [{t}]"))
+            .unwrap_or_default();
+        text.push_str(&format!("**Outcome**{tag}: {outcome_str}\n"));
+    }
+    if let Some(ext) = external.as_deref().filter(|s| !s.is_empty()) {
+        text.push_str(&format!("**External**: {ext}\n"));
+    }
+    text.push('\n');
+
     if matches!(mode, PackMode::Full) {
         text.push_str(&render_lifecycle(conn, task_id)?);
     }

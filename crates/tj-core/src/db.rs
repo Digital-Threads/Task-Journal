@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS index_state (
 );
 "#;
 
+/// v0.4.0 task-as-goal redesign: explicit goal/outcome on tasks +
+/// typed artifacts on events. NULLable so existing rows survive
+/// without backfill. Wipes the pack cache so old packs (rendered
+/// without Goal/Outcome blocks) regenerate on next view.
+const MIGRATION_003: &str = r#"
+ALTER TABLE tasks ADD COLUMN goal        TEXT;
+ALTER TABLE tasks ADD COLUMN outcome     TEXT;
+ALTER TABLE tasks ADD COLUMN outcome_tag TEXT;
+ALTER TABLE tasks ADD COLUMN external    TEXT;
+ALTER TABLE events_index ADD COLUMN artifacts TEXT;
+DELETE FROM task_pack_cache;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -88,6 +101,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: MIGRATION_002,
+    },
+    Migration {
+        version: 3,
+        sql: MIGRATION_003,
     },
 ];
 
@@ -261,6 +278,97 @@ pub fn task_status(conn: &Connection, task_id: &str) -> anyhow::Result<Option<St
     let mut stmt = conn.prepare("SELECT status FROM tasks WHERE task_id = ?1")?;
     let mut rows = stmt.query(rusqlite::params![task_id])?;
     Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
+}
+
+/// Set or replace `tasks.goal` for an existing task. Caller is
+/// expected to have validated the task exists (via `task_exists`); we
+/// don't error on no-op rows so the upsert pattern is uniform.
+pub fn set_task_goal(conn: &Connection, task_id: &str, goal: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE tasks SET goal = ?1 WHERE task_id = ?2",
+        rusqlite::params![goal, task_id],
+    )
+    .with_context(|| format!("set goal for {task_id}"))?;
+    // Pack cache is now stale for this task — drop the entry so the
+    // next render picks up the new goal.
+    conn.execute(
+        "DELETE FROM task_pack_cache WHERE task_id = ?1",
+        rusqlite::params![task_id],
+    )?;
+    Ok(())
+}
+
+/// Set or replace the closure metadata. Pass `None` for `outcome_tag`
+/// to leave it unset; pass `Some("done"|"abandoned"|"superseded")`
+/// for a structured tag. Free-text `outcome` is the primary field.
+pub fn set_task_outcome(
+    conn: &Connection,
+    task_id: &str,
+    outcome: &str,
+    outcome_tag: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE tasks SET outcome = ?1, outcome_tag = ?2 WHERE task_id = ?3",
+        rusqlite::params![outcome, outcome_tag, task_id],
+    )
+    .with_context(|| format!("set outcome for {task_id}"))?;
+    conn.execute(
+        "DELETE FROM task_pack_cache WHERE task_id = ?1",
+        rusqlite::params![task_id],
+    )?;
+    Ok(())
+}
+
+/// Append an external reference to `tasks.external`. The column is
+/// stored as a comma-separated list — small, append-mostly, no
+/// uniqueness constraint. Acceptable shapes (loose, not enforced):
+/// `beads:claude-memory-rsw`, `github:#42`, `jira:PROJ-1234`.
+pub fn add_task_external(conn: &Connection, task_id: &str, reference: &str) -> anyhow::Result<()> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT external FROM tasks WHERE task_id = ?1",
+            rusqlite::params![task_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .with_context(|| format!("read external for {task_id}"))?;
+    let next = match current {
+        Some(s) if !s.is_empty() => format!("{s},{reference}"),
+        _ => reference.to_string(),
+    };
+    conn.execute(
+        "UPDATE tasks SET external = ?1 WHERE task_id = ?2",
+        rusqlite::params![next, task_id],
+    )?;
+    conn.execute(
+        "DELETE FROM task_pack_cache WHERE task_id = ?1",
+        rusqlite::params![task_id],
+    )?;
+    Ok(())
+}
+
+/// Read-only metadata bundle used by pack rendering (and TUI list
+/// teasers in v0.4.0+). Returns `None` for unknown tasks.
+#[derive(Debug, Clone, Default)]
+pub struct TaskMetadata {
+    pub goal: Option<String>,
+    pub outcome: Option<String>,
+    pub outcome_tag: Option<String>,
+    pub external: Option<String>,
+}
+
+pub fn task_metadata(conn: &Connection, task_id: &str) -> anyhow::Result<Option<TaskMetadata>> {
+    let mut stmt =
+        conn.prepare("SELECT goal, outcome, outcome_tag, external FROM tasks WHERE task_id = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![task_id])?;
+    Ok(match rows.next()? {
+        Some(r) => Some(TaskMetadata {
+            goal: r.get::<_, Option<String>>(0)?,
+            outcome: r.get::<_, Option<String>>(1)?,
+            outcome_tag: r.get::<_, Option<String>>(2)?,
+            external: r.get::<_, Option<String>>(3)?,
+        }),
+        None => None,
+    })
 }
 
 /// Look up the most recent `event_id` we've ingested for this project.

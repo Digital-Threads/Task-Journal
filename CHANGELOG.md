@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-08
+
+Task model redesign — Phase 1. A task is now an explicit
+**goal → outcome** record, not a free-form bag of events. Lets the pack
+answer "what was I trying to do, did it work, and what did it
+produce?" without re-reading the whole chain.
+
+### Added
+- `tasks.goal` column — the intent ("why am I touching this code").
+  Set via `task-journal create --goal "<text>"` at creation, or later
+  via `task-journal goal <task_id> "<text>"`.
+- `tasks.outcome` + `tasks.outcome_tag` columns — what actually
+  happened on close. Set via
+  `task-journal close <id> --reason "..." --outcome "..." --outcome-tag done|abandoned|superseded`.
+  Tag is validated against the enum.
+- `tasks.external` column — comma-separated free-form references
+  (commit hashes, PR URLs, file paths). Append via
+  `task-journal external <task_id> --add "<ref>"`.
+- `events_index.artifacts` column — reserved for Phase 2 classifier
+  artifact extraction (commit_hash, files, linked_issue).
+- `tj_core::db::set_task_goal`, `set_task_outcome`, `add_task_external`,
+  `task_metadata` (returns `TaskMetadata` struct) helpers.
+
+### Changed
+- Pack output now renders a **Goal** line (or `(not set)`), an
+  **Outcome [tag]** line for closed tasks (or `(not recorded)`), and
+  an **External** line when references exist. Resume packs and `pack`
+  command both updated.
+- Schema migrated to v003. `task_pack_cache` is wiped on migration so
+  existing tasks re-render with the new fields visible.
+
+### Migration notes
+Existing tasks keep their events but get `(not set)` / `(not
+recorded)` placeholders until the new flags are used. Phase 2 will
+add a `task-journal reclassify <id>` to backfill goals/outcomes from
+event history.
+
 ## [0.3.1] - 2026-05-08
 
 Three correctness fixes for the auto-capture pipeline. The journal

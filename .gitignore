@@ -10,3 +10,7 @@
 *.sqlite-journal
 *.sqlite-wal
 .DS_Store
+
+# Token Pilot local cache
+.token-pilot/
+.token-pilot-fingerprint.json

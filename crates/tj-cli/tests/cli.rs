@@ -1237,6 +1237,207 @@ fn ingest_hook_session_start_with_no_open_tasks_emits_no_context() {
 }
 
 #[test]
+fn create_with_goal_renders_in_pack() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Add OAuth", "--goal", "Implement PKCE flow"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: Implement PKCE flow"));
+}
+
+#[test]
+fn create_without_goal_renders_not_set_placeholder() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "No goal"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Force goal to populate via the post-hoc command path so the row
+    // exists in SQLite (create without --goal skips the SQLite write,
+    // and pack needs the row to render). Without setting goal here we
+    // still exercise the `(not set)` placeholder path because pack
+    // reads via ingest_new_events first.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: (not set)"));
+}
+
+#[test]
+fn close_with_outcome_renders_outcome_block() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Ship feature X", "--goal", "deliver X"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "close",
+            &task_id,
+            "--outcome",
+            "Shipped in v0.4.0",
+            "--outcome-tag",
+            "done",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("**Outcome** [done]: Shipped in v0.4.0"));
+}
+
+#[test]
+fn close_rejects_invalid_outcome_tag() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "T"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", &task_id, "--outcome", "ok", "--outcome-tag", "wat"])
+        .assert()
+        .failure()
+        .stderr(contains("invalid --outcome-tag"));
+}
+
+#[test]
+fn goal_command_updates_existing_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Initial title"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["goal", &task_id, "Set after the fact"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: Set after the fact"));
+}
+
+#[test]
+fn external_add_appends_references() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Linked work"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["external", &task_id, "--add", "beads:claude-memory-rsw"])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["external", &task_id, "--add", "github:#42"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("**External**: beads:claude-memory-rsw,github:#42"));
+}
+
+#[test]
 fn ingest_hook_short_circuits_when_in_classifier_env_set() {
     // Recursion guard: classifier sets TJ_IN_CLASSIFIER=1 before
     // spawning claude. The nested claude re-fires our hooks; without
