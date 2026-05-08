@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -39,6 +39,7 @@ ureq = { version = "2", features = ["json"] }
 ratatui = "0.29"
 crossterm = "0.28"
 fd-lock = "4"
+regex = "1"
 
 # Test deps
 assert_fs = "1"

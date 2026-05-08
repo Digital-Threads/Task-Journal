@@ -91,6 +91,15 @@ ALTER TABLE events_index ADD COLUMN artifacts TEXT;
 DELETE FROM task_pack_cache;
 "#;
 
+// v0.5.0 Phase B — artifacts auto-extract on ingest. The column was
+// added in v003 but stayed NULL for everyone; v004 just wipes the
+// pack cache so newly-extracted artifacts surface in the next pack
+// render. Existing events stay NULL until `reclassify` (Phase B+) or
+// `rebuild-state` is run.
+const MIGRATION_004: &str = r#"
+DELETE FROM task_pack_cache;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -105,6 +114,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: MIGRATION_003,
+    },
+    Migration {
+        version: 4,
+        sql: MIGRATION_004,
     },
 ];
 
@@ -371,6 +384,118 @@ pub fn task_metadata(conn: &Connection, task_id: &str) -> anyhow::Result<Option<
     })
 }
 
+/// Find tasks (open or closed) whose events reference any of the given
+/// issue identifiers (FIN-868, JIRA-123, INC-7…). Looks at the
+/// per-event `artifacts.linked_issues` column populated on ingest.
+/// Returns `(task_id, status)` deduplicated, most-recent first. Used
+/// by the v0.5.0 Phase C auto-link flow to recognise that a fresh
+/// prompt is a continuation of a prior task.
+pub fn find_tasks_by_linked_issues(
+    conn: &Connection,
+    issues: &[String],
+) -> anyhow::Result<Vec<(String, String)>> {
+    if issues.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Stage A: collect candidate task_ids whose events_index.artifacts
+    // contains any of the requested issue strings. JSON1 is overkill
+    // here — a substring LIKE on the raw JSON is correct given the
+    // ticket id format ("FIN-868") never appears outside its own
+    // linked_issues array.
+    let mut candidate_ids: Vec<String> = Vec::new();
+    for issue in issues {
+        let pattern = format!("%\"{}\"%", issue.replace('%', "\\%"));
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT task_id FROM events_index
+             WHERE artifacts LIKE ?1
+             ORDER BY timestamp DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern], |r| r.get::<_, String>(0))?;
+        for r in rows {
+            let id = r?;
+            if !candidate_ids.contains(&id) {
+                candidate_ids.push(id);
+            }
+        }
+    }
+    // Stage B: hydrate status for each candidate.
+    let mut out = Vec::with_capacity(candidate_ids.len());
+    for id in candidate_ids {
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                rusqlite::params![&id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(s) = status {
+            out.push((id, s));
+        }
+    }
+    Ok(out)
+}
+
+/// Re-run artifact extraction over every event of a task and write the
+/// result back to `events_index.artifacts`. Used to backfill events
+/// that were ingested before Phase B landed. Returns the number of
+/// events touched. Wipes the pack cache for the task so the next
+/// render reflects the freshly extracted artifacts.
+pub fn reclassify_task_artifacts(conn: &Connection, task_id: &str) -> anyhow::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT ei.event_id, COALESCE(sf.text, '') FROM events_index ei
+         LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+         WHERE ei.task_id = ?1",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![task_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let count = rows.len();
+    for (event_id, text) in rows {
+        let arts = crate::artifacts::extract(&text);
+        let json = if arts.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&arts)?)
+        };
+        conn.execute(
+            "UPDATE events_index SET artifacts = ?1 WHERE event_id = ?2",
+            rusqlite::params![json, event_id],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM task_pack_cache WHERE task_id = ?1",
+        rusqlite::params![task_id],
+    )?;
+    Ok(count)
+}
+
+/// Aggregate artifacts (commit hashes, PR URLs, ticket IDs, files,
+/// branches) across every event of a task, deduplicated. Reads the
+/// per-event JSON payload that `ingest_new_events` populated. Skips
+/// events whose `artifacts` column is NULL or unparseable rather than
+/// failing the pack render.
+pub fn task_artifacts(
+    conn: &Connection,
+    task_id: &str,
+) -> anyhow::Result<crate::artifacts::Artifacts> {
+    let mut stmt = conn.prepare(
+        "SELECT artifacts FROM events_index
+         WHERE task_id = ?1 AND artifacts IS NOT NULL
+         ORDER BY timestamp ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
+    let mut acc = crate::artifacts::Artifacts::default();
+    for row in rows {
+        let json = row?;
+        if let Ok(parsed) = serde_json::from_str::<crate::artifacts::Artifacts>(&json) {
+            acc.merge(parsed);
+        }
+    }
+    Ok(acc)
+}
+
 /// Look up the most recent `event_id` we've ingested for this project.
 /// Returns `None` when the project has never been indexed (first call,
 /// or migration v002 just landed on an existing 0.1.x DB).
@@ -490,12 +615,22 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         .as_str()
         .unwrap()
         .to_string();
+    // v0.5.0 Phase B: scrape artifacts (commit hashes, PR URLs, ticket
+    // IDs, file paths, branch names) out of the event text. Storing
+    // per-event so reclassify can recompute without touching foreign
+    // events; pack aggregates and dedupes across events at render time.
+    let artifacts = crate::artifacts::extract(&event.text);
+    let artifacts_json = if artifacts.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&artifacts)?)
+    };
     conn.execute(
-        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status, artifacts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             event.event_id, event.task_id, type_str,
-            event.timestamp, event.confidence, status_str
+            event.timestamp, event.confidence, status_str, artifacts_json
         ],
     )?;
     // search_fts has no PK; clear then insert to keep idempotent across rebuild_state replays.

@@ -236,6 +236,29 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     if let Some(ext) = external.as_deref().filter(|s| !s.is_empty()) {
         text.push_str(&format!("**External**: {ext}\n"));
     }
+
+    // v0.5.0 Phase B: artifacts auto-extracted from event text. Render
+    // only categories that have entries — empty groups are noise on a
+    // 30-event task. Order is stable so packs diff cleanly.
+    let arts = crate::db::task_artifacts(conn, task_id)?;
+    if !arts.is_empty() {
+        text.push_str("**Artifacts**:\n");
+        if !arts.commit_hashes.is_empty() {
+            text.push_str(&format!("- commits: {}\n", arts.commit_hashes.join(", ")));
+        }
+        if !arts.pr_urls.is_empty() {
+            text.push_str(&format!("- PRs: {}\n", arts.pr_urls.join(", ")));
+        }
+        if !arts.linked_issues.is_empty() {
+            text.push_str(&format!("- issues: {}\n", arts.linked_issues.join(", ")));
+        }
+        if !arts.files.is_empty() {
+            text.push_str(&format!("- files: {}\n", arts.files.join(", ")));
+        }
+        if !arts.branch_names.is_empty() {
+            text.push_str(&format!("- branches: {}\n", arts.branch_names.join(", ")));
+        }
+    }
     text.push('\n');
 
     if matches!(mode, PackMode::Full) {

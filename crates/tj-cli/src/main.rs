@@ -636,6 +636,16 @@ enum Commands {
         #[arg(long)]
         outcome_tag: Option<String>,
     },
+    /// Reopen a previously closed task (writes a `reopen` event and
+    /// flips status back to `open`). Use when the same scope comes
+    /// back, e.g. a regression on a shipped fix or a follow-up bug
+    /// that belongs in the original chain rather than a new task.
+    Reopen {
+        task_id: String,
+        /// One-line reason for reopening (regression, follow-up, etc).
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Set or update the goal of an existing task.
     Goal {
         task_id: String,
@@ -653,6 +663,11 @@ enum Commands {
         #[arg(long = "add")]
         add: String,
     },
+    /// Re-run artifact extraction over every event of a task and
+    /// refresh the pack cache. Use after upgrading from v0.4.x — older
+    /// events were ingested before the artifact column was populated,
+    /// so they have empty `artifacts` JSON until reclassify backfills.
+    Reclassify { task_id: String },
     /// Full-text search across events (FTS5).
     Search {
         /// Query string.
@@ -1011,6 +1026,38 @@ fn main() -> Result<()> {
             writer.flush_durable()?;
             println!("{}", event.event_id);
         }
+        Commands::Reopen { task_id, reason } => {
+            // The Reopen event itself flips tasks.status back to open
+            // when ingested (db::apply_lifecycle handles this). The CLI
+            // job is just to assert the task exists and write the event.
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if !tj_core::db::task_exists(&conn, &task_id)? {
+                anyhow::bail!("task not found: {task_id}");
+            }
+            drop(conn);
+
+            let mut event = tj_core::event::Event::new(
+                &task_id,
+                tj_core::event::EventType::Reopen,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                reason.clone().unwrap_or_else(|| "(reopened)".into()),
+            );
+            if let Some(r) = reason {
+                event.meta = serde_json::json!({"reason": r});
+            }
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+            println!("{}", event.event_id);
+        }
         Commands::Goal { task_id, text } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -1042,6 +1089,27 @@ fn main() -> Result<()> {
             }
             tj_core::db::add_task_external(&conn, &task_id, &add)?;
             println!("ok");
+        }
+        Commands::Reclassify { task_id } => {
+            // Walk events_index for this task, re-run artifact extraction
+            // over each event's text (looked up via search_fts), and
+            // overwrite the artifacts column. Pack cache is wiped after
+            // so the next render picks up the new artifacts block. Used
+            // primarily to backfill v0.4.x events that were ingested
+            // before extraction existed.
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if !tj_core::db::task_exists(&conn, &task_id)? {
+                anyhow::bail!("task not found: {task_id}");
+            }
+            let count = tj_core::db::reclassify_task_artifacts(&conn, &task_id)?;
+            println!("reclassified {} events", count);
         }
         Commands::EventCorrect {
             corrects,
@@ -2000,6 +2068,31 @@ fn auto_open_task_from_prompt(
     tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
     if !goal.is_empty() {
         tj_core::db::set_task_goal(conn, &task_id, &goal)?;
+    }
+
+    // v0.5.0 Phase C: if the prompt mentions any tracked issue
+    // identifiers (FIN-868, JIRA-123…), search the journal for prior
+    // tasks that referenced the same issue. Auto-link them via the
+    // External column and warn on stderr when the prior is closed —
+    // user can reopen it instead of starting fresh.
+    let prompt_arts = tj_core::artifacts::extract(prompt);
+    if !prompt_arts.linked_issues.is_empty() {
+        let related = tj_core::db::find_tasks_by_linked_issues(conn, &prompt_arts.linked_issues)?;
+        for (other_id, status) in related {
+            if other_id == task_id {
+                continue;
+            }
+            let _ = tj_core::db::add_task_external(conn, &task_id, &format!("linked:{other_id}"));
+            if status == "closed" {
+                eprintln!(
+                    "task-journal: prompt references issue(s) {}, which appear in closed task {} — \
+                     run `task-journal reopen {}` if this is a continuation rather than new scope.",
+                    prompt_arts.linked_issues.join(","),
+                    other_id,
+                    other_id
+                );
+            }
+        }
     }
 
     Ok(tj_core::classifier::TaskContext {

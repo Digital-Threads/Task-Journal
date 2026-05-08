@@ -30,6 +30,7 @@ rusqlite = { workspace = true }
 ureq = { workspace = true }
 tracing = { workspace = true }
 fd-lock = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

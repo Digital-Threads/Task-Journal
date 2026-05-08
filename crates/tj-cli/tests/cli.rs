@@ -1877,6 +1877,245 @@ fn ingest_hook_auto_opens_task_when_no_open_tasks() {
 }
 
 #[test]
+fn reopen_command_flips_status_back_to_open() {
+    // v0.5.0 Phase C: a closed task can be revived via `reopen`. The
+    // [reopen] event itself triggers the status flip (db lifecycle).
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Reopen target"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", &task_id, "--reason", "first close"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("[status: closed]"));
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["reopen", &task_id, "--reason", "regression came back"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("[status: open]"));
+}
+
+#[test]
+fn auto_open_links_to_prior_task_referencing_same_issue() {
+    // v0.5.0 Phase C: if a fresh prompt mentions a ticket id that
+    // already shows up in the journal, the new auto-opened task gets
+    // an external "linked:tj-other" pointer so the chain is visible
+    // in the pack rather than orphaned.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let prior = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Original FIN work"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &prior,
+            "--type",
+            "decision",
+            "--text",
+            "fixed FIN-868 paygate fee duplicate write",
+        ])
+        .assert()
+        .success();
+    // Close the prior task — auto-open's link target is closed-but-
+    // related, exactly the regression-came-back scenario.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", &prior, "--reason", "shipped"])
+        .assert()
+        .success();
+
+    // Now fire a fresh UserPromptSubmit referencing the same ticket.
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-link",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "FIN-868 came back: paygate fee written twice on partial refund"
+    })
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        .args(["ingest-hook", "--backend", "cli"])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .stderr(contains(format!("reopen {}", prior)));
+
+    // Find the newly auto-opened task and confirm it has a linked
+    // pointer back to the prior in External.
+    let search_out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "paygate"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(search_out).unwrap();
+    let new_id = body
+        .lines()
+        .find(|l| l.starts_with("tj-") && !l.contains(&prior))
+        .map(|s| s.trim().to_string())
+        .expect("auto-opened task must show up in search alongside prior");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &new_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains(format!("linked:{}", prior)));
+}
+
+#[test]
+fn pack_renders_artifacts_block_from_event_text() {
+    // v0.5.0 Phase B: artifacts (commits, PRs, issues) auto-extracted
+    // from event text appear in pack as **Artifacts** block.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "FIN-868 host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "fixed in abc1234 — see https://github.com/Digital-Threads/Task-Journal/pull/42 — references FIN-868",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Artifacts**:"))
+        .stdout(contains("commits: abc1234"))
+        .stdout(contains(
+            "PRs: https://github.com/Digital-Threads/Task-Journal/pull/42",
+        ))
+        .stdout(contains("issues: FIN-868"));
+}
+
+#[test]
+fn reclassify_backfills_artifacts_for_existing_events() {
+    // After upgrade from v0.4.x, old events have NULL artifacts. The
+    // `reclassify` command must walk the event_index and re-extract.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Backfill host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "evidence",
+            "--text",
+            "verified at commit deadbeef99",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["reclassify", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("reclassified"));
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("commits: deadbeef99"));
+}
+
+#[test]
 fn ingest_hook_auto_open_disabled_via_env() {
     // Opt-out path: TJ_AUTO_OPEN_TASKS=0 must restore the v0.4.0
     // behaviour (drop the prompt silently when no open task exists).

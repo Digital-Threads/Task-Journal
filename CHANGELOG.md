@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-08
+
+Auto-everything release. Phase B + C of the v0.5.0 plan land
+together: artifacts get scraped out of every event automatically,
+and prompts that mention a known ticket id auto-link back to the
+prior task that handled it.
+
+### Added — Phase B (artifacts auto-extract)
+- New `tj_core::artifacts` module with `Artifacts` struct +
+  regex-based `extract(text)`. Pulls commit hashes (7-40 hex), GitHub
+  / GitLab PR URLs, ticket IDs (FIN-868 etc), file paths, and branch
+  names from any free-form text.
+- `events_index.artifacts` (added in v0.4.0 schema v003) is now
+  populated on every `ingest_new_events` call. Per-event JSON keeps
+  reclassify cheap.
+- `db::task_artifacts(conn, task_id)` aggregates and dedupes across
+  every event of a task.
+- Pack output gets a new `**Artifacts**:` block listing commits, PRs,
+  issues, files, branches when any are present.
+- New CLI `task-journal reclassify <task_id>` walks existing events
+  and backfills `artifacts` for journals upgraded from v0.4.x.
+
+### Added — Phase C (linked_issue / reopen)
+- `db::find_tasks_by_linked_issues(conn, issues)` searches every
+  task whose events reference a given ticket id.
+- `auto_open_task_from_prompt` now extracts artifacts from the
+  prompt; if any ticket id matches a prior task, the new task gets
+  `linked:tj-old-id` appended to its External column. When the prior
+  task is closed, a hint goes to stderr suggesting
+  `task-journal reopen <id>` instead of fresh scope.
+- New CLI `task-journal reopen <task_id> [--reason "..."]` flips a
+  closed task back to open (writes a `[reopen]` event whose lifecycle
+  hook handles the status flip).
+
+### Schema
+- Migration v004 wipes the pack cache so existing tasks pick up the
+  new Artifacts block on next render. Events still need `reclassify`
+  to backfill the `artifacts` column for old data.
+
+### Tests
+- 9 new unit tests for `tj_core::artifacts` (commit / PR / issue /
+  file / branch extraction + dedup + JSON round-trip).
+- 4 new integration tests in tj-cli covering pack rendering with
+  artifacts, reclassify backfill, reopen lifecycle, and Phase C
+  auto-link to closed task.
+
 ## [0.4.1] - 2026-05-08
 
 v0.5.0 Phase A — auto-create tasks. Removes the manual
