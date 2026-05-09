@@ -16,7 +16,7 @@ name = "task-journal"
 path = "src/main.rs"
 
 [dependencies]
-tj-core = { package = "task-journal-core", version = "0.6.1", path = "../tj-core" }
+tj-core = { package = "task-journal-core", version = "0.6.2", path = "../tj-core" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
@@ -29,6 +29,9 @@ chrono = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 assert_fs = { workspace = true }

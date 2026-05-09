@@ -57,6 +57,34 @@ impl Classifier for ClaudeCliClassifier {
             .ok_or_else(|| anyhow!("TJ_CLASSIFIER_CLI is empty"))?;
         let base_args: Vec<&str> = parts.collect();
 
+        // v0.6.2: when invoking bare `claude` (no wrapper), inject
+        // `--strict-mcp-config --mcp-config {"mcpServers":{}}` so the
+        // inner haiku-claude does NOT spawn every configured MCP
+        // server (notably task-journal-mcp itself). Without this, each
+        // classification spawned ~24 MCP servers and blew up the WSL2
+        // process table (claude-memory-9ty). `--bare` would also do
+        // the job but breaks subscription auth (claude-memory-0kk),
+        // and `--no-plugins` does not exist in the public CLI as of
+        // 2.1.x. Hooks still fire on the inner claude; the
+        // `TJ_IN_CLASSIFIER=1` env var (set below) short-circuits
+        // ingest-hook re-entry.
+        //
+        // Wrappers like `aimux run dt claude` may not pass through
+        // unknown args, so detection is: only inject when base_args
+        // is empty (program == bare claude binary).
+        let mut args: Vec<&str> = base_args.clone();
+        let is_bare_claude = base_args.is_empty()
+            && std::path::Path::new(program)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s == "claude" || s == "claude.exe")
+                .unwrap_or(false);
+        if is_bare_claude {
+            args.push("--strict-mcp-config");
+            args.push("--mcp-config");
+            args.push(r#"{"mcpServers":{}}"#);
+        }
+
         // `--bare` would skip hooks/CLAUDE.md/skills (cheap + non-recursive),
         // but it ALSO bypasses the subscription credentials file and only
         // works with ANTHROPIC_API_KEY — see claude-memory-0kk. Most users
@@ -65,7 +93,7 @@ impl Classifier for ClaudeCliClassifier {
         // it on entry and short-circuits, breaking the loop without
         // touching auth.
         let output = std::process::Command::new(program)
-            .args(&base_args)
+            .args(&args)
             .args([
                 "-p",
                 "--model",

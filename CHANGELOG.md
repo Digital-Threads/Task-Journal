@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-05-09
+
+Fork-bomb fix. Synchronous classifier in `ingest-hook` was blocking
+each Claude Code hook for 5-30s while spawning a nested
+`claude -p` that loaded all installed plugins (including
+task-journal-mcp itself), so within minutes ~19 stale
+`task-journal ingest-hook` and `task-journal-mcp` processes piled up
+and WSL2 died on `EAGAIN: pthread_create`.
+
+### Fixed
+- `ingest-hook` no longer blocks on the classifier. Real-classifier
+  events are queued to `pending/<id>.json` (schema "v2") and a
+  detached `task-journal classify-worker` child drains them in the
+  background. Hook returns in <100ms instead of 5-30s. Mock-classifier
+  path stays synchronous (tests rely on it); set `TJ_INGEST_SYNC=1`
+  to force sync mode for the real path too.
+- `tj_core::classifier::cli::ClaudeCliClassifier` injects
+  `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` automatically
+  when the configured command is bare `claude` (no wrapper). Wrappers
+  like `aimux run dt claude` are detected by non-empty base args and
+  left alone — wrappers may not pass through unknown flags. Stops the
+  inner haiku-claude from spawning task-journal-mcp (and ~24 other MCP
+  servers) per classification. `--bare` not used because it breaks
+  subscription auth (claude-memory-0kk); `--no-plugins` does not exist
+  in claude 2.1.x CLI.
+- New project-scoped worker lockfile at
+  `state_dir/classifier-<project_hash>.lock` caps in-flight
+  classifier workers at 1 per project. PID is written to the lockfile
+  on acquire; stale lockfiles (dead PID) are reclaimed automatically.
+
+### Added
+- Hidden `task-journal classify-worker --backend <cli|api>`
+  subcommand. Internal — spawned by `ingest-hook`. Not stable API.
+
+### Changed (internal)
+- `pending/<id>.json` gained a `"schema"` field. v2 entries carry
+  `kind`, `text`, `project_hash`, `events_path`, `backend` and route
+  through `classify-worker`. v1 entries (legacy `text`+`error` shape)
+  still parse and route through the existing `pending retry` path.
+
 ## [0.6.1] - 2026-05-08
 
 Branch-name regex was too greedy and captured the next word after any

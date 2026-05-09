@@ -424,6 +424,12 @@ fn run_pending_retry(
         }
         let body = std::fs::read_to_string(&path)?;
         let mut v: serde_json::Value = serde_json::from_str(&body)?;
+        // v0.6.2: skip v2 entries here — those are async-queued events
+        // owned by classify-worker. The retry path is for legacy v1
+        // entries that already failed in the inline path.
+        if v.get("schema").and_then(|x| x.as_str()) == Some("v2") {
+            continue;
+        }
         let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
         let text = v
             .get("text")
@@ -821,6 +827,17 @@ enum Commands {
         /// Test/dev override: confidence value. Hidden from --help.
         #[arg(long, hide = true)]
         mock_confidence: Option<f64>,
+    },
+    /// Internal: drain pending v2 entries and classify each one.
+    /// Spawned as a detached child by ingest-hook so the hook can
+    /// return in <100ms instead of blocking 5-30s on `claude -p`.
+    /// Holds a project-scoped file lock — only one worker per project
+    /// at a time. Hidden from --help; not a public API.
+    #[command(hide = true)]
+    ClassifyWorker {
+        /// Classifier backend: "cli" or "api". Defaults to cli.
+        #[arg(long, default_value = "cli")]
+        backend: String,
     },
 }
 
@@ -1524,6 +1541,38 @@ fn main() -> Result<()> {
                 mock_confidence,
             )?;
 
+            // v0.6.2 fork-bomb fix. The real-classifier path used to run
+            // `claude -p` synchronously inside the hook, blocking each
+            // UserPromptSubmit/PostToolUse/Stop for 5-30s. Symptoms:
+            // ~19 stale ingest-hook + task-journal-mcp procs accumulated
+            // within minutes (claude-memory-9ty). Now: queue the event
+            // to pending/<id>.json (schema v2) and spawn a detached
+            // classify-worker child. Hook returns in <100ms.
+            //
+            // Mock path stays synchronous — many tests rely on it. The
+            // env override TJ_INGEST_SYNC=1 also forces sync, used by
+            // tests that exercise the real-classifier code path with
+            // /bin/false stubs.
+            let force_sync = std::env::var("TJ_INGEST_SYNC")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let is_mock = mock_event_type.is_some() && mock_task_id.is_some();
+            if !is_mock && !force_sync {
+                let _ = persist_pending_v2(
+                    &events_path,
+                    &kind,
+                    &text,
+                    &project_hash,
+                    &backend,
+                )?;
+                // Fire-and-forget worker. Errors here are best-effort —
+                // a failure to spawn just means the entry sits in
+                // pending/ until the next hook fires another spawn.
+                let _ = spawn_classify_worker(&backend);
+                return Ok(());
+            }
+
             // Derive author_hint from hook kind: user prompts → "user", everything else → "assistant"
             let author_hint = if kind.contains("UserPrompt") {
                 "user"
@@ -1688,6 +1737,9 @@ fn main() -> Result<()> {
             );
 
             println!("{}", event.event_id);
+        }
+        Commands::ClassifyWorker { backend } => {
+            run_classify_worker(&backend)?;
         }
         Commands::Export {
             format,
@@ -2205,6 +2257,332 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
     Ok(())
 }
 
+/// v0.6.2: queue an ingest event for the detached classify-worker. The
+/// hook returns immediately after writing this entry so it does not
+/// block Claude Code's hook timeout (was 5-30s, now <100ms). Schema "v2"
+/// distinguishes async-ingest entries from legacy v1 (text+error) ones
+/// the `pending retry` path knows how to handle.
+fn persist_pending_v2(
+    events_path: &std::path::Path,
+    kind: &str,
+    text: &str,
+    project_hash: &str,
+    backend: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let pending_dir = events_path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("pending");
+    std::fs::create_dir_all(&pending_dir)?;
+    let id = ulid::Ulid::new().to_string();
+    let payload = serde_json::json!({
+        "schema": "v2",
+        "kind": kind,
+        "text": text,
+        "project_hash": project_hash,
+        "events_path": events_path.to_string_lossy(),
+        "backend": backend,
+        "queued_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let path = pending_dir.join(format!("{id}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
+    Ok(path)
+}
+
+/// Spawn the classify-worker as a detached child. We deliberately drop
+/// the `Child` handle so the parent (the actual Claude Code hook child)
+/// can exit without waiting; the worker re-parents to init on Linux.
+/// stdin/stdout/stderr are nulled so the worker doesn't keep the hook's
+/// pipes open. TJ_CLASSIFIER_BUMP marks the spawn for telemetry; clear
+/// TJ_IN_CLASSIFIER because the worker NEEDS to call the classifier.
+fn spawn_classify_worker(backend: &str) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate current task-journal exe")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("classify-worker")
+        .arg("--backend")
+        .arg(backend)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .env("TJ_CLASSIFIER_BUMP", "1")
+        .env_remove("TJ_IN_CLASSIFIER");
+    let _child = cmd.spawn().context("spawn classify-worker")?;
+    // Drop child intentionally — Linux init reaps when parent exits.
+    Ok(())
+}
+
+/// File-lock guard for the classify-worker. Holds the lockfile until
+/// dropped; ensures cleanup on panic. One worker per project_hash.
+struct WorkerLock {
+    path: std::path::PathBuf,
+}
+
+impl WorkerLock {
+    /// Try to acquire the lock. Returns Ok(Some(_)) on success, Ok(None)
+    /// if another live worker holds it, Err on filesystem failure.
+    fn try_acquire(project_hash: &str) -> anyhow::Result<Option<Self>> {
+        let dir = tj_core::paths::state_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("classifier-{project_hash}.lock"));
+
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(Some(Self { path }));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Inspect existing lockfile. If PID is alive → another
+                    // worker is running; back off. If dead/missing →
+                    // remove stale file and retry.
+                    let body = std::fs::read_to_string(&path).unwrap_or_default();
+                    let pid: Option<u32> = body.trim().parse().ok();
+                    if let Some(pid) = pid {
+                        if pid_is_alive(pid) {
+                            return Ok(None);
+                        }
+                    }
+                    // Stale (no PID, or dead PID) — remove and retry.
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+impl Drop for WorkerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    // kill(pid, 0) probes existence without sending a signal.
+    // SAFETY: libc::kill is a thin syscall wrapper, no aliasing concerns.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    // Conservative on non-Unix: assume alive so we don't double-spawn.
+    // The lockfile gets cleaned up on Drop in the normal exit path.
+    true
+}
+
+/// classify-worker: drain pending v2 entries by running the real
+/// classifier. v1 entries (legacy text+error shape) are left for
+/// `pending retry`. Holds a project-scoped file lock so only one
+/// worker per project runs at a time.
+fn run_classify_worker(backend: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+
+    let lock = match WorkerLock::try_acquire(&project_hash)? {
+        Some(l) => l,
+        None => return Ok(()), // another worker is running
+    };
+
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let pending = events_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("events_dir has no grandparent"))?
+        .join("pending");
+    if !pending.exists() {
+        drop(lock);
+        return Ok(());
+    }
+
+    // Snapshot entries up front so concurrent re-queues don't loop us.
+    let mut entries: Vec<std::path::PathBuf> = Vec::new();
+    for e in std::fs::read_dir(&pending)? {
+        let e = e?;
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("json") {
+            entries.push(p);
+        }
+    }
+
+    for path in entries {
+        if let Err(err) = process_pending_entry(&path, &events_path, &project_hash, backend) {
+            // Non-fatal: leave the file in place; pending-retry / next
+            // worker invocation can re-attempt. Avoid writing to stderr
+            // since stderr is nulled — but in tests stderr is captured.
+            eprintln!("classify-worker: {} failed: {err:#}", path.display());
+        }
+    }
+
+    drop(lock);
+    Ok(())
+}
+
+/// Process one pending entry. Routes by schema:
+/// - "v2" → real-classifier path (auto_open + classify + persist event)
+/// - anything else (legacy "v1" with text/error) → leave for `pending retry`
+fn process_pending_entry(
+    path: &std::path::Path,
+    events_path: &std::path::Path,
+    project_hash: &str,
+    backend: &str,
+) -> anyhow::Result<()> {
+    let body = std::fs::read_to_string(path)?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let schema = v.get("schema").and_then(|x| x.as_str()).unwrap_or("v1");
+    if schema != "v2" {
+        return Ok(()); // legacy entry, handled by `pending retry`
+    }
+
+    let kind = v
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .unwrap_or("Stop")
+        .to_string();
+    let text = v
+        .get("text")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Mirror the synchronous flow that used to live in IngestHook —
+    // see commit history of v0.6.1 for the original. Auto-open, run
+    // classifier, apply integrity safeguards, persist event, telemetry.
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    }
+
+    let mut recent = recent_task_contexts(&conn, 5)?;
+    if recent.is_empty() {
+        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+            .ok()
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if auto_open_disabled || !kind.contains("UserPrompt") {
+            // Nothing to do — drop the entry silently.
+            std::fs::remove_file(path)?;
+            return Ok(());
+        }
+        let new_task = auto_open_task_from_prompt(events_path, project_hash, &conn, &text)?;
+        recent.push(new_task);
+    }
+
+    let author_hint = if kind.contains("UserPrompt") {
+        "user"
+    } else {
+        "assistant"
+    };
+
+    use tj_core::classifier::Classifier;
+    let classifier: Box<dyn Classifier> = match backend {
+        "cli" => Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default()),
+        "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
+        other => anyhow::bail!("unknown backend: {other}"),
+    };
+    let input = tj_core::classifier::ClassifyInput {
+        text: text.clone(),
+        author_hint: author_hint.into(),
+        recent_tasks: recent,
+    };
+    let out = match classifier.classify(&input) {
+        Ok(o) => o,
+        Err(e) => {
+            // Persist as legacy v1 pending entry so `pending retry`
+            // surfaces it; remove the v2 source.
+            persist_pending(events_path, &text, &e.to_string())?;
+            std::fs::remove_file(path)?;
+            return Ok(());
+        }
+    };
+
+    let Some(tid) = out.task_id_guess else {
+        std::fs::remove_file(path)?;
+        return Ok(());
+    };
+
+    use tj_core::event::EventType;
+    if matches!(out.event_type, EventType::Close) && kind == "Stop" {
+        std::fs::remove_file(path)?;
+        return Ok(());
+    }
+    match tj_core::db::task_status(&conn, &tid)? {
+        None => {
+            persist_pending(
+                events_path,
+                &text,
+                &format!("task_id_guess `{tid}` not found"),
+            )?;
+            std::fs::remove_file(path)?;
+            return Ok(());
+        }
+        Some(s) if s == "closed" => {
+            persist_pending(
+                events_path,
+                &text,
+                &format!("task_id_guess `{tid}` is closed"),
+            )?;
+            std::fs::remove_file(path)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let confidence = out.confidence;
+    let evidence_strength = out.evidence_strength;
+    let etype = out.event_type;
+    let event_text = out.suggested_text;
+
+    let mut event = tj_core::event::Event::new(
+        &tid,
+        etype,
+        tj_core::event::Author::Classifier,
+        tj_core::event::Source::Hook,
+        event_text,
+    );
+    event.confidence = Some(confidence);
+    event.status = tj_core::classifier::decide_status(confidence);
+    event.evidence_strength = evidence_strength;
+
+    let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+    writer.append(&event)?;
+    writer.flush_durable()?;
+
+    let metrics_path = tj_core::paths::metrics_dir()?.join(format!("{project_hash}.jsonl"));
+    let etype_str = serde_json::to_value(etype)?
+        .as_str()
+        .unwrap_or("?")
+        .to_string();
+    let status_str = serde_json::to_value(event.status)?
+        .as_str()
+        .unwrap_or("?")
+        .to_string();
+    let _ = tj_core::classifier::telemetry::append(
+        &metrics_path,
+        &tj_core::classifier::telemetry::TelemetryRecord {
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            project_hash: project_hash.to_string(),
+            task_id_guess: Some(tid.clone()),
+            event_type: etype_str,
+            confidence,
+            status: status_str,
+            error: None,
+        },
+    );
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 fn drain_pending(
     events_path: &std::path::Path,
     mock_etype: Option<&str>,
@@ -2229,6 +2607,11 @@ fn drain_pending(
 
         let body = std::fs::read_to_string(entry.path())?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
+        // v0.6.2: skip v2 entries — those are owned by classify-worker.
+        // Removing them here would silently drop async-queued events.
+        if v.get("schema").and_then(|x| x.as_str()) == Some("v2") {
+            continue;
+        }
         let text = v
             .get("text")
             .and_then(|x| x.as_str())

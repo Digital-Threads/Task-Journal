@@ -1839,6 +1839,10 @@ fn ingest_hook_auto_opens_task_when_no_open_tasks() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        // v0.6.2: real-classifier path now async by default. Force sync
+        // here so auto-open + pending side-effects are observable
+        // synchronously after the command returns.
+        .env("TJ_INGEST_SYNC", "1")
         .args(["ingest-hook", "--backend", "cli"])
         .write_stdin(payload)
         .assert()
@@ -1983,6 +1987,9 @@ fn auto_open_links_to_prior_task_referencing_same_issue() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        // v0.6.2: force sync so the auto-open side effect (reopen note
+        // on stderr) is observable synchronously.
+        .env("TJ_INGEST_SYNC", "1")
         .args(["ingest-hook", "--backend", "cli"])
         .write_stdin(payload)
         .assert()
@@ -2138,6 +2145,8 @@ fn ingest_hook_auto_open_disabled_via_env() {
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_CLASSIFIER_CLI", "/bin/false")
         .env("TJ_AUTO_OPEN_TASKS", "0")
+        // v0.6.2: force sync so post-conditions are observable.
+        .env("TJ_INGEST_SYNC", "1")
         .args(["ingest-hook", "--backend", "cli"])
         .write_stdin(payload)
         .assert()
@@ -2156,5 +2165,193 @@ fn ingest_hook_auto_open_disabled_via_env() {
     assert!(
         !body.contains("marker_noautoopen_xyz"),
         "auto-open must be skipped when TJ_AUTO_OPEN_TASKS=0, got: {body:?}"
+    );
+}
+
+// ---------------- v0.6.2 async classifier tests ----------------
+
+/// v0.6.2: ingest-hook must NOT block on the classifier. The
+/// real-classifier path queues a v2 pending entry and detaches a
+/// worker, so the hook returns in <100ms even when the configured
+/// classifier command is `/bin/false` (instant fail) or worse.
+#[test]
+fn ingest_hook_returns_fast_in_async_mode() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-fast",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "fast async marker xyz123"
+    })
+    .to_string();
+
+    let start = std::time::Instant::now();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        .args(["ingest-hook", "--backend", "cli"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+    let elapsed = start.elapsed();
+
+    // Generous budget — the hook itself does almost no work; the
+    // classifier subprocess runs in the detached worker. Pre-fix,
+    // this took 5-30s. Post-fix, expect well under 1s; assert <2s
+    // so flaky CI doesn't fail us.
+    assert!(
+        elapsed < std::time::Duration::from_millis(2000),
+        "ingest-hook must return in <2s in async mode, took {elapsed:?}"
+    );
+
+    // A v2 pending entry must have been written. We don't assert
+    // worker progress — worker is detached and may or may not have
+    // finished by the time we look.
+    let pending = dir.path().join("task-journal").join("pending");
+    assert!(pending.exists(), "pending dir must exist after queuing");
+    let entries: Vec<_> = std::fs::read_dir(&pending)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension().and_then(|s| s.to_str()) == Some("json")
+        })
+        .collect();
+    // Worker may have already drained; in that case at least the
+    // worker should have left a v1 pending entry from /bin/false
+    // failure (persist_pending in the real-classifier branch). So
+    // either way: at least one .json file ought to be present, OR
+    // the auto-open happened (events file exists). Be tolerant.
+    let events = dir.path().join("task-journal").join("events");
+    let has_pending = !entries.is_empty();
+    let has_events = events.exists()
+        && std::fs::read_dir(&events)
+            .map(|d| d.count() > 0)
+            .unwrap_or(false);
+    assert!(
+        has_pending || has_events,
+        "either pending entry or events file must exist after async hook"
+    );
+}
+
+/// classify-worker exits cleanly even when the classifier command is
+/// /bin/false. v2 entries that fail to classify get re-queued as v1
+/// pending entries (so `pending list` surfaces them).
+#[test]
+fn classify_worker_handles_classifier_failure_cleanly() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    // Pre-create a v2 pending entry by hand.
+    let pending = dir.path().join("task-journal").join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let project_hash =
+        tj_core::project_hash::from_path(&cwd).expect("compute project hash");
+    let events_path = dir
+        .path()
+        .join("task-journal")
+        .join("events")
+        .join(format!("{project_hash}.jsonl"));
+    std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+
+    let entry = pending.join("01worker.json");
+    let body = serde_json::json!({
+        "schema": "v2",
+        "kind": "UserPromptSubmit",
+        "text": "worker test marker",
+        "project_hash": project_hash,
+        "events_path": events_path.to_string_lossy(),
+        "backend": "cli",
+        "queued_at": "2026-05-08T00:00:00Z",
+    });
+    std::fs::write(&entry, body.to_string()).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        .args(["classify-worker", "--backend", "cli"])
+        .assert()
+        .success();
+
+    // Lockfile must not be left behind.
+    let state = dir.path().join("task-journal").join("state");
+    if state.exists() {
+        for e in std::fs::read_dir(&state).unwrap() {
+            let p = e.unwrap().path();
+            assert!(
+                !p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .ends_with(".lock"),
+                "lockfile must be removed after worker exits, found: {p:?}"
+            );
+        }
+    }
+}
+
+/// Lockfile prevents concurrent workers in the same project. We can't
+/// easily race two real spawns deterministically in a unit test, so
+/// instead simulate a held lock by writing a lockfile with our own
+/// (live) PID, then run classify-worker and assert it exits cleanly
+/// without draining the queue.
+#[test]
+fn classify_worker_respects_existing_lock() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let project_hash =
+        tj_core::project_hash::from_path(&cwd).expect("compute project hash");
+
+    // Pre-create a v2 pending entry.
+    let pending = dir.path().join("task-journal").join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let events_path = dir
+        .path()
+        .join("task-journal")
+        .join("events")
+        .join(format!("{project_hash}.jsonl"));
+    std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+    let entry = pending.join("01locked.json");
+    std::fs::write(
+        &entry,
+        serde_json::json!({
+            "schema": "v2",
+            "kind": "UserPromptSubmit",
+            "text": "locked marker",
+            "project_hash": project_hash,
+            "events_path": events_path.to_string_lossy(),
+            "backend": "cli",
+            "queued_at": "2026-05-08T00:00:00Z",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Hand-roll a lockfile with this process's (live) PID. The
+    // worker should see the live PID and bail without touching the
+    // pending entry.
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let lock_path = state.join(format!("classifier-{project_hash}.lock"));
+    std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        .args(["classify-worker", "--backend", "cli"])
+        .assert()
+        .success();
+
+    // Pending entry must still be there — the second worker bailed.
+    assert!(
+        entry.exists(),
+        "pending entry must survive — second worker must not have drained it"
+    );
+    // Our hand-rolled lockfile must still be there too — the bailing
+    // worker must NOT remove a lock it didn't acquire.
+    assert!(
+        lock_path.exists(),
+        "lockfile must survive — bailing worker must not delete others' locks"
     );
 }
