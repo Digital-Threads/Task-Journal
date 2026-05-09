@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-05-09
+
+Drop empty-text events at the hook boundary. PostToolUse for tools
+with no `tool_response` (SlashCommand, background ops, etc.) used to
+queue text="" entries that always failed classification and littered
+`pending/` with v1 dead entries.
+
+### Fixed
+- `ingest-hook` now early-returns when `text.trim().is_empty()` for
+  the real-classifier path. Mock path (test-only) keeps the event.
+  Saves a haiku call per empty event and prevents pending-queue
+  pollution from silent tools.
+
 ## [0.6.2] - 2026-05-09
 
 Fork-bomb fix. Synchronous classifier in `ingest-hook` was blocking

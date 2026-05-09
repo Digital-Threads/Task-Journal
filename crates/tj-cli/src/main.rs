@@ -1541,6 +1541,18 @@ fn main() -> Result<()> {
                 mock_confidence,
             )?;
 
+            // v0.6.3: drop empty-text events before queueing. PostToolUse
+            // hooks for tools without a `tool_response` (SlashCommand,
+            // background ops, etc.) used to reach the classifier with
+            // text="" — wasting a haiku call per event and littering
+            // pending/ with v1 dead entries. Mock path keeps the event
+            // for explicit test coverage, so this guard runs only outside
+            // mock paths.
+            let is_mock_pre = mock_event_type.is_some() && mock_task_id.is_some();
+            if !is_mock_pre && text.trim().is_empty() {
+                return Ok(());
+            }
+
             // v0.6.2 fork-bomb fix. The real-classifier path used to run
             // `claude -p` synchronously inside the hook, blocking each
             // UserPromptSubmit/PostToolUse/Stop for 5-30s. Symptoms:
