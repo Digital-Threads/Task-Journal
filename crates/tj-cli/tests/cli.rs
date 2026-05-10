@@ -2355,3 +2355,405 @@ fn classify_worker_respects_existing_lock() {
         "lockfile must survive — bailing worker must not delete others' locks"
     );
 }
+
+// =====================================================================
+// v0.7.0: statusline / PreCompact / /rewind / rejected / export-pr
+// =====================================================================
+
+#[test]
+fn statusline_empty_when_no_project_state() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    // Run from a subdir that has no project_hash matching state — empty
+    // string is the contract (don't break CC bottom strip on a fresh
+    // machine).
+    let workdir = dir.path().join("clean");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["statusline"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8(out).unwrap(), "");
+}
+
+#[test]
+fn statusline_renders_open_count_and_task_id() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Statusline subject"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["statusline"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.starts_with('['), "must start with [: {s}");
+    assert!(s.ends_with(']'), "must end with ]: {s}");
+    assert!(s.contains(&task_id), "must contain task id: {s}");
+    assert!(s.contains("open: 1"), "must contain open count: {s}");
+    assert!(s.contains("pending: 0"), "must contain pending count: {s}");
+    assert!(s.contains("stale: 0"), "must contain stale count: {s}");
+}
+
+#[test]
+fn precompact_hook_appends_marker_decision_to_open_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Compactable thing"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--kind", "PreCompact", "--text", ""])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(
+            contains("[decision]")
+                .and(contains("Conversation compacted at"))
+                .and(contains("single reasoning unit")),
+        );
+}
+
+#[test]
+fn precompact_hook_with_no_open_task_writes_nothing() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    // No create — events file does not yet exist.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--kind", "PreCompact", "--text", ""])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn rewind_prompt_appends_correction_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Path I wish I hadn't taken"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "ingest-hook",
+            "--kind",
+            "UserPromptSubmit",
+            "--text",
+            "/rewind go back to plan A",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(
+            contains("[correction]").and(contains("/rewind")),
+        );
+}
+
+#[test]
+fn install_hooks_wires_precompact_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert()
+        .success();
+    let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    assert!(
+        s.contains("PreCompact"),
+        "settings.json must wire PreCompact: {s}"
+    );
+}
+
+#[test]
+fn rejected_command_finds_rejection_events_by_topic() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Add OAuth login"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Two rejections + one decision → topic search must surface only
+    // the matching rejection.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event", &task_id, "--type", "rejection",
+            "--text", "Implicit grant deprecated by RFC 9700",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event", &task_id, "--type", "rejection",
+            "--text", "Symmetric session keys leak across browser tabs",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event", &task_id, "--type", "decision",
+            "--text", "Use authorization code with PKCE per RFC 9700",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["rejected", "implicit"])
+        .assert()
+        .success()
+        .stdout(
+            contains(&task_id)
+                .and(contains("Implicit grant"))
+                .and(contains("Add OAuth login"))
+                .and(contains("Symmetric session keys").not()),
+        );
+}
+
+#[test]
+fn export_pr_renders_summary_changes_rejections_verification_affected() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args([
+                "create",
+                "Export PR test",
+                "--goal",
+                "Wire OAuth via PKCE",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event", &task_id, "--type", "decision",
+            "--text", "Adopt PKCE flow in src/auth/oauth.rs",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event", &task_id, "--type", "rejection",
+            "--text", "Implicit grant deprecated",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event", &task_id, "--type", "evidence",
+            "--text", "Test suite green: 142 passed",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["export-pr", &task_id])
+        .assert()
+        .success()
+        .stdout(
+            contains("## Summary")
+                .and(contains("Wire OAuth via PKCE"))
+                .and(contains("## Changes"))
+                .and(contains("Adopt PKCE flow"))
+                .and(contains("## Why this approach (vs alternatives)"))
+                .and(contains("Implicit grant deprecated"))
+                .and(contains("## Verification"))
+                .and(contains("Test suite green"))
+                .and(contains("## Affected"))
+                .and(contains("src/auth/oauth.rs")),
+        );
+}
+
+#[test]
+fn export_pr_omits_optional_sections_when_no_data() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Bare task"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["export-pr", &task_id])
+        .assert()
+        .success()
+        .stdout(
+            contains("## Summary")
+                .and(contains("## Changes"))
+                .and(contains("## Why this approach").not())
+                .and(contains("## Verification").not())
+                .and(contains("## Affected").not()),
+        );
+}
+
+#[test]
+fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    // Pre-create a task so the project state exists at all (otherwise
+    // task_artifacts can't even open the DB).
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Sentinel"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["export-pr", "tj-zzzz"])
+        .assert()
+        .failure()
+        .stderr(contains("task not found: tj-zzzz"));
+}

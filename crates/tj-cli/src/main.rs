@@ -839,6 +839,34 @@ enum Commands {
         #[arg(long, default_value = "cli")]
         backend: String,
     },
+    /// One-line status snapshot for the Claude Code statusline. Prints
+    /// `[tj-x9rz · open: N · pending: N · stale: N]`. Sub-100ms by
+    /// design — wire it via `~/.claude/settings.json` `statusLine`.
+    /// Hidden from --help; not a human command.
+    #[command(hide = true)]
+    Statusline,
+    /// Cross-task search for `rejection` events matching a topic. Helpful
+    /// when the agent is about to repeat a path that was already turned
+    /// down — query the topic, see the prior rejection.
+    Rejected {
+        /// Search topic (FTS5 when possible, LIKE fallback for tokens
+        /// containing FTS-unfriendly chars like `-`).
+        topic: String,
+        /// Search across all projects on this machine.
+        #[arg(long)]
+        all_projects: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Restrict to events newer than N days.
+        #[arg(long)]
+        since: Option<i64>,
+    },
+    /// Render a task as PR-description Markdown (Summary, Changes,
+    /// Why-this-approach, Verification, Affected). Reuses event log +
+    /// artifacts; introduces no new tables.
+    ExportPr {
+        task_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1345,6 +1373,10 @@ fn main() -> Result<()> {
                     // tasks for the current project, and emits the
                     // additionalContext envelope Claude Code expects.
                     "SessionStart":    [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                    // PreCompact: drop a marker decision event on the most-recent
+                    // open task so the post-compact agent sees a clear boundary
+                    // in the journal between pre- and post-compaction reasoning.
+                    "PreCompact":      [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                 });
                 hooks_obj.insert("hooks".into(), entries);
 
@@ -1533,6 +1565,59 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            // PreCompact: Claude Code is about to compact the conversation.
+            // Drop a marker decision event on the most-recent open task so
+            // the post-compact agent sees a clear boundary in the journal.
+            // The marker is intentionally minimal — a future v0.7.x may
+            // synthesize a real summary if CC starts exposing one on stdin.
+            if kind == "PreCompact" {
+                if !events_path.exists() {
+                    return Ok(());
+                }
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                let recent = recent_task_contexts(&conn, 1)?;
+                let Some(tc) = recent.into_iter().next() else {
+                    return Ok(());
+                };
+                let now = chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let marker_text = format!(
+                    "Conversation compacted at {now}; preceding events should be treated as a single reasoning unit."
+                );
+                let mut event = tj_core::event::Event::new(
+                    &tc.task_id,
+                    tj_core::event::EventType::Decision,
+                    tj_core::event::Author::Classifier,
+                    tj_core::event::Source::Hook,
+                    marker_text,
+                );
+                event.confidence = Some(1.0);
+                event.status = tj_core::event::EventStatus::Confirmed;
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+                let metrics_path =
+                    tj_core::paths::metrics_dir()?.join(format!("{project_hash}.jsonl"));
+                let _ = tj_core::classifier::telemetry::append(
+                    &metrics_path,
+                    &tj_core::classifier::telemetry::TelemetryRecord {
+                        timestamp: chrono::Utc::now()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        project_hash: project_hash.clone(),
+                        task_id_guess: Some(tc.task_id.clone()),
+                        event_type: "decision".into(),
+                        confidence: 1.0,
+                        status: "confirmed".into(),
+                        error: None,
+                    },
+                );
+                println!("{}", event.event_id);
+                return Ok(());
+            }
+
             // Drain any pending entries first (Task 10 fills the real-classifier branch).
             drain_pending(
                 &events_path,
@@ -1550,6 +1635,40 @@ fn main() -> Result<()> {
             // mock paths.
             let is_mock_pre = mock_event_type.is_some() && mock_task_id.is_some();
             if !is_mock_pre && text.trim().is_empty() {
+                return Ok(());
+            }
+
+            // v0.7.0 /rewind sentinel. When the user prepends `/rewind`
+            // to their prompt they're telling us: the path I just walked
+            // was wrong, ignore it. We don't mass-mark prior events as
+            // rejected (too destructive — the agent might have learned
+            // useful negatives along the way). Instead leave a single
+            // correction event so any pack consumer sees the boundary.
+            if !is_mock_pre && kind == "UserPromptSubmit" && is_rewind_prompt(&text) {
+                if !events_path.exists() {
+                    return Ok(());
+                }
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                let recent = recent_task_contexts(&conn, 1)?;
+                let Some(tc) = recent.into_iter().next() else {
+                    return Ok(());
+                };
+                let mut event = tj_core::event::Event::new(
+                    &tc.task_id,
+                    tj_core::event::EventType::Correction,
+                    tj_core::event::Author::User,
+                    tj_core::event::Source::Hook,
+                    "User invoked /rewind — preceding events on this task should be reconsidered. They may have been part of a path the user explicitly rolled back.".to_string(),
+                );
+                event.confidence = Some(1.0);
+                event.status = tj_core::event::EventStatus::Confirmed;
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+                println!("{}", event.event_id);
                 return Ok(());
             }
 
@@ -2133,7 +2252,386 @@ fn main() -> Result<()> {
                 eprintln!("\nImported {total_tasks} task(s) with {total_events} event(s).");
             }
         }
+        Commands::Statusline => {
+            // Failure mode: print empty + exit 0. CC re-renders the
+            // statusline on every keystroke; a panic or non-zero exit
+            // would visibly break the bottom strip. Better to look
+            // empty than to look broken.
+            print!("{}", run_statusline().unwrap_or_default());
+        }
+        Commands::Rejected {
+            topic,
+            all_projects,
+            limit,
+            since,
+        } => {
+            run_rejected(&topic, all_projects, limit, since)?;
+        }
+        Commands::ExportPr { task_id } => {
+            run_export_pr(&task_id)?;
+        }
     }
+    Ok(())
+}
+
+/// Returns the rendered statusline string. Sub-100ms target: ONE
+/// SQLite open per project, no classifier calls, no FTS5 hits — only
+/// the small `tasks` table. Empty string when there's no project
+/// state at all (clean cwd outside any tracked project).
+fn run_statusline() -> anyhow::Result<String> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    // Bail early on a clean machine. Both files missing → nothing to
+    // show; printing empty keeps CC's bottom strip silent.
+    if !state_path.exists() && !events_path.exists() {
+        return Ok(String::new());
+    }
+    // Lazy-bootstrap the SQLite when events exist but state doesn't —
+    // happens right after `create` and before any pack/search call.
+    // tj_core::db::open runs migrations; ingest_new_events backfills
+    // the tasks/events_index tables from JSONL.
+    if !state_path.exists() && events_path.exists() {
+        let conn = tj_core::db::open(&state_path)?;
+        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    }
+    let conn = rusqlite::Connection::open(&state_path)?;
+
+    // Most-recently-touched open task. NULL is fine — the task line
+    // becomes optional in the output.
+    let recent_open: Option<String> = conn
+        .query_row(
+            "SELECT task_id FROM tasks WHERE project_hash = ?1 AND status = 'open'
+             ORDER BY last_event_at DESC LIMIT 1",
+            rusqlite::params![project_hash],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+
+    let open_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE project_hash = ?1 AND status = 'open'",
+            rusqlite::params![project_hash],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    // Stale: open + last_event_at older than 7 days. Reuse stale_tasks
+    // to keep the cutoff arithmetic in one place.
+    let stale_count = tj_core::db::stale_tasks(&conn, 7)?
+        .into_iter()
+        .filter(|t| {
+            // stale_tasks doesn't filter by project, so do it here.
+            // Cheaper than a second query.
+            conn.query_row(
+                "SELECT project_hash FROM tasks WHERE task_id = ?1",
+                rusqlite::params![t.task_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|h| h == project_hash)
+            .unwrap_or(false)
+        })
+        .count();
+
+    // Pending dir is global — one entry per queued classifier failure.
+    // No project filter (matches the brief; per-project counting would
+    // need extra metadata in each pending file).
+    let pending_count = pending_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(&d).ok())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x == "json")
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    let inner = match recent_open {
+        Some(id) => format!(
+            "{id} · open: {open_count} · pending: {pending_count} · stale: {stale_count}"
+        ),
+        None => format!(
+            "open: {open_count} · pending: {pending_count} · stale: {stale_count}"
+        ),
+    };
+    Ok(format!("[{inner}]"))
+}
+
+/// `True` when the prompt's first non-whitespace token is `/rewind`
+/// (case-insensitive). Pulled out as a free function so unit tests
+/// can hammer the parsing without spinning up a binary.
+fn is_rewind_prompt(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let token = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    token.eq_ignore_ascii_case("/rewind")
+}
+
+/// Tokens FTS5 considers special — fall back to LIKE when the topic
+/// contains one of these. Mirrors the heuristic in `task_search`.
+fn topic_is_fts_safe(topic: &str) -> bool {
+    !topic
+        .chars()
+        .any(|c| matches!(c, '-' | '"' | '*' | ':' | '(' | ')'))
+}
+
+fn run_rejected(
+    topic: &str,
+    all_projects: bool,
+    limit: usize,
+    since: Option<i64>,
+) -> Result<()> {
+    let cutoff: Option<String> = since.map(|d| {
+        (chrono::Utc::now() - chrono::Duration::days(d))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    });
+
+    let state_dir = tj_core::paths::state_dir()?;
+    let project_filter: Option<String> = if all_projects {
+        None
+    } else {
+        let cwd = std::env::current_dir()?;
+        Some(tj_core::project_hash::from_path(&cwd)?)
+    };
+
+    let hashes: Vec<String> = if let Some(h) = &project_filter {
+        // Lazy-create the SQLite for the current project so the cwd
+        // case still works on a fresh clone (no events_dir yet).
+        let events_path = tj_core::paths::events_dir()?.join(format!("{h}.jsonl"));
+        if events_path.exists() {
+            let state_path = state_dir.join(format!("{h}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+            tj_core::db::ingest_new_events(&conn, &events_path, h)?;
+        }
+        vec![h.clone()]
+    } else {
+        tj_core::db::list_all_projects(&state_dir)?
+    };
+
+    // Collect → sort by ts desc → take limit. A single UNION ALL across
+    // attached DBs would be faster but rusqlite's bundled build doesn't
+    // ship ATTACH-friendly ergonomics; per-project loop is fine here.
+    let mut hits: Vec<(String, String, String, String, String)> = Vec::new();
+    for hash in hashes {
+        let path = state_dir.join(format!("{hash}.sqlite"));
+        let conn = match rusqlite::Connection::open(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let use_fts = topic_is_fts_safe(topic);
+        let sql = if use_fts {
+            "SELECT ei.event_id, ei.task_id, ei.timestamp, sf.text, t.title
+             FROM events_index ei
+             JOIN search_fts sf ON sf.event_id = ei.event_id
+             JOIN tasks t ON t.task_id = ei.task_id
+             WHERE ei.type = 'rejection'
+               AND search_fts MATCH ?1
+               AND (?2 IS NULL OR ei.timestamp >= ?2)
+             ORDER BY ei.timestamp DESC LIMIT ?3"
+        } else {
+            "SELECT ei.event_id, ei.task_id, ei.timestamp, sf.text, t.title
+             FROM events_index ei
+             JOIN search_fts sf ON sf.event_id = ei.event_id
+             JOIN tasks t ON t.task_id = ei.task_id
+             WHERE ei.type = 'rejection'
+               AND sf.text LIKE ?1
+               AND (?2 IS NULL OR ei.timestamp >= ?2)
+             ORDER BY ei.timestamp DESC LIMIT ?3"
+        };
+
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let bind_q = if use_fts {
+            topic.to_string()
+        } else {
+            format!("%{topic}%")
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![bind_q, cutoff, limit as i64],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        ) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for row in rows.flatten() {
+            hits.push(row);
+        }
+    }
+
+    // Cross-project re-sort. Within one project the SQL ORDER BY
+    // already did this, but UNION-ALL semantics need a second pass.
+    hits.sort_by(|a, b| b.2.cmp(&a.2));
+    hits.truncate(limit);
+
+    for (_eid, task_id, ts, text, title) in hits {
+        // YYYY-MM-DD slice of an RFC3339 timestamp; cheap and stable.
+        let date = ts.get(..10).unwrap_or(&ts);
+        // Squash newlines so multi-line rejections still render as
+        // one block per hit.
+        let one_line: String = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        println!("{task_id}\t{date}\t\"{one_line}\"");
+        println!("\t\t(in task: {title})");
+    }
+    Ok(())
+}
+
+fn run_export_pr(task_id: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    }
+
+    // Fetch task title up-front; bail with a typed exit code so callers
+    // can distinguish "not found" from a generic IO error.
+    let title: String = match conn
+        .query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            rusqlite::params![task_id],
+            |r| r.get::<_, String>(0),
+        ) {
+        Ok(t) => t,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            eprintln!("Error: task not found: {task_id}");
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let meta = tj_core::db::task_metadata(&conn, task_id)?.unwrap_or_default();
+    let summary = meta.goal.unwrap_or_else(|| title.clone());
+
+    // Pull all events ordered ASC so the PR description reads like a
+    // narrative (oldest decision first → newest).
+    let mut stmt = conn.prepare(
+        "SELECT ei.type, sf.text FROM events_index ei
+         LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+         WHERE ei.task_id = ?1 ORDER BY ei.timestamp ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| {
+        let ty: String = r.get(0)?;
+        let txt: Option<String> = r.get(1)?;
+        Ok((ty, txt.unwrap_or_default()))
+    })?;
+    let mut decisions: Vec<String> = Vec::new();
+    let mut rejections: Vec<String> = Vec::new();
+    let mut evidence: Vec<String> = Vec::new();
+    for row in rows {
+        let (ty, text) = row?;
+        let one_line: String = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if one_line.is_empty() {
+            continue;
+        }
+        match ty.as_str() {
+            "decision" => decisions.push(one_line),
+            "rejection" => rejections.push(one_line),
+            "evidence" => evidence.push(one_line),
+            _ => {}
+        }
+    }
+
+    let arts = tj_core::db::task_artifacts(&conn, task_id)?;
+
+    let mut out = String::new();
+    out.push_str("## Summary\n");
+    out.push_str(&summary);
+    out.push_str("\n\n");
+
+    out.push_str("## Changes\n");
+    if decisions.is_empty() {
+        out.push_str("- (no decision events recorded)\n");
+    } else {
+        for d in &decisions {
+            out.push_str(&format!("- {d}\n"));
+        }
+    }
+    out.push('\n');
+
+    if !rejections.is_empty() {
+        out.push_str("## Why this approach (vs alternatives)\n");
+        for r in &rejections {
+            out.push_str(&format!("- {r}\n"));
+        }
+        out.push('\n');
+    }
+
+    if !evidence.is_empty() {
+        out.push_str("## Verification\n");
+        for e in &evidence {
+            out.push_str(&format!("- {e}\n"));
+        }
+        out.push('\n');
+    }
+
+    let any_arts = !arts.files.is_empty()
+        || !arts.commit_hashes.is_empty()
+        || !arts.linked_issues.is_empty()
+        || !arts.branch_names.is_empty()
+        || !arts.pr_urls.is_empty();
+    if any_arts {
+        out.push_str("## Affected\n");
+        if !arts.files.is_empty() {
+            out.push_str(&format!("- Files: {}\n", arts.files.join(", ")));
+        }
+        if !arts.commit_hashes.is_empty() {
+            out.push_str(&format!(
+                "- Commits: {}\n",
+                arts.commit_hashes.join(", ")
+            ));
+        }
+        if !arts.linked_issues.is_empty() {
+            out.push_str(&format!(
+                "- Issues: {}\n",
+                arts.linked_issues.join(", ")
+            ));
+        }
+        if !arts.branch_names.is_empty() {
+            out.push_str(&format!(
+                "- Branches: {}\n",
+                arts.branch_names.join(", ")
+            ));
+        }
+        if !arts.pr_urls.is_empty() {
+            out.push_str(&format!("- PRs: {}\n", arts.pr_urls.join(", ")));
+        }
+        out.push('\n');
+    }
+
+    print!("{}", out);
     Ok(())
 }
 
@@ -2731,4 +3229,43 @@ fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
         "redirect" => Redirect,
         other => anyhow::bail!("unknown event type: {other}"),
     })
+}
+
+#[cfg(test)]
+mod inline_tests {
+    // Sits at the bottom of the file to satisfy
+    // `clippy::items_after_test_module` — every other free fn must be
+    // declared before this module begins.
+    use super::*;
+
+    #[test]
+    fn is_rewind_prompt_simple() {
+        assert!(is_rewind_prompt("/rewind"));
+        assert!(is_rewind_prompt("/rewind back to plan A"));
+        assert!(is_rewind_prompt("  /rewind"));
+        assert!(is_rewind_prompt("\t/rewind"));
+    }
+
+    #[test]
+    fn is_rewind_prompt_case_insensitive() {
+        assert!(is_rewind_prompt("/Rewind"));
+        assert!(is_rewind_prompt("/REWIND"));
+    }
+
+    #[test]
+    fn is_rewind_prompt_rejects_non_match() {
+        assert!(!is_rewind_prompt("rewind"));
+        assert!(!is_rewind_prompt("hello /rewind"));
+        assert!(!is_rewind_prompt(""));
+        assert!(!is_rewind_prompt("/rewinder"));
+    }
+
+    #[test]
+    fn topic_is_fts_safe_basic() {
+        assert!(topic_is_fts_safe("oauth"));
+        assert!(topic_is_fts_safe("foo bar"));
+        assert!(!topic_is_fts_safe("foo-bar"));
+        assert!(!topic_is_fts_safe("\"quote\""));
+        assert!(!topic_is_fts_safe("col:name"));
+    }
 }

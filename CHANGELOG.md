@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-10
+
+Reasoning-chain ergonomics: surface the journal in the Claude Code
+statusline, capture compaction + rewind boundaries automatically, and
+make rejection lookup + PR-description rendering first-class CLI
+commands. All additive — no schema breaking changes from 0.6.x.
+
+### Added
+- `task-journal statusline` — sub-100ms one-liner for the Claude Code
+  statusline. Renders `[tj-x9rz · open: N · pending: N · stale: N]`
+  using only the small `tasks` table, no FTS5 hits, no classifier
+  calls. Hidden from `--help` (it's tooling, not a human command).
+  Wire it via `~/.claude/settings.json` `"statusLine"`.
+- `task-journal rejected <topic>` — cross-task rejection lookup.
+  FTS5 by default, LIKE fallback for FTS-unfriendly topics (e.g.
+  `oauth-pkce`). Supports `--all-projects`, `--limit`, `--since`.
+  Surfaces approaches that were already turned down so the agent
+  doesn't repeat them.
+- `task-journal export-pr <id>` — render a task as PR-description
+  Markdown: Summary, Changes (decisions), Why-this-approach
+  (rejections), Verification (evidence), Affected (artifacts).
+  Reuses existing event log + artifacts; no new tables.
+- PreCompact hook handler — Claude Code emits `PreCompact` before
+  compaction; ingest-hook now drops a marker `decision` event on the
+  most-recent open task so the post-compact agent sees a clear
+  boundary in the journal.
+- `/rewind` UserPromptSubmit marker — when the user prepends `/rewind`
+  to a prompt, ingest-hook appends a single `correction` event
+  instead of running the classifier. Conservative — does NOT mass-mark
+  prior events as rejected; just leaves a sentinel for pack readers.
+- Plugin skill `rejected.md` wrapping the new CLI command.
+
+### Changed
+- `install-hooks` now wires a `PreCompact` event entry alongside the
+  existing `UserPromptSubmit` / `PostToolUse` / `Stop` / `SessionStart`
+  hooks. Re-run `task-journal install-hooks` to pick this up.
+
 ## [0.6.3] - 2026-05-09
 
 Drop empty-text events at the hook boundary. PostToolUse for tools

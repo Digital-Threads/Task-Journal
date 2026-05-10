@@ -78,8 +78,32 @@ That's it. Restart Claude Code, start working, and the journal fills itself.
 - **Auto-capture via Claude Code hooks.** Every prompt, tool call, and Claude reply is classified by a small `claude -p` invocation and appended as a typed event (`finding` / `decision` / `evidence` / `rejection` / …). Hook returns in <100 ms — classification happens in the background, never blocks your session.
 - **Artifact extraction.** Each event scans its text for commit hashes, PR URLs, file paths, issue IDs, and branch names. Aggregated artifacts are how Task Journal links related tasks: when you start a new task touching the same issue or file, the prior task is surfaced automatically.
 - **Resume packs.** `task_pack` (MCP tool or CLI) renders a task into a compact Markdown briefing — Goal, Outcome, decisions, rejections, evidence, artifacts — that fits in a fresh agent's context window without dumping the raw event log.
+- **Auto-capture boundaries.** Beyond per-event capture, two extra hooks mark *reasoning boundaries* automatically: `PreCompact` drops a marker decision when Claude Code is about to compact, and a `/rewind`-prefixed prompt appends a single correction event so pack readers see where the user rolled back. No mass-rejection of prior events — the boundary is a sentinel, not a rewrite.
 
 Source of truth is an append-only JSONL log per project. SQLite holds derived state and is fully rebuildable. Nothing is sent off-machine except the classifier prompt to your own `claude -p` (subscription) or the Anthropic API.
+
+### Statusline integration
+
+Show `[tj-x9rz · open: 3 · pending: 2 · stale: 1]` at the bottom of every Claude Code render. The most-recently-touched open task in the current project, plus open / queued-classifier-failure / 7-day-idle counts. Sub-100ms by design — safe to wire into the per-keystroke statusline.
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "task-journal statusline"
+  }
+}
+```
+
+### PR description from a task
+
+When the work is done, render the task as a PR-ready Markdown block: Summary (goal), Changes (decisions), Why-this-approach (rejections), Verification (evidence), Affected (files / commits / issues / branches / PRs).
+
+```bash
+task-journal export-pr tj-x9rz1f | gh pr create --body-file -
+```
 
 ## Daily use (no manual commands needed)
 
@@ -127,6 +151,9 @@ task-journal pack tj-x9rz1f --mode full
 | `pack <id> --mode compact\|full` | Render a resume pack |
 | `events list [--limit N]` | List recent events |
 | `search <query> [--all-projects]` | Full-text search (FTS5) |
+| `rejected <topic> [--all-projects] [--limit N] [--since DAYS]` | Cross-task rejection lookup — surfaces approaches already turned down |
+| `export-pr <id>` | Render a task as PR-description Markdown |
+| `statusline` | One-liner for `~/.claude/settings.json` `statusLine` (sub-100ms) |
 | `stale [--days N]` | List open tasks idle >N days |
 | `reclassify <id>` | Re-extract artifacts from a task's events |
 | `pending list \| retry` | Inspect or retry queued classifier failures |
