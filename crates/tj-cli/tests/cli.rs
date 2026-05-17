@@ -2166,9 +2166,7 @@ fn ingest_hook_returns_fast_in_async_mode() {
     let entries: Vec<_> = std::fs::read_dir(&pending)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|s| s.to_str()) == Some("json")
-        })
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
     // Worker may have already drained; in that case at least the
     // worker should have left a v1 pending entry from /bin/false
@@ -2197,8 +2195,7 @@ fn classify_worker_handles_classifier_failure_cleanly() {
     let pending = dir.path().join("task-journal").join("pending");
     std::fs::create_dir_all(&pending).unwrap();
     let cwd = std::env::current_dir().unwrap();
-    let project_hash =
-        tj_core::project_hash::from_path(&cwd).expect("compute project hash");
+    let project_hash = tj_core::project_hash::from_path(&cwd).expect("compute project hash");
     let events_path = dir
         .path()
         .join("task-journal")
@@ -2251,8 +2248,7 @@ fn classify_worker_handles_classifier_failure_cleanly() {
 fn classify_worker_respects_existing_lock() {
     let dir = assert_fs::TempDir::new().unwrap();
     let cwd = std::env::current_dir().unwrap();
-    let project_hash =
-        tj_core::project_hash::from_path(&cwd).expect("compute project hash");
+    let project_hash = tj_core::project_hash::from_path(&cwd).expect("compute project hash");
 
     // Pre-create a v2 pending entry.
     let pending = dir.path().join("task-journal").join("pending");
@@ -2509,7 +2505,10 @@ fn precompact_ingests_transcript_tail_into_pending_v2() {
             assert_eq!(v["kind"], "PreCompactChunk");
         }
     }
-    assert!(saw_user && saw_assistant, "missing one of the chunks: user={saw_user} assistant={saw_assistant}");
+    assert!(
+        saw_user && saw_assistant,
+        "missing one of the chunks: user={saw_user} assistant={saw_assistant}"
+    );
 }
 
 #[test]
@@ -2552,7 +2551,10 @@ fn precompact_skips_transcript_entries_older_than_last_event() {
     let queued_count = std::fs::read_dir(&pending_dir)
         .map(|it| it.count())
         .unwrap_or(0);
-    assert_eq!(queued_count, 0, "no chunks must be queued for ancient transcript");
+    assert_eq!(
+        queued_count, 0,
+        "no chunks must be queued for ancient transcript"
+    );
 }
 
 #[test]
@@ -2598,9 +2600,7 @@ fn rewind_prompt_appends_correction_event() {
         .args(["pack", &task_id, "--mode", "full"])
         .assert()
         .success()
-        .stdout(
-            contains("[correction]").and(contains("/rewind")),
-        );
+        .stdout(contains("[correction]").and(contains("/rewind")));
 }
 
 #[test]
@@ -2648,8 +2648,12 @@ fn rejected_command_finds_rejection_events_by_topic() {
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
         .args([
-            "event", &task_id, "--type", "rejection",
-            "--text", "Implicit grant deprecated by RFC 9700",
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Implicit grant deprecated by RFC 9700",
         ])
         .assert()
         .success();
@@ -2658,8 +2662,12 @@ fn rejected_command_finds_rejection_events_by_topic() {
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
         .args([
-            "event", &task_id, "--type", "rejection",
-            "--text", "Symmetric session keys leak across browser tabs",
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Symmetric session keys leak across browser tabs",
         ])
         .assert()
         .success();
@@ -2668,8 +2676,12 @@ fn rejected_command_finds_rejection_events_by_topic() {
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
         .args([
-            "event", &task_id, "--type", "decision",
-            "--text", "Use authorization code with PKCE per RFC 9700",
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Use authorization code with PKCE per RFC 9700",
         ])
         .assert()
         .success();
@@ -2700,12 +2712,7 @@ fn export_pr_renders_summary_changes_rejections_verification_affected() {
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .current_dir(&workdir)
-            .args([
-                "create",
-                "Export PR test",
-                "--goal",
-                "Wire OAuth via PKCE",
-            ])
+            .args(["create", "Export PR test", "--goal", "Wire OAuth via PKCE"])
             .assert()
             .success()
             .get_output()
@@ -2721,8 +2728,12 @@ fn export_pr_renders_summary_changes_rejections_verification_affected() {
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
         .args([
-            "event", &task_id, "--type", "decision",
-            "--text", "Adopt PKCE flow in src/auth/oauth.rs",
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Adopt PKCE flow in src/auth/oauth.rs",
         ])
         .assert()
         .success();
@@ -2731,8 +2742,12 @@ fn export_pr_renders_summary_changes_rejections_verification_affected() {
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
         .args([
-            "event", &task_id, "--type", "rejection",
-            "--text", "Implicit grant deprecated",
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Implicit grant deprecated",
         ])
         .assert()
         .success();
@@ -2741,8 +2756,12 @@ fn export_pr_renders_summary_changes_rejections_verification_affected() {
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
         .args([
-            "event", &task_id, "--type", "evidence",
-            "--text", "Test suite green: 142 passed",
+            "event",
+            &task_id,
+            "--type",
+            "evidence",
+            "--text",
+            "Test suite green: 142 passed",
         ])
         .assert()
         .success();

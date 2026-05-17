@@ -120,7 +120,9 @@ mod tests {
     fn from_env_constructs_without_key() {
         // SAFETY: tests in this crate do not concurrently read these env vars.
         let prev = std::env::var("ANTHROPIC_API_KEY").ok();
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY"); }
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
         let hybrid = HybridClassifier::from_env();
         assert!(!hybrid.has_llm_fallback());
         unsafe {

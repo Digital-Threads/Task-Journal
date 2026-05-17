@@ -864,9 +864,7 @@ enum Commands {
     /// Render a task as PR-description Markdown (Summary, Changes,
     /// Why-this-approach, Verification, Affected). Reuses event log +
     /// artifacts; introduces no new tables.
-    ExportPr {
-        task_id: String,
-    },
+    ExportPr { task_id: String },
 }
 
 #[derive(Subcommand)]
@@ -1604,8 +1602,7 @@ fn main() -> Result<()> {
                 }
 
                 // (2) Boundary marker.
-                let now = chrono::Utc::now()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 let marker_text = format!(
                     "Conversation compacted at {now}; preceding events should be treated as a single reasoning unit."
                 );
@@ -1712,13 +1709,7 @@ fn main() -> Result<()> {
                 .unwrap_or(false);
             let is_mock = mock_event_type.is_some() && mock_task_id.is_some();
             if !is_mock && !force_sync {
-                let _ = persist_pending_v2(
-                    &events_path,
-                    &kind,
-                    &text,
-                    &project_hash,
-                    &backend,
-                )?;
+                let _ = persist_pending_v2(&events_path, &kind, &text, &project_hash, &backend)?;
                 // Fire-and-forget worker. Errors here are best-effort —
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
@@ -1733,145 +1724,146 @@ fn main() -> Result<()> {
                 "assistant"
             };
 
-            let (etype, task_id, confidence, evidence_strength, suggested_text) =
-                if let (Some(t), Some(tid)) = (mock_event_type.as_deref(), mock_task_id.as_deref())
-                {
-                    (
-                        parse_event_type(t)?,
-                        tid.to_string(),
-                        mock_confidence.unwrap_or(1.0),
-                        None,
-                        None,
-                    )
-                } else {
-                    let state_path =
-                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                    let conn = tj_core::db::open(&state_path)?;
-                    if events_path.exists() {
-                        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            let (etype, task_id, confidence, evidence_strength, suggested_text) = if let (
+                Some(t),
+                Some(tid),
+            ) =
+                (mock_event_type.as_deref(), mock_task_id.as_deref())
+            {
+                (
+                    parse_event_type(t)?,
+                    tid.to_string(),
+                    mock_confidence.unwrap_or(1.0),
+                    None,
+                    None,
+                )
+            } else {
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                if events_path.exists() {
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                }
+                let mut recent = recent_task_contexts(&conn, 5)?;
+                if recent.is_empty() {
+                    // No open tasks. v0.5.0 Phase A: auto-open a new
+                    // task from the user's prompt so subsequent
+                    // events have somewhere to land. Without this
+                    // every fresh session was a black hole — events
+                    // dropped silently because there was nothing to
+                    // classify against. Opt-out via
+                    // TJ_AUTO_OPEN_TASKS=0; only fires for
+                    // UserPromptSubmit (assistant tool calls
+                    // shouldn't conjure tasks).
+                    let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+                        .ok()
+                        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                        .unwrap_or(false);
+                    if auto_open_disabled || !kind.contains("UserPrompt") {
+                        return Ok(());
                     }
-                    let mut recent = recent_task_contexts(&conn, 5)?;
-                    if recent.is_empty() {
-                        // No open tasks. v0.5.0 Phase A: auto-open a new
-                        // task from the user's prompt so subsequent
-                        // events have somewhere to land. Without this
-                        // every fresh session was a black hole — events
-                        // dropped silently because there was nothing to
-                        // classify against. Opt-out via
-                        // TJ_AUTO_OPEN_TASKS=0; only fires for
-                        // UserPromptSubmit (assistant tool calls
-                        // shouldn't conjure tasks).
-                        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
-                            .ok()
-                            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-                            .unwrap_or(false);
-                        if auto_open_disabled || !kind.contains("UserPrompt") {
-                            return Ok(());
-                        }
-                        let new_task =
-                            auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?;
-                        recent.push(new_task);
-                    }
+                    let new_task =
+                        auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?;
+                    recent.push(new_task);
+                }
 
-                    use tj_core::classifier::Classifier;
-                    let classifier: Box<dyn Classifier> = match backend.as_str() {
-                        // v0.8.0: hybrid is the new default. Heuristic
-                        // pattern-matching first (free), Anthropic API
-                        // fallback when uncertain (requires ANTHROPIC_API_KEY).
-                        // No background spawn of `claude -p` — that subprocess
-                        // now bills tokens separately from Pro/Max.
-                        "hybrid" | "" => Box::new(
-                            tj_core::classifier::hybrid::HybridClassifier::from_env(),
-                        ),
-                        "api" => {
-                            Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?)
-                        }
-                        "heuristic" => {
-                            // Heuristic-only: no LLM at all. Trades coverage
-                            // for absolute zero-cost / offline operation.
-                            use tj_core::classifier::heuristic::try_heuristic;
-                            use tj_core::classifier::{ClassifyInput, ClassifyOutput};
-                            struct HeuristicOnly;
-                            impl Classifier for HeuristicOnly {
-                                fn classify(
-                                    &self,
-                                    input: &ClassifyInput,
-                                ) -> anyhow::Result<ClassifyOutput> {
-                                    try_heuristic(input).ok_or_else(|| {
+                use tj_core::classifier::Classifier;
+                let classifier: Box<dyn Classifier> = match backend.as_str() {
+                    // v0.8.0: hybrid is the new default. Heuristic
+                    // pattern-matching first (free), Anthropic API
+                    // fallback when uncertain (requires ANTHROPIC_API_KEY).
+                    // No background spawn of `claude -p` — that subprocess
+                    // now bills tokens separately from Pro/Max.
+                    "hybrid" | "" => {
+                        Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env())
+                    }
+                    "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
+                    "heuristic" => {
+                        // Heuristic-only: no LLM at all. Trades coverage
+                        // for absolute zero-cost / offline operation.
+                        use tj_core::classifier::heuristic::try_heuristic;
+                        use tj_core::classifier::{ClassifyInput, ClassifyOutput};
+                        struct HeuristicOnly;
+                        impl Classifier for HeuristicOnly {
+                            fn classify(
+                                &self,
+                                input: &ClassifyInput,
+                            ) -> anyhow::Result<ClassifyOutput> {
+                                try_heuristic(input).ok_or_else(|| {
                                         anyhow::anyhow!(
                                             "heuristic uncertain (heuristic-only mode has no LLM fallback)"
                                         )
                                     })
-                                }
                             }
-                            Box::new(HeuristicOnly)
                         }
-                        other => anyhow::bail!(
-                            "unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)"
-                        ),
-                    };
-                    let input = tj_core::classifier::ClassifyInput {
-                        text: text.clone(),
-                        author_hint: author_hint.into(),
-                        recent_tasks: recent,
-                    };
-                    let out = match classifier.classify(&input) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            persist_pending(&events_path, &text, &e.to_string())?;
-                            return Ok(());
-                        }
-                    };
-
-                    let Some(tid) = out.task_id_guess else {
-                        return Ok(());
-                    };
-
-                    // Journal-integrity safeguards. The classifier sometimes
-                    // mis-attributes events to old or closed tasks (no fault
-                    // of the model — its prompt only sees recent_tasks). We
-                    // reject three patterns that produce confusing journals:
-                    //
-                    //   1. Stop-hook → Close event. The Stop hook fires at
-                    //      every Claude Code session end. Session ending
-                    //      != task done. Closes happen via explicit
-                    //      `task-journal close <id>` only.
-                    //   2. task_id_guess pointing at a non-existent task —
-                    //      route to pending so the user can decide later.
-                    //   3. task_id_guess pointing at a CLOSED task — same
-                    //      treatment; closed tasks must stay closed.
-                    use tj_core::event::EventType;
-                    if matches!(out.event_type, EventType::Close) && kind == "Stop" {
-                        return Ok(());
+                        Box::new(HeuristicOnly)
                     }
-                    match tj_core::db::task_status(&conn, &tid)? {
-                        None => {
-                            persist_pending(
-                                &events_path,
-                                &text,
-                                &format!("task_id_guess `{tid}` not found"),
-                            )?;
-                            return Ok(());
-                        }
-                        Some(s) if s == "closed" => {
-                            persist_pending(
-                                &events_path,
-                                &text,
-                                &format!("task_id_guess `{tid}` is closed"),
-                            )?;
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
-
-                    (
-                        out.event_type,
-                        tid,
-                        out.confidence,
-                        out.evidence_strength,
-                        Some(out.suggested_text),
-                    )
+                    other => anyhow::bail!(
+                        "unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)"
+                    ),
                 };
+                let input = tj_core::classifier::ClassifyInput {
+                    text: text.clone(),
+                    author_hint: author_hint.into(),
+                    recent_tasks: recent,
+                };
+                let out = match classifier.classify(&input) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        persist_pending(&events_path, &text, &e.to_string())?;
+                        return Ok(());
+                    }
+                };
+
+                let Some(tid) = out.task_id_guess else {
+                    return Ok(());
+                };
+
+                // Journal-integrity safeguards. The classifier sometimes
+                // mis-attributes events to old or closed tasks (no fault
+                // of the model — its prompt only sees recent_tasks). We
+                // reject three patterns that produce confusing journals:
+                //
+                //   1. Stop-hook → Close event. The Stop hook fires at
+                //      every Claude Code session end. Session ending
+                //      != task done. Closes happen via explicit
+                //      `task-journal close <id>` only.
+                //   2. task_id_guess pointing at a non-existent task —
+                //      route to pending so the user can decide later.
+                //   3. task_id_guess pointing at a CLOSED task — same
+                //      treatment; closed tasks must stay closed.
+                use tj_core::event::EventType;
+                if matches!(out.event_type, EventType::Close) && kind == "Stop" {
+                    return Ok(());
+                }
+                match tj_core::db::task_status(&conn, &tid)? {
+                    None => {
+                        persist_pending(
+                            &events_path,
+                            &text,
+                            &format!("task_id_guess `{tid}` not found"),
+                        )?;
+                        return Ok(());
+                    }
+                    Some(s) if s == "closed" => {
+                        persist_pending(
+                            &events_path,
+                            &text,
+                            &format!("task_id_guess `{tid}` is closed"),
+                        )?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+
+                (
+                    out.event_type,
+                    tid,
+                    out.confidence,
+                    out.evidence_strength,
+                    Some(out.suggested_text),
+                )
+            };
 
             // Use classifier's suggested_text if available (it's more concise and specific),
             // fall back to raw hook text for mock/manual events.
@@ -2403,12 +2395,10 @@ fn run_statusline() -> anyhow::Result<String> {
         .unwrap_or(0);
 
     let inner = match recent_open {
-        Some(id) => format!(
-            "{id} · open: {open_count} · pending: {pending_count} · stale: {stale_count}"
-        ),
-        None => format!(
-            "open: {open_count} · pending: {pending_count} · stale: {stale_count}"
-        ),
+        Some(id) => {
+            format!("{id} · open: {open_count} · pending: {pending_count} · stale: {stale_count}")
+        }
+        None => format!("open: {open_count} · pending: {pending_count} · stale: {stale_count}"),
     };
     Ok(format!("[{inner}]"))
 }
@@ -2418,10 +2408,7 @@ fn run_statusline() -> anyhow::Result<String> {
 /// can hammer the parsing without spinning up a binary.
 fn is_rewind_prompt(text: &str) -> bool {
     let trimmed = text.trim_start();
-    let token = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
+    let token = trimmed.split_whitespace().next().unwrap_or("");
     token.eq_ignore_ascii_case("/rewind")
 }
 
@@ -2433,12 +2420,7 @@ fn topic_is_fts_safe(topic: &str) -> bool {
         .any(|c| matches!(c, '-' | '"' | '*' | ':' | '(' | ')'))
 }
 
-fn run_rejected(
-    topic: &str,
-    all_projects: bool,
-    limit: usize,
-    since: Option<i64>,
-) -> Result<()> {
+fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64>) -> Result<()> {
     let cutoff: Option<String> = since.map(|d| {
         (chrono::Utc::now() - chrono::Duration::days(d))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -2507,18 +2489,15 @@ fn run_rejected(
         } else {
             format!("%{topic}%")
         };
-        let rows = match stmt.query_map(
-            rusqlite::params![bind_q, cutoff, limit as i64],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    r.get::<_, String>(4)?,
-                ))
-            },
-        ) {
+        let rows = match stmt.query_map(rusqlite::params![bind_q, cutoff, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, String>(4)?,
+            ))
+        }) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -2562,12 +2541,11 @@ fn run_export_pr(task_id: &str) -> Result<()> {
 
     // Fetch task title up-front; bail with a typed exit code so callers
     // can distinguish "not found" from a generic IO error.
-    let title: String = match conn
-        .query_row(
-            "SELECT title FROM tasks WHERE task_id = ?1",
-            rusqlite::params![task_id],
-            |r| r.get::<_, String>(0),
-        ) {
+    let title: String = match conn.query_row(
+        "SELECT title FROM tasks WHERE task_id = ?1",
+        rusqlite::params![task_id],
+        |r| r.get::<_, String>(0),
+    ) {
         Ok(t) => t,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             eprintln!("Error: task not found: {task_id}");
@@ -2596,12 +2574,7 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     let mut evidence: Vec<String> = Vec::new();
     for row in rows {
         let (ty, text) = row?;
-        let one_line: String = text
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let one_line: String = text.lines().next().unwrap_or("").trim().to_string();
         if one_line.is_empty() {
             continue;
         }
@@ -2657,22 +2630,13 @@ fn run_export_pr(task_id: &str) -> Result<()> {
             out.push_str(&format!("- Files: {}\n", arts.files.join(", ")));
         }
         if !arts.commit_hashes.is_empty() {
-            out.push_str(&format!(
-                "- Commits: {}\n",
-                arts.commit_hashes.join(", ")
-            ));
+            out.push_str(&format!("- Commits: {}\n", arts.commit_hashes.join(", ")));
         }
         if !arts.linked_issues.is_empty() {
-            out.push_str(&format!(
-                "- Issues: {}\n",
-                arts.linked_issues.join(", ")
-            ));
+            out.push_str(&format!("- Issues: {}\n", arts.linked_issues.join(", ")));
         }
         if !arts.branch_names.is_empty() {
-            out.push_str(&format!(
-                "- Branches: {}\n",
-                arts.branch_names.join(", ")
-            ));
+            out.push_str(&format!("- Branches: {}\n", arts.branch_names.join(", ")));
         }
         if !arts.pr_urls.is_empty() {
             out.push_str(&format!("- PRs: {}\n", arts.pr_urls.join(", ")));
@@ -3092,19 +3056,14 @@ fn process_pending_entry(
 
     use tj_core::classifier::Classifier;
     let classifier: Box<dyn Classifier> = match backend {
-        "hybrid" | "" => {
-            Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env())
-        }
+        "hybrid" | "" => Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env()),
         "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
         "heuristic" => {
             use tj_core::classifier::heuristic::try_heuristic;
             use tj_core::classifier::{ClassifyInput, ClassifyOutput};
             struct HeuristicOnly;
             impl Classifier for HeuristicOnly {
-                fn classify(
-                    &self,
-                    input: &ClassifyInput,
-                ) -> anyhow::Result<ClassifyOutput> {
+                fn classify(&self, input: &ClassifyInput) -> anyhow::Result<ClassifyOutput> {
                     try_heuristic(input).ok_or_else(|| {
                         anyhow::anyhow!(
                             "heuristic uncertain (heuristic-only mode has no LLM fallback)"
@@ -3114,9 +3073,9 @@ fn process_pending_entry(
             }
             Box::new(HeuristicOnly)
         }
-        other => anyhow::bail!(
-            "unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)"
-        ),
+        other => {
+            anyhow::bail!("unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)")
+        }
     };
     let input = tj_core::classifier::ClassifyInput {
         text: text.clone(),

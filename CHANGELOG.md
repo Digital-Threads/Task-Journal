@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-17
+
+### Fixed
+- `cargo fmt --all --check` on the v0.9.0 release commit failed and
+  blocked the release pipeline. v0.9.1 carries only the formatting
+  fixes — no behavior change.
+
 ## [0.9.0] - 2026-05-17
 
 **Breaking — `cli` backend removed.** v0.8.0 left it as a deprecated
