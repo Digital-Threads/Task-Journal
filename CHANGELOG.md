@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-17
+
+PreCompact closes the gap before compaction — the synchronous hook only
+fires on `PostToolUse`, so any reasoning between the final tool call and
+the compact event used to vanish. v0.7.1 reads the transcript JSONL on
+`PreCompact`, enqueues entries newer than the active task's last event
+timestamp as pending v2 chunks, and spawns the classify-worker. The
+boundary marker still lands as before; the catch-up is additive.
+
+### Added
+- PreCompact transcript catch-up — `ingest-hook --kind=PreCompact` now
+  reads `transcript_path` from the hook stdin payload, walks the
+  session JSONL, and enqueues user/assistant entries newer than the
+  task's last event timestamp as pending v2 chunks (`UserPromptSubmit`
+  / `PreCompactChunk`). The classify-worker picks them up after the
+  hook returns. Best-effort: missing or unreadable transcript falls
+  through to the marker-only path.
+- Plugin `hooks.json` now wires `PreCompact` (was previously only
+  installed via `install-hooks`). Plugin users get the catch-up
+  without re-running the installer.
+- `TJ_DISABLE_CLASSIFY_SPAWN=1` env var — skips the classify-worker
+  spawn after enqueueing. Test-only; not documented as public.
+
+### Fixed
+- Plugin `hooks.json` PostToolUse template — was passing
+  `--text="$TOOL_OUTPUT"` (an env var Claude Code never sets), feeding
+  the classifier empty text and dropping every PostToolUse event in
+  the plugin install path. Now reads the hook payload from stdin like
+  `install-hooks` already does. Plugin users may see a sudden
+  uplift in captured events — by design.
+
 ## [0.7.0] - 2026-05-10
 
 Reasoning-chain ergonomics: surface the journal in the Claude Code

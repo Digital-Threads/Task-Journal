@@ -2483,6 +2483,127 @@ fn precompact_hook_with_no_open_task_writes_nothing() {
 }
 
 #[test]
+fn precompact_ingests_transcript_tail_into_pending_v2() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let _task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Compactable thing"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Forge a transcript JSONL with two entries strictly newer than any
+    // timestamp `task-journal create` could have produced (year 2099) —
+    // so the catch-up walk sees them as "post-last-event".
+    let transcript = workdir.join("session.jsonl");
+    let line_user = r#"{"type":"user","uuid":"u1","timestamp":"2099-01-01T00:00:00.000Z","sessionId":"s1","message":{"content":"I think the auth middleware drops the token at the refresh boundary"}}"#;
+    let line_assistant = r#"{"type":"assistant","uuid":"a1","timestamp":"2099-01-01T00:00:05.000Z","sessionId":"s1","message":{"content":[{"type":"text","text":"Confirmed: src/auth/refresh.rs uses < instead of <= at the expiry comparison."}]}}"#;
+    std::fs::write(&transcript, format!("{line_user}\n{line_assistant}\n")).unwrap();
+
+    let stdin_payload = serde_json::json!({
+        "hook_event_name": "PreCompact",
+        "transcript_path": transcript.to_str().unwrap(),
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "cli"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success();
+
+    let pending_dir = dir.path().join("task-journal").join("pending");
+    let queued: Vec<_> = std::fs::read_dir(&pending_dir)
+        .expect("pending dir must exist after PreCompact ingest")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        queued.len(),
+        2,
+        "expected 2 pending v2 chunks (user + assistant), got {}",
+        queued.len()
+    );
+
+    // Verify v2 schema and that one entry carries the user text, the other the assistant text.
+    let mut saw_user = false;
+    let mut saw_assistant = false;
+    for entry in &queued {
+        let body = std::fs::read_to_string(entry.path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["schema"], "v2");
+        let text = v["text"].as_str().unwrap_or("");
+        if text.contains("auth middleware drops the token") {
+            saw_user = true;
+            assert_eq!(v["kind"], "UserPromptSubmit");
+        }
+        if text.contains("uses < instead of <=") {
+            saw_assistant = true;
+            assert_eq!(v["kind"], "PreCompactChunk");
+        }
+    }
+    assert!(saw_user && saw_assistant, "missing one of the chunks: user={saw_user} assistant={saw_assistant}");
+}
+
+#[test]
+fn precompact_skips_transcript_entries_older_than_last_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Already covered"])
+        .assert()
+        .success();
+
+    // Transcript with entries from year 2000 — strictly older than the
+    // task's create event. Catch-up must skip both, leaving pending empty.
+    let transcript = workdir.join("session.jsonl");
+    let line_old = r#"{"type":"user","uuid":"u1","timestamp":"2000-01-01T00:00:00.000Z","sessionId":"s1","message":{"content":"ancient chatter that classifier already processed"}}"#;
+    std::fs::write(&transcript, format!("{line_old}\n")).unwrap();
+
+    let stdin_payload = serde_json::json!({
+        "hook_event_name": "PreCompact",
+        "transcript_path": transcript.to_str().unwrap(),
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "cli"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success();
+
+    let pending_dir = dir.path().join("task-journal").join("pending");
+    let queued_count = std::fs::read_dir(&pending_dir)
+        .map(|it| it.count())
+        .unwrap_or(0);
+    assert_eq!(queued_count, 0, "no chunks must be queued for ancient transcript");
+}
+
+#[test]
 fn rewind_prompt_appends_correction_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");

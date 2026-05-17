@@ -6,7 +6,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "task-journal ingest-hook --kind=PostToolUse --text=\"$TOOL_OUTPUT\" --backend=cli 2>/dev/null || true"
+            "command": "task-journal ingest-hook --backend=cli 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "task-journal ingest-hook --backend=cli 2>/dev/null || true"
           }
         ]
       }

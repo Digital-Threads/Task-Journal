@@ -1514,8 +1514,8 @@ fn main() -> Result<()> {
             // `$CLAUDE_HOOK_TEXT` env vars that Claude Code does NOT set,
             // so production was always called with empty text and every
             // event ended up rejected — see claude-memory-rsw.
-            let (kind, text) = match (kind, text) {
-                (Some(k), Some(t)) => (k, t),
+            let (kind, text, payload) = match (kind, text) {
+                (Some(k), Some(t)) => (k, t, serde_json::Value::Null),
                 _ => parse_hook_stdin()?,
             };
 
@@ -1566,10 +1566,14 @@ fn main() -> Result<()> {
             }
 
             // PreCompact: Claude Code is about to compact the conversation.
-            // Drop a marker decision event on the most-recent open task so
-            // the post-compact agent sees a clear boundary in the journal.
-            // The marker is intentionally minimal — a future v0.7.x may
-            // synthesize a real summary if CC starts exposing one on stdin.
+            // Two responsibilities:
+            //   1. Catch-up ingest — read the transcript JSONL tail (entries
+            //      newer than the active task's last event timestamp) and
+            //      enqueue them as pending v2 chunks for the classify-worker.
+            //      Closes the gap between the last PostToolUse hook and the
+            //      compaction event, where chunks would otherwise be lost.
+            //   2. Boundary marker — synthetic decision event so the
+            //      post-compact agent sees a clear cut in the journal.
             if kind == "PreCompact" {
                 if !events_path.exists() {
                     return Ok(());
@@ -1582,6 +1586,38 @@ fn main() -> Result<()> {
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
+
+                // (1) Catch-up ingest. Best-effort: missing transcript_path
+                // or unreadable JSONL falls through to the marker only.
+                let last_event_ts: Option<String> = conn
+                    .query_row(
+                        "SELECT timestamp FROM events_index WHERE task_id=?1 \
+                         ORDER BY timestamp DESC LIMIT 1",
+                        rusqlite::params![&tc.task_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok();
+                let transcript_path = payload
+                    .get("transcript_path")
+                    .and_then(|x| x.as_str())
+                    .map(std::path::PathBuf::from);
+                if let Some(tp) = transcript_path.as_ref() {
+                    if tp.exists() {
+                        let enq = precompact_enqueue_transcript_chunks(
+                            tp,
+                            &events_path,
+                            &project_hash,
+                            &backend,
+                            last_event_ts.as_deref(),
+                        )
+                        .unwrap_or(0);
+                        if enq > 0 && std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
+                            let _ = spawn_classify_worker(&backend);
+                        }
+                    }
+                }
+
+                // (2) Boundary marker.
                 let now = chrono::Utc::now()
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 let marker_text = format!(
@@ -2801,6 +2837,54 @@ fn persist_pending_v2(
     Ok(path)
 }
 
+/// PreCompact catch-up: parse the transcript JSONL and enqueue text
+/// chunks newer than `last_event_ts` as pending v2 entries. The
+/// classify-worker picks them up afterwards. Returns the number of
+/// chunks queued. Errors are absorbed — best-effort, never fatal.
+fn precompact_enqueue_transcript_chunks(
+    transcript_path: &std::path::Path,
+    events_path: &std::path::Path,
+    project_hash: &str,
+    backend: &str,
+    last_event_ts: Option<&str>,
+) -> anyhow::Result<usize> {
+    use tj_core::session::parser::{
+        extract_assistant_texts, extract_user_text, parse_session, SessionEntry,
+    };
+    let parsed = match parse_session(transcript_path) {
+        Ok(p) => p,
+        Err(_) => return Ok(0),
+    };
+    let mut count = 0usize;
+    for entry in &parsed.entries {
+        let (ts, text, kind) = match entry {
+            SessionEntry::User(u) => {
+                let text = extract_user_text(u).unwrap_or_default();
+                (u.timestamp.clone(), text, "UserPromptSubmit")
+            }
+            SessionEntry::Assistant(a) => {
+                let texts = extract_assistant_texts(a);
+                if texts.is_empty() {
+                    continue;
+                }
+                (a.timestamp.clone(), texts.join("\n"), "PreCompactChunk")
+            }
+            _ => continue,
+        };
+        if text.trim().len() < 20 {
+            continue;
+        }
+        if let Some(last) = last_event_ts {
+            if ts.as_str() <= last {
+                continue;
+            }
+        }
+        persist_pending_v2(events_path, kind, &text, project_hash, backend)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Spawn the classify-worker as a detached child. We deliberately drop
 /// the `Child` handle so the parent (the actual Claude Code hook child)
 /// can exit without waiting; the worker re-parents to init on Linux.
@@ -3164,13 +3248,13 @@ fn drain_pending(
 /// piping), we silently return ("Stop", "") so the hook becomes a no-op
 /// instead of erroring — matches the `|| true` safety net in the
 /// installed hook command.
-fn parse_hook_stdin() -> anyhow::Result<(String, String)> {
+fn parse_hook_stdin() -> anyhow::Result<(String, String, serde_json::Value)> {
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
         .context("read hook payload from stdin")?;
     let buf = buf.trim();
     if buf.is_empty() {
-        return Ok(("Stop".into(), String::new()));
+        return Ok(("Stop".into(), String::new(), serde_json::Value::Null));
     }
     let v: serde_json::Value =
         serde_json::from_str(buf).with_context(|| format!("parse hook payload JSON: {buf}"))?;
@@ -3209,7 +3293,7 @@ fn parse_hook_stdin() -> anyhow::Result<(String, String)> {
         _ => String::new(),
     };
 
-    Ok((kind, text))
+    Ok((kind, text, v))
 }
 
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
