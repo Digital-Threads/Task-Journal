@@ -136,6 +136,16 @@ fn dirs_home() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize every test that touches `CLAUDE_CONFIG_DIR`. Cargo runs
+    /// unit tests in parallel by default; two tests mutating the same
+    /// process env race (set in A, observed in B) and flaked Windows CI
+    /// (saw "C:\Users\runneradmin\.claude" when expecting the override).
+    /// Tests that touch the env take this lock before the first set_var.
+    /// `lock().unwrap_or_else(|p| p.into_inner())` swallows poisoning
+    /// from a panicking sibling test — env is restored regardless.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn encode_path_replaces_separators() {
@@ -257,6 +267,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_with_env_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -281,6 +292,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_returns_none_when_no_match() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -296,6 +308,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_returns_none_when_projects_dir_missing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         // Don't create a "projects" subdir — it doesn't exist.
 
@@ -319,20 +332,46 @@ mod tests {
 
     // --- claude_config_dir ---
 
+    /// Both `CLAUDE_CONFIG_DIR` cases are combined into one test so the
+    /// env-var read/write/restore steps run serially. Cargo runs unit
+    /// tests in parallel by default; two tests touching the same process
+    /// env on Windows raced (set in test A, observed in test B) and
+    /// flaked CI. Save → set → assert → restore inside one body makes
+    /// the dependency local. Uses a portable tempdir-style path rather
+    /// than the hardcoded "/tmp/..." that doesn't exist on Windows.
     #[test]
-    fn claude_config_dir_respects_env_var() {
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/custom-claude-config");
-        let dir = claude_config_dir().unwrap();
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        assert_eq!(dir, PathBuf::from("/tmp/custom-claude-config"));
-    }
+    fn claude_config_dir_handles_env_var() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: the ENV_LOCK above serializes us against the other
+        // CLAUDE_CONFIG_DIR tests in this module; prev → restore at
+        // the end gives a clean exit regardless of panic.
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
 
-    #[test]
-    fn claude_config_dir_ignores_empty_env_var() {
-        std::env::set_var("CLAUDE_CONFIG_DIR", "");
+        // Case 1: non-empty value is honored verbatim. Use a portable
+        // path (std::env::temp_dir() works on Linux/macOS/Windows).
+        let custom = std::env::temp_dir().join("tj-custom-claude-config");
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", &custom);
+        }
         let dir = claude_config_dir().unwrap();
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        // Should fall back to home dir + .claude.
-        assert!(dir.to_string_lossy().ends_with(".claude"));
+        assert_eq!(dir, custom);
+
+        // Case 2: empty value falls back to home + .claude.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", "");
+        }
+        let dir = claude_config_dir().unwrap();
+        assert!(
+            dir.to_string_lossy().ends_with(".claude"),
+            "fallback must land in <home>/.claude, got: {dir:?}"
+        );
+
+        // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
     }
 }

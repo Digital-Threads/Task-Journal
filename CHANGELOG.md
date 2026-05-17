@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-17
+
+### Fixed
+- Windows CI flake in `session::discovery::tests::*` — four tests
+  mutated `CLAUDE_CONFIG_DIR` in parallel and observed each other's
+  writes. Now serialized through a module-level `Mutex<()>`; the
+  Windows runner sees the expected override path. Linux/macOS were
+  asymptomatically affected by the same race.
+- `claude_config_dir_respects_env_var` no longer hardcodes
+  `/tmp/custom-claude-config` (invalid on Windows). Uses
+  `std::env::temp_dir()` for a portable path.
+
 ## [0.9.1] - 2026-05-17
 
 ### Fixed
