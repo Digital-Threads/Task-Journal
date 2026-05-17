@@ -2876,14 +2876,14 @@ fn persist_pending_v2(
 }
 
 /// Transcript catch-up: parse the JSONL session log and enqueue user
-/// + assistant text entries newer than `last_event_ts` as pending v2
+/// and assistant text entries newer than `last_event_ts` as pending v2
 /// chunks. The classify-worker picks them up afterwards. Returns the
 /// number of chunks queued. Errors are absorbed — best-effort, never
 /// fatal. Used by both PreCompact (before compaction) and Stop (end
 /// of session) hooks to recover events the synchronous PostToolUse
-/// hook didn't see — internal classifier `claude -p` calls, MCP
-/// responses with thinking-only assistant turns, or the final
-/// assistant message before a session ends.
+/// hook didn't see (internal classifier calls, MCP responses with
+/// thinking-only assistant turns, or the final assistant message
+/// before a session ends).
 ///
 /// `assistant_chunk_kind` tags assistant-side entries so the source
 /// hook is visible in the pending queue (e.g. "PreCompactChunk"

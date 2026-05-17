@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-05-17
+
+### Fixed
+- Clippy `doc_lazy_continuation` lint on v0.9.3 release commit
+  failed CI (rustc 1.95 promoted the lint to a hard error under
+  `-D warnings`). The docstring on
+  `enqueue_transcript_chunks_since_last_event` started a line with
+  `+`, which the new lint reads as a list item whose continuation
+  lines must be indented. Replaced with prose ("user and assistant
+  text entries"). No behavior change.
+
 ## [0.9.3] - 2026-05-17
 
 **Stop hook learns to catch up.** Previously the `Stop` hook fired
