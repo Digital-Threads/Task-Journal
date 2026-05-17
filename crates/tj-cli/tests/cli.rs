@@ -918,74 +918,26 @@ fn install_hooks_uninstall_preserves_third_party_hook_entries() {
     );
 }
 
-#[test]
-fn install_hooks_with_classifier_command_writes_env() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("HOME", dir.path())
-        .args([
-            "install-hooks",
-            "--scope",
-            "user",
-            "--classifier-command",
-            "aimux run dt",
-        ])
-        .assert()
-        .success();
-    let content = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(
-        v.get("env")
-            .and_then(|e| e.get("TJ_CLASSIFIER_CLI"))
-            .and_then(|s| s.as_str()),
-        Some("aimux run dt"),
-        "env.TJ_CLASSIFIER_CLI must be set: {content}"
-    );
-}
+// v0.9.0: removed three tests that asserted behavior of `--classifier-command`
+// and the `TJ_CLASSIFIER_CLI` env var. Both features were removed together
+// with the `cli` backend — see `install_hooks_uninstall_removes_legacy_classifier_env`
+// below for the remaining back-compat assertion.
 
 #[test]
-fn install_hooks_without_classifier_command_does_not_set_env() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user"])
-        .assert()
-        .success();
-    let content = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert!(
-        v.get("env")
-            .and_then(|e| e.get("TJ_CLASSIFIER_CLI"))
-            .is_none(),
-        "TJ_CLASSIFIER_CLI must NOT be present when flag not passed: {content}"
-    );
-}
-
-#[test]
-fn install_hooks_uninstall_removes_classifier_env_but_preserves_others() {
+fn install_hooks_uninstall_removes_legacy_classifier_env() {
+    // Back-compat: users upgrading from <0.9.0 may have `TJ_CLASSIFIER_CLI`
+    // sitting in their settings.json from a previous install. `--uninstall`
+    // must still strip it, even though we no longer write the key on install.
     let dir = assert_fs::TempDir::new().unwrap();
     let claude_dir = dir.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(
         claude_dir.join("settings.json"),
-        serde_json::json!({ "env": { "OTHER_KEY": "keep_me" } }).to_string(),
+        serde_json::json!({ "env": { "TJ_CLASSIFIER_CLI": "aimux run dt", "OTHER_KEY": "keep_me" } })
+            .to_string(),
     )
     .unwrap();
 
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("HOME", dir.path())
-        .args([
-            "install-hooks",
-            "--scope",
-            "user",
-            "--classifier-command",
-            "aimux run dt",
-        ])
-        .assert()
-        .success();
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
@@ -999,7 +951,7 @@ fn install_hooks_uninstall_removes_classifier_env_but_preserves_others() {
         v.get("env")
             .and_then(|e| e.get("TJ_CLASSIFIER_CLI"))
             .is_none(),
-        "TJ_CLASSIFIER_CLI must be removed on uninstall: {after}"
+        "legacy TJ_CLASSIFIER_CLI must be removed on uninstall: {after}"
     );
     assert_eq!(
         v.get("env")
@@ -1843,7 +1795,7 @@ fn ingest_hook_auto_opens_task_when_no_open_tasks() {
         // here so auto-open + pending side-effects are observable
         // synchronously after the command returns.
         .env("TJ_INGEST_SYNC", "1")
-        .args(["ingest-hook", "--backend", "cli"])
+        .args(["ingest-hook", "--backend", "hybrid"])
         .write_stdin(payload)
         .assert()
         .success();
@@ -1990,7 +1942,7 @@ fn auto_open_links_to_prior_task_referencing_same_issue() {
         // v0.6.2: force sync so the auto-open side effect (reopen note
         // on stderr) is observable synchronously.
         .env("TJ_INGEST_SYNC", "1")
-        .args(["ingest-hook", "--backend", "cli"])
+        .args(["ingest-hook", "--backend", "hybrid"])
         .write_stdin(payload)
         .assert()
         .success()
@@ -2147,7 +2099,7 @@ fn ingest_hook_auto_open_disabled_via_env() {
         .env("TJ_AUTO_OPEN_TASKS", "0")
         // v0.6.2: force sync so post-conditions are observable.
         .env("TJ_INGEST_SYNC", "1")
-        .args(["ingest-hook", "--backend", "cli"])
+        .args(["ingest-hook", "--backend", "hybrid"])
         .write_stdin(payload)
         .assert()
         .success();
@@ -2191,7 +2143,7 @@ fn ingest_hook_returns_fast_in_async_mode() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_CLASSIFIER_CLI", "/bin/false")
-        .args(["ingest-hook", "--backend", "cli"])
+        .args(["ingest-hook", "--backend", "hybrid"])
         .write_stdin(payload)
         .assert()
         .success();
@@ -2261,7 +2213,7 @@ fn classify_worker_handles_classifier_failure_cleanly() {
         "text": "worker test marker",
         "project_hash": project_hash,
         "events_path": events_path.to_string_lossy(),
-        "backend": "cli",
+        "backend": "hybrid",
         "queued_at": "2026-05-08T00:00:00Z",
     });
     std::fs::write(&entry, body.to_string()).unwrap();
@@ -2270,7 +2222,7 @@ fn classify_worker_handles_classifier_failure_cleanly() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_CLASSIFIER_CLI", "/bin/false")
-        .args(["classify-worker", "--backend", "cli"])
+        .args(["classify-worker", "--backend", "hybrid"])
         .assert()
         .success();
 
@@ -2320,7 +2272,7 @@ fn classify_worker_respects_existing_lock() {
             "text": "locked marker",
             "project_hash": project_hash,
             "events_path": events_path.to_string_lossy(),
-            "backend": "cli",
+            "backend": "hybrid",
             "queued_at": "2026-05-08T00:00:00Z",
         })
         .to_string(),
@@ -2339,7 +2291,7 @@ fn classify_worker_respects_existing_lock() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_CLASSIFIER_CLI", "/bin/false")
-        .args(["classify-worker", "--backend", "cli"])
+        .args(["classify-worker", "--backend", "hybrid"])
         .assert()
         .success();
 
@@ -2523,7 +2475,7 @@ fn precompact_ingests_transcript_tail_into_pending_v2() {
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "cli"])
+        .args(["ingest-hook", "--backend", "hybrid"])
         .write_stdin(stdin_payload)
         .assert()
         .success();
@@ -2591,7 +2543,7 @@ fn precompact_skips_transcript_entries_older_than_last_event() {
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "cli"])
+        .args(["ingest-hook", "--backend", "hybrid"])
         .write_stdin(stdin_payload)
         .assert()
         .success();

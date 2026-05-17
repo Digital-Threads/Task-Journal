@@ -75,12 +75,12 @@ That's it. Restart Claude Code, start working, and the journal fills itself.
 
 ## How it works
 
-- **Auto-capture via Claude Code hooks.** Every prompt, tool call, and Claude reply is classified by a small `claude -p` invocation and appended as a typed event (`finding` / `decision` / `evidence` / `rejection` / …). Hook returns in <100 ms — classification happens in the background, never blocks your session.
+- **Auto-capture via Claude Code hooks.** Every prompt, tool call, and Claude reply runs through a two-stage classifier and lands as a typed event (`finding` / `decision` / `evidence` / `rejection` / …). Stage 1 is a fast in-process heuristic — pattern-matches obvious phrasing in EN+RU for zero cost. Stage 2 falls back to the Anthropic API (`ANTHROPIC_API_KEY`) only when the heuristic is uncertain. Hook returns in <100 ms — both stages run in a detached background worker, never blocking your session.
 - **Artifact extraction.** Each event scans its text for commit hashes, PR URLs, file paths, issue IDs, and branch names. Aggregated artifacts are how Task Journal links related tasks: when you start a new task touching the same issue or file, the prior task is surfaced automatically.
 - **Resume packs.** `task_pack` (MCP tool or CLI) renders a task into a compact Markdown briefing — Goal, Outcome, decisions, rejections, evidence, artifacts — that fits in a fresh agent's context window without dumping the raw event log.
-- **Auto-capture boundaries.** Beyond per-event capture, two extra hooks mark *reasoning boundaries* automatically: `PreCompact` drops a marker decision when Claude Code is about to compact, and a `/rewind`-prefixed prompt appends a single correction event so pack readers see where the user rolled back. No mass-rejection of prior events — the boundary is a sentinel, not a rewrite.
+- **Auto-capture boundaries.** Beyond per-event capture, two extra hooks mark *reasoning boundaries* automatically. On `PreCompact`, Task Journal reads the transcript JSONL tail (entries newer than the active task's last event) and enqueues anything the synchronous hooks missed before the compact — then drops a marker decision so the post-compact agent sees a clear cut. A `/rewind`-prefixed prompt appends a single correction event so pack readers see where the user rolled back. No mass-rejection of prior events — the boundary is a sentinel, not a rewrite.
 
-Source of truth is an append-only JSONL log per project. SQLite holds derived state and is fully rebuildable. Nothing is sent off-machine except the classifier prompt to your own `claude -p` (subscription) or the Anthropic API.
+Source of truth is an append-only JSONL log per project. SQLite holds derived state and is fully rebuildable. Nothing is sent off-machine except the classifier prompt to the Anthropic API — and only when the local heuristic is uncertain. With no `ANTHROPIC_API_KEY` set, Task Journal still works: the heuristic handles the obvious cases, and anything it can't classify sits in the local pending queue for later retry.
 
 ### Statusline integration
 
@@ -183,9 +183,8 @@ The MCP server exposes five tools to Claude Code (and any MCP client):
 
 | Env var | Effect | Default |
 |---------|--------|---------|
-| `TJ_CLASSIFIER_CLI` | Classifier command. When set to bare `claude`, Task Journal automatically injects `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` so the inner classifier session does not load every plugin in your settings (keeps classifier startup fast). | `claude` |
-| `TJ_CLASSIFIER_MODEL` | Model alias for the classifier (`claude -p` or HTTP API). | `haiku` (CLI) / `claude-haiku-4-5-20251001` (API) |
-| `ANTHROPIC_API_KEY` | Required for `--backend=api` (HTTP classifier). | _unset_ |
+| `ANTHROPIC_API_KEY` | Powers the API stage of `--backend=hybrid` (default) and is required for `--backend=api`. Without it, only the offline heuristic runs and ambiguous chunks land in the local pending queue. | _unset_ |
+| `TJ_CLASSIFIER_MODEL` | Override the Anthropic model used by the API stage. | `claude-haiku-4-5-20251001` |
 | `TJ_AUTO_OPEN_TASKS` | Set to `0` / `false` to disable auto-opening a task from `UserPromptSubmit` when no open task exists. | `1` |
 
 ## Event types

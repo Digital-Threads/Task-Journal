@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-17
+
+**Breaking — `cli` backend removed.** v0.8.0 left it as a deprecated
+alias for `hybrid`; v0.9.0 deletes the implementation. With it goes
+the `--classifier-command` flag, the `TJ_CLASSIFIER_CLI` env var
+(only the back-compat strip on uninstall stays), and the
+`ClaudeCliClassifier` struct.
+
+If you upgraded to v0.8.0 you saw a one-line deprecation warning on
+every hook; that's the whole migration story. On v0.9.0 the value
+`--backend=cli` errors with `unknown backend: cli (expected hybrid,
+api, or heuristic)`.
+
+### Removed
+- `tj_core::classifier::cli::ClaudeCliClassifier` and the entire
+  `tj_core::classifier::cli` module.
+- `crates/tj-core/tests/classifier_eval.rs` and its fixtures — the
+  eval harness depended on `ClaudeCliClassifier`.
+- `task-journal install-hooks --classifier-command <CMD>` flag.
+- `TJ_CLASSIFIER_CLI` env var write on install. The variable is
+  still **stripped** on `--uninstall` to clean up settings.json from
+  pre-0.9 installs (back-compat).
+- Default value handling for `--backend=cli`. It now hits the
+  generic `unknown backend` error path.
+
+### Documentation
+- README rewritten around the hybrid model — heuristic stage
+  characterized, API stage as the optional fallback, no `claude -p`
+  references anywhere.
+- Plugin skill description (`SKILL.md`) drops the Pro/Max
+  subscription claim that was no longer true.
+- Configuration table trimmed to the two env vars that still matter:
+  `ANTHROPIC_API_KEY` and `TJ_CLASSIFIER_MODEL`.
+
+### Migration
+- Re-run `task-journal install-hooks --scope user` to refresh
+  `~/.claude/settings.json` without the legacy `--backend=cli` flag
+  and without `TJ_CLASSIFIER_CLI` in `env`.
+- If you want the API stage (recommended for full coverage), set
+  `ANTHROPIC_API_KEY` in your shell or in the same `settings.json`
+  `env` block.
+
 ## [0.8.0] - 2026-05-17
 
 **Breaking — classifier backend reshaped.** Anthropic changed `claude -p`

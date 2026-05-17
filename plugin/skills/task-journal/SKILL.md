@@ -65,7 +65,7 @@ The plugin's MCP server exposes 5 tools:
 
 ## Auto-capture
 
-Hooks are installed via `task-journal install-hooks --scope user`. They use `claude -p --model haiku` (your Pro/Max subscription, no API key needed) to auto-classify chat chunks into events. Manual recording via MCP tools always works as a complement.
+Hooks are installed via `task-journal install-hooks --scope user`. Auto-classification runs through a two-stage hybrid: a local heuristic catches obvious decisions, rejections, evidence, and findings for free; ambiguous chunks fall back to the Anthropic API when `ANTHROPIC_API_KEY` is set. Without the key, the heuristic still works and uncertain chunks queue for later retry. Manual recording via MCP tools always works as a complement.
 
 ## Storage
 

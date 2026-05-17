@@ -718,11 +718,6 @@ enum Commands {
         /// Remove our hook entries instead of installing.
         #[arg(long)]
         uninstall: bool,
-        /// Override classifier command. Writes env.TJ_CLASSIFIER_CLI into settings.json
-        /// so wrappers (aimux, litellm, etc.) work without manual env setup.
-        /// Default: classifier uses `claude -p`.
-        #[arg(long)]
-        classifier_command: Option<String>,
         /// After installing hooks, retro-import existing Claude Code session
         /// history for the current project. Equivalent to running
         /// `task-journal backfill` afterwards. Onboarding shortcut.
@@ -1271,7 +1266,6 @@ fn main() -> Result<()> {
         Commands::InstallHooks {
             scope,
             uninstall,
-            classifier_command,
             backfill,
         } => {
             let settings_path = match scope.as_str() {
@@ -1388,23 +1382,6 @@ fn main() -> Result<()> {
                     "PreCompact":      [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                 });
                 hooks_obj.insert("hooks".into(), entries);
-
-                // Optional: set env.TJ_CLASSIFIER_CLI for users running classifier
-                // through a wrapper (aimux, litellm, etc.). Claude Code reads this
-                // env block and propagates the var to hook subprocesses, so users
-                // don't need to mess with bashrc.
-                if let Some(cmd) = classifier_command {
-                    let env = hooks_obj
-                        .entry("env".to_string())
-                        .or_insert_with(|| serde_json::json!({}));
-                    let env_obj = env
-                        .as_object_mut()
-                        .ok_or_else(|| anyhow::anyhow!("settings.env is not a JSON object"))?;
-                    env_obj.insert(
-                        "TJ_CLASSIFIER_CLI".to_string(),
-                        serde_json::Value::String(cmd),
-                    );
-                }
             }
             std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
             println!("{}", settings_path.display());
@@ -1806,18 +1783,6 @@ fn main() -> Result<()> {
                         "hybrid" | "" => Box::new(
                             tj_core::classifier::hybrid::HybridClassifier::from_env(),
                         ),
-                        // Legacy alias — keeps existing settings.json + plugin
-                        // hooks installed by 0.7.x working without manual edits.
-                        // Same dispatch as hybrid; the warning lands on stderr
-                        // which Claude Code captures into hook logs.
-                        "cli" => {
-                            eprintln!(
-                                "warn: --backend=cli is deprecated (claude -p no longer rides Pro/Max). Routing to --backend=hybrid."
-                            );
-                            Box::new(
-                                tj_core::classifier::hybrid::HybridClassifier::from_env(),
-                            )
-                        }
                         "api" => {
                             Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?)
                         }
@@ -3127,9 +3092,31 @@ fn process_pending_entry(
 
     use tj_core::classifier::Classifier;
     let classifier: Box<dyn Classifier> = match backend {
-        "cli" => Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default()),
+        "hybrid" | "" => {
+            Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env())
+        }
         "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
-        other => anyhow::bail!("unknown backend: {other}"),
+        "heuristic" => {
+            use tj_core::classifier::heuristic::try_heuristic;
+            use tj_core::classifier::{ClassifyInput, ClassifyOutput};
+            struct HeuristicOnly;
+            impl Classifier for HeuristicOnly {
+                fn classify(
+                    &self,
+                    input: &ClassifyInput,
+                ) -> anyhow::Result<ClassifyOutput> {
+                    try_heuristic(input).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "heuristic uncertain (heuristic-only mode has no LLM fallback)"
+                        )
+                    })
+                }
+            }
+            Box::new(HeuristicOnly)
+        }
+        other => anyhow::bail!(
+            "unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)"
+        ),
     };
     let input = tj_core::classifier::ClassifyInput {
         text: text.clone(),
