@@ -1587,12 +1587,13 @@ fn main() -> Result<()> {
                     .map(std::path::PathBuf::from);
                 if let Some(tp) = transcript_path.as_ref() {
                     if tp.exists() {
-                        let enq = precompact_enqueue_transcript_chunks(
+                        let enq = enqueue_transcript_chunks_since_last_event(
                             tp,
                             &events_path,
                             &project_hash,
                             &backend,
                             last_event_ts.as_deref(),
+                            "PreCompactChunk",
                         )
                         .unwrap_or(0);
                         if enq > 0 && std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
@@ -1634,6 +1635,66 @@ fn main() -> Result<()> {
                     },
                 );
                 println!("{}", event.event_id);
+                return Ok(());
+            }
+
+            // Stop: Claude Code is about to end the session. Same
+            // catch-up logic as PreCompact (read transcript tail,
+            // enqueue chunks newer than the active task's last
+            // event timestamp), but no boundary marker — a session
+            // end isn't a reasoning boundary, the task is just
+            // pausing. The v0.7.0-era Stop hook fired with hardcoded
+            // text="Session ended" which carried no signal and just
+            // littered the pending queue with noise; v0.9.3 replaces
+            // that with a real catch-up.
+            //
+            // Skip the catch-up when running through the mock test
+            // path (mock_event_type + mock_task_id) — those tests
+            // expect their explicit `--kind=Stop` invocation to fall
+            // through to the mock-classifier dispatch below, not be
+            // intercepted by the new transcript-tail logic.
+            let is_mock_stop = mock_event_type.is_some() && mock_task_id.is_some();
+            if !is_mock_stop && kind == "Stop" {
+                if !events_path.exists() {
+                    return Ok(());
+                }
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                let recent = recent_task_contexts(&conn, 1)?;
+                let Some(tc) = recent.into_iter().next() else {
+                    return Ok(());
+                };
+
+                let last_event_ts: Option<String> = conn
+                    .query_row(
+                        "SELECT timestamp FROM events_index WHERE task_id=?1 \
+                         ORDER BY timestamp DESC LIMIT 1",
+                        rusqlite::params![&tc.task_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok();
+                let transcript_path = payload
+                    .get("transcript_path")
+                    .and_then(|x| x.as_str())
+                    .map(std::path::PathBuf::from);
+                if let Some(tp) = transcript_path.as_ref() {
+                    if tp.exists() {
+                        let enq = enqueue_transcript_chunks_since_last_event(
+                            tp,
+                            &events_path,
+                            &project_hash,
+                            &backend,
+                            last_event_ts.as_deref(),
+                            "StopChunk",
+                        )
+                        .unwrap_or(0);
+                        if enq > 0 && std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
+                            let _ = spawn_classify_worker(&backend);
+                        }
+                    }
+                }
                 return Ok(());
             }
 
@@ -2814,16 +2875,27 @@ fn persist_pending_v2(
     Ok(path)
 }
 
-/// PreCompact catch-up: parse the transcript JSONL and enqueue text
-/// chunks newer than `last_event_ts` as pending v2 entries. The
-/// classify-worker picks them up afterwards. Returns the number of
-/// chunks queued. Errors are absorbed — best-effort, never fatal.
-fn precompact_enqueue_transcript_chunks(
+/// Transcript catch-up: parse the JSONL session log and enqueue user
+/// + assistant text entries newer than `last_event_ts` as pending v2
+/// chunks. The classify-worker picks them up afterwards. Returns the
+/// number of chunks queued. Errors are absorbed — best-effort, never
+/// fatal. Used by both PreCompact (before compaction) and Stop (end
+/// of session) hooks to recover events the synchronous PostToolUse
+/// hook didn't see — internal classifier `claude -p` calls, MCP
+/// responses with thinking-only assistant turns, or the final
+/// assistant message before a session ends.
+///
+/// `assistant_chunk_kind` tags assistant-side entries so the source
+/// hook is visible in the pending queue (e.g. "PreCompactChunk"
+/// vs "StopChunk"). User entries always tag as "UserPromptSubmit"
+/// to trigger `process_pending_entry`'s auto-open behavior.
+fn enqueue_transcript_chunks_since_last_event(
     transcript_path: &std::path::Path,
     events_path: &std::path::Path,
     project_hash: &str,
     backend: &str,
     last_event_ts: Option<&str>,
+    assistant_chunk_kind: &str,
 ) -> anyhow::Result<usize> {
     use tj_core::session::parser::{
         extract_assistant_texts, extract_user_text, parse_session, SessionEntry,
@@ -2844,7 +2916,7 @@ fn precompact_enqueue_transcript_chunks(
                 if texts.is_empty() {
                     continue;
                 }
-                (a.timestamp.clone(), texts.join("\n"), "PreCompactChunk")
+                (a.timestamp.clone(), texts.join("\n"), assistant_chunk_kind)
             }
             _ => continue,
         };

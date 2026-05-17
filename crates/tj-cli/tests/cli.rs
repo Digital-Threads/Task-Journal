@@ -2558,6 +2558,123 @@ fn precompact_skips_transcript_entries_older_than_last_event() {
 }
 
 #[test]
+fn stop_ingests_transcript_tail_into_pending_v2() {
+    // v0.9.3: Stop hook does transcript catch-up (like PreCompact)
+    // instead of injecting hardcoded "Session ended" noise.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let _task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "End-of-session catch-up"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let transcript = workdir.join("session.jsonl");
+    let line_user = r#"{"type":"user","uuid":"u1","timestamp":"2099-01-01T00:00:00.000Z","sessionId":"s1","message":{"content":"the refund flow needs idempotency keys per payment provider"}}"#;
+    let line_assistant = r#"{"type":"assistant","uuid":"a1","timestamp":"2099-01-01T00:00:05.000Z","sessionId":"s1","message":{"content":[{"type":"text","text":"Confirmed: dlocal returns 200 OK for duplicate calls when idempotency-key header is set."}]}}"#;
+    std::fs::write(&transcript, format!("{line_user}\n{line_assistant}\n")).unwrap();
+
+    let stdin_payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "transcript_path": transcript.to_str().unwrap(),
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success();
+
+    let pending_dir = dir.path().join("task-journal").join("pending");
+    let queued: Vec<_> = std::fs::read_dir(&pending_dir)
+        .expect("pending dir must exist after Stop catch-up")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        queued.len(),
+        2,
+        "expected 2 pending v2 chunks (user + assistant), got {}",
+        queued.len()
+    );
+
+    let mut saw_user = false;
+    let mut saw_assistant = false;
+    for entry in &queued {
+        let body = std::fs::read_to_string(entry.path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["schema"], "v2");
+        let text = v["text"].as_str().unwrap_or("");
+        if text.contains("idempotency keys per payment provider") {
+            saw_user = true;
+            assert_eq!(v["kind"], "UserPromptSubmit");
+        }
+        if text.contains("dlocal returns 200 OK") {
+            saw_assistant = true;
+            // Distinct kind from PreCompactChunk — lets ops grep which hook queued it.
+            assert_eq!(v["kind"], "StopChunk");
+        }
+    }
+    assert!(
+        saw_user && saw_assistant,
+        "missing one of the chunks: user={saw_user} assistant={saw_assistant}"
+    );
+}
+
+#[test]
+fn stop_without_transcript_path_is_silent_noop() {
+    // Belt-and-braces: when CC's Stop payload omits transcript_path
+    // (or hook is invoked manually with no stdin), we must not crash
+    // and must not litter pending/ with placeholder entries — the
+    // pre-v0.9.3 "Session ended" text noise we deliberately removed.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "noop check"])
+        .assert()
+        .success();
+
+    let stdin_payload = serde_json::json!({"hook_event_name": "Stop"}).to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success();
+
+    let pending_dir = dir.path().join("task-journal").join("pending");
+    let queued_count = std::fs::read_dir(&pending_dir)
+        .map(|it| it.count())
+        .unwrap_or(0);
+    assert_eq!(
+        queued_count, 0,
+        "Stop without transcript_path must NOT queue any pending entry"
+    );
+}
+
+#[test]
 fn rewind_prompt_appends_correction_event() {
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");

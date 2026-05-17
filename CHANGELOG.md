@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-05-17
+
+**Stop hook learns to catch up.** Previously the `Stop` hook fired
+with a hardcoded `--text="Session ended"` — a sentinel string that
+carried no semantic signal and just littered the pending queue with
+unclassifiable noise (the heuristic skipped it, the API would have
+spent a haiku call to say "this is nothing"). v0.9.3 replaces it with
+the same transcript-tail catch-up that PreCompact already does:
+parse the JSONL session log, enqueue user + assistant entries newer
+than the active task's last event timestamp, spawn the
+classify-worker. No boundary marker — a session end isn't a
+reasoning boundary, just a pause.
+
+### Added
+- Stop-hook transcript catch-up. Mirrors the PreCompact catch-up
+  introduced in v0.7.1. Reads `transcript_path` from the hook stdin
+  payload; chunks land as `UserPromptSubmit` (user) or `StopChunk`
+  (assistant) pending v2 entries. Distinct `StopChunk` kind lets ops
+  grep the pending dir by source hook.
+- `enqueue_transcript_chunks_since_last_event` helper — extracted
+  from the PreCompact branch so both hooks share the same code path.
+  Old `precompact_enqueue_transcript_chunks` was renamed; same body,
+  one new parameter (`assistant_chunk_kind`).
+
+### Changed
+- Plugin `hooks.json` Stop entry no longer pins
+  `--kind=Stop --text="Session ended"`. Reads hook stdin payload
+  like PostToolUse and PreCompact already do.
+
+### Compatibility
+- Mock test path (`--mock-event-type` + `--mock-task-id`) bypasses
+  the new Stop branch so existing test fixtures invoking
+  `--kind=Stop` with mock args still hit the mock-classifier
+  dispatch instead of being intercepted by transcript catch-up.
+
 ## [0.9.2] - 2026-05-17
 
 ### Fixed

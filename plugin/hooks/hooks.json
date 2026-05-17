@@ -24,10 +24,11 @@
     ],
     "Stop": [
       {
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "task-journal ingest-hook --kind=Stop --text=\"Session ended\" 2>/dev/null || true"
+            "command": "task-journal ingest-hook 2>/dev/null || true"
           }
         ]
       }
