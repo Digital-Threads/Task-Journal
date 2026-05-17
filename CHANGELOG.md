@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-17
+
+**Breaking — classifier backend reshaped.** Anthropic changed `claude -p`
+to bill against a separate token budget instead of riding the Pro/Max
+subscription, so the v0.7.x `--backend=cli` path silently charged users
+who had explicitly opted into "free background". v0.8.0 removes it from
+the default path and replaces it with a heuristic-first hybrid.
+
+### Added
+- New `--backend=hybrid` (now the default). Keyword heuristic runs
+  first — handles obvious decisions, rejections, evidence, findings,
+  constraints, hypotheses, corrections in EN+RU at zero cost. If the
+  heuristic is uncertain (or no rule fires), falls back to the
+  Anthropic API backend when `ANTHROPIC_API_KEY` is set; otherwise
+  the chunk stays in `pending/` for later retry. No `claude -p`
+  subprocess.
+- New `--backend=heuristic` — heuristic only, no LLM. For users who
+  want strict zero-cost / offline operation and accept lower coverage.
+- `tj_core::classifier::heuristic::try_heuristic` — public helper for
+  pattern-matched classification, returning `Option<ClassifyOutput>`.
+- `tj_core::classifier::hybrid::HybridClassifier` — production
+  default. Exposes `from_env()` (picks up `ANTHROPIC_API_KEY`) and
+  `has_llm_fallback()` for callers that want to surface state to the
+  user.
+
+### Changed
+- Default backend in `task-journal ingest-hook` and
+  `task-journal classify-worker` changed from `cli` to `hybrid`.
+- `install-hooks` settings.json template no longer pins
+  `--backend=cli`; the binary default wins.
+- Plugin `hooks.json` (PostToolUse / PreCompact / Stop) no longer
+  passes `--backend=cli`. Same default-wins reasoning.
+
+### Deprecated
+- `--backend=cli` now routes to `hybrid` and prints a one-line
+  deprecation warning on stderr. The `ClaudeCliClassifier` struct
+  stays in `tj_core::classifier::cli` for the v0.7.x eval harness
+  but is no longer reachable from production code. Will be removed
+  in v0.9.0.
+
+### Migration
+- **Users with Pro/Max only and no API key** — keep working: the
+  heuristic catches the most common cases; chunks it can't classify
+  land in `pending/` and you can drain them later when you set an
+  API key (or just leave them — they don't block anything).
+- **Users with `ANTHROPIC_API_KEY` set** — best experience. Heuristic
+  saves API calls on obvious cases; the API handles the rest.
+- **No action required.** Old `~/.claude/settings.json` with
+  `--backend=cli` still works (alias). Re-run `install-hooks` to
+  remove the deprecation warning.
+
 ## [0.7.1] - 2026-05-17
 
 PreCompact closes the gap before compaction — the synchronous hook only

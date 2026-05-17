@@ -813,10 +813,15 @@ enum Commands {
         /// tool_name+input+response for PostToolUse, etc.).
         #[arg(long)]
         text: Option<String>,
-        /// Classifier backend: "cli" uses `claude -p` (free with your Pro/Max
-        /// subscription) or "api" uses Anthropic API (requires `ANTHROPIC_API_KEY`).
-        /// Default: cli.
-        #[arg(long, default_value = "cli")]
+        /// Classifier backend:
+        ///   - "hybrid" (default) — keyword heuristic first (free, offline);
+        ///     Anthropic API fallback when uncertain (needs ANTHROPIC_API_KEY).
+        ///   - "api" — always call the Anthropic API. Best quality, paid.
+        ///   - "heuristic" — heuristic only, no LLM. Fastest, lowest coverage.
+        ///   - "cli" — deprecated alias for hybrid. The old `claude -p` path
+        ///     was removed in v0.8.0 because Anthropic now bills it
+        ///     separately from Pro/Max.
+        #[arg(long, default_value = "hybrid")]
         backend: String,
         /// Test/dev override: bypass classifier and force this event type. Hidden from --help.
         #[arg(long, hide = true)]
@@ -835,8 +840,8 @@ enum Commands {
     /// at a time. Hidden from --help; not a public API.
     #[command(hide = true)]
     ClassifyWorker {
-        /// Classifier backend: "cli" or "api". Defaults to cli.
-        #[arg(long, default_value = "cli")]
+        /// Classifier backend: "hybrid", "api", or "heuristic". Defaults to hybrid.
+        #[arg(long, default_value = "hybrid")]
         backend: String,
     },
     /// One-line status snapshot for the Claude Code statusline. Prints
@@ -1363,7 +1368,11 @@ fn main() -> Result<()> {
                 // at env vars Claude Code never sets and therefore always
                 // fed the classifier empty text. Stdin-only is the correct
                 // wiring (see claude-memory-rsw).
-                let cmd = "task-journal ingest-hook --backend=cli || true";
+                // No --backend flag: the binary's default (hybrid) wins.
+                // Hybrid = free heuristic first, Anthropic API fallback when
+                // uncertain. Users wanting always-api can edit settings.json
+                // and add `--backend=api`.
+                let cmd = "task-journal ingest-hook || true";
                 let entries = serde_json::json!({
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
@@ -1789,13 +1798,52 @@ fn main() -> Result<()> {
 
                     use tj_core::classifier::Classifier;
                     let classifier: Box<dyn Classifier> = match backend.as_str() {
-                        "cli" => Box::new(tj_core::classifier::cli::ClaudeCliClassifier::default()),
+                        // v0.8.0: hybrid is the new default. Heuristic
+                        // pattern-matching first (free), Anthropic API
+                        // fallback when uncertain (requires ANTHROPIC_API_KEY).
+                        // No background spawn of `claude -p` — that subprocess
+                        // now bills tokens separately from Pro/Max.
+                        "hybrid" | "" => Box::new(
+                            tj_core::classifier::hybrid::HybridClassifier::from_env(),
+                        ),
+                        // Legacy alias — keeps existing settings.json + plugin
+                        // hooks installed by 0.7.x working without manual edits.
+                        // Same dispatch as hybrid; the warning lands on stderr
+                        // which Claude Code captures into hook logs.
+                        "cli" => {
+                            eprintln!(
+                                "warn: --backend=cli is deprecated (claude -p no longer rides Pro/Max). Routing to --backend=hybrid."
+                            );
+                            Box::new(
+                                tj_core::classifier::hybrid::HybridClassifier::from_env(),
+                            )
+                        }
                         "api" => {
                             Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?)
                         }
-                        other => {
-                            anyhow::bail!("unknown backend: {other} (expected `cli` or `api`)")
+                        "heuristic" => {
+                            // Heuristic-only: no LLM at all. Trades coverage
+                            // for absolute zero-cost / offline operation.
+                            use tj_core::classifier::heuristic::try_heuristic;
+                            use tj_core::classifier::{ClassifyInput, ClassifyOutput};
+                            struct HeuristicOnly;
+                            impl Classifier for HeuristicOnly {
+                                fn classify(
+                                    &self,
+                                    input: &ClassifyInput,
+                                ) -> anyhow::Result<ClassifyOutput> {
+                                    try_heuristic(input).ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "heuristic uncertain (heuristic-only mode has no LLM fallback)"
+                                        )
+                                    })
+                                }
+                            }
+                            Box::new(HeuristicOnly)
                         }
+                        other => anyhow::bail!(
+                            "unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)"
+                        ),
                     };
                     let input = tj_core::classifier::ClassifyInput {
                         text: text.clone(),
