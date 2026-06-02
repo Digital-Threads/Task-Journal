@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-02
+
+**SessionStart envelope: `sessionTitle` + `initialUserMessage`.**
+X2 of the v0.10.x undocumented-hooks adoption. Extends the existing
+`hookSpecificOutput` envelope emitted by `task-journal ingest-hook`
+on SessionStart with the two extra fields verified in Claude Code
+2.1.160's K45 Zod schema. `additionalContext` already injected the
+full task pack into the system prompt; the new fields give the model
+a sharper "where were we" signal:
+
+- `sessionTitle` — shown as the terminal tab / window label. Format:
+  `TJ — <task-id> (<n> open)`. Always emitted when there is at least
+  one open task.
+- `initialUserMessage` — prepended to the user's first real prompt
+  this session. Format: `[Task Journal resumed: <id> — <title>]`.
+  Emitted only when the primary task has at least one non-`open`
+  event (i.e. real activity, not just creation marker), so fresh
+  tasks don't get an unsolicited "resuming" preamble. Gated by
+  `TJ_INITIAL_USER_MESSAGE=0` for users who'd rather opt out.
+
+### Added
+- `sessionTitle` field on SessionStart envelope.
+- `initialUserMessage` field on SessionStart envelope, with hollow-
+  task and env-var-opt-out guards.
+- 2 new integration tests:
+  `session_start_emits_no_initial_user_message_for_hollow_task`,
+  `session_start_initial_user_message_disabled_via_env`.
+- Existing `ingest_hook_session_start_emits_resume_pack_json` test
+  now asserts both new fields.
+
+### Migration
+- None — additive on the SessionStart envelope. Older Claude Code
+  versions ignore unknown keys. The feature is invisible until the
+  primary task accumulates a non-`open` event.
+
 ## [0.10.0] - 2026-06-02
 
 **`asyncRewake` on PostToolUse — zero-latency happy path, wake on backlog.**

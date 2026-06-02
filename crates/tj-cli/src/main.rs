@@ -1539,11 +1539,52 @@ fn main() -> Result<()> {
                     bundle.push_str(&pack.text);
                     bundle.push_str("\n\n");
                 }
+
+                // v0.10.1 X2: extend SessionStart envelope with the
+                // undocumented `sessionTitle` + `initialUserMessage`
+                // fields verified in Claude Code 2.1.160's K45 Zod
+                // schema. additionalContext already injects the full
+                // pack into the system prompt; these two extras give
+                // the model a sharper "where were we" signal so it
+                // doesn't have to grep the pack to find the active
+                // task ID.
+                //
+                // sessionTitle: terminal tab / window label. Always
+                // emitted when there are open tasks — the count alone
+                // is useful even with no primary activity.
+                //
+                // initialUserMessage: prepended to the user's first
+                // real prompt this session. We only emit it when the
+                // primary task already has events — otherwise it's an
+                // unsolicited "resuming" preamble on a hollow task and
+                // adds noise. Gated by TJ_INITIAL_USER_MESSAGE=0 for
+                // tests / users who'd rather not see it.
+                let primary = &recent[0];
+                let mut hook_specific = serde_json::json!({
+                    "hookEventName": "SessionStart",
+                    "additionalContext": bundle.trim_end(),
+                    "sessionTitle": format!(
+                        "TJ — {} ({} open)",
+                        primary.task_id,
+                        recent.len(),
+                    ),
+                });
+                let allow_initial_user_msg =
+                    std::env::var("TJ_INITIAL_USER_MESSAGE").as_deref() != Ok("0");
+                // `task-journal create` writes an [open] event, so
+                // last_events is never literally empty even for a
+                // freshly created task. Require at least one non-open
+                // event so we don't inject "Resuming task X" the moment
+                // it was just opened with nothing to resume yet.
+                let has_real_events = primary.last_events.iter().any(|e| !e.starts_with("[open]"));
+                if allow_initial_user_msg && has_real_events {
+                    hook_specific["initialUserMessage"] = serde_json::Value::String(format!(
+                        "[Task Journal resumed: {} — {}]",
+                        primary.task_id, primary.title,
+                    ));
+                }
                 let envelope = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": bundle.trim_end(),
-                    }
+                    "hookSpecificOutput": hook_specific,
                 });
                 println!("{}", serde_json::to_string(&envelope)?);
                 return Ok(());
