@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-06-02
+
+**`watchPaths` + FileChanged → auto-evidence on marker file edits.** X4
+of the v0.10.x undocumented-hooks adoption. SessionStart envelope now
+emits `watchPaths` — Claude Code starts monitoring the project's
+marker files (CLAUDE.md, README.md, .docs/plans/), and whenever one
+of them changes (write, create, delete), Claude Code fires the
+`FileChanged` hook event. Our `ingest-hook` handler translates that
+into an `evidence` event on the active task. Captures
+"instructions / plans were edited mid-session" without anyone manually
+typing it. Schema verified in Claude Code 2.1.160:
+`literal("FileChanged"), file_path: y.string(), event:
+y.enum(["change","add","unlink"])`.
+
+### Added
+- SessionStart envelope emits `watchPaths` containing the absolute
+  paths of `CLAUDE.md`, `README.md`, and `.docs/plans` when they
+  exist under the current cwd. Missing files are skipped — Claude
+  Code's watcher logs an error on non-existent paths, so we don't
+  ask it to watch them.
+- `FileChanged` branch in the `ingest-hook` handler: appends an
+  `evidence` event (`FileChanged (change|add|unlink): <relative path>`)
+  to the most-recent open task. No active task → silently no-op.
+- 4 new integration tests:
+  - `session_start_emits_watch_paths_for_existing_marker_files`
+  - `session_start_omits_watch_paths_when_disabled_via_env`
+  - `file_changed_hook_appends_evidence_to_active_task`
+  - `file_changed_hook_with_no_open_task_is_no_op`
+
+### Changed
+- Path display in FileChanged evidence trims the project cwd prefix
+  so the journal stays project-relative and doesn't waste tokens on
+  the absolute home path.
+
+### Configuration
+- `TJ_WATCH_PATHS=0` suppresses watchPaths emission for users who
+  don't want their marker-file edits auto-logged.
+
+### Migration
+- None — additive on SessionStart envelope + new hook branch.
+  Claude Code 2.1.x+ required for FileChanged event firing; older
+  versions ignore unknown envelope keys and never emit FileChanged,
+  so the handler simply never fires for them.
+
 ## [0.10.1] - 2026-06-02
 
 **SessionStart envelope: `sessionTitle` + `initialUserMessage`.**

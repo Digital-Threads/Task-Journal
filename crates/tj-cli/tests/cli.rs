@@ -3130,6 +3130,202 @@ fn posttooluse_payload() -> String {
 }
 
 #[test]
+fn session_start_emits_watch_paths_for_existing_marker_files() {
+    // v0.10.2 X4: SessionStart envelope must include `watchPaths` with
+    // existing marker files (CLAUDE.md, README.md, .docs/plans). Files
+    // that don't exist are skipped — Claude Code's watcher logs an
+    // error and gives up on missing paths, so we don't emit them.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(workdir.join(".docs").join("plans")).unwrap();
+    std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
+    // README.md intentionally absent — must NOT appear in watchPaths.
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Watch paths test"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let _ = task_id;
+
+    let body = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+    let watches = v["hookSpecificOutput"]["watchPaths"]
+        .as_array()
+        .expect("watchPaths must be present when at least one marker exists");
+    let joined: String = watches
+        .iter()
+        .filter_map(|x| x.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    assert!(
+        joined.contains("CLAUDE.md"),
+        "CLAUDE.md must be watched: {joined}"
+    );
+    assert!(
+        joined.contains("plans"),
+        ".docs/plans must be watched: {joined}"
+    );
+    assert!(
+        !joined.contains("README.md"),
+        "README.md does not exist, must NOT be watched: {joined}"
+    );
+}
+
+#[test]
+fn session_start_omits_watch_paths_when_disabled_via_env() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Watch paths env-disabled"])
+        .assert()
+        .success();
+
+    let body = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_WATCH_PATHS", "0")
+            .current_dir(&workdir)
+            .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+    assert!(
+        v["hookSpecificOutput"]["watchPaths"].is_null(),
+        "TJ_WATCH_PATHS=0 must suppress watchPaths emission"
+    );
+    assert!(
+        v["hookSpecificOutput"]["sessionTitle"].is_string(),
+        "sessionTitle still emitted independently"
+    );
+}
+
+#[test]
+fn file_changed_hook_appends_evidence_to_active_task() {
+    // v0.10.2 X4: FileChanged hook handler should append an evidence
+    // event to the most-recent open task with the changed path
+    // (trimmed project-relative) and the change kind.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "FileChanged evidence test"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let touched = workdir.join("CLAUDE.md");
+    std::fs::write(&touched, "# rules v2").unwrap();
+
+    let stdin_payload = serde_json::json!({
+        "hook_event_name": "FileChanged",
+        "file_path": touched.to_str().unwrap(),
+        "event": "change",
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("FileChanged (change)"))
+        .stdout(contains("CLAUDE.md"));
+}
+
+#[test]
+fn file_changed_hook_with_no_open_task_is_no_op() {
+    // FileChanged on a clean events dir should not crash, not create
+    // events_path, not open a task — just return Ok silently.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let touched = workdir.join("CLAUDE.md");
+    std::fs::write(&touched, "# rules").unwrap();
+
+    let stdin_payload = serde_json::json!({
+        "hook_event_name": "FileChanged",
+        "file_path": touched.to_str().unwrap(),
+        "event": "add",
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success();
+
+    let events_path = dir.path().join("task-journal").join("events");
+    assert!(
+        !events_path.exists()
+            || std::fs::read_dir(&events_path)
+                .map(|d| d.count() == 0)
+                .unwrap_or(true),
+        "FileChanged on a fresh project must not write any events file"
+    );
+}
+
+#[test]
 fn asyncrewake_below_threshold_exits_zero() {
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");

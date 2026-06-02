@@ -1540,6 +1540,33 @@ fn main() -> Result<()> {
                     bundle.push_str("\n\n");
                 }
 
+                // v0.10.2 X4: emit `watchPaths` so Claude Code starts
+                // monitoring our marker files (CLAUDE.md, README.md,
+                // .docs/plans). When any of them changes, Claude Code
+                // fires a FileChanged hook event — our ingest-hook
+                // handler below treats those as `evidence` entries on
+                // the active task so the journal captures
+                // "instructions were updated mid-session" without the
+                // user manually logging it. Only paths that exist at
+                // SessionStart time are emitted (no point watching a
+                // non-existent file — Claude Code logs `watcher error`
+                // and gives up on it). Gated by TJ_WATCH_PATHS=0.
+                let allow_watch_paths = std::env::var("TJ_WATCH_PATHS").as_deref() != Ok("0");
+                let watch_candidates = [
+                    cwd.join("CLAUDE.md"),
+                    cwd.join("README.md"),
+                    cwd.join(".docs").join("plans"),
+                ];
+                let watch_paths: Vec<String> = if allow_watch_paths {
+                    watch_candidates
+                        .iter()
+                        .filter(|p| p.exists())
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
                 // v0.10.1 X2: extend SessionStart envelope with the
                 // undocumented `sessionTitle` + `initialUserMessage`
                 // fields verified in Claude Code 2.1.160's K45 Zod
@@ -1569,6 +1596,14 @@ fn main() -> Result<()> {
                         recent.len(),
                     ),
                 });
+                if !watch_paths.is_empty() {
+                    hook_specific["watchPaths"] = serde_json::Value::Array(
+                        watch_paths
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                }
                 let allow_initial_user_msg =
                     std::env::var("TJ_INITIAL_USER_MESSAGE").as_deref() != Ok("0");
                 // `task-journal create` writes an [open] event, so
@@ -1587,6 +1622,64 @@ fn main() -> Result<()> {
                     "hookSpecificOutput": hook_specific,
                 });
                 println!("{}", serde_json::to_string(&envelope)?);
+                return Ok(());
+            }
+
+            // v0.10.2 X4: FileChanged. Claude Code 2.1.x fires this
+            // event whenever a path in `watchPaths` (emitted on
+            // SessionStart) changes. Payload: { file_path, event:
+            // "change"|"add"|"unlink" }. We translate it into an
+            // `evidence` event on the active task — captures
+            // "the user/agent edited CLAUDE.md mid-session" without
+            // anyone typing anything. Schema verified in 2.1.160:
+            // `literal("FileChanged"), file_path: y.string(), event:
+            // y.enum(["change","add","unlink"])`.
+            //
+            // No active task → drop silently (we're not opening a
+            // task just because a watched file moved). No events_path
+            // → ditto, fresh project.
+            if kind == "FileChanged" {
+                if !events_path.exists() {
+                    return Ok(());
+                }
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                let recent = recent_task_contexts(&conn, 1)?;
+                let Some(tc) = recent.into_iter().next() else {
+                    return Ok(());
+                };
+                let file_path = payload
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)");
+                let change = payload
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("change");
+                // Trim noisy absolute paths to project-relative when
+                // possible — the journal is per-project so the prefix
+                // is redundant and just steals tokens from the pack.
+                let display_path = cwd
+                    .to_str()
+                    .and_then(|c| file_path.strip_prefix(c))
+                    .map(|s| s.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| file_path.to_string());
+                let evidence_text = format!("FileChanged ({change}): {display_path}");
+                let mut event = tj_core::event::Event::new(
+                    &tc.task_id,
+                    tj_core::event::EventType::Evidence,
+                    tj_core::event::Author::Classifier,
+                    tj_core::event::Source::Hook,
+                    evidence_text,
+                );
+                event.confidence = Some(0.9);
+                event.status = tj_core::event::EventStatus::Confirmed;
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+                println!("{}", event.event_id);
                 return Ok(());
             }
 
