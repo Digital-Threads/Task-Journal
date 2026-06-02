@@ -6,7 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "task-journal ingest-hook 2>/dev/null || true"
+            "command": "TJ_ASYNC_REWAKE=1 task-journal ingest-hook 2>/dev/null",
+            "asyncRewake": true,
+            "rewakeSummary": "Task Journal backlog forming"
           }
         ]
       }

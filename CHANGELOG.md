@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-02
+
+**`asyncRewake` on PostToolUse — zero-latency happy path, wake on backlog.**
+Adopts the undocumented `asyncRewake: true` Claude Code hook field (verified
+present in 2.1.160's Zod schema as `asyncRewake` + `rewakeMessage` +
+`rewakeSummary`). The PostToolUse hook now runs entirely in the background:
+the model never blocks on `task-journal ingest-hook` on the success path,
+even though the binary still does its full persist-to-`pending/` + spawn-
+classify-worker work. When the pending queue grows past 25 entries, the
+hook exits with code 2, which Claude Code interprets as "wake the model
+with a system reminder." The model sees `rewakeSummary` ("Task Journal
+backlog forming") plus the hook's stdout — a one-liner pointing at
+`task-journal pending-gc --days 0`. The classifier-can't-keep-up state
+becomes visible BEFORE it grows into the hundreds (the v0.6.2 fork-bomb
+era saw 515 entries before a user noticed).
+
+PreCompact and Stop hooks stay synchronous — they do transcript catch-up
+that must finish before compaction/exit, and exit code 2 from a sync
+hook BLOCKS the operation in Claude Code's contract. The wake-signal is
+gated on `TJ_ASYNC_REWAKE=1`, which only the PostToolUse hook command
+sets; CLI invocations and sync hooks never exit 2 even on overflow.
+
+### Added
+- `PENDING_OVERFLOW_THRESHOLD = 25` const and `count_pending_entries`
+  helper in `tj-cli` — best-effort directory count, IO errors return 0
+  so a borked filesystem never wakes the model with noise.
+- 3 new integration tests: `asyncrewake_below_threshold_exits_zero`,
+  `asyncrewake_overflow_exits_two_with_drain_hint`,
+  `asyncrewake_overflow_without_env_does_not_exit_two` — the last one
+  is the sync-hook safety guarantee.
+
+### Changed
+- `plugin/hooks/hooks.json` PostToolUse entry now declares
+  `"asyncRewake": true` + `"rewakeSummary": "Task Journal backlog forming"`
+  and the command sets `TJ_ASYNC_REWAKE=1`. Dropped the trailing
+  `|| true` from the PostToolUse command — asyncRewake hooks treat
+  exit codes themselves; other exit codes are ignored, only code 2
+  wakes. PreCompact and Stop entries are unchanged.
+
+### Migration
+- `task-journal install-hooks --uninstall && task-journal install-hooks`
+  to pick up the new hook contract. Claude Code 2.1.x or later required
+  for the `asyncRewake` field to be recognized (silently ignored on
+  older versions — they will run the PostToolUse hook synchronously
+  as a fallback). The 25-entry threshold is hard-coded for v0.10.0;
+  later releases may make it configurable.
+
 ## [0.9.4] - 2026-05-17
 
 ### Fixed

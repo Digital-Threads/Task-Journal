@@ -1775,6 +1775,25 @@ fn main() -> Result<()> {
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
                 let _ = spawn_classify_worker(&backend);
+
+                // v0.10.0 asyncRewake backlog signal. Only the PostToolUse
+                // hook runs as asyncRewake (hooks.json sets TJ_ASYNC_REWAKE=1
+                // there), so other kinds — and direct CLI invocations —
+                // never exit 2 even on overflow. Exit code 2 from a sync
+                // hook would BLOCK the operation; only asyncRewake hooks
+                // treat code 2 as "wake the model with rewakeMessage". stdout
+                // is appended to the wake message, so the user sees the
+                // drain command without us reaching into stderr.
+                let allow_wake = std::env::var("TJ_ASYNC_REWAKE").as_deref() == Ok("1");
+                if allow_wake && kind == "PostToolUse" {
+                    let pending_count = count_pending_entries(&events_path).unwrap_or(0);
+                    if pending_count > PENDING_OVERFLOW_THRESHOLD {
+                        println!(
+                            "Task Journal pending queue: {pending_count} entries. Classifier behind — run `task-journal pending-gc --days 0` to drain.",
+                        );
+                        std::process::exit(2);
+                    }
+                }
                 return Ok(());
             }
 
@@ -2844,6 +2863,41 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
 /// v0.6.2: queue an ingest event for the detached classify-worker. The
 /// hook returns immediately after writing this entry so it does not
 /// block Claude Code's hook timeout (was 5-30s, now <100ms). Schema "v2"
+/// Threshold for the v0.10.0 asyncRewake backlog signal. When the
+/// PostToolUse hook (configured with `asyncRewake: true` in
+/// `hooks.json`) finds more than this many entries already queued
+/// in `pending/`, it exits with code 2 to wake the model with a
+/// system reminder pointing at `task-journal pending-gc`. Tuned so
+/// that normal load (<5 in-flight at any moment) never trips, but
+/// a stuck classifier surfaces visibly before the queue grows into
+/// the hundreds (the v0.6.2 fork-bomb era saw 515 entries before a
+/// user noticed).
+const PENDING_OVERFLOW_THRESHOLD: usize = 25;
+
+/// Count `.json` (and `.json.dead`) entries currently sitting in
+/// `pending/` next to `events_path`. Best-effort: any IO error
+/// returns 0 so a borked filesystem never wakes the model with
+/// noise. Used by the asyncRewake backlog signal.
+fn count_pending_entries(events_path: &std::path::Path) -> anyhow::Result<usize> {
+    let dir = events_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("events_path has no grandparent"))?
+        .join("pending");
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some("json") = path.extension().and_then(|e| e.to_str()) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// distinguishes async-ingest entries from legacy v1 (text+error) ones
 /// the `pending retry` path knows how to handle.
 fn persist_pending_v2(

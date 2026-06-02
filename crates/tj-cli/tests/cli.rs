@@ -2966,3 +2966,135 @@ fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
         .failure()
         .stderr(contains("task not found: tj-zzzz"));
 }
+
+// v0.10.0: asyncRewake backlog signal. PostToolUse hook configured with
+// asyncRewake:true in hooks.json sets TJ_ASYNC_REWAKE=1; when pending/
+// has more than PENDING_OVERFLOW_THRESHOLD (25) entries already queued,
+// ingest-hook exits 2 with a wake-message on stdout. Sync hooks (or
+// CLI invocations without the env var) must NEVER exit 2 — that would
+// block the operation in Claude Code's hook contract.
+fn seed_pending_chunks(pending_dir: &std::path::Path, count: usize) {
+    std::fs::create_dir_all(pending_dir).unwrap();
+    for i in 0..count {
+        let payload = serde_json::json!({
+            "schema": "v2",
+            "kind": "PostToolUse",
+            "text": format!("seed-{i}"),
+            "project_hash": "deadbeefdeadbeef",
+            "events_path": "/tmp/unused.jsonl",
+            "backend": "hybrid",
+            "queued_at": "2099-01-01T00:00:00Z",
+        });
+        std::fs::write(
+            pending_dir.join(format!("seed-{i:04}.json")),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+fn posttooluse_payload() -> String {
+    serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo hi"},
+        "tool_response": {"stdout": "hi"},
+    })
+    .to_string()
+}
+
+#[test]
+fn asyncrewake_below_threshold_exits_zero() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Async wake test below threshold"])
+        .assert()
+        .success();
+
+    // Seed 5 entries — well under the 25 threshold.
+    let pending = dir.path().join("task-journal").join("pending");
+    seed_pending_chunks(&pending, 5);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_ASYNC_REWAKE", "1")
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(posttooluse_payload())
+        .assert()
+        .success(); // exit 0, no wake
+}
+
+#[test]
+fn asyncrewake_overflow_exits_two_with_drain_hint() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Async wake overflow test"])
+        .assert()
+        .success();
+
+    // Seed 30 entries — over the 25 threshold.
+    let pending = dir.path().join("task-journal").join("pending");
+    seed_pending_chunks(&pending, 30);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_ASYNC_REWAKE", "1")
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(posttooluse_payload())
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(contains("Task Journal pending queue"))
+        .stdout(contains("pending-gc"));
+}
+
+#[test]
+fn asyncrewake_overflow_without_env_does_not_exit_two() {
+    // Sync hook safety: without TJ_ASYNC_REWAKE=1 we must NEVER exit 2
+    // even on overflow, because exit 2 from a sync hook blocks the
+    // operation in Claude Code. CLI invocations and the PreCompact/Stop
+    // hooks (which stay sync) rely on this guarantee.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Sync hook safety test"])
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    seed_pending_chunks(&pending, 30);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env_remove("TJ_ASYNC_REWAKE")
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(posttooluse_payload())
+        .assert()
+        .success(); // exit 0, no wake — must not block sync hooks
+}
