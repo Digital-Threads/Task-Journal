@@ -182,6 +182,10 @@ pub struct TaskSearchParams {
     pub query: String,
     pub status: Option<String>,
     pub project: Option<String>,
+    /// v0.10.3+: restrict matches to a single event type
+    /// (`decision`, `evidence`, `finding`, `rejection`, ...).
+    /// Accepts any value in [`tj_core::event::EventType::ALL`].
+    pub event_type: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskSearchResult {
@@ -326,6 +330,8 @@ impl TaskJournalServer {
     ) -> Result<Json<TaskSearchResult>, McpError> {
         traced_tool("task_search", async move {
             let query = p.query.clone();
+            let raw_query = p.query.clone();
+            let event_type = p.event_type.clone();
             let results = run_blocking(move || {
                 let (project_hash, events_path, state_path) = project_paths()?;
                 let conn_arc = cached_open(&state_path)?;
@@ -335,12 +341,66 @@ impl TaskJournalServer {
                 if events_path.exists() {
                     tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 }
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT 50",
-                )?;
-                let ids: Vec<String> = stmt
-                    .query_map(rusqlite::params![p.query], |r| r.get::<_, String>(0))?
-                    .collect::<Result<_, _>>()?;
+
+                // v0.10.3: sanitize FTS5 query. Hyphenated IDs like
+                // `OPS-306` previously crashed with "no such column: 306"
+                // because FTS5 reads `-` as column-prefix syntax. Wrap
+                // such queries in phrase quotes; safe queries pass
+                // through unchanged so AND semantics are preserved.
+                let fts_query = tj_core::fts::sanitize_query(&raw_query);
+                let (sql, fts_only) = match &event_type {
+                    Some(_) => (
+                        "SELECT DISTINCT task_id FROM search_fts \
+                         WHERE search_fts MATCH ?1 AND type = ?2 LIMIT 50",
+                        false,
+                    ),
+                    None => (
+                        "SELECT DISTINCT task_id FROM search_fts \
+                         WHERE search_fts MATCH ?1 LIMIT 50",
+                        true,
+                    ),
+                };
+                let mut stmt = conn.prepare(sql)?;
+                let mut ids: Vec<String> = if fts_only {
+                    stmt.query_map(rusqlite::params![fts_query], |r| r.get::<_, String>(0))?
+                        .collect::<Result<_, _>>()?
+                } else {
+                    let ty = event_type.as_deref().unwrap();
+                    stmt.query_map(rusqlite::params![fts_query, ty], |r| r.get::<_, String>(0))?
+                        .collect::<Result<_, _>>()?
+                };
+
+                // v0.10.3: LIKE fallback. FTS5 phrase search miss when
+                // tokenizer split differs from the user's mental model
+                // (e.g. `bulk-repack` in source vs `bulk repack` in
+                // query). On zero FTS hits, scan event text directly so
+                // hyphenated identifiers and partial-word recall work.
+                if ids.is_empty() {
+                    let like = tj_core::fts::like_pattern(&raw_query);
+                    let (sql_like, type_bind) = match &event_type {
+                        Some(_) => (
+                            "SELECT DISTINCT task_id FROM search_fts \
+                             WHERE text LIKE ?1 AND type = ?2 LIMIT 50",
+                            true,
+                        ),
+                        None => (
+                            "SELECT DISTINCT task_id FROM search_fts \
+                             WHERE text LIKE ?1 LIMIT 50",
+                            false,
+                        ),
+                    };
+                    let mut stmt_like = conn.prepare(sql_like)?;
+                    ids = if type_bind {
+                        let ty = event_type.as_deref().unwrap();
+                        stmt_like
+                            .query_map(rusqlite::params![like, ty], |r| r.get::<_, String>(0))?
+                            .collect::<Result<_, _>>()?
+                    } else {
+                        stmt_like
+                            .query_map(rusqlite::params![like], |r| r.get::<_, String>(0))?
+                            .collect::<Result<_, _>>()?
+                    };
+                }
                 Ok(ids)
             })
             .await?;

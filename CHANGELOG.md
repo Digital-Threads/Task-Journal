@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-06-06
+
+**Search & pack quality fixes from real user feedback.** Five bugs hit
+during a month-long session: FTS5 query crashes on hyphenated
+identifiers (`OPS-306` → `no such column: 306`), event-body search
+missing hits the tokenizer split differently than the query, pack
+truncation cutting the **newest** decision (most important) instead
+of the oldest, no way to filter search by event type, and duplicate
+"Conversation compacted" markers when PreCompact fires twice within
+the same second.
+
+### Added
+- `tj_core::fts::sanitize_query` — phrase-quotes FTS5 metacharacters
+  (`-` `:` `*` `(` `)` `"` `/`) so identifiers like `OPS-306`, paths
+  like `src/main.rs`, and tokens like `ttl:30s` stop crashing the
+  `search_fts MATCH` planner. Multi-word queries pass through
+  unchanged so default AND semantics are preserved.
+- `tj_core::fts::like_pattern` — wraps a query as `%query%` for the
+  LIKE-fallback path described below.
+- `--type <event_type>` flag on `task-journal search` and matching
+  `event_type` field on the MCP `task_search` tool. Restricts hits
+  to a single event class (`decision`, `evidence`, `finding`, ...).
+- LIKE fallback in both CLI `search` and MCP `task_search`: when the
+  sanitized FTS5 phrase returns zero hits, the same query is rerun
+  against `search_fts.text LIKE %query%`. Recovers cases where the
+  unicode61 tokenizer split the source text differently from the
+  query string.
+
+### Changed
+- `render_active_decisions`, `render_evidence`, `render_rejected`
+  now `ORDER BY ... DESC` (newest-first). The summary/final decision
+  the agent records just before close lives at the *top* of its
+  section so end-of-pack truncation drops the **oldest** rows, not
+  the newest.
+- `FULL_BUDGET` bumped 10 KiB → 24 KiB. Real long-running tasks
+  (50–100 events with detailed decision text) blew past 10 KiB after
+  a couple of weeks and the budget was the binding constraint on
+  what survived. 24 KiB still fits comfortably inside any modern
+  LLM context window.
+
+### Fixed
+- B1 (CRITICAL): `task_search "OPS-306"` no longer crashes with
+  `MCP error -32603: no such column: 306`. Same fix covers all
+  paths/colon-prefixed tokens/glob-shaped queries.
+- B2 (HIGH): event-body terms now reach the user via the LIKE
+  fallback when an FTS5 token-split mismatch otherwise hides them.
+- B3 (HIGH): the **newest** decision is now the first line of the
+  Active decisions section and survives truncation; the user's
+  "final summary" pattern no longer gets clipped.
+- B5 (LOW): two `PreCompact` hook firings within 60 s no longer
+  double-write the boundary marker. The dedup check inspects the
+  most-recent decision event for the active task and skips the
+  append if it already looks like a recent compaction marker.
+
+### Migration
+- No schema changes. Existing tasks pick up the new ordering on the
+  next pack render (cache is keyed by mode, not order, so callers
+  may need to clear `task_pack_cache` once for visible effect — or
+  wait for the next event to invalidate it organically).
+
+### CLI / MCP API
+- CLI: `task-journal search <query> [--type TYPE]` is additive.
+- MCP `task_search`: new optional `event_type: Option<String>`
+  parameter. Existing callers that omit it see no behavior change
+  besides the FTS5 crash fix.
+
 ## [0.10.2] - 2026-06-02
 
 **`watchPaths` + FileChanged → auto-evidence on marker file edits.** X4

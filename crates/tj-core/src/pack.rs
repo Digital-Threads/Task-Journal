@@ -60,8 +60,11 @@ fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyho
 
 fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Evidence\n");
-    let mut stmt = conn
-        .prepare("SELECT text, strength FROM evidence WHERE task_id=?1 ORDER BY evidence_id ASC")?;
+    // v0.10.3: newest evidence first (ULID DESC). Matches the
+    // decision-ordering fix so truncation prefers older rows.
+    let mut stmt = conn.prepare(
+        "SELECT text, strength FROM evidence WHERE task_id=?1 ORDER BY evidence_id DESC",
+    )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
         let t: String = r.get(0)?;
         let s: String = r.get(1)?;
@@ -82,10 +85,12 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
 
 fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Rejected\n");
+    // v0.10.3: newest-first so end-of-pack truncation drops the
+    // OLDEST rejections, not the latest decision the agent recorded.
     let mut id_stmt = conn.prepare(
         "SELECT event_id FROM events_index
          WHERE task_id=?1 AND type='rejection'
-         ORDER BY timestamp ASC",
+         ORDER BY timestamp DESC",
     )?;
     let mut text_stmt = conn.prepare("SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1")?;
     let event_ids: Vec<String> = id_stmt
@@ -106,8 +111,12 @@ fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
 
 fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Active decisions\n");
+    // v0.10.3: newest decision first. `decision_id` is a ULID so DESC
+    // gives reverse-chronological order. The summary/final-decision
+    // event the agent records just before close is now the FIRST line
+    // of this section, surviving end-of-pack truncation.
     let mut stmt = conn.prepare(
-        "SELECT text FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id ASC",
+        "SELECT text FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
     let mut count = 0;
@@ -312,7 +321,11 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
     // Token-budget truncation: cap pack size so it always fits an LLM context window.
-    const FULL_BUDGET: usize = 10 * 1024;
+    // v0.10.3: full bumped 10K → 24K. Real tasks accumulate 50-100 events
+    // and the prior cap clipped final-summary decisions even after the
+    // ORDER BY DESC reshuffle. 24K still fits comfortably inside any
+    // modern LLM context budget.
+    const FULL_BUDGET: usize = 24 * 1024;
     const COMPACT_BUDGET: usize = 2 * 1024;
     const TRUNC_MARKER: &str = "\n\n_(truncated to fit pack budget)_\n";
     let budget = match mode {
@@ -562,9 +575,10 @@ mod tests {
             db::index_event(&conn, &ev).unwrap();
         }
         let pack = assemble(&conn, "tj-big", PackMode::Full).unwrap();
+        // v0.10.3: FULL_BUDGET bumped 10K → 24K + truncation slack.
         assert!(
-            pack.text.len() <= 12 * 1024,
-            "pack must stay under ~12KB; got {} bytes",
+            pack.text.len() <= 26 * 1024,
+            "pack must stay under ~26KB; got {} bytes",
             pack.text.len()
         );
         assert!(pack.metadata.truncated, "metadata.truncated must be true");

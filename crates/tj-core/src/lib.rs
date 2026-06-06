@@ -51,6 +51,7 @@ pub mod artifacts;
 pub mod classifier;
 pub mod db;
 pub mod event;
+pub mod fts;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;

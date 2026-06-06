@@ -3420,3 +3420,331 @@ fn asyncrewake_overflow_without_env_does_not_exit_two() {
         .assert()
         .success(); // exit 0, no wake — must not block sync hooks
 }
+
+// ---------------------------------------------------------------------------
+// v0.10.3 — search/pack quality fixes (user feedback)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_does_not_crash_on_hyphenated_identifier() {
+    // B1 regression: `task_search "OPS-306"` used to crash with
+    // `no such column: 306` because FTS5 parsed `-` as column-prefix.
+    // sanitize_query wraps the query in phrase quotes so it now runs.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "create",
+            "Ticket OPS-306 fix",
+            "--goal",
+            "Resolve OPS-306 customer report",
+        ])
+        .assert()
+        .success();
+
+    // Bare FTS5 search would have raised "no such column: 306".
+    // Verify the call exits 0 and prints at least one task_id line.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["search", "OPS-306"])
+        .assert()
+        .success()
+        .stdout(contains("tj-"));
+}
+
+#[test]
+fn search_does_not_crash_on_slash_or_colon() {
+    // Same B1 family — paths and `ttl:30s`-style tokens used to crash.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "create",
+            "Touch src/main.rs and configure ttl:30s",
+            "--goal",
+            "src/main.rs hot path with ttl:30s cache",
+        ])
+        .assert()
+        .success();
+
+    for q in &["src/main.rs", "ttl:30s", "foo*bar", "func()"] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["search", q])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn search_falls_back_to_like_when_fts_token_split_misses() {
+    // B2: `bulk-repack` ends up tokenized as `bulk` + `repack`.
+    // A user query `bulk repack` SHOULD match via the default FTS5
+    // AND-tokens semantics (passes through sanitize_query unchanged).
+    // But a query `bulk-repack` (with hyphen) is phrase-quoted; if
+    // the source text only has one of the variants and the FTS phrase
+    // returns nothing, the LIKE fallback recovers the hit.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "task title"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "do the bulk-repack on next push",
+        ])
+        .assert()
+        .success();
+
+    // Phrase-quoted "bulk-repack" — FTS5 phrase will not match unless
+    // tokenizer emits adjacent `bulk` + `repack`. LIKE fallback rescues.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["search", "bulk-repack"])
+        .assert()
+        .success()
+        .stdout(contains(&task_id));
+}
+
+#[test]
+fn search_filters_by_event_type() {
+    // B4: --type lets the agent target one event class.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "feature work"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "switching to plan X",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "switching off plan Y",
+        ])
+        .assert()
+        .success();
+
+    // --type=decision must hit
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["search", "switching", "--type", "decision"])
+        .assert()
+        .success()
+        .stdout(contains(&task_id));
+    // --type=evidence (no matching event) must succeed with no hits
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["search", "switching", "--type", "evidence"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(&task_id),
+        "evidence filter must not return decision/rejection rows"
+    );
+}
+
+#[test]
+fn pack_full_keeps_newest_decision_when_budget_tight() {
+    // B3: the user's complaint was that the LATEST (most-important)
+    // decision was the one cut by FULL_BUDGET. Render order is now
+    // newest-first, so a small pack truncated at the end keeps the
+    // newest decision on top.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "decision ordering test"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Append decisions oldest → newest. The LAST one must be the one
+    // that survives truncation.
+    for i in 0..3 {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args([
+                "event",
+                &task_id,
+                "--type",
+                "decision",
+                "--text",
+                &format!("decision number {i}"),
+            ])
+            .assert()
+            .success();
+    }
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "FINAL_SUMMARY_MARKER_v0_10_3",
+        ])
+        .assert()
+        .success();
+
+    let pack = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["pack", &task_id, "--mode", "full"])
+        .output()
+        .unwrap();
+    assert!(pack.status.success(), "pack must succeed");
+    let body = String::from_utf8_lossy(&pack.stdout);
+    let idx_final = body.find("FINAL_SUMMARY_MARKER_v0_10_3");
+    let idx_zero = body.find("decision number 0");
+    assert!(
+        idx_final.is_some(),
+        "newest decision must appear in pack output"
+    );
+    if let (Some(a), Some(b)) = (idx_final, idx_zero) {
+        assert!(
+            a < b,
+            "newest decision must render BEFORE the oldest one (newest-first ordering)"
+        );
+    }
+}
+
+#[test]
+fn precompact_dedupes_marker_within_60s_window() {
+    // B5: two PreCompact firings within DEDUP_WINDOW_SECS must not
+    // each append a "Conversation compacted at T" marker.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "dedup test"])
+        .assert()
+        .success();
+
+    // First PreCompact hook fires and emits the boundary marker.
+    let first = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--kind", "PreCompact", "--text", ""])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_out = String::from_utf8(first.stdout).unwrap();
+    assert!(
+        !first_out.trim().is_empty(),
+        "first PreCompact must emit the marker event id"
+    );
+
+    // Second firing same second must be deduped — stdout empty.
+    let second = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--kind", "PreCompact", "--text", ""])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second_out = String::from_utf8(second.stdout).unwrap();
+    assert!(
+        second_out.trim().is_empty(),
+        "second PreCompact within DEDUP_WINDOW must NOT emit a new event id; got: {second_out:?}"
+    );
+}

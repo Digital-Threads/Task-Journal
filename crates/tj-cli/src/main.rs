@@ -700,6 +700,10 @@ enum Commands {
         /// Search across all projects on this machine, not just the cwd one.
         #[arg(long)]
         all_projects: bool,
+        /// v0.10.3+: restrict matches to a single event type
+        /// (`decision`, `evidence`, `finding`, `rejection`, ...).
+        #[arg(long = "type", value_name = "TYPE")]
+        event_type: Option<String>,
     },
     /// Append a correction event referencing an earlier event_id.
     EventCorrect {
@@ -1738,6 +1742,45 @@ fn main() -> Result<()> {
 
                 // (2) Boundary marker.
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+                // v0.10.3: dedupe near-duplicate markers. Two PreCompact
+                // hook firings within DEDUP_WINDOW_SECS — caused by
+                // multi-plugin race, rapid compact-then-restore, or a
+                // retried hook — both append "Conversation compacted at
+                // T" events with the same wall-clock second. Skip if
+                // the most recent decision event already carries this
+                // marker text and was written under a minute ago.
+                const DEDUP_WINDOW_SECS: i64 = 60;
+                let last_marker: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT ei.timestamp, COALESCE(sf.text, '') \
+                         FROM events_index ei \
+                         LEFT JOIN search_fts sf ON sf.event_id = ei.event_id \
+                         WHERE ei.task_id = ?1 AND ei.type = 'decision' \
+                         ORDER BY ei.timestamp DESC LIMIT 1",
+                        rusqlite::params![&tc.task_id],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .ok();
+                if let Some((ts, text)) = last_marker {
+                    if text.starts_with("Conversation compacted at") {
+                        if let Ok(prev) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                            let delta = (chrono::Utc::now()
+                                .signed_duration_since(prev.with_timezone(&chrono::Utc)))
+                            .num_seconds();
+                            if delta.abs() < DEDUP_WINDOW_SECS {
+                                // Marker recently appended — skip the
+                                // second one. Still print SOMETHING so
+                                // hook callers see a stable exit shape;
+                                // emit the previous event_id we'd have
+                                // duplicated would not be available here
+                                // without an extra query, so emit empty.
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 let marker_text = format!(
                     "Conversation compacted at {now}; preceding events should be treated as a single reasoning unit."
                 );
@@ -2266,7 +2309,12 @@ fn main() -> Result<()> {
             query,
             limit,
             all_projects,
+            event_type,
         } => {
+            // v0.10.3: sanitize FTS5 query so hyphenated IDs / paths /
+            // colons no longer crash with "no such column" mid-search.
+            let fts_query = tj_core::fts::sanitize_query(&query);
+            let like_query = tj_core::fts::like_pattern(&query);
             if all_projects {
                 let state_dir = tj_core::paths::state_dir()?;
                 let hashes = tj_core::db::list_all_projects(&state_dir)?;
@@ -2276,19 +2324,17 @@ fn main() -> Result<()> {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
-                    let mut stmt = match conn.prepare(
-                        "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2"
+                    let ids = match run_search(
+                        &conn,
+                        &fts_query,
+                        &like_query,
+                        event_type.as_deref(),
+                        limit,
                     ) {
-                        Ok(s) => s,
+                        Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let rows = match stmt.query_map(rusqlite::params![&query, limit as i64], |r| {
-                        r.get::<_, String>(0)
-                    }) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    for id in rows.flatten() {
+                    for id in ids {
                         println!("{hash}\t{id}");
                     }
                 }
@@ -2304,14 +2350,7 @@ fn main() -> Result<()> {
                 if events_path.exists() {
                     tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 }
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT task_id FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2",
-                )?;
-                let ids: Vec<String> = stmt
-                    .query_map(rusqlite::params![query, limit as i64], |r| {
-                        r.get::<_, String>(0)
-                    })?
-                    .collect::<Result<_, _>>()?;
+                let ids = run_search(&conn, &fts_query, &like_query, event_type.as_deref(), limit)?;
                 for id in ids {
                     println!("{id}");
                 }
@@ -2632,6 +2671,77 @@ fn topic_is_fts_safe(topic: &str) -> bool {
     !topic
         .chars()
         .any(|c| matches!(c, '-' | '"' | '*' | ':' | '(' | ')'))
+}
+
+/// v0.10.3: shared search helper used by `Commands::Search` for both
+/// the cwd and `--all-projects` paths. Runs the sanitized FTS5 MATCH
+/// first; on zero hits, scans `search_fts.text` via `LIKE` so
+/// hyphenated identifiers (e.g. `OPS-306`) and substrings missed by
+/// the unicode61 tokenizer still surface.
+fn run_search(
+    conn: &rusqlite::Connection,
+    fts_query: &str,
+    like_query: &str,
+    event_type: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let (fts_sql, fts_uses_type) = match event_type {
+        Some(_) => (
+            "SELECT DISTINCT task_id FROM search_fts \
+             WHERE search_fts MATCH ?1 AND type = ?2 LIMIT ?3",
+            true,
+        ),
+        None => (
+            "SELECT DISTINCT task_id FROM search_fts \
+             WHERE search_fts MATCH ?1 LIMIT ?2",
+            false,
+        ),
+    };
+    let mut stmt = conn.prepare(fts_sql)?;
+    let ids: Vec<String> = if fts_uses_type {
+        let ty = event_type.unwrap();
+        stmt.query_map(rusqlite::params![fts_query, ty, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    } else {
+        stmt.query_map(rusqlite::params![fts_query, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    if !ids.is_empty() {
+        return Ok(ids);
+    }
+
+    let (like_sql, like_uses_type) = match event_type {
+        Some(_) => (
+            "SELECT DISTINCT task_id FROM search_fts \
+             WHERE text LIKE ?1 AND type = ?2 LIMIT ?3",
+            true,
+        ),
+        None => (
+            "SELECT DISTINCT task_id FROM search_fts \
+             WHERE text LIKE ?1 LIMIT ?2",
+            false,
+        ),
+    };
+    let mut stmt_like = conn.prepare(like_sql)?;
+    let ids_like: Vec<String> = if like_uses_type {
+        let ty = event_type.unwrap();
+        stmt_like
+            .query_map(rusqlite::params![like_query, ty, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        stmt_like
+            .query_map(rusqlite::params![like_query, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    Ok(ids_like)
 }
 
 fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64>) -> Result<()> {
