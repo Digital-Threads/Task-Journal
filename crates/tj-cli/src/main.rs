@@ -1512,6 +1512,12 @@ fn main() -> Result<()> {
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
             std::fs::create_dir_all(events_path.parent().unwrap())?;
 
+            // Live Claude Code session id (hook payload → env fallback),
+            // stamped additively onto the live events this hook emits so
+            // consumers can correlate them with the session. None when
+            // neither source is present (standalone behaviour unchanged).
+            let live_session_id = tj_core::session_id::live_session_id(Some(&payload));
+
             // SessionStart: emit a JSON envelope with compact resume-packs of
             // open tasks so Claude Code injects them into its system context
             // automatically. This is the load-bearing UX for "the journal
@@ -1680,6 +1686,7 @@ fn main() -> Result<()> {
                 );
                 event.confidence = Some(0.9);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
@@ -1732,6 +1739,7 @@ fn main() -> Result<()> {
                             &backend,
                             last_event_ts.as_deref(),
                             "PreCompactChunk",
+                            live_session_id.as_deref(),
                         )
                         .unwrap_or(0);
                         if enq > 0 && std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
@@ -1793,6 +1801,7 @@ fn main() -> Result<()> {
                 );
                 event.confidence = Some(1.0);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
@@ -1865,6 +1874,7 @@ fn main() -> Result<()> {
                             &backend,
                             last_event_ts.as_deref(),
                             "StopChunk",
+                            live_session_id.as_deref(),
                         )
                         .unwrap_or(0);
                         if enq > 0 && std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
@@ -1947,7 +1957,7 @@ fn main() -> Result<()> {
                 .unwrap_or(false);
             let is_mock = mock_event_type.is_some() && mock_task_id.is_some();
             if !is_mock && !force_sync {
-                let _ = persist_pending_v2(&events_path, &kind, &text, &project_hash, &backend)?;
+                let _ = persist_pending_v2(&events_path, &kind, &text, &project_hash, &backend, live_session_id.as_deref())?;
                 // Fire-and-forget worker. Errors here are best-effort —
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
@@ -3150,6 +3160,7 @@ fn persist_pending_v2(
     text: &str,
     project_hash: &str,
     backend: &str,
+    session_id: Option<&str>,
 ) -> anyhow::Result<std::path::PathBuf> {
     let pending_dir = events_path
         .parent()
@@ -3159,7 +3170,7 @@ fn persist_pending_v2(
         .join("pending");
     std::fs::create_dir_all(&pending_dir)?;
     let id = ulid::Ulid::new().to_string();
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "schema": "v2",
         "kind": kind,
         "text": text,
@@ -3168,6 +3179,9 @@ fn persist_pending_v2(
         "backend": backend,
         "queued_at": chrono::Utc::now().to_rfc3339(),
     });
+    if let Some(sid) = session_id {
+        payload["session_id"] = serde_json::Value::String(sid.to_string());
+    }
     let path = pending_dir.join(format!("{id}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
     Ok(path)
@@ -3194,6 +3208,7 @@ fn enqueue_transcript_chunks_since_last_event(
     backend: &str,
     last_event_ts: Option<&str>,
     assistant_chunk_kind: &str,
+    session_id: Option<&str>,
 ) -> anyhow::Result<usize> {
     use tj_core::session::parser::{
         extract_assistant_texts, extract_user_text, parse_session, SessionEntry,
@@ -3226,7 +3241,7 @@ fn enqueue_transcript_chunks_since_last_event(
                 continue;
             }
         }
-        persist_pending_v2(events_path, kind, &text, project_hash, backend)?;
+        persist_pending_v2(events_path, kind, &text, project_hash, backend, session_id)?;
         count += 1;
     }
     Ok(count)
@@ -3394,6 +3409,9 @@ fn process_pending_entry(
         .unwrap_or("")
         .to_string();
 
+    // Inherit the session id queued on the v2 chunk (additive; absent → None).
+    let chunk_session_id = tj_core::session_id::session_id_from_payload(&v);
+
     // Mirror the synchronous flow that used to live in IngestHook —
     // see commit history of v0.6.1 for the original. Auto-open, run
     // classifier, apply integrity safeguards, persist event, telemetry.
@@ -3510,6 +3528,7 @@ fn process_pending_entry(
     event.confidence = Some(confidence);
     event.status = tj_core::classifier::decide_status(confidence);
     event.evidence_strength = evidence_strength;
+    tj_core::session_id::stamp_session_id(&mut event.meta, chunk_session_id.as_deref());
 
     let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
     writer.append(&event)?;
@@ -3685,6 +3704,33 @@ mod inline_tests {
     // `clippy::items_after_test_module` — every other free fn must be
     // declared before this module begins.
     use super::*;
+
+    #[test]
+    fn persist_pending_v2_includes_session_id_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let p = persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", Some("sess-9"))
+            .unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["session_id"], serde_json::json!("sess-9"));
+        assert_eq!(
+            tj_core::session_id::session_id_from_payload(&v).as_deref(),
+            Some("sess-9")
+        );
+    }
+
+    #[test]
+    fn persist_pending_v2_omits_session_id_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let p = persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("session_id").is_none());
+    }
 
     #[test]
     fn is_rewind_prompt_simple() {

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-08
+
+**Live `session_id` on emitted events (additive, opt-in).** The journal now
+stamps the active Claude Code session id onto the events it emits itself —
+hook-driven events (synchronous FileChanged/PreCompact and the async
+classify-worker path) and the MCP tools (`task_create`, `event_add`,
+`task_close`). This lets external consumers correlate journal events with
+the originating session without time-window heuristics.
+
+Fully backward-compatible: the id is read from the hook payload's
+`session_id` field, falling back to the `CLAUDE_CODE_SESSION_ID` env var.
+When neither is present (standalone use), nothing is added and behavior is
+byte-identical to before. This is distinct from the existing transcript
+`session_id` *parsing* — that passive read-only lookup is unchanged.
+
+### Added
+- `tj_core::session_id` — helpers to resolve the live session id
+  (`live_session_id`, `session_id_from_payload`, `session_id_from_env`) and
+  additively stamp it into an event's free-form `meta` (`stamp_session_id`).
+- `meta.session_id` on live hook events and MCP events when a source is
+  available. The pending-v2 chunk now carries `session_id` so async
+  classify-worker events inherit it.
+
 ## [0.10.3] - 2026-06-06
 
 **Search & pack quality fixes from real user feedback.** Five bugs hit

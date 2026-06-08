@@ -431,6 +431,10 @@ impl TaskJournalServer {
                     p.initial_context.clone().unwrap_or_else(|| p.title.clone()),
                 );
                 event.meta = serde_json::json!({"title": p.title.clone()});
+                tj_core::session_id::stamp_session_id(
+                    &mut event.meta,
+                    tj_core::session_id::session_id_from_env().as_deref(),
+                );
 
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
@@ -483,6 +487,10 @@ impl TaskJournalServer {
                 );
                 event.corrects = p.corrects.clone();
                 event.supersedes = p.supersedes.clone();
+                tj_core::session_id::stamp_session_id(
+                    &mut event.meta,
+                    tj_core::session_id::session_id_from_env().as_deref(),
+                );
 
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
@@ -557,6 +565,10 @@ impl TaskJournalServer {
                     meta.insert("outcome_tag".into(), serde_json::Value::String(t.clone()));
                 }
                 event.meta = serde_json::Value::Object(meta);
+                tj_core::session_id::stamp_session_id(
+                    &mut event.meta,
+                    tj_core::session_id::session_id_from_env().as_deref(),
+                );
 
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
