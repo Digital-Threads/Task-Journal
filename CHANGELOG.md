@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-06-08
+
+**Fix: `pack` panicked on multibyte UTF-8.** Pack truncation sliced the
+rendered text at a raw byte index, panicking ("byte index N is not a char
+boundary") whenever the budget cutoff landed inside a multibyte character —
+i.e. on Cyrillic/CJK/emoji-heavy journals that exceed the pack budget.
+ASCII-only content was unaffected, so it stayed latent. Truncation now cuts
+at a UTF-8 char boundary.
+
+### Fixed
+- `tj_core::pack` truncation is now char-boundary-safe (`truncate_to_budget`);
+  packs with non-ASCII text exceeding the budget no longer panic.
+
 ## [0.11.0] - 2026-06-08
 
 **Live `session_id` on emitted events (additive, opt-in).** The journal now
