@@ -164,6 +164,23 @@ fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> 
     Ok(out)
 }
 
+/// Truncate `text` to at most `budget` bytes, cutting at a UTF-8 char
+/// boundary and preferring the last newline within the kept prefix, then
+/// append `marker`. Char-boundary-safe: a raw `text[..budget]` byte slice
+/// panics when `budget` lands inside a multibyte char (Cyrillic/CJK/emoji).
+fn truncate_to_budget(text: &mut String, budget: usize, marker: &str) {
+    if text.len() <= budget {
+        return;
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cutoff = text[..end].rfind('\n').unwrap_or(end);
+    text.truncate(cutoff);
+    text.push_str(marker);
+}
+
 pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Result<TaskPack> {
     let mode_str = match mode {
         PackMode::Compact => "compact",
@@ -334,9 +351,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     };
     let truncated = text.len() > budget;
     if truncated {
-        let cutoff = text[..budget].rfind('\n').unwrap_or(budget);
-        text.truncate(cutoff);
-        text.push_str(TRUNC_MARKER);
+        truncate_to_budget(&mut text, budget, TRUNC_MARKER);
     }
 
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -583,6 +598,29 @@ mod tests {
         );
         assert!(pack.metadata.truncated, "metadata.truncated must be true");
         assert!(pack.text.contains("truncated to fit pack budget"));
+    }
+
+    #[test]
+    fn truncate_to_budget_handles_multibyte_boundary() {
+        // 1 ASCII byte shifts every 'я' (2 bytes) start to an ODD offset, so an
+        // EVEN budget lands INSIDE a char — a raw text[..budget] slice would panic.
+        let marker = "\n[cut]";
+        let mut s = String::from("x");
+        s.push_str(&"я".repeat(2000)); // total = 1 + 4000 = 4001 bytes
+        let budget = 100usize; // even → mid-char given the odd char starts
+        assert!(!s.is_char_boundary(budget), "precondition: budget must be mid-char");
+        truncate_to_budget(&mut s, budget, marker); // must NOT panic
+        assert!(s.ends_with(marker));
+        assert!(s.len() <= budget + marker.len());
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "result must be valid UTF-8");
+    }
+
+    #[test]
+    fn truncate_to_budget_noop_under_budget() {
+        let mut s = String::from("маленький текст");
+        let before = s.clone();
+        truncate_to_budget(&mut s, 10_000, "\n[cut]");
+        assert_eq!(s, before);
     }
 
     #[test]
