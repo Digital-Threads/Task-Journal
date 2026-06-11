@@ -595,7 +595,7 @@ enum Commands {
         /// with `task-journal goal <id> "<text>"`.
         #[arg(long)]
         goal: Option<String>,
-        /// Parent task id — makes this a subtask of <id>.
+        /// Parent task id — makes this a subtask of the given id.
         #[arg(long)]
         parent: Option<String>,
     },

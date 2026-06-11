@@ -202,7 +202,7 @@ pub struct TaskCreateParams {
     /// "why was this done?" answers weeks later. Optional only for
     /// backwards compat; agents should always pass it.
     pub goal: Option<String>,
-    /// Parent task id — makes this a subtask of <id>. Validated: the
+    /// Parent task id — makes this a subtask of the given id. Validated: the
     /// parent must exist and the link must not introduce a cycle.
     pub parent: Option<String>,
 }
