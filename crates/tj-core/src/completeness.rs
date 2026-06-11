@@ -74,9 +74,7 @@ pub fn assess(
     let mut evidence = 0usize;
     let mut suggested = 0usize;
     {
-        let mut stmt = conn.prepare(
-            "SELECT type, status FROM events_index WHERE task_id = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT type, status FROM events_index WHERE task_id = ?1")?;
         let rows = stmt.query_map(rusqlite::params![task_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -108,8 +106,10 @@ pub fn assess(
     if pending_count > 0 {
         gaps.push(Gap {
             kind: GapKind::PendingLeak,
-            detail: format!("{pending_count} pending entr{} not yet classified",
-                if pending_count == 1 { "y" } else { "ies" }),
+            detail: format!(
+                "{pending_count} pending entr{} not yet classified",
+                if pending_count == 1 { "y" } else { "ies" }
+            ),
         });
     }
 
@@ -123,8 +123,7 @@ pub fn pending_count() -> usize {
     fn inner() -> anyhow::Result<usize> {
         let cwd = std::env::current_dir()?;
         let project_hash = crate::project_hash::from_path(&cwd)?;
-        let events_path =
-            crate::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+        let events_path = crate::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
         let dir = events_path
             .parent()
             .and_then(|p| p.parent())
@@ -195,8 +194,10 @@ mod tests {
         let (_d, c) = conn();
         open_task(&c, "t2");
         // Set a goal, then close without outcome.
-        c.execute("UPDATE tasks SET goal='ship X' WHERE task_id='t2'", []).unwrap();
-        c.execute("UPDATE tasks SET status='closed' WHERE task_id='t2'", []).unwrap();
+        c.execute("UPDATE tasks SET goal='ship X' WHERE task_id='t2'", [])
+            .unwrap();
+        c.execute("UPDATE tasks SET status='closed' WHERE task_id='t2'", [])
+            .unwrap();
         let r = assess(&c, "t2", 0).unwrap();
         assert!(r.gaps.iter().any(|g| g.kind == GapKind::ClosedNoOutcome));
         assert!(!r.gaps.iter().any(|g| g.kind == GapKind::NoGoal));
@@ -214,14 +215,18 @@ mod tests {
         use crate::event::EventStatus;
         let (_d, c) = conn();
         open_task(&c, "t3");
-        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t3'", []).unwrap();
+        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t3'", [])
+            .unwrap();
         add_event(&c, "t3", EventType::Decision, EventStatus::Confirmed);
         let r = assess(&c, "t3", 0).unwrap();
         assert!(r.gaps.iter().any(|g| g.kind == GapKind::DecisionNoEvidence));
 
         add_event(&c, "t3", EventType::Evidence, EventStatus::Confirmed);
         let r2 = assess(&c, "t3", 0).unwrap();
-        assert!(!r2.gaps.iter().any(|g| g.kind == GapKind::DecisionNoEvidence));
+        assert!(!r2
+            .gaps
+            .iter()
+            .any(|g| g.kind == GapKind::DecisionNoEvidence));
     }
 
     #[test]
@@ -229,11 +234,16 @@ mod tests {
         use crate::event::EventStatus;
         let (_d, c) = conn();
         open_task(&c, "t4");
-        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t4'", []).unwrap();
+        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t4'", [])
+            .unwrap();
         add_event(&c, "t4", EventType::Finding, EventStatus::Suggested);
         add_event(&c, "t4", EventType::Finding, EventStatus::Suggested);
         let r = assess(&c, "t4", 0).unwrap();
-        let g = r.gaps.iter().find(|g| g.kind == GapKind::SuggestedUnconfirmed).unwrap();
+        let g = r
+            .gaps
+            .iter()
+            .find(|g| g.kind == GapKind::SuggestedUnconfirmed)
+            .unwrap();
         assert!(g.detail.contains('2'));
     }
 
@@ -241,9 +251,14 @@ mod tests {
     fn pending_leak_fires_when_count_positive() {
         let (_d, c) = conn();
         open_task(&c, "t5");
-        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t5'", []).unwrap();
+        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t5'", [])
+            .unwrap();
         let r = assess(&c, "t5", 3).unwrap();
-        let g = r.gaps.iter().find(|g| g.kind == GapKind::PendingLeak).unwrap();
+        let g = r
+            .gaps
+            .iter()
+            .find(|g| g.kind == GapKind::PendingLeak)
+            .unwrap();
         assert!(g.detail.contains('3'));
 
         let r0 = assess(&c, "t5", 0).unwrap();
@@ -266,7 +281,10 @@ mod tests {
     #[test]
     fn render_section_lists_gaps() {
         let r = CompletenessReport {
-            gaps: vec![Gap { kind: GapKind::NoGoal, detail: "no goal recorded".into() }],
+            gaps: vec![Gap {
+                kind: GapKind::NoGoal,
+                detail: "no goal recorded".into(),
+            }],
         };
         let s = render_section(&r).unwrap();
         assert!(s.contains("Completeness (1)"));

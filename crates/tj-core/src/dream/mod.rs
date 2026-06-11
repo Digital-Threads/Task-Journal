@@ -91,7 +91,13 @@ mod tests {
         let events_path = d.path().join("events.jsonl");
 
         // Seed the task so upsert/index has a home (open event).
-        let open = Event::new("tj-1", EventType::Open, Author::User, Source::Cli, "Demo".into());
+        let open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "Demo".into(),
+        );
         crate::db::upsert_task_from_event(&conn, &open, "ph").unwrap();
 
         let backend = MockDreamBackend {
@@ -114,8 +120,15 @@ mod tests {
             project_hash: "ph".into(),
             dry_run: false,
         };
-        let report =
-            run_dream(&conn, &events_path, &opts, &backend, vec![task_input()], "run-1").unwrap();
+        let report = run_dream(
+            &conn,
+            &events_path,
+            &opts,
+            &backend,
+            vec![task_input()],
+            "run-1",
+        )
+        .unwrap();
 
         assert_eq!(report.sessions_processed, 1);
         assert_eq!(report.events_backfilled, 1); // dup dropped
@@ -135,8 +148,15 @@ mod tests {
             project_hash: "ph".into(),
             dry_run: true,
         };
-        let report =
-            run_dream(&conn, &events_path, &opts, &backend, vec![task_input()], "run-1").unwrap();
+        let report = run_dream(
+            &conn,
+            &events_path,
+            &opts,
+            &backend,
+            vec![task_input()],
+            "run-1",
+        )
+        .unwrap();
         assert_eq!(report.sessions_processed, 1);
         assert_eq!(report.events_backfilled, 0);
         assert!(!events_path.exists());

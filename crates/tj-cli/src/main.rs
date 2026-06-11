@@ -1690,8 +1690,7 @@ fn main() -> Result<()> {
             // mcp__ tools) — gated MCP-only, falls through to the queue path so
             // event capture is unaffected. Disabled by TJ_PUSH_RECALL=0.
             if kind == "PostToolUse" && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0") {
-                if let Some(envelope) =
-                    push_recall_envelope(&payload, &events_path, &project_hash)
+                if let Some(envelope) = push_recall_envelope(&payload, &events_path, &project_hash)
                 {
                     println!("{}", serde_json::to_string(&envelope)?);
                 }
@@ -2147,7 +2146,14 @@ fn main() -> Result<()> {
                 .unwrap_or(false);
             let is_mock = mock_event_type.is_some() && mock_task_id.is_some();
             if !is_mock && !force_sync {
-                let _ = persist_pending_v2(&events_path, &kind, &text, &project_hash, &backend, live_session_id.as_deref())?;
+                let _ = persist_pending_v2(
+                    &events_path,
+                    &kind,
+                    &text,
+                    &project_hash,
+                    &backend,
+                    live_session_id.as_deref(),
+                )?;
                 // Fire-and-forget worker. Errors here are best-effort —
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
@@ -2378,10 +2384,8 @@ fn main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
-            let events_path =
-                tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-            let state_path =
-                tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
             let conn = tj_core::db::open(&state_path)?;
 
             // 1. Resolve session files in scope.
@@ -3406,13 +3410,14 @@ fn recent_task_contexts(
              ORDER BY ei.timestamp DESC LIMIT ?2",
         )?;
         let constraints: Vec<String> = c_stmt
-            .query_map(
-                rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT],
-                |r| {
-                    let txt: Option<String> = r.get(0)?;
-                    Ok(txt.unwrap_or_default().chars().take(120).collect::<String>())
-                },
-            )?
+            .query_map(rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT], |r| {
+                let txt: Option<String> = r.get(0)?;
+                Ok(txt
+                    .unwrap_or_default()
+                    .chars()
+                    .take(120)
+                    .collect::<String>())
+            })?
             .collect::<Result<Vec<String>, _>>()?
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -4357,13 +4362,23 @@ mod inline_tests {
     #[test]
     fn task_matches_by_session_id_or_time_window() {
         use tj_core::event::{Author, Event, EventType, Source};
-        let mut tagged =
-            Event::new("tj-1", EventType::Finding, Author::Agent, Source::Hook, "x".into());
+        let mut tagged = Event::new(
+            "tj-1",
+            EventType::Finding,
+            Author::Agent,
+            Source::Hook,
+            "x".into(),
+        );
         tagged.meta = serde_json::json!({"session_id": "sess-1"});
         assert!(task_matches_session(&[tagged], "sess-1", None, None));
 
-        let mut legacy =
-            Event::new("tj-2", EventType::Finding, Author::Agent, Source::Hook, "y".into());
+        let mut legacy = Event::new(
+            "tj-2",
+            EventType::Finding,
+            Author::Agent,
+            Source::Hook,
+            "y".into(),
+        );
         legacy.timestamp = "2026-01-01T00:00:30Z".into();
         legacy.meta = serde_json::json!({}); // no session_id
         assert!(task_matches_session(
@@ -4386,8 +4401,15 @@ mod inline_tests {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join("events").join("h.jsonl");
         std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
-        let p = persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", Some("sess-9"))
-            .unwrap();
+        let p = persist_pending_v2(
+            &events_path,
+            "PostToolUse",
+            "txt",
+            "h",
+            "hybrid",
+            Some("sess-9"),
+        )
+        .unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["session_id"], serde_json::json!("sess-9"));
@@ -4402,7 +4424,8 @@ mod inline_tests {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join("events").join("h.jsonl");
         std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
-        let p = persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
+        let p =
+            persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("session_id").is_none());
@@ -4476,7 +4499,9 @@ mod inline_tests {
         let ctxs = recent_task_contexts(&conn, 5).unwrap();
         let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
         assert!(
-            ctx.constraints.iter().any(|s| s.contains("API limit 100/min")),
+            ctx.constraints
+                .iter()
+                .any(|s| s.contains("API limit 100/min")),
             "constraints should include the constraint event, got {:?}",
             ctx.constraints
         );
@@ -4526,11 +4551,24 @@ mod inline_tests {
 
         let ctxs = recent_task_contexts(&conn, 5).unwrap();
         let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
-        assert_eq!(ctx.constraints.len(), 5, "bounded to CONSTRAINT_CONTEXT_LIMIT");
+        assert_eq!(
+            ctx.constraints.len(),
+            5,
+            "bounded to CONSTRAINT_CONTEXT_LIMIT"
+        );
         // The 5 most recent are numbers 2..=6.
-        assert!(ctx.constraints.iter().any(|s| s.contains("constraint number 6")));
-        assert!(!ctx.constraints.iter().any(|s| s.contains("constraint number 0")));
-        assert!(!ctx.constraints.iter().any(|s| s.contains("constraint number 1")));
+        assert!(ctx
+            .constraints
+            .iter()
+            .any(|s| s.contains("constraint number 6")));
+        assert!(!ctx
+            .constraints
+            .iter()
+            .any(|s| s.contains("constraint number 0")));
+        assert!(!ctx
+            .constraints
+            .iter()
+            .any(|s| s.contains("constraint number 1")));
     }
 
     #[test]

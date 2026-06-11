@@ -493,8 +493,13 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
         // Task with no goal → NoGoal gap.
-        let e = crate::event::Event::new("g1", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli, "T".into());
+        let e = crate::event::Event::new(
+            "g1",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "T".into(),
+        );
         crate::db::upsert_task_from_event(&conn, &e, "ph").unwrap();
         crate::db::index_event(&conn, &e).unwrap();
 
@@ -507,13 +512,19 @@ mod tests {
     fn pack_no_completeness_section_when_complete() {
         let d = tempfile::TempDir::new().unwrap();
         let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
-        let mut e = crate::event::Event::new("g2", crate::event::EventType::Open,
-            crate::event::Author::User, crate::event::Source::Cli, "T".into());
+        let mut e = crate::event::Event::new(
+            "g2",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "T".into(),
+        );
         e.meta = serde_json::json!({"title": "T"});
         crate::db::upsert_task_from_event(&conn, &e, "ph").unwrap();
         crate::db::index_event(&conn, &e).unwrap();
         // Give it a goal so NoGoal doesn't fire; open + no decisions → complete.
-        conn.execute("UPDATE tasks SET goal='g' WHERE task_id='g2'", []).unwrap();
+        conn.execute("UPDATE tasks SET goal='g' WHERE task_id='g2'", [])
+            .unwrap();
         // pending_count() resolves `<data_dir>/pending`. Point the data dir at
         // the isolated tempdir (no pending/ child) so the PendingLeak rule
         // stays silent regardless of the real dev environment.
@@ -745,11 +756,17 @@ mod tests {
         let mut s = String::from("x");
         s.push_str(&"я".repeat(2000)); // total = 1 + 4000 = 4001 bytes
         let budget = 100usize; // even → mid-char given the odd char starts
-        assert!(!s.is_char_boundary(budget), "precondition: budget must be mid-char");
+        assert!(
+            !s.is_char_boundary(budget),
+            "precondition: budget must be mid-char"
+        );
         truncate_to_budget(&mut s, budget, marker); // must NOT panic
         assert!(s.ends_with(marker));
         assert!(s.len() <= budget + marker.len());
-        assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "result must be valid UTF-8");
+        assert!(
+            std::str::from_utf8(s.as_bytes()).is_ok(),
+            "result must be valid UTF-8"
+        );
     }
 
     #[test]

@@ -60,10 +60,7 @@ mod tests {
         let r = in_scope(s, Some(at(150)), None);
         assert_eq!(
             r,
-            vec![
-                std::path::PathBuf::from("c"),
-                std::path::PathBuf::from("b")
-            ]
+            vec![std::path::PathBuf::from("c"), std::path::PathBuf::from("b")]
         );
     }
 
@@ -86,10 +83,7 @@ mod tests {
         let r = in_scope(s, None, Some(2));
         assert_eq!(
             r,
-            vec![
-                std::path::PathBuf::from("c"),
-                std::path::PathBuf::from("b")
-            ]
+            vec![std::path::PathBuf::from("c"), std::path::PathBuf::from("b")]
         );
     }
 }

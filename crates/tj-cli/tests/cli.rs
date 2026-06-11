@@ -4202,8 +4202,14 @@ fn post_tool_use_mcp_prepends_recall_banner() {
         .and_then(|h| h.get("updatedMCPToolOutput"))
         .and_then(|s| s.as_str())
         .expect("updatedMCPToolOutput missing");
-    assert!(updated.starts_with('\u{26a0}'), "must start with banner: {updated}");
-    assert!(updated.contains("axum"), "banner must mention the recall: {updated}");
+    assert!(
+        updated.starts_with('\u{26a0}'),
+        "must start with banner: {updated}"
+    );
+    assert!(
+        updated.contains("axum"),
+        "banner must mention the recall: {updated}"
+    );
     assert!(
         updated.contains("REAL TOOL OUTPUT 12345"),
         "original tool output must be preserved: {updated}"
@@ -4367,7 +4373,12 @@ fn session_start_additional_context(source: &str) -> String {
         Command::cargo_bin("task-journal")
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
-            .args(["create", "Ship the widget", "--goal", "Ship the dashboard widget"])
+            .args([
+                "create",
+                "Ship the widget",
+                "--goal",
+                "Ship the dashboard widget",
+            ])
             .assert()
             .success()
             .get_output()
@@ -4451,7 +4462,10 @@ fn session_start_startup_has_no_reminder() {
 /// Recursively collect file names under `dir` that match a predicate.
 /// Used to locate the sandboxed Claude-memory file without reconstructing
 /// the exact `encode_project_path` transform of the test's cwd.
-fn find_files_recursive(dir: &std::path::Path, pred: &dyn Fn(&str) -> bool) -> Vec<std::path::PathBuf> {
+fn find_files_recursive(
+    dir: &std::path::Path,
+    pred: &dyn Fn(&str) -> bool,
+) -> Vec<std::path::PathBuf> {
     let mut hits = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -4494,7 +4508,14 @@ fn export_memory_dry_run_prints_path_and_content_no_write() {
         .unwrap()
         .env("XDG_DATA_HOME", xdg.path())
         .current_dir(proj.path())
-        .args(["close", &task_id, "--outcome", "done", "--outcome-tag", "done"])
+        .args([
+            "close",
+            &task_id,
+            "--outcome",
+            "done",
+            "--outcome-tag",
+            "done",
+        ])
         .assert()
         .success();
 
@@ -4510,7 +4531,9 @@ fn export_memory_dry_run_prints_path_and_content_no_write() {
         .stdout(contains("name: ship-x"));
 
     // Nothing written under the sandboxed Claude config dir.
-    let written = find_files_recursive(claude.path(), &|n| n.starts_with("tj-") && n.ends_with(".md"));
+    let written = find_files_recursive(claude.path(), &|n| {
+        n.starts_with("tj-") && n.ends_with(".md")
+    });
     assert!(written.is_empty(), "dry-run must not write: {written:?}");
 }
 
@@ -4540,7 +4563,14 @@ fn export_memory_writes_one_idempotent_file() {
         .unwrap()
         .env("XDG_DATA_HOME", xdg.path())
         .current_dir(proj.path())
-        .args(["close", &task_id, "--outcome", "done", "--outcome-tag", "done"])
+        .args([
+            "close",
+            &task_id,
+            "--outcome",
+            "done",
+            "--outcome-tag",
+            "done",
+        ])
         .assert()
         .success();
 
@@ -4556,8 +4586,9 @@ fn export_memory_writes_one_idempotent_file() {
     }
 
     let prefix = format!("tj-{task_id}-");
-    let files =
-        find_files_recursive(claude.path(), &|n| n.starts_with(&prefix) && n.ends_with(".md"));
+    let files = find_files_recursive(claude.path(), &|n| {
+        n.starts_with(&prefix) && n.ends_with(".md")
+    });
     assert_eq!(files.len(), 1, "exactly one idempotent file: {files:?}");
 
     let body = std::fs::read_to_string(&files[0]).unwrap();
@@ -4591,7 +4622,14 @@ fn export_memory_all_closed_skips_open() {
         .unwrap()
         .env("XDG_DATA_HOME", xdg.path())
         .current_dir(proj.path())
-        .args(["close", &task_a, "--outcome", "done", "--outcome-tag", "done"])
+        .args([
+            "close",
+            &task_a,
+            "--outcome",
+            "done",
+            "--outcome-tag",
+            "done",
+        ])
         .assert()
         .success();
 
@@ -4620,10 +4658,8 @@ fn export_memory_all_closed_skips_open() {
         .assert()
         .success();
 
-    let for_a =
-        find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_a}-")));
-    let for_b =
-        find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_b}-")));
+    let for_a = find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_a}-")));
+    let for_b = find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_b}-")));
     assert_eq!(for_a.len(), 1, "closed task A exported: {for_a:?}");
     assert!(for_b.is_empty(), "open task B must be skipped: {for_b:?}");
 }

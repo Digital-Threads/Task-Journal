@@ -33,10 +33,9 @@ pub fn active_task_reminder(conn: &Connection) -> anyhow::Result<Option<String>>
          ORDER BY ei.timestamp DESC LIMIT ?2",
     )?;
     let constraints: Vec<String> = stmt
-        .query_map(
-            rusqlite::params![task_id, MAX_CONSTRAINTS as i64],
-            |r| r.get::<_, Option<String>>(0),
-        )?
+        .query_map(rusqlite::params![task_id, MAX_CONSTRAINTS as i64], |r| {
+            r.get::<_, Option<String>>(0)
+        })?
         .filter_map(|r| r.ok().flatten())
         .filter(|t| !t.trim().is_empty())
         .collect();
@@ -63,13 +62,25 @@ mod tests {
     const PH: &str = "ph-test";
 
     fn open_event(task: &str, title: &str) -> Event {
-        let mut e = Event::new(task, EventType::Open, Author::User, Source::Cli, title.into());
+        let mut e = Event::new(
+            task,
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            title.into(),
+        );
         e.meta = serde_json::json!({ "title": title });
         e
     }
 
     fn constraint_event(task: &str, text: &str, ts: &str) -> Event {
-        let mut e = Event::new(task, EventType::Constraint, Author::Agent, Source::Chat, text.into());
+        let mut e = Event::new(
+            task,
+            EventType::Constraint,
+            Author::Agent,
+            Source::Chat,
+            text.into(),
+        );
         e.status = EventStatus::Confirmed;
         e.timestamp = ts.into();
         e
@@ -91,7 +102,11 @@ mod tests {
         // should appear, the oldest must be absent.
         let events = vec![
             open_event("tj-1", "Build the widget"),
-            constraint_event("tj-1", "OLDEST: rate limit is 100/min", "2026-06-01T00:00:00Z"),
+            constraint_event(
+                "tj-1",
+                "OLDEST: rate limit is 100/min",
+                "2026-06-01T00:00:00Z",
+            ),
             constraint_event("tj-1", "API key rotates daily", "2026-06-02T00:00:00Z"),
             constraint_event("tj-1", "Must support offline mode", "2026-06-03T00:00:00Z"),
             constraint_event("tj-1", "NEWEST: ship before Friday", "2026-06-04T00:00:00Z"),
@@ -117,7 +132,13 @@ mod tests {
 
     #[test]
     fn reminder_none_when_task_closed() {
-        let mut close = Event::new("tj-1", EventType::Close, Author::User, Source::Cli, "done".into());
+        let mut close = Event::new(
+            "tj-1",
+            EventType::Close,
+            Author::User,
+            Source::Cli,
+            "done".into(),
+        );
         close.timestamp = "2026-06-05T00:00:00Z".into();
         let events = vec![open_event("tj-1", "Build the widget"), close];
         let (_d, conn) = seed(&events);

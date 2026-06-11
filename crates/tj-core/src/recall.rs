@@ -25,9 +25,9 @@ pub const RELEVANCE_THRESHOLD: f64 = 1.0;
 /// high-frequency glue words plus the noise tokens that leak in from the
 /// synthesized tool-call JSON (`Bash: {"command": …}`).
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "you", "are", "was", "but", "not", "this",
-    "that", "from", "have", "has", "had", "will", "your", "our", "out", "let",
-    "lets", "command", "output", "input", "tool", "bash", "name", "response",
+    "the", "and", "for", "with", "you", "are", "was", "but", "not", "this", "that", "from", "have",
+    "has", "had", "will", "your", "our", "out", "let", "lets", "command", "output", "input",
+    "tool", "bash", "name", "response",
 ];
 
 /// Build an FTS5 OR-of-tokens query from a free-text context string. A raw
@@ -162,12 +162,13 @@ pub fn relevant_recall(
         .into_iter()
         .filter(|(_, s)| *s >= RELEVANCE_THRESHOLD)
         .filter_map(|(eid, score)| {
-            meta.remove(&eid).map(|(task_id, event_type, text)| RecallHit {
-                task_id,
-                event_type,
-                text,
-                score,
-            })
+            meta.remove(&eid)
+                .map(|(task_id, event_type, text)| RecallHit {
+                    task_id,
+                    event_type,
+                    text,
+                    score,
+                })
         })
         .collect();
     hits.sort_by(|a, b| {
@@ -320,7 +321,9 @@ mod tests {
         );
         let (_d, conn) = seeded(&[rej]);
 
-        assert!(relevant_recall(&conn, "", DEFAULT_MAX_HITS).unwrap().is_empty());
+        assert!(relevant_recall(&conn, "", DEFAULT_MAX_HITS)
+            .unwrap()
+            .is_empty());
         assert!(relevant_recall(&conn, "   ", DEFAULT_MAX_HITS)
             .unwrap()
             .is_empty());
