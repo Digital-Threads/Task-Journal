@@ -22,10 +22,20 @@ cargo fmt --all --check
 
 # Bump version в Cargo.toml workspace (раз — все crates наследуют через version.workspace = true)
 # Edit Cargo.toml: version = "0.1.1" (или 0.2.0, 1.0.0, etc.)
-git add Cargo.toml
+#
+# ВАЖНО: версия плагина НЕ наследуется из Cargo.toml — синхронь вручную, иначе
+# `/plugin update` будет показывать старую версию (см. историю: 0.10.3 vs 0.12.0).
+# Обнови до той же версии:
+#   - plugin/.claude-plugin/plugin.json        → "version"
+#   - .claude-plugin/marketplace.json          → metadata.version И plugins[0].version
+git add Cargo.toml plugin/.claude-plugin/plugin.json .claude-plugin/marketplace.json
 git commit -m "chore: bump version to v0.1.1"
 git push
 ```
+
+> **Не забудь тег.** Версия в `Cargo.toml` сама по себе НЕ публикует. crates.io и
+> GitHub Release триггерит только push тега `vX.Y.Z` (шаг 2). Если бампнул версию
+> в feature-PR и смёржил без тега — релиз НЕ вышел, crates.io отстанет.
 
 ### 2. Tag + push
 
