@@ -5,3 +5,4 @@
 //! the JSONL source of truth is never mutated.
 
 pub mod backend;
+pub mod prompt;
