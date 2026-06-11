@@ -3223,6 +3223,10 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// How many of a task's most-recent `constraint` events to surface in
+/// the classifier prompt. Kept small so the prompt stays bounded.
+const CONSTRAINT_CONTEXT_LIMIT: i64 = 5;
+
 fn recent_task_contexts(
     conn: &rusqlite::Connection,
     limit: usize,
@@ -3253,11 +3257,35 @@ fn recent_task_contexts(
                 ))
             })?
             .collect::<Result<_, _>>()?;
+
+        // Gather the task's most-recent `constraint` events so the
+        // classifier can recognise chunks that violate a known limit.
+        // Mirrors the last_events join, filtered to constraints and
+        // bounded to keep the prompt small.
+        let mut c_stmt = conn.prepare(
+            "SELECT sf.text FROM events_index ei
+             LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+             WHERE ei.task_id = ?1 AND ei.type = 'constraint'
+             ORDER BY ei.timestamp DESC LIMIT ?2",
+        )?;
+        let constraints: Vec<String> = c_stmt
+            .query_map(
+                rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT],
+                |r| {
+                    let txt: Option<String> = r.get(0)?;
+                    Ok(txt.unwrap_or_default().chars().take(120).collect::<String>())
+                },
+            )?
+            .collect::<Result<Vec<String>, _>>()?
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+
         out.push(tj_core::classifier::TaskContext {
             task_id,
             title,
             last_events,
-            constraints: vec![],
+            constraints,
         });
     }
     Ok(out)
@@ -4263,6 +4291,109 @@ mod inline_tests {
         assert!(!is_rewind_prompt("hello /rewind"));
         assert!(!is_rewind_prompt(""));
         assert!(!is_rewind_prompt("/rewinder"));
+    }
+
+    #[test]
+    fn recent_task_contexts_gathers_constraints() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+        let project_hash = "h";
+
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        let mut open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task one".into(),
+        );
+        open.meta = serde_json::json!({ "title": "task one" });
+        open.timestamp = "2026-01-01T00:00:00Z".into();
+        writer.append(&open).unwrap();
+        let mut cons = Event::new(
+            "tj-1",
+            EventType::Constraint,
+            Author::Agent,
+            Source::Hook,
+            "API limit 100/min".into(),
+        );
+        cons.timestamp = "2026-01-01T00:00:01Z".into();
+        writer.append(&cons).unwrap();
+        let mut find = Event::new(
+            "tj-1",
+            EventType::Finding,
+            Author::Agent,
+            Source::Hook,
+            "read http.rs".into(),
+        );
+        find.timestamp = "2026-01-01T00:00:02Z".into();
+        writer.append(&find).unwrap();
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
+
+        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
+        assert!(
+            ctx.constraints.iter().any(|s| s.contains("API limit 100/min")),
+            "constraints should include the constraint event, got {:?}",
+            ctx.constraints
+        );
+        assert!(
+            !ctx.constraints.iter().any(|s| s.contains("read http.rs")),
+            "constraints must exclude non-constraint events, got {:?}",
+            ctx.constraints
+        );
+    }
+
+    #[test]
+    fn recent_task_contexts_bounds_constraints_to_n() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+        let project_hash = "h";
+
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        let mut open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task one".into(),
+        );
+        open.meta = serde_json::json!({ "title": "task one" });
+        open.timestamp = "2026-01-01T00:00:00Z".into();
+        writer.append(&open).unwrap();
+        for i in 0..7 {
+            let mut cons = Event::new(
+                "tj-1",
+                EventType::Constraint,
+                Author::Agent,
+                Source::Hook,
+                format!("constraint number {i}"),
+            );
+            // Increasing timestamps so DESC ordering keeps the most recent.
+            cons.timestamp = format!("2026-01-01T00:00:1{i}Z");
+            writer.append(&cons).unwrap();
+        }
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
+
+        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
+        assert_eq!(ctx.constraints.len(), 5, "bounded to CONSTRAINT_CONTEXT_LIMIT");
+        // The 5 most recent are numbers 2..=6.
+        assert!(ctx.constraints.iter().any(|s| s.contains("constraint number 6")));
+        assert!(!ctx.constraints.iter().any(|s| s.contains("constraint number 0")));
+        assert!(!ctx.constraints.iter().any(|s| s.contains("constraint number 1")));
     }
 
     #[test]
