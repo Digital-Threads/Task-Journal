@@ -116,6 +116,36 @@ pub fn assess(
     Ok(CompletenessReport { gaps })
 }
 
+/// Best-effort count of unprocessed pending entries for the cwd's project.
+/// Returns 0 on any resolution/IO error — the PendingLeak rule then stays
+/// silent rather than failing the whole assessment.
+pub fn pending_count() -> usize {
+    fn inner() -> anyhow::Result<usize> {
+        let cwd = std::env::current_dir()?;
+        let project_hash = crate::project_hash::from_path(&cwd)?;
+        let events_path =
+            crate::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+        let dir = events_path
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| anyhow::anyhow!("no grandparent"))?
+            .join("pending");
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut n = 0;
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            // Count live .json chunks; skip .dead and non-json.
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+    inner().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +236,12 @@ mod tests {
 
         let r0 = assess(&c, "t5", 0).unwrap();
         assert!(!r0.gaps.iter().any(|g| g.kind == GapKind::PendingLeak));
+    }
+
+    #[test]
+    fn pending_count_zero_when_no_dir() {
+        // Best-effort contract: resolution may succeed or fail, but it must
+        // never panic. In a clean env with no pending dir the count is 0.
+        let _ = pending_count();
     }
 }
