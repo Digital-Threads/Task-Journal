@@ -29,17 +29,29 @@ jobs:
           fi
           echo "Token is set (length: ${#CARGO_REGISTRY_TOKEN})"
 
-      - name: Publish task-journal-core
-        run: cargo publish -p task-journal-core
-
-      - name: Wait for crates.io to index core
-        run: sleep 60
-
-      - name: Publish task-journal-cli
-        run: cargo publish -p task-journal-cli
-
-      - name: Wait for crates.io to index cli
-        run: sleep 30
-
-      - name: Publish task-journal-mcp
-        run: cargo publish -p task-journal-mcp
+      # Idempotent publish: a crate version that is already on crates.io is
+      # treated as success, so a re-run (e.g. after a partial publish) finishes
+      # the remaining crates instead of failing on the first one.
+      - name: Publish crates
+        run: |
+          set -u
+          publish() {
+            crate="$1"
+            out=$(cargo publish -p "$crate" 2>&1); rc=$?
+            echo "$out"
+            if [ "$rc" -eq 0 ]; then
+              echo ">> $crate: published"
+              return 0
+            fi
+            if echo "$out" | grep -q "already exists on crates.io"; then
+              echo ">> $crate: this version is already on crates.io — skipping"
+              return 0
+            fi
+            echo "::error::cargo publish $crate failed (exit $rc)"
+            return "$rc"
+          }
+          publish task-journal-core
+          echo "Waiting for crates.io to index core..."; sleep 60
+          publish task-journal-cli
+          echo "Waiting for crates.io to index cli..."; sleep 30
+          publish task-journal-mcp
