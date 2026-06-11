@@ -168,6 +168,20 @@ fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> 
 /// boundary and preferring the last newline within the kept prefix, then
 /// append `marker`. Char-boundary-safe: a raw `text[..budget]` byte slice
 /// panics when `budget` lands inside a multibyte char (Cyrillic/CJK/emoji).
+/// Render a compact one-level roll-up of a task's direct children, or None
+/// when it has no children. Each child: status, id, title. Bounded.
+fn render_subtasks(conn: &Connection, task_id: &str) -> anyhow::Result<Option<String>> {
+    let kids = crate::db::children_of(conn, task_id)?;
+    if kids.is_empty() {
+        return Ok(None);
+    }
+    let mut s = format!("\n## Subtasks ({})\n", kids.len());
+    for k in &kids {
+        s.push_str(&format!("- [{}] {} — {}\n", k.status, k.task_id, k.title));
+    }
+    Ok(Some(s))
+}
+
 fn truncate_to_budget(text: &mut String, budget: usize, marker: &str) {
     if text.len() <= budget {
         return;
@@ -342,6 +356,13 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         text.push_str(&section);
     }
 
+    // One-level roll-up of direct children (parents only). Appended before
+    // truncation so it shares the pack budget. Task 5 busts the parent cache
+    // when a child changes, so the next assemble regenerates fresh.
+    if let Some(subtasks) = render_subtasks(conn, task_id)? {
+        text.push_str(&subtasks);
+    }
+
     // Token-budget truncation: cap pack size so it always fits an LLM context window.
     // v0.10.3: full bumped 10K → 24K. Real tasks accumulate 50-100 events
     // and the prior cap clipped final-summary decisions even after the
@@ -390,6 +411,43 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn parent_pack_contains_subtasks_section() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+
+        // Parent + one child, each with an open event.
+        let mut p = crate::event::Event::new(
+            "p",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "Parent".into(),
+        );
+        p.meta = serde_json::json!({"title": "Parent"});
+        crate::db::upsert_task_from_event(&conn, &p, "ph").unwrap();
+        crate::db::index_event(&conn, &p).unwrap();
+
+        let mut c = crate::event::Event::new(
+            "c",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "Child".into(),
+        );
+        c.meta = serde_json::json!({"title": "Child", "parent_id": "p"});
+        crate::db::upsert_task_from_event(&conn, &c, "ph").unwrap();
+        crate::db::index_event(&conn, &c).unwrap();
+
+        let parent_pack = assemble(&conn, "p", PackMode::Compact).unwrap();
+        assert!(parent_pack.text.contains("Subtasks"));
+        assert!(parent_pack.text.contains("Child"));
+        assert!(parent_pack.text.contains("c")); // child id
+
+        let child_pack = assemble(&conn, "c", PackMode::Compact).unwrap();
+        assert!(!child_pack.text.contains("Subtasks"));
     }
 
     #[test]
