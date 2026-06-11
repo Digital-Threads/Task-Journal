@@ -34,7 +34,10 @@ jobs:
       # the remaining crates instead of failing on the first one.
       - name: Publish crates
         run: |
-          set -u
+          # GitHub runs steps with `bash -e`; disable errexit so a non-zero
+          # `cargo publish` (e.g. an already-published version) doesn't abort
+          # the script before the per-crate tolerance check below.
+          set +e
           publish() {
             crate="$1"
             out=$(cargo publish -p "$crate" 2>&1); rc=$?
