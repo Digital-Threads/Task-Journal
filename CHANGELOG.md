@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0]
+
+### Added
+- Capture-completeness flagging: a task's resume-pack now shows a `Completeness`
+  section listing structural gaps (closed without outcome, decisions without
+  evidence, unconfirmed suggested events, missing goal, unclassified pending
+  entries) — shown only when gaps exist. Read-only; reusable
+  `completeness::assess` API for the upcoming close-gate.
+
 ## [0.11.1] - 2026-06-08
 
 **Fix: `pack` panicked on multibyte UTF-8.** Pack truncation sliced the
