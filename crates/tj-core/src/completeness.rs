@@ -105,8 +105,13 @@ pub fn assess(
         });
     }
 
-    // (pending rule in Task 3)
-    let _ = pending_count;
+    if pending_count > 0 {
+        gaps.push(Gap {
+            kind: GapKind::PendingLeak,
+            detail: format!("{pending_count} pending entr{} not yet classified",
+                if pending_count == 1 { "y" } else { "ies" }),
+        });
+    }
 
     Ok(CompletenessReport { gaps })
 }
@@ -188,5 +193,18 @@ mod tests {
         let r = assess(&c, "t4", 0).unwrap();
         let g = r.gaps.iter().find(|g| g.kind == GapKind::SuggestedUnconfirmed).unwrap();
         assert!(g.detail.contains('2'));
+    }
+
+    #[test]
+    fn pending_leak_fires_when_count_positive() {
+        let (_d, c) = conn();
+        open_task(&c, "t5");
+        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t5'", []).unwrap();
+        let r = assess(&c, "t5", 3).unwrap();
+        let g = r.gaps.iter().find(|g| g.kind == GapKind::PendingLeak).unwrap();
+        assert!(g.detail.contains('3'));
+
+        let r0 = assess(&c, "t5", 0).unwrap();
+        assert!(!r0.gaps.iter().any(|g| g.kind == GapKind::PendingLeak));
     }
 }
