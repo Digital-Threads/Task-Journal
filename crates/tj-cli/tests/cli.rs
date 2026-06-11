@@ -4447,3 +4447,201 @@ fn session_start_startup_has_no_reminder() {
         "non-compact SessionStart must NOT inject the reminder: {ctx}"
     );
 }
+
+/// Recursively collect file names under `dir` that match a predicate.
+/// Used to locate the sandboxed Claude-memory file without reconstructing
+/// the exact `encode_project_path` transform of the test's cwd.
+fn find_files_recursive(dir: &std::path::Path, pred: &dyn Fn(&str) -> bool) -> Vec<std::path::PathBuf> {
+    let mut hits = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                hits.extend(find_files_recursive(&path, pred));
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if pred(name) {
+                    hits.push(path.clone());
+                }
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn export_memory_dry_run_prints_path_and_content_no_write() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Ship X", "--goal", "Ship X"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["close", &task_id, "--outcome", "done", "--outcome-tag", "done"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(proj.path())
+        .args(["export-memory", "--task", &task_id, "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains(&format!("memory/tj-{task_id}-ship-x.md")))
+        .stdout(contains("name: ship-x"));
+
+    // Nothing written under the sandboxed Claude config dir.
+    let written = find_files_recursive(claude.path(), &|n| n.starts_with("tj-") && n.ends_with(".md"));
+    assert!(written.is_empty(), "dry-run must not write: {written:?}");
+}
+
+#[test]
+fn export_memory_writes_one_idempotent_file() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Ship X", "--goal", "Ship X"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["close", &task_id, "--outcome", "done", "--outcome-tag", "done"])
+        .assert()
+        .success();
+
+    for _ in 0..2 {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("CLAUDE_CONFIG_DIR", claude.path())
+            .current_dir(proj.path())
+            .args(["export-memory", "--task", &task_id])
+            .assert()
+            .success();
+    }
+
+    let prefix = format!("tj-{task_id}-");
+    let files =
+        find_files_recursive(claude.path(), &|n| n.starts_with(&prefix) && n.ends_with(".md"));
+    assert_eq!(files.len(), 1, "exactly one idempotent file: {files:?}");
+
+    let body = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(body.starts_with("---\n"), "frontmatter fence: {body}");
+    assert!(body.contains("type: project"), "metadata type: {body}");
+}
+
+#[test]
+fn export_memory_all_closed_skips_open() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    let task_a = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Closed A", "--goal", "A"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["close", &task_a, "--outcome", "done", "--outcome-tag", "done"])
+        .assert()
+        .success();
+
+    let task_b = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Open B", "--goal", "B"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(proj.path())
+        .args(["export-memory", "--all-closed"])
+        .assert()
+        .success();
+
+    let for_a =
+        find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_a}-")));
+    let for_b =
+        find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_b}-")));
+    assert_eq!(for_a.len(), 1, "closed task A exported: {for_a:?}");
+    assert!(for_b.is_empty(), "open task B must be skipped: {for_b:?}");
+}
+
+#[test]
+fn export_memory_missing_task_exits_1() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(proj.path())
+        .args(["export-memory", "--task", "tj-nope"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("task not found"));
+}

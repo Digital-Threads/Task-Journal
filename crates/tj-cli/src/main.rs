@@ -894,6 +894,18 @@ enum Commands {
     /// Why-this-approach, Verification, Affected). Reuses event log +
     /// artifacts; introduces no new tables.
     ExportPr { task_id: String },
+    /// Export task knowledge as Claude-memory frontmatter files (feeds native dream).
+    ExportMemory {
+        /// Export a single task by id.
+        #[arg(long, conflicts_with = "all_closed")]
+        task: Option<String>,
+        /// Export all closed tasks (default scope when no flag is given).
+        #[arg(long)]
+        all_closed: bool,
+        /// Print target paths + content without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2826,6 +2838,13 @@ fn main() -> Result<()> {
         Commands::ExportPr { task_id } => {
             run_export_pr(&task_id)?;
         }
+        Commands::ExportMemory {
+            task,
+            all_closed,
+            dry_run,
+        } => {
+            run_export_memory(task.as_deref(), all_closed, dry_run)?;
+        }
     }
     Ok(())
 }
@@ -3231,6 +3250,113 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     }
 
     print!("{}", out);
+    Ok(())
+}
+
+fn run_export_memory(task: Option<&str>, _all_closed: bool, dry_run: bool) -> Result<()> {
+    const MAX_ITEMS: usize = 10;
+
+    let cwd = std::env::current_dir()?;
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    }
+
+    // Resolve scope.
+    let task_ids: Vec<String> = match task {
+        Some(id) => {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM tasks WHERE task_id = ?1",
+                    rusqlite::params![id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !exists {
+                eprintln!("Error: task not found: {id}");
+                std::process::exit(1);
+            }
+            vec![id.to_string()]
+        }
+        None => {
+            // default + --all-closed → all closed tasks
+            let mut stmt =
+                conn.prepare("SELECT task_id FROM tasks WHERE status='closed' ORDER BY task_id")?;
+            let ids = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ids
+        }
+    };
+
+    if task_ids.is_empty() {
+        eprintln!("note: no closed tasks to export");
+        return Ok(());
+    }
+
+    // Memory dir: ~/.claude/projects/<encoded-cwd>/memory/
+    let memory_dir = tj_core::session::discovery::projects_dir()?
+        .join(tj_core::session::discovery::encode_project_path(&cwd_str))
+        .join("memory");
+
+    for id in &task_ids {
+        let title: String = conn.query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?;
+        let meta = tj_core::db::task_metadata(&conn, id)?.unwrap_or_default();
+
+        // decision + constraint one-liners, oldest-first (== run_export_pr style).
+        let mut stmt = conn.prepare(
+            "SELECT ei.type, sf.text FROM events_index ei
+             LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+             WHERE ei.task_id = ?1 AND ei.type IN ('decision','constraint')
+             ORDER BY ei.timestamp ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut decisions = Vec::new();
+        let mut constraints = Vec::new();
+        for row in rows {
+            let (ty, text) = row?;
+            let line = text.lines().next().unwrap_or("").trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            match ty.as_str() {
+                "decision" if decisions.len() < MAX_ITEMS => decisions.push(line),
+                "constraint" if constraints.len() < MAX_ITEMS => constraints.push(line),
+                _ => {}
+            }
+        }
+
+        let slug = tj_core::frontmatter::slugify(&title);
+        let content = tj_core::frontmatter::render_memory(&tj_core::frontmatter::MemoryInput {
+            title: &title,
+            meta: &meta,
+            decisions: &decisions,
+            constraints: &constraints,
+        });
+        let file_path = memory_dir.join(format!("tj-{id}-{slug}.md"));
+
+        if dry_run {
+            println!("# would write: {}", file_path.display());
+            println!("{content}");
+        } else {
+            std::fs::create_dir_all(&memory_dir)?;
+            std::fs::write(&file_path, content)?;
+            println!("wrote {}", file_path.display());
+        }
+    }
     Ok(())
 }
 
