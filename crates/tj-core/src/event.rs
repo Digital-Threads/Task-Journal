@@ -51,6 +51,7 @@ pub enum Source {
     Hook,
     Manual,
     Cli,
+    Dream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -167,6 +168,14 @@ mod tests {
             serde_json::to_string(&EvidenceStrength::Strong).unwrap(),
             "\"strong\""
         );
+    }
+
+    #[test]
+    fn source_dream_serializes_to_snake_case() {
+        let j = serde_json::to_string(&Source::Dream).unwrap();
+        assert_eq!(j, "\"dream\"");
+        let back: Source = serde_json::from_str("\"dream\"").unwrap();
+        assert_eq!(back, Source::Dream);
     }
 
     #[test]
