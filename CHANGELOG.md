@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence, unconfirmed suggested events, missing goal, unclassified pending
   entries) — shown only when gaps exist. Read-only; reusable
   `completeness::assess` API for the upcoming close-gate.
+- `task-journal dream` — offline memory backfill (Pass A). Re-reads session
+  transcripts and appends significant typed events the realtime classifier
+  missed, stamped `source=dream`, `status=suggested` (visible, prunable).
+  Manual trigger; `--dry-run`, `--since`, `--task`, `--limit`. Reuses the
+  Anthropic HTTP backend via `TJ_DREAM_MODEL` / `TJ_DREAM_MAX_TOKENS`.
+  Additive — the JSONL source of truth is never mutated.
 
 ## [0.11.1] - 2026-06-08
 
