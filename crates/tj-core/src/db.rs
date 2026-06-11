@@ -964,6 +964,16 @@ pub fn would_create_cycle(
     Ok(true)
 }
 
+/// Number of direct children of `task_id` whose status is still open.
+pub fn count_open_children(conn: &Connection, task_id: &str) -> anyhow::Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE parent_id = ?1 AND status = 'open'",
+        rusqlite::params![task_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
 /// Clear the pack cache for a task and its parent (roll-up depends on both).
 pub fn invalidate_pack_cascade(conn: &Connection, task_id: &str) -> anyhow::Result<()> {
     conn.execute(
@@ -1648,5 +1658,30 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM task_pack_cache", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 0, "both child and parent pack caches cleared");
+    }
+
+    #[test]
+    fn count_open_children_counts_only_open() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("p", "P"), "ph").unwrap();
+        let mut c1 = make_open_event("c1", "C1");
+        c1.meta = serde_json::json!({"title": "C1", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c1, "ph").unwrap();
+        // Close c1.
+        let mut close = crate::event::Event::new(
+            "c1",
+            crate::event::EventType::Close,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "done".into(),
+        );
+        close.timestamp = "2026-01-02T00:00:00Z".into();
+        upsert_task_from_event(&conn, &close, "ph").unwrap();
+        let mut c2 = make_open_event("c2", "C2");
+        c2.meta = serde_json::json!({"title": "C2", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c2, "ph").unwrap();
+
+        assert_eq!(count_open_children(&conn, "p").unwrap(), 1); // only c2
     }
 }

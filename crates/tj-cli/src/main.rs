@@ -1113,6 +1113,7 @@ fn main() -> Result<()> {
             if let Some(o) = outcome.as_deref() {
                 tj_core::db::set_task_outcome(&conn, &task_id, o, outcome_tag.as_deref())?;
             }
+            let open_kids = tj_core::db::count_open_children(&conn, &task_id)?;
             drop(conn);
 
             let mut event = tj_core::event::Event::new(
@@ -1129,6 +1130,9 @@ fn main() -> Result<()> {
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
+            if open_kids > 0 {
+                eprintln!("note: {open_kids} open subtask(s) under {task_id}");
+            }
             println!("{}", event.event_id);
         }
         Commands::Stale { days } => {

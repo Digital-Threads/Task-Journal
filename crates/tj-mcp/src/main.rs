@@ -240,6 +240,11 @@ pub struct TaskCloseParams {
 pub struct TaskCloseResult {
     pub task_id: String,
     pub closed: bool,
+    /// Optional advisory note — e.g. "note: N open subtask(s)" when the
+    /// closed task still has open children. `None` when there's nothing
+    /// to flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
@@ -542,10 +547,11 @@ impl TaskJournalServer {
     ) -> Result<Json<TaskCloseResult>, McpError> {
         traced_tool("task_close", async move {
             let task_id = p.task_id.clone();
-            run_blocking(move || {
+            let open_kids = run_blocking(move || {
                 let (project_hash, events_path, state_path) = project_paths()?;
 
                 let conn_arc = cached_open(&state_path)?;
+                let open_kids;
                 {
                     let conn = conn_arc
                         .lock()
@@ -571,6 +577,7 @@ impl TaskJournalServer {
                     if let Some(o) = p.outcome.as_deref() {
                         tj_core::db::set_task_outcome(&conn, &p.task_id, o, p.outcome_tag.as_deref())?;
                     }
+                    open_kids = tj_core::db::count_open_children(&conn, &p.task_id)?;
                 } // release the connection lock before doing the JSONL append
 
                 let mut event = tj_core::event::Event::new(
@@ -597,12 +604,18 @@ impl TaskJournalServer {
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
-                Ok(())
+                Ok(open_kids)
             })
             .await?;
+            let note = if open_kids > 0 {
+                Some(format!("note: {open_kids} open subtask(s)"))
+            } else {
+                None
+            };
             Ok(Json(TaskCloseResult {
                 task_id,
                 closed: true,
+                note,
             }))
         })
         .await
@@ -691,6 +704,23 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Handler tests touch process-global state (PROJECT_DIR_OVERRIDE OnceLock
+    /// + XDG_DATA_HOME env), so they must run one at a time and share a single
+    /// project dir. This guard serializes them and lazily pins the override +
+    /// XDG to a single persistent tempdir for the whole test binary.
+    fn handler_env() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+        static PROJ: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let home = HOME.get_or_init(|| tempfile::TempDir::new().unwrap());
+        let proj = PROJ.get_or_init(|| tempfile::TempDir::new().unwrap());
+        std::env::set_var("XDG_DATA_HOME", home.path());
+        let _ = PROJECT_DIR_OVERRIDE.set(proj.path().to_path_buf());
+        guard
+    }
+
     fn keys_of(v: &serde_json::Value) -> Vec<String> {
         v.as_object()
             .map(|o| o.keys().cloned().collect())
@@ -737,6 +767,7 @@ mod tests {
         let close = TaskCloseResult {
             task_id: "tj-x".into(),
             closed: true,
+            note: None,
         };
         assert!(!keys_of(&serde_json::to_value(&close).unwrap()).contains(&"stub".to_string()));
     }
@@ -880,12 +911,7 @@ mod tests {
         // (set once via PROJECT_DIR_OVERRIDE). Create a parent, then a child
         // with parent = Some(parent_id); assert the child's open event in the
         // JSONL carries meta.parent_id.
-        let xdg = tempfile::TempDir::new().unwrap();
-        let proj = tempfile::TempDir::new().unwrap();
-        std::env::set_var("XDG_DATA_HOME", xdg.path());
-        // OnceLock — only this test sets it; ignore if a prior test already did.
-        let _ = PROJECT_DIR_OVERRIDE.set(proj.path().to_path_buf());
-
+        let _env = handler_env();
         let server = TaskJournalServer;
 
         let parent = server
@@ -912,7 +938,7 @@ mod tests {
             .0
             .task_id;
 
-        let (_, events_path, _) = resolve_project_paths(proj.path()).unwrap();
+        let (_, events_path, _) = project_paths().unwrap();
         let jsonl = std::fs::read_to_string(&events_path).unwrap();
         let child_open = jsonl
             .lines()
@@ -923,8 +949,47 @@ mod tests {
             child_open["meta"]["parent_id"].as_str(),
             Some(parent.as_str())
         );
+    }
 
-        std::env::remove_var("XDG_DATA_HOME");
+    #[tokio::test]
+    async fn task_close_notes_open_subtasks() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let parent = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Parent".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        // One open child under the parent.
+        server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Child".into(),
+                initial_context: None,
+                goal: None,
+                parent: Some(parent.clone()),
+            }))
+            .await
+            .unwrap();
+
+        let res = server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: parent.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res.note.as_deref(), Some("note: 1 open subtask(s)"));
     }
 
     #[test]
