@@ -756,6 +756,22 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Offline memory backfill: re-read session transcripts and append
+    /// significant events the realtime classifier missed (dream Pass A).
+    Dream {
+        /// Only sessions in the last N days (overrides the watermark).
+        #[arg(long)]
+        since: Option<i64>,
+        /// Only this task's sessions.
+        #[arg(long)]
+        task: Option<String>,
+        /// Show scope without calling the API or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap sessions processed this run.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Export tasks as Markdown or JSON to stdout.
     Export {
         /// Output format: md, json.
@@ -2179,6 +2195,80 @@ fn main() -> Result<()> {
         }
         Commands::ClassifyWorker { backend } => {
             run_classify_worker(&backend)?;
+        }
+        Commands::Dream {
+            since,
+            task,
+            dry_run,
+            limit,
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path =
+                tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path =
+                tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+
+            // 1. Resolve session files in scope.
+            let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+            let Some(project_dir) = project_dir else {
+                println!("dream: no Claude Code sessions found for this project");
+                return Ok(());
+            };
+            let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;
+
+            let since_time = if let Some(days) = since {
+                Some(
+                    std::time::SystemTime::now()
+                        - std::time::Duration::from_secs((days.max(0) as u64) * 86_400),
+                )
+            } else {
+                // Watermark → SystemTime. Absent watermark = all sessions.
+                match tj_core::dream::state::last_dream_at(&conn, &project_hash)? {
+                    Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
+                        .ok()
+                        .map(std::time::SystemTime::from),
+                    None => None,
+                }
+            };
+
+            let scoped: Vec<tj_core::dream::scope::SessionFile> = session_paths
+                .into_iter()
+                .filter_map(|p| {
+                    let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
+                    Some(tj_core::dream::scope::SessionFile { path: p, mtime })
+                })
+                .collect();
+            let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
+
+            // 2. Assemble (session_id, BackfillInput) per session.
+            let run_id = ulid::Ulid::new().to_string();
+            let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
+
+            // 3. Run.
+            let opts = tj_core::dream::DreamOptions {
+                project_hash: project_hash.clone(),
+                dry_run,
+            };
+            if dry_run {
+                println!("dream (dry-run): {} session(s) in scope", sessions.len());
+                return Ok(());
+            }
+            let backend = tj_core::dream::http::AnthropicDreamBackend::from_env()?;
+            let report =
+                tj_core::dream::run_dream(&conn, &events_path, &opts, &backend, sessions, &run_id)?;
+
+            // 4. Advance watermark to now (only reached on success).
+            tj_core::dream::state::set_last_dream_at(
+                &conn,
+                &project_hash,
+                &chrono::Utc::now().to_rfc3339(),
+            )?;
+            println!(
+                "dream: {} session(s) processed, {} event(s) backfilled",
+                report.sessions_processed, report.events_backfilled
+            );
         }
         Commands::Export {
             format,
@@ -3696,6 +3786,152 @@ fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
         "redirect" => Redirect,
         other => anyhow::bail!("unknown event type: {other}"),
     })
+}
+
+/// Flatten a parsed session transcript into role-tagged turns, in order.
+fn flatten_transcript(parsed: &tj_core::session::parser::ParsedSession) -> String {
+    use tj_core::session::parser::{extract_assistant_texts, extract_user_text, SessionEntry};
+    let mut s = String::new();
+    for entry in &parsed.entries {
+        match entry {
+            SessionEntry::User(u) => {
+                if let Some(text) = extract_user_text(u) {
+                    s.push_str("user: ");
+                    s.push_str(&text);
+                    s.push('\n');
+                }
+            }
+            SessionEntry::Assistant(a) => {
+                for text in extract_assistant_texts(a) {
+                    s.push_str("assistant: ");
+                    s.push_str(&text);
+                    s.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+/// True when any of `events` ties this task to the session: precise match
+/// on `meta.session_id`, or (for legacy events with no session_id) a
+/// timestamp falling inside the session's `[first_ts, last_ts]` window.
+fn task_matches_session(
+    events: &[tj_core::event::Event],
+    session_id: &str,
+    first_ts: Option<&str>,
+    last_ts: Option<&str>,
+) -> bool {
+    events.iter().any(|e| {
+        // Precise: event tagged with this session.
+        if e.meta.get("session_id").and_then(|v| v.as_str()) == Some(session_id) {
+            return true;
+        }
+        // Legacy fallback: timestamp inside the session window.
+        if e.meta.get("session_id").is_none() {
+            if let (Some(f), Some(l)) = (first_ts, last_ts) {
+                return e.timestamp.as_str() >= f && e.timestamp.as_str() <= l;
+            }
+        }
+        false
+    })
+}
+
+/// Read the project's events from `events_path`, group by `task_id`, and
+/// return candidate task contexts for sessions whose events match this
+/// session (precise session_id, or legacy time-window). Each context
+/// carries the task title and up to the last ~20 event texts (dedup
+/// context for the backend).
+fn candidate_tasks_for_session(
+    events_path: &std::path::Path,
+    session_id: &str,
+    first_ts: Option<&str>,
+    last_ts: Option<&str>,
+) -> anyhow::Result<Vec<tj_core::dream::backend::BackfillTaskContext>> {
+    use std::collections::BTreeMap;
+    use tj_core::dream::backend::BackfillTaskContext;
+    use tj_core::event::{Event, EventType};
+
+    if !events_path.exists() {
+        return Ok(Vec::new());
+    }
+    let body = std::fs::read_to_string(events_path)?;
+    let mut by_task: BTreeMap<String, Vec<Event>> = BTreeMap::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(e) = serde_json::from_str::<Event>(line) {
+            by_task.entry(e.task_id.clone()).or_default().push(e);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (task_id, events) in by_task {
+        if !task_matches_session(&events, session_id, first_ts, last_ts) {
+            continue;
+        }
+        // Title from the Open event when present, else the first event's text.
+        let title = events
+            .iter()
+            .find(|e| e.event_type == EventType::Open)
+            .or_else(|| events.first())
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        let existing_events: Vec<String> = events
+            .iter()
+            .rev()
+            .take(20)
+            .rev()
+            .map(|e| e.text.clone())
+            .collect();
+        out.push(BackfillTaskContext {
+            task_id,
+            title,
+            existing_events,
+        });
+    }
+    Ok(out)
+}
+
+/// Assemble per-session `(session_id, BackfillInput)` from the in-scope
+/// session transcripts and the project's existing events.
+fn build_dream_inputs(
+    events_path: &std::path::Path,
+    sessions: &[std::path::PathBuf],
+    task_filter: Option<&str>,
+) -> anyhow::Result<Vec<(String, tj_core::dream::backend::BackfillInput)>> {
+    use tj_core::dream::backend::BackfillInput;
+    use tj_core::session::parser::parse_session;
+
+    let mut out = Vec::new();
+    for path in sessions {
+        let session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let parsed = parse_session(path)?;
+
+        let candidates = candidate_tasks_for_session(
+            events_path,
+            &session_id,
+            parsed.first_timestamp.as_deref(),
+            parsed.last_timestamp.as_deref(),
+        )?;
+        let tasks: Vec<_> = candidates
+            .into_iter()
+            .filter(|t| task_filter.map_or(true, |f| f == t.task_id))
+            .collect();
+        if tasks.is_empty() {
+            continue;
+        }
+
+        let transcript = flatten_transcript(&parsed);
+        out.push((session_id, BackfillInput { tasks, transcript }));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
