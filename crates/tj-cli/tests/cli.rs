@@ -105,6 +105,45 @@ fn close_command_marks_task_closed_in_pack() {
 }
 
 #[test]
+fn close_warns_on_completeness_gap() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    // Create a task WITH a goal so the NoGoal gap won't fire.
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Gap me", "--goal", "ship it"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Close WITHOUT an outcome → ClosedNoOutcome gap. The close still succeeds
+    // and prints the gap to stderr.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", &task_id, "--reason", "done"])
+        .assert()
+        .success()
+        .stderr(contains("closed without a recorded outcome"));
+
+    // And the task is actually closed.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("status: closed"));
+}
+
+#[test]
 fn doctor_exits_zero_on_fresh_install() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")

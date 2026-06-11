@@ -1161,6 +1161,30 @@ fn main() -> Result<()> {
             if open_kids > 0 {
                 eprintln!("note: {open_kids} open subtask(s) under {task_id}");
             }
+
+            // Non-blocking completeness warning. The close above already
+            // succeeded; re-open, apply the close event to the index, then
+            // assess. Any error here must NOT fail the close — handle
+            // locally, never `?`-propagate.
+            if let Ok(conn) = tj_core::db::open(&state_path) {
+                let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
+                if let Ok(report) = tj_core::completeness::assess(
+                    &conn,
+                    &task_id,
+                    tj_core::completeness::pending_count(),
+                ) {
+                    if !report.is_complete() {
+                        eprintln!(
+                            "note: task {task_id} closed with {} completeness gap(s):",
+                            report.gaps.len()
+                        );
+                        for g in &report.gaps {
+                            eprintln!("  ⚠ {}", g.detail);
+                        }
+                    }
+                }
+            }
+
             println!("{}", event.event_id);
         }
         Commands::Stale { days } => {
