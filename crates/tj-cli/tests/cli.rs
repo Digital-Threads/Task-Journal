@@ -3923,3 +3923,229 @@ fn list_tree_indents_children_under_parents() {
         "child line must be indented, got: {child_line:?}"
     );
 }
+
+// --- Push-recall (claude-memory-60m) -----------------------------------
+
+/// Seed a confirmed rejection mentioning `axum` on a fresh task, returning
+/// the (TempDir, task_id). Mirrors the SessionStart-test seeding: `create`
+/// + `event --type rejection`.
+fn seed_axum_rejection() -> (assert_fs::TempDir, String) {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Push recall host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Tried switching the server to axum but it broke rmcp stdio.",
+        ])
+        .assert()
+        .success();
+    (dir, task_id)
+}
+
+#[test]
+fn post_tool_use_emits_recall_additional_context() {
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "let's switch the server to axum" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+
+    // The recall envelope is one of possibly several stdout lines (the
+    // mock path also prints the new event_id). Find the JSON line.
+    let env_line = body
+        .lines()
+        .find(|l| l.contains("additionalContext"))
+        .unwrap_or_else(|| panic!("no recall envelope on stdout, got: {body:?}"));
+    let v: serde_json::Value = serde_json::from_str(env_line.trim()).unwrap();
+    let ctx = v
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|s| s.as_str())
+        .expect("additionalContext missing");
+    assert!(ctx.contains("⚠ recall"), "ctx: {ctx}");
+    assert!(ctx.contains("axum"), "ctx: {ctx}");
+    assert_eq!(
+        v.get("hookSpecificOutput")
+            .and_then(|h| h.get("hookEventName"))
+            .and_then(|s| s.as_str()),
+        Some("PostToolUse"),
+    );
+}
+
+#[test]
+fn post_tool_use_no_recall_when_no_match() {
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "update the frontend stylesheet colors" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("additionalContext"),
+        "must not emit recall envelope for a non-matching tool turn, got: {body:?}"
+    );
+}
+
+#[test]
+fn tj_push_recall_env_disables() {
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "let's switch the server to axum" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_PUSH_RECALL", "0")
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("additionalContext"),
+        "TJ_PUSH_RECALL=0 must suppress the recall envelope, got: {body:?}"
+    );
+}
+
+#[test]
+fn post_tool_use_skips_recall_for_mcp_tools() {
+    // Dedup gate vs claude-memory-7km: mcp__ tool turns are 7km's territory
+    // (updatedMCPToolOutput). This path must stay silent for them.
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__task-journal__task_search",
+        "tool_input": { "query": "let's switch the server to axum" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("additionalContext"),
+        "mcp__ tool turns must not emit a recall envelope (7km owns them), got: {body:?}"
+    );
+}

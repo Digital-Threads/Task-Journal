@@ -1615,6 +1615,61 @@ fn main() -> Result<()> {
             // neither source is present (standalone behaviour unchanged).
             let live_session_id = tj_core::session_id::live_session_id(Some(&payload));
 
+            // Push-recall (claude-memory-60m). Best-effort, fail-open, read-only.
+            // After a (non-MCP) tool call, surface a relevant prior
+            // rejection/decision via an additionalContext envelope so the agent
+            // doesn't re-walk a ruled-out path. Gated by TJ_PUSH_RECALL=0.
+            //
+            // Dedup vs claude-memory-7km: skip MCP-tool turns — those are
+            // handled by 7km's updatedMCPToolOutput path, so emitting
+            // additionalContext here too would double-surface the same recall.
+            // The two paths are mutually exclusive by tool type (this =
+            // non-mcp tools; 7km = mcp__ tools). The block only adds a stdout
+            // envelope; it never touches the JSONL log or the pending flow
+            // below, and any error is swallowed so the hook can't break.
+            let tool_is_mcp = payload
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(|n| n.starts_with("mcp__"))
+                .unwrap_or(false);
+            if kind == "PostToolUse"
+                && !tool_is_mcp
+                && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0")
+                && events_path.exists()
+            {
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                if let Ok(conn) = tj_core::db::open(&state_path) {
+                    let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
+                    if let Ok(hits) = tj_core::recall::relevant_recall(
+                        &conn,
+                        &text,
+                        tj_core::recall::DEFAULT_MAX_HITS,
+                    ) {
+                        if !hits.is_empty() {
+                            let mut ctx = String::new();
+                            for h in &hits {
+                                let verb = match h.event_type {
+                                    tj_core::event::EventType::Rejection => "previously rejected",
+                                    _ => "previously decided",
+                                };
+                                ctx.push_str(&format!(
+                                    "⚠ recall: in task {} you {}: {}\n",
+                                    h.task_id, verb, h.text
+                                ));
+                            }
+                            let envelope = serde_json::json!({
+                                "hookSpecificOutput": {
+                                    "hookEventName": "PostToolUse",
+                                    "additionalContext": ctx.trim_end(),
+                                }
+                            });
+                            println!("{}", serde_json::to_string(&envelope)?);
+                        }
+                    }
+                }
+            }
+
             // SessionStart: emit a JSON envelope with compact resume-packs of
             // open tasks so Claude Code injects them into its system context
             // automatically. This is the load-bearing UX for "the journal

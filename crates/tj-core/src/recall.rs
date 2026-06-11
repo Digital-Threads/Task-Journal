@@ -19,24 +19,31 @@ pub const DEFAULT_MAX_HITS: usize = 2;
 /// Min blended score to surface. Autonomously-chosen default, flagged for review.
 pub const RELEVANCE_THRESHOLD: f64 = 1.0;
 
-/// FTS-safety check mirrors main.rs::topic_is_fts_safe.
-fn fts_safe(q: &str) -> bool {
-    !q.chars()
-        .any(|c| matches!(c, '-' | '"' | '*' | ':' | '(' | ')'))
-}
+/// Common, low-signal words dropped from the OR-token query. Without this,
+/// a shared stopword like "the" between an unrelated tool call and a prior
+/// rejection scores a spurious hit. Kept deliberately small — just the
+/// high-frequency glue words plus the noise tokens that leak in from the
+/// synthesized tool-call JSON (`Bash: {"command": …}`).
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "you", "are", "was", "but", "not", "this",
+    "that", "from", "have", "has", "had", "will", "your", "our", "out", "let",
+    "lets", "command", "output", "input", "tool", "bash", "name", "response",
+];
 
 /// Build an FTS5 OR-of-tokens query from a free-text context string. A raw
 /// multi-word context like "let's switch to axum" parses as an implicit AND
 /// under FTS5, so it would never match a short rejection that only shares one
-/// token. We instead OR the individual word tokens (apostrophes/punctuation
-/// stripped, stop-short tokens dropped) so any shared keyword scores a hit —
-/// the same recall intent as `run_rejected`'s MATCH, widened for prose input.
-/// Returns `None` when no usable token survives (caller skips the FTS branch).
+/// token. We instead OR the individual word tokens (punctuation stripped,
+/// short tokens and stopwords dropped) so any shared *meaningful* keyword
+/// scores a hit — the same recall intent as `run_rejected`'s MATCH, widened
+/// for prose input. Returns `None` when no usable token survives (caller
+/// then falls back to a raw LIKE on the query).
 fn fts_or_query(query_text: &str) -> Option<String> {
     let tokens: Vec<String> = query_text
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() >= 3)
         .map(|t| t.to_lowercase())
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
         .collect();
     if tokens.is_empty() {
         return None;
@@ -65,11 +72,14 @@ pub fn relevant_recall(
     let mut meta: HashMap<String, (String, EventType, String)> = HashMap::new();
 
     // 1) Text signal: FTS5 OR-of-tokens MATCH, restricted to confirmed
-    //    rejection/decision (mirrors run_rejected's join). Falls back to a
-    //    raw LIKE substring when the context isn't FTS-safe (e.g. it carries
-    //    a hyphenated id like OPS-306) or yields no usable token — the same
-    //    fallback shape run_search uses.
-    let use_fts = fts_safe(query_text) && fts_or_query(query_text).is_some();
+    //    rejection/decision (mirrors run_rejected's join). The tokenizer
+    //    strips all punctuation, so the resulting `a OR b OR c` query is
+    //    always FTS-safe even when the raw context is noisy tool-call JSON
+    //    (`Bash: {"command":"…"}`) full of `:`/`"`/`{}` that would otherwise
+    //    trip the FTS5 parser. Falls back to a raw LIKE substring only when
+    //    no usable token survives — the same fallback shape run_search uses.
+    let fts_or = fts_or_query(query_text);
+    let use_fts = fts_or.is_some();
     let sql = if use_fts {
         "SELECT ei.event_id, ei.task_id, ei.type, sf.text
          FROM events_index ei
@@ -85,8 +95,8 @@ pub fn relevant_recall(
            AND ei.type IN ('rejection','decision')
            AND sf.text LIKE ?1"
     };
-    let bind = if use_fts {
-        fts_or_query(query_text).unwrap_or_default()
+    let bind = if let Some(or_query) = fts_or {
+        or_query
     } else {
         crate::fts::like_pattern(query_text)
     };
