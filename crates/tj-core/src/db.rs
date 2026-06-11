@@ -110,6 +110,14 @@ CREATE TABLE IF NOT EXISTS dream_state (
 );
 "#;
 
+/// v0.12.0 subtask hierarchy — nullable `parent_id` carries the parent
+/// task on the `open` event's `meta.parent_id`. Existing flat tasks stay
+/// NULL. Index supports `children_of` lookups.
+const MIGRATION_006: &str = r#"
+ALTER TABLE tasks ADD COLUMN parent_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -132,6 +140,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         sql: MIGRATION_005,
+    },
+    Migration {
+        version: 6,
+        sql: MIGRATION_006,
     },
 ];
 
@@ -1448,5 +1460,24 @@ mod tests {
         assert_eq!(id, "tj-7f3a");
         assert_eq!(title, "Add OAuth login");
         assert_eq!(status, "open");
+    }
+
+    #[test]
+    fn migration_adds_parent_id_column_nullable() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        // Seed a task via an open event (no parent).
+        let e = make_open_event("tj-a", "Top");
+        upsert_task_from_event(&conn, &e, "ph").unwrap();
+
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE task_id = ?1",
+                rusqlite::params!["tj-a"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
     }
 }
