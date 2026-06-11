@@ -1,6 +1,7 @@
 //! Pass A per-session backfill: dedup-guard + provenance stamping.
 
 use crate::dream::backend::BackfillEvent;
+use crate::event::{Author, Event, EventStatus, Source};
 use std::collections::HashSet;
 
 /// Similarity at or above which a proposed event is considered a
@@ -43,6 +44,26 @@ pub fn dedup_guard(proposed: Vec<BackfillEvent>, existing: &[String]) -> Vec<Bac
         .collect()
 }
 
+/// Build a journal Event from a proposed backfill event, stamping dream
+/// provenance. `run_id` and `session_id` go into meta for traceability.
+pub fn to_event(b: &BackfillEvent, run_id: &str, session_id: &str) -> Event {
+    let mut e = Event::new(
+        b.task_id.clone(),
+        b.event_type,
+        Author::Agent,
+        Source::Dream,
+        b.text.clone(),
+    );
+    e.status = EventStatus::Suggested;
+    e.timestamp = b.timestamp.clone();
+    e.meta = serde_json::json!({
+        "dream_run_id": run_id,
+        "session_id": session_id,
+        "backfilled": true,
+    });
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +98,19 @@ mod tests {
     #[test]
     fn disjoint_text_is_similarity_zero() {
         assert_eq!(similarity("alpha beta", "gamma delta"), 0.0);
+    }
+
+    #[test]
+    fn to_event_stamps_dream_provenance() {
+        let b = ev("New constraint discovered");
+        let e = to_event(&b, "run-1", "sess-9");
+        assert_eq!(e.source, crate::event::Source::Dream);
+        assert_eq!(e.author, crate::event::Author::Agent);
+        assert_eq!(e.status, crate::event::EventStatus::Suggested);
+        assert_eq!(e.timestamp, "2026-06-08T10:00:00Z");
+        assert_eq!(e.meta["session_id"], serde_json::json!("sess-9"));
+        assert_eq!(e.meta["dream_run_id"], serde_json::json!("run-1"));
+        assert_eq!(e.meta["backfilled"], serde_json::json!(true));
+        assert_eq!(e.task_id, "tj-1");
     }
 }
