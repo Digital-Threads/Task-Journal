@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.12.0]
 
 ### Added
+- Push-recall: after a tool call, the PostToolUse hook surfaces a relevant prior
+  `rejection`/`decision` via `additionalContext` ("⚠ recall: in task X you
+  previously rejected …"), so the agent doesn't re-walk a ruled-out path.
+  Conservative (≤2 hits above a relevance threshold), read-only, best-effort
+  (errors never break the hook). New `tj_core::recall::relevant_recall` engine.
+  Disable with `TJ_PUSH_RECALL=0`.
 - Close gate: closing a task now surfaces its completeness gaps (from
   `completeness::assess`) — CLI prints them to stderr, MCP `task_close` returns
   them in a new `completeness_gaps` field. Non-blocking: the close always
