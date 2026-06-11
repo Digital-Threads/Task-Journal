@@ -4149,3 +4149,212 @@ fn post_tool_use_skips_recall_for_mcp_tools() {
         "mcp__ tool turns must not emit a recall envelope (7km owns them), got: {body:?}"
     );
 }
+
+// --- Push-recall via updatedMCPToolOutput (claude-memory-7km) ----------
+
+#[test]
+fn post_tool_use_mcp_prepends_recall_banner() {
+    // An MCP tool call whose input echoes a prior rejection must have a recall
+    // banner PREPENDED to what Claude sees of its output, with the real output
+    // preserved below the banner (7km's updatedMCPToolOutput path).
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__some-server__do_thing",
+        "tool_input": { "approach": "let's switch the server to axum" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+
+    let env_line = body
+        .lines()
+        .find(|l| l.contains("updatedMCPToolOutput"))
+        .unwrap_or_else(|| panic!("no updatedMCPToolOutput envelope on stdout, got: {body:?}"));
+    let v: serde_json::Value = serde_json::from_str(env_line.trim()).unwrap();
+    let updated = v
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("updatedMCPToolOutput"))
+        .and_then(|s| s.as_str())
+        .expect("updatedMCPToolOutput missing");
+    assert!(updated.starts_with('\u{26a0}'), "must start with banner: {updated}");
+    assert!(updated.contains("axum"), "banner must mention the recall: {updated}");
+    assert!(
+        updated.contains("REAL TOOL OUTPUT 12345"),
+        "original tool output must be preserved: {updated}"
+    );
+    assert_eq!(
+        v.get("hookSpecificOutput")
+            .and_then(|h| h.get("hookEventName"))
+            .and_then(|s| s.as_str()),
+        Some("PostToolUse"),
+    );
+}
+
+#[test]
+fn post_tool_use_non_mcp_tool_emits_no_mcp_output() {
+    // The 7km path is MCP-only: a non-MCP tool (Bash) must never emit
+    // updatedMCPToolOutput, even when its input echoes a rejection.
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "let's switch the server to axum" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("updatedMCPToolOutput"),
+        "non-MCP tool turns must not emit updatedMCPToolOutput, got: {body:?}"
+    );
+}
+
+#[test]
+fn post_tool_use_mcp_no_recall_passes_through() {
+    // MCP tool, but its input matches no rejection: emit nothing, pass through.
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__some-server__do_thing",
+        "tool_input": { "approach": "update the frontend stylesheet colors" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("updatedMCPToolOutput"),
+        "no-hit MCP turn must pass through (no envelope), got: {body:?}"
+    );
+}
+
+#[test]
+fn push_recall_mcp_does_not_drop_capture() {
+    // The push-recall block must fall through to the normal capture path:
+    // the MCP tool call is still ingested as an event (mock path emits the
+    // new event_id on stdout).
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__some-server__do_thing",
+        "tool_input": { "approach": "let's switch the server to axum" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    // The captured finding lands in the task pack — capture is unaffected by
+    // the push-recall envelope.
+    let pack = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["pack", &task_id, "--mode", "full"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        pack.contains("do_thing"),
+        "MCP tool call must still be captured into the journal, pack: {pack}"
+    );
+}

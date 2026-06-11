@@ -1670,6 +1670,21 @@ fn main() -> Result<()> {
                 }
             }
 
+            // Push-recall via updatedMCPToolOutput (claude-memory-7km). For an
+            // MCP PostToolUse turn whose input echoes a prior rejection/decision,
+            // prepend a recall banner to what Claude sees of that tool's output.
+            // Best-effort, read-only: any miss or error emits nothing and the
+            // real output passes through unchanged. Complements 60m (which skips
+            // mcp__ tools) — gated MCP-only, falls through to the queue path so
+            // event capture is unaffected. Disabled by TJ_PUSH_RECALL=0.
+            if kind == "PostToolUse" && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0") {
+                if let Some(envelope) =
+                    push_recall_envelope(&payload, &events_path, &project_hash)
+                {
+                    println!("{}", serde_json::to_string(&envelope)?);
+                }
+            }
+
             // SessionStart: emit a JSON envelope with compact resume-packs of
             // open tasks so Claude Code injects them into its system context
             // automatically. This is the load-bearing UX for "the journal
@@ -3857,6 +3872,86 @@ fn drain_pending(
 /// piping), we silently return ("Stop", "") so the hook becomes a no-op
 /// instead of erroring — matches the `|| true` safety net in the
 /// installed hook command.
+/// Build a PostToolUse `updatedMCPToolOutput` envelope when an MCP tool call
+/// echoes a prior rejection/decision (claude-memory-7km). Returns None
+/// (pass through, emit nothing) for non-MCP tools, no hits, or any error.
+/// Never panics, never mutates the journal.
+///
+/// Dedup vs claude-memory-60m: this fires ONLY for `mcp__` tools; 60m's
+/// `additionalContext` path skips those. The two are mutually exclusive by
+/// tool type so a single recall is never double-surfaced.
+fn push_recall_envelope(
+    payload: &serde_json::Value,
+    events_path: &std::path::Path,
+    project_hash: &str,
+) -> Option<serde_json::Value> {
+    // MCP-only gate: Claude Code prefixes MCP tools `mcp__<server>__<tool>`.
+    let tool_name = payload.get("tool_name").and_then(|v| v.as_str())?;
+    if !tool_name.starts_with("mcp__") {
+        return None;
+    }
+    if !events_path.exists() {
+        return None;
+    }
+    let query_text = payload
+        .get("tool_input")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    if query_text.trim().is_empty() {
+        return None;
+    }
+    let original = payload
+        .get("tool_response")
+        .map(render_tool_response)
+        .unwrap_or_default();
+
+    let state_path = tj_core::paths::state_dir()
+        .ok()?
+        .join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path).ok()?;
+    let _ = tj_core::db::ingest_new_events(&conn, events_path, project_hash);
+    // Reuse 60m's recall engine + threshold — no recall logic lives here.
+    let hits =
+        tj_core::recall::relevant_recall(&conn, &query_text, tj_core::recall::DEFAULT_MAX_HITS)
+            .ok()?;
+    if hits.is_empty() {
+        return None;
+    }
+    let updated = format!("{}\n\n{}", render_recall_banner(&hits), original);
+    Some(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedMCPToolOutput": updated,
+        }
+    }))
+}
+
+/// One ⚠ line per recall hit (mirrors the close-gate / SessionStart convention).
+fn render_recall_banner(hits: &[tj_core::recall::RecallHit]) -> String {
+    let mut s = String::from("\u{26a0} Task Journal recall — you may be repeating a prior path:");
+    for h in hits {
+        let verb = match h.event_type {
+            tj_core::event::EventType::Rejection => "rejected",
+            _ => "decided on",
+        };
+        s.push_str(&format!(
+            "\n  \u{26a0} in task {} you previously {} this: {}",
+            h.task_id, verb, h.text
+        ));
+    }
+    s
+}
+
+/// Collapse a `tool_response` JSON value to the text Claude would have seen.
+/// A bare string is used as-is; any other JSON is stringified (mirrors how
+/// `parse_hook_stdin` stringifies `tool_response`).
+fn render_tool_response(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn parse_hook_stdin() -> anyhow::Result<(String, String, serde_json::Value)> {
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
