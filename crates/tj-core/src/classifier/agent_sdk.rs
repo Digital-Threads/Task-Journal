@@ -1,0 +1,269 @@
+//! Claude CLI ("agent SDK") classifier backend.
+//!
+//! Runs the locally-installed, already-authenticated `claude` binary in
+//! non-interactive print mode, pinned to Haiku, to classify a chunk *without*
+//! an `ANTHROPIC_API_KEY`. This resurrects the v0.7.x `cli` backend that was
+//! removed in v0.8.0 — but honestly: since **2026-06-15** a headless
+//! `claude -p` run draws from the separate **Agent SDK** monthly credit pool
+//! (~$20 Pro / $100 Max 5x / $200 Max 20x, at API rates), not the interactive
+//! Pro/Max pool. Classification is Haiku-class and tiny (a few hundred tokens
+//! per chunk), so the credit lasts a long time — but it is not strictly free.
+//!
+//! The command execution is abstracted behind [`CommandRunner`] so the parsing
+//! path is unit-testable with a fake; the suite never shells out to `claude`.
+
+use super::{Classifier, ClassifyInput, ClassifyOutput};
+use anyhow::{anyhow, Context};
+use std::process::Command;
+
+/// Default model. `claude --model` accepts the short alias and resolves it to
+/// the current dated id (`claude-haiku-4-5-20251001`). Override with
+/// `TJ_AGENT_SDK_MODEL`.
+pub const DEFAULT_MODEL: &str = "claude-haiku-4-5";
+
+/// "Run the classifier command and hand back its raw stdout." The production
+/// impl shells out to `claude`; tests inject a fake returning canned JSON.
+pub trait CommandRunner: Send + Sync {
+    /// Run the classification for `prompt` against `model`, returning the raw
+    /// stdout (the `--output-format json` wrapper) on success.
+    fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String>;
+}
+
+/// Production runner: invokes the local `claude` binary in print mode, pinned
+/// to the given model, asking for the JSON envelope and an isolated MCP config
+/// (`--strict-mcp-config` keeps the project's own MCP servers — including this
+/// very journal — out of the classification subprocess).
+pub struct ClaudeBinaryRunner;
+
+impl CommandRunner for ClaudeBinaryRunner {
+    fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
+        let output = Command::new("claude")
+            .arg("-p")
+            .arg(prompt)
+            .arg("--model")
+            .arg(model)
+            .arg("--output-format")
+            .arg("json")
+            .arg("--strict-mcp-config")
+            .output()
+            .context("failed to spawn `claude` (is Claude Code installed and on PATH?)")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "`claude -p` exited with {}: {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+pub struct ClaudeCliClassifier {
+    model: String,
+    runner: Box<dyn CommandRunner>,
+}
+
+impl ClaudeCliClassifier {
+    /// Build from environment. Returns `None` unless a `claude` binary is on
+    /// PATH (probed with `claude --version`) — the caller then falls through to
+    /// the next backend. Model comes from `TJ_AGENT_SDK_MODEL`, else Haiku.
+    pub fn from_env() -> Option<Self> {
+        if !claude_on_path() {
+            return None;
+        }
+        let model = std::env::var("TJ_AGENT_SDK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+        Some(Self {
+            model,
+            runner: Box::new(ClaudeBinaryRunner),
+        })
+    }
+
+    /// Test/dev constructor: inject a fake runner and an explicit model so the
+    /// parse path can be exercised without a live `claude` login.
+    pub fn with_runner(model: impl Into<String>, runner: Box<dyn CommandRunner>) -> Self {
+        Self {
+            model: model.into(),
+            runner,
+        }
+    }
+}
+
+/// The JSON wrapper emitted by `claude --output-format json`. We only need the
+/// error flag and the `result` string (the model's verdict text); the rest of
+/// the envelope (usage, cost, timings) is ignored.
+#[derive(serde::Deserialize)]
+struct CliEnvelope {
+    #[serde(default)]
+    is_error: bool,
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    subtype: Option<String>,
+}
+
+impl Classifier for ClaudeCliClassifier {
+    fn classify(&self, input: &ClassifyInput) -> anyhow::Result<ClassifyOutput> {
+        let prompt = crate::classifier::prompt::build(input);
+        let stdout = self.runner.run(&self.model, &prompt)?;
+        let envelope: CliEnvelope = serde_json::from_str(stdout.trim()).with_context(|| {
+            format!(
+                "claude --output-format json wrapper parse failed; got: {}",
+                stdout.trim()
+            )
+        })?;
+        if envelope.is_error {
+            return Err(anyhow!(
+                "claude reported an error (subtype={})",
+                envelope.subtype.as_deref().unwrap_or("unknown")
+            ));
+        }
+        let verdict = envelope
+            .result
+            .ok_or_else(|| anyhow!("claude json wrapper had no `result` field"))?;
+        super::parse_verdict(&verdict)
+    }
+}
+
+/// Probe whether `claude` resolves on PATH and runs. Cheap (`--version` does
+/// no network) and tolerant — any spawn/exec failure means "not available".
+fn claude_on_path() -> bool {
+    Command::new("claude")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classifier::{decide_status, CONFIDENCE_THRESHOLD};
+    use crate::event::{EventStatus, EventType};
+
+    /// Fake runner: returns canned stdout, ignoring model/prompt. Captures the
+    /// model it was asked for so tests can assert the pin.
+    struct FakeRunner {
+        canned: String,
+        seen_model: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakeRunner {
+        fn new(canned: impl Into<String>) -> Self {
+            Self {
+                canned: canned.into(),
+                seen_model: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, model: &str, _prompt: &str) -> anyhow::Result<String> {
+            *self.seen_model.lock().unwrap() = Some(model.to_string());
+            Ok(self.canned.clone())
+        }
+    }
+
+    fn input() -> ClassifyInput {
+        ClassifyInput {
+            text: "We adopted Rust for the journal core.".into(),
+            author_hint: "assistant".into(),
+            recent_tasks: vec![],
+        }
+    }
+
+    fn envelope(result_json: &str) -> String {
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": result_json,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parses_canned_verdict_into_classify_output() {
+        let verdict = r#"{"event_type":"decision","task_id_guess":"tj-x","confidence":0.93,"evidence_strength":null,"suggested_text":"Adopt Rust."}"#;
+        let c = ClaudeCliClassifier::with_runner(
+            DEFAULT_MODEL,
+            Box::new(FakeRunner::new(envelope(verdict))),
+        );
+        let out = c.classify(&input()).unwrap();
+        assert_eq!(out.event_type, EventType::Decision);
+        assert_eq!(out.task_id_guess.as_deref(), Some("tj-x"));
+        assert!((out.confidence - 0.93).abs() < 1e-6);
+        // 0.93 >= 0.85 → confirmed.
+        assert_eq!(decide_status(out.confidence), EventStatus::Confirmed);
+    }
+
+    /// Adapter so a test can keep an `Arc` handle to inspect the runner after
+    /// it is boxed into the classifier.
+    struct ArcRunner(std::sync::Arc<FakeRunner>);
+    impl CommandRunner for ArcRunner {
+        fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
+            self.0.run(model, prompt)
+        }
+    }
+
+    #[test]
+    fn pins_the_configured_model() {
+        let verdict = r#"{"event_type":"finding","task_id_guess":null,"confidence":0.9,"evidence_strength":null,"suggested_text":"x"}"#;
+        let captured = std::sync::Arc::new(FakeRunner::new(envelope(verdict)));
+        let c = ClaudeCliClassifier::with_runner(
+            "claude-haiku-4-5",
+            Box::new(ArcRunner(captured.clone())),
+        );
+        let _ = c.classify(&input()).unwrap();
+        assert_eq!(
+            captured.seen_model.lock().unwrap().as_deref(),
+            Some("claude-haiku-4-5"),
+            "classifier must pin the model it was constructed with"
+        );
+    }
+
+    #[test]
+    fn decide_status_at_the_0_85_threshold() {
+        for (conf, expect) in [
+            (0.85_f64, EventStatus::Confirmed),
+            (0.84_f64, EventStatus::Suggested),
+        ] {
+            let verdict = format!(
+                r#"{{"event_type":"evidence","task_id_guess":null,"confidence":{conf},"evidence_strength":"strong","suggested_text":"t"}}"#
+            );
+            let c = ClaudeCliClassifier::with_runner(
+                DEFAULT_MODEL,
+                Box::new(FakeRunner::new(envelope(&verdict))),
+            );
+            let out = c.classify(&input()).unwrap();
+            assert!((out.confidence - conf).abs() < 1e-6);
+            assert_eq!(decide_status(out.confidence), expect);
+            assert_eq!(CONFIDENCE_THRESHOLD, 0.85);
+        }
+    }
+
+    #[test]
+    fn tolerates_code_fence_wrapped_verdict() {
+        let verdict = "```json\n{\"event_type\":\"rejection\",\"task_id_guess\":null,\"confidence\":0.88,\"evidence_strength\":null,\"suggested_text\":\"won't work\"}\n```";
+        let c = ClaudeCliClassifier::with_runner(
+            DEFAULT_MODEL,
+            Box::new(FakeRunner::new(envelope(verdict))),
+        );
+        let out = c.classify(&input()).unwrap();
+        assert_eq!(out.event_type, EventType::Rejection);
+    }
+
+    #[test]
+    fn errors_when_claude_reports_is_error() {
+        let canned = serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "result": null,
+        })
+        .to_string();
+        let c = ClaudeCliClassifier::with_runner(DEFAULT_MODEL, Box::new(FakeRunner::new(canned)));
+        let err = c.classify(&input()).unwrap_err();
+        assert!(format!("{err}").contains("error"), "got: {err}");
+    }
+}

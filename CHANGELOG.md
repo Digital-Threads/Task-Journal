@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`agent-sdk` classifier backend** — subscription-native LLM classification
+  via the local, already-authenticated `claude` binary, no `ANTHROPIC_API_KEY`
+  required. `tj_core::classifier::agent_sdk::ClaudeCliClassifier` invokes
+  `claude -p <prompt> --model claude-haiku-4-5 --output-format json
+  --strict-mcp-config`, parses the JSON envelope's `result`, and reuses the
+  shared verdict parser. Command execution is injected via a `CommandRunner`
+  trait so the path is unit-testable without shelling out. `from_env()` returns
+  `None` unless `claude` is on PATH; model overridable with `TJ_AGENT_SDK_MODEL`.
+  - Wired into `--backend` selection (`ingest-hook`, `classify-worker`) and
+    added to `install-hooks --backend`, alongside `hybrid` | `api` | `heuristic`.
+  - **Hybrid fallback is now an ordered chain**: heuristic (≥ 0.7) → `agent-sdk`
+    (if `claude` on PATH) → `api` (if key) → `pending/`. Reorder via
+    `TJ_HYBRID_LLM_ORDER` (default `agent-sdk,api`) to prefer the API key.
+  - **Honest cost note**: since **2026-06-15** a headless `claude -p` run draws
+    from the separate Agent SDK monthly credit pool (~$20 Pro / $100 Max 5x /
+    $200 Max 20x at API rates), not the interactive pool. Documented in the
+    README, `--backend` help, and `doctor`.
+
 ## [0.12.0]
 
 ### Added

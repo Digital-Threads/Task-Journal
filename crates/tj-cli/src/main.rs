@@ -506,9 +506,10 @@ fn run_doctor() -> Result<DoctorReport> {
         }
         Ok(_) | Err(_) => {
             notes.push(
-                "claude CLI not on PATH — that's fine if you use the API backend \
-                 (set ANTHROPIC_API_KEY). For the CLI backend (free with Pro/Max), \
-                 install Claude Code from https://claude.com/claude-code"
+                "claude CLI not on PATH — that's fine if you use the `api` backend \
+                 (set ANTHROPIC_API_KEY). For the `agent-sdk` backend (no API key; \
+                 uses your Claude login, drawing the Agent SDK credit pool since \
+                 2026-06-15), install Claude Code from https://claude.com/claude-code"
                     .into(),
             );
             (false, None)
@@ -736,6 +737,12 @@ enum Commands {
         /// `task-journal backfill` afterwards. Onboarding shortcut.
         #[arg(long)]
         backfill: bool,
+        /// Classifier backend baked into the installed hook command:
+        /// "hybrid" (default), "agent-sdk", "api", or "heuristic". Use
+        /// "agent-sdk" to classify via the local `claude` login without an
+        /// ANTHROPIC_API_KEY (see `ingest-hook --help` for the credit note).
+        #[arg(long, default_value = "hybrid")]
+        backend: String,
     },
     /// Show local classifier and journal statistics.
     Stats,
@@ -838,13 +845,18 @@ enum Commands {
         #[arg(long)]
         text: Option<String>,
         /// Classifier backend:
-        ///   - "hybrid" (default) — keyword heuristic first (free, offline);
-        ///     Anthropic API fallback when uncertain (needs ANTHROPIC_API_KEY).
-        ///   - "api" — always call the Anthropic API. Best quality, paid.
+        ///   - "hybrid" (default) — keyword heuristic first (free, offline),
+        ///     then the configured LLM fallback chain (agent-sdk, then api;
+        ///     reorder with TJ_HYBRID_LLM_ORDER). Only available backends run.
+        ///   - "agent-sdk" — classify via the local, already-logged-in `claude`
+        ///     binary; no ANTHROPIC_API_KEY needed. Pinned to Haiku (override
+        ///     with TJ_AGENT_SDK_MODEL). NOTE: since 2026-06-15 a headless
+        ///     `claude -p` draws from the separate Agent SDK monthly credit
+        ///     pool (~$20 Pro / $100 Max 5x / $200 Max 20x at API rates), not
+        ///     the interactive pool. Classification is tiny, so it lasts.
+        ///   - "api" — always call the Anthropic API. Needs ANTHROPIC_API_KEY.
         ///   - "heuristic" — heuristic only, no LLM. Fastest, lowest coverage.
-        ///   - "cli" — deprecated alias for hybrid. The old `claude -p` path
-        ///     was removed in v0.8.0 because Anthropic now bills it
-        ///     separately from Pro/Max.
+        ///   - "cli" — removed in v0.8.0; use "agent-sdk" (its resurrection).
         #[arg(long, default_value = "hybrid")]
         backend: String,
         /// Test/dev override: bypass classifier and force this event type. Hidden from --help.
@@ -864,7 +876,8 @@ enum Commands {
     /// at a time. Hidden from --help; not a public API.
     #[command(hide = true)]
     ClassifyWorker {
-        /// Classifier backend: "hybrid", "api", or "heuristic". Defaults to hybrid.
+        /// Classifier backend: "hybrid", "agent-sdk", "api", or "heuristic".
+        /// Defaults to hybrid.
         #[arg(long, default_value = "hybrid")]
         backend: String,
     },
@@ -1378,6 +1391,7 @@ fn main() -> Result<()> {
             scope,
             uninstall,
             backfill,
+            backend,
         } => {
             let settings_path = match scope.as_str() {
                 "user" => {
@@ -1473,11 +1487,25 @@ fn main() -> Result<()> {
                 // at env vars Claude Code never sets and therefore always
                 // fed the classifier empty text. Stdin-only is the correct
                 // wiring (see claude-memory-rsw).
-                // No --backend flag: the binary's default (hybrid) wins.
-                // Hybrid = free heuristic first, Anthropic API fallback when
-                // uncertain. Users wanting always-api can edit settings.json
-                // and add `--backend=api`.
-                let cmd = "task-journal ingest-hook || true";
+                // Bake the selected backend into the hook command. Default
+                // "hybrid" stays flag-free (heuristic first, then the agent-sdk
+                // → api fallback chain). A non-default backend — e.g.
+                // `--backend=agent-sdk` for subscription users with no API key
+                // — is passed through so the spawned classify-worker honors it.
+                if !matches!(
+                    backend.as_str(),
+                    "hybrid" | "agent-sdk" | "api" | "heuristic"
+                ) {
+                    anyhow::bail!(
+                        "unknown --backend: {backend} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
+                    );
+                }
+                let cmd_string = if backend == "hybrid" {
+                    "task-journal ingest-hook || true".to_string()
+                } else {
+                    format!("task-journal ingest-hook --backend={backend} || true")
+                };
+                let cmd = cmd_string.as_str();
                 let entries = serde_json::json!({
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                     "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
@@ -2241,6 +2269,15 @@ fn main() -> Result<()> {
                         Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env())
                     }
                     "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
+                    "agent-sdk" => Box::new(
+                        tj_core::classifier::agent_sdk::ClaudeCliClassifier::from_env()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "agent-sdk backend selected but no `claude` binary on PATH — \
+                                     install Claude Code (https://claude.com/claude-code) or pick another --backend"
+                                )
+                            })?,
+                    ),
                     "heuristic" => {
                         // Heuristic-only: no LLM at all. Trades coverage
                         // for absolute zero-cost / offline operation.
@@ -2262,7 +2299,7 @@ fn main() -> Result<()> {
                         Box::new(HeuristicOnly)
                     }
                     other => anyhow::bail!(
-                        "unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)"
+                        "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
                     ),
                 };
                 let input = tj_core::classifier::ClassifyInput {
@@ -3859,6 +3896,14 @@ fn process_pending_entry(
     let classifier: Box<dyn Classifier> = match backend {
         "hybrid" | "" => Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env()),
         "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
+        "agent-sdk" => Box::new(
+            tj_core::classifier::agent_sdk::ClaudeCliClassifier::from_env().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent-sdk backend selected but no `claude` binary on PATH — \
+                     install Claude Code (https://claude.com/claude-code) or pick another --backend"
+                )
+            })?,
+        ),
         "heuristic" => {
             use tj_core::classifier::heuristic::try_heuristic;
             use tj_core::classifier::{ClassifyInput, ClassifyOutput};
@@ -3874,9 +3919,9 @@ fn process_pending_entry(
             }
             Box::new(HeuristicOnly)
         }
-        other => {
-            anyhow::bail!("unknown backend: {other} (expected `hybrid`, `api`, or `heuristic`)")
-        }
+        other => anyhow::bail!(
+            "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
+        ),
     };
     let input = tj_core::classifier::ClassifyInput {
         text: text.clone(),
