@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.12.0]
 
 ### Added
+- Active-task reminder after compaction: when Claude Code reconstructs context
+  via a SessionStart with `source="compact"`, the journal now prepends the
+  most-recent open task's title + goal + up to 3 in-force `constraint` texts to
+  `additionalContext` — so the post-compaction agent doesn't lose what it was
+  doing or its hard constraints. Pure, read-only, best-effort (never breaks the
+  hook). New `tj_core::reminder::active_task_reminder`. Copies the mechanic of
+  the experimental `criticalSystemReminder` without depending on that unstable
+  field.
 - Constraint-as-context: the event classifier now sees each active task's most
   recent `constraint` events (≤ 5) in its prompt, under a "Known constraints for
   <task>" block, with an instruction to prefer `rejection`/`correction` when a
