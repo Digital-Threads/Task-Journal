@@ -57,6 +57,7 @@ pub mod fts;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;
+pub mod recall;
 pub mod session;
 pub mod session_id;
 pub mod storage;
