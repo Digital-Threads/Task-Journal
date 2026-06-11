@@ -907,6 +907,42 @@ pub fn list_tasks_by_project(
     Ok(rows)
 }
 
+/// Direct children of a task (one level), newest activity first.
+pub fn children_of(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.task_id, t.title, t.status, t.last_event_at,
+                COALESCE(c.cnt, 0) AS event_count
+         FROM tasks t
+         LEFT JOIN (
+             SELECT task_id, COUNT(*) AS cnt FROM events_index GROUP BY task_id
+         ) c ON c.task_id = t.task_id
+         WHERE t.parent_id = ?1
+         ORDER BY (t.status = 'open') DESC, t.last_event_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![task_id], |r| {
+            Ok(TaskRow {
+                task_id: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                status: r.get::<_, String>(2)?,
+                last_event_at: r.get::<_, String>(3)?,
+                event_count: r.get::<_, i64>(4)? as usize,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The stored parent of a task, if any.
+pub fn parent_of(conn: &Connection, task_id: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT parent_id FROM tasks WHERE task_id = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![task_id])?;
+    Ok(match rows.next()? {
+        Some(r) => r.get::<_, Option<String>>(0)?,
+        None => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1509,5 +1545,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parent.as_deref(), Some("tj-parent"));
+    }
+
+    #[test]
+    fn children_of_and_parent_of_work() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("p", "Parent"), "ph").unwrap();
+
+        let mut c1 = make_open_event("c1", "Child1");
+        c1.meta = serde_json::json!({"title": "Child1", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c1, "ph").unwrap();
+        let mut c2 = make_open_event("c2", "Child2");
+        c2.meta = serde_json::json!({"title": "Child2", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c2, "ph").unwrap();
+
+        let kids = children_of(&conn, "p").unwrap();
+        let ids: Vec<&str> = kids.iter().map(|t| t.task_id.as_str()).collect();
+        assert!(ids.contains(&"c1") && ids.contains(&"c2"));
+        assert_eq!(kids.len(), 2);
+
+        assert_eq!(parent_of(&conn, "c1").unwrap().as_deref(), Some("p"));
+        assert_eq!(parent_of(&conn, "p").unwrap(), None);
     }
 }
