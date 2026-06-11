@@ -146,6 +146,18 @@ pub fn pending_count() -> usize {
     inner().unwrap_or(0)
 }
 
+/// Render the Completeness section, or None when there are no gaps.
+pub fn render_section(report: &CompletenessReport) -> Option<String> {
+    if report.gaps.is_empty() {
+        return None;
+    }
+    let mut s = format!("\n## Completeness ({})\n", report.gaps.len());
+    for g in &report.gaps {
+        s.push_str(&format!("- ⚠ {}\n", g.detail));
+    }
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +255,21 @@ mod tests {
         // Best-effort contract: resolution may succeed or fail, but it must
         // never panic. In a clean env with no pending dir the count is 0.
         let _ = pending_count();
+    }
+
+    #[test]
+    fn render_section_none_when_complete() {
+        let r = CompletenessReport::default();
+        assert!(render_section(&r).is_none());
+    }
+
+    #[test]
+    fn render_section_lists_gaps() {
+        let r = CompletenessReport {
+            gaps: vec![Gap { kind: GapKind::NoGoal, detail: "no goal recorded".into() }],
+        };
+        let s = render_section(&r).unwrap();
+        assert!(s.contains("Completeness (1)"));
+        assert!(s.contains("no goal recorded"));
     }
 }

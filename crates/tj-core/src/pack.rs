@@ -337,6 +337,11 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
+    let report = crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
+    if let Some(section) = crate::completeness::render_section(&report) {
+        text.push_str(&section);
+    }
+
     // Token-budget truncation: cap pack size so it always fits an LLM context window.
     // v0.10.3: full bumped 10K → 24K. Real tasks accumulate 50-100 events
     // and the prior cap clipped final-summary decisions even after the
@@ -385,6 +390,42 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn pack_shows_completeness_section_when_gaps() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        // Task with no goal → NoGoal gap.
+        let e = crate::event::Event::new("g1", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli, "T".into());
+        crate::db::upsert_task_from_event(&conn, &e, "ph").unwrap();
+        crate::db::index_event(&conn, &e).unwrap();
+
+        let pack = assemble(&conn, "g1", PackMode::Compact).unwrap();
+        assert!(pack.text.contains("Completeness"));
+        assert!(pack.text.contains("no goal recorded"));
+    }
+
+    #[test]
+    fn pack_no_completeness_section_when_complete() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        let mut e = crate::event::Event::new("g2", crate::event::EventType::Open,
+            crate::event::Author::User, crate::event::Source::Cli, "T".into());
+        e.meta = serde_json::json!({"title": "T"});
+        crate::db::upsert_task_from_event(&conn, &e, "ph").unwrap();
+        crate::db::index_event(&conn, &e).unwrap();
+        // Give it a goal so NoGoal doesn't fire; open + no decisions → complete.
+        conn.execute("UPDATE tasks SET goal='g' WHERE task_id='g2'", []).unwrap();
+        // pending_count() resolves `<data_dir>/pending`. Point the data dir at
+        // the isolated tempdir (no pending/ child) so the PendingLeak rule
+        // stays silent regardless of the real dev environment.
+        std::env::set_var("TASK_JOURNAL_DATA_DIR", d.path());
+
+        let pack = assemble(&conn, "g2", PackMode::Compact).unwrap();
+        std::env::remove_var("TASK_JOURNAL_DATA_DIR");
+        assert!(!pack.text.contains("## Completeness"));
     }
 
     #[test]
