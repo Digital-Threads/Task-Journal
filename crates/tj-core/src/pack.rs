@@ -116,12 +116,21 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
     // event the agent records just before close is now the FIRST line
     // of this section, surviving end-of-pack truncation.
     let mut stmt = conn.prepare(
-        "SELECT text FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id DESC",
+        "SELECT text, alternatives FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id DESC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
     let mut count = 0;
     for row in rows {
-        out.push_str(&format!("- {}\n", row?));
+        let (text, alternatives) = row?;
+        out.push_str(&format!("- {text}\n"));
+        // v0.12.0: structured alternatives render under the decision so the
+        // pack shows "considered A/B/C, chose X" without reconstructing it
+        // from the hypothesis+rejection chain.
+        if let Some(block) = render_alternatives(alternatives.as_deref()) {
+            out.push_str(&block);
+        }
         count += 1;
     }
     if count == 0 {
@@ -129,6 +138,35 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
     }
     out.push('\n');
     Ok(out)
+}
+
+/// Render a decision's `meta.alternatives` JSON as indented bullet lines.
+/// Returns `None` when absent or malformed (the decision still renders
+/// without the block — a bad alternatives payload never hides the choice).
+/// Each entry is `{option, chosen?, rationale?}`; the chosen option is
+/// marked so the final choice is unambiguous.
+fn render_alternatives(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let arr = parsed.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut block = String::from("  - considered:\n");
+    for entry in arr {
+        let option = entry.get("option").and_then(|v| v.as_str())?;
+        let chosen = entry
+            .get("chosen")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let marker = if chosen { "✓ chose" } else { "✗" };
+        let rationale = entry.get("rationale").and_then(|v| v.as_str());
+        match rationale {
+            Some(r) => block.push_str(&format!("    - {marker} {option} — {r}\n")),
+            None => block.push_str(&format!("    - {marker} {option}\n")),
+        }
+    }
+    Some(block)
 }
 
 fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
@@ -954,6 +992,66 @@ mod tests {
         assert!(
             pack.text.contains("Adopt Rust"),
             "decision text missing: {}",
+            pack.text
+        );
+    }
+
+    #[test]
+    fn pack_renders_decision_alternatives() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new(
+            "tj-alt",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
+        open_e.meta = serde_json::json!({"title": "Alt test"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let mut dec = Event::new(
+            "tj-alt",
+            EventType::Decision,
+            Author::Agent,
+            Source::Chat,
+            "Use SQLite for storage".into(),
+        );
+        dec.meta = serde_json::json!({
+            "alternatives": [
+                {"option": "SQLite", "chosen": true, "rationale": "embedded, zero-ops"},
+                {"option": "Postgres", "chosen": false, "rationale": "too heavy for a local tool"}
+            ]
+        });
+        db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        db::index_event(&conn, &dec).unwrap();
+
+        let pack = assemble(&conn, "tj-alt", PackMode::Full).unwrap();
+        // The decision itself still renders.
+        assert!(
+            pack.text.contains("Use SQLite for storage"),
+            "decision text missing: {}",
+            pack.text
+        );
+        // Considered alternatives surface, both chosen and rejected, with rationale.
+        assert!(
+            pack.text.contains("considered"),
+            "alternatives header missing: {}",
+            pack.text
+        );
+        assert!(
+            pack.text.contains("SQLite") && pack.text.contains("Postgres"),
+            "both options missing: {}",
+            pack.text
+        );
+        assert!(
+            pack.text.contains("too heavy for a local tool"),
+            "rejected rationale missing: {}",
             pack.text
         );
     }
