@@ -53,6 +53,7 @@ pub mod completeness;
 pub mod db;
 pub mod dream;
 pub mod event;
+pub mod frontmatter;
 pub mod fts;
 pub mod pack;
 pub mod paths;
