@@ -219,6 +219,11 @@ pub struct EventAddParams {
     pub text: String,
     pub corrects: Option<String>,
     pub supersedes: Option<String>,
+    /// v0.12.0: structured alternatives for a `decision` event — a JSON
+    /// array of `{option, chosen, rationale}` objects making the considered
+    /// options and the final choice explicit. Stamped onto
+    /// `meta.alternatives`. Rejected with an error on any non-decision type.
+    pub alternatives: Option<serde_json::Value>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct EventAddResult {
@@ -512,6 +517,17 @@ impl TaskJournalServer {
                 std::fs::create_dir_all(events_path.parent().unwrap())?;
 
                 let event_type = parse_event_type(&p.event_type)?;
+                // v0.12.0: structured alternatives are decision-only. Reject
+                // them on any other type with a clear error rather than
+                // silently dropping the payload.
+                if p.alternatives.is_some()
+                    && event_type != tj_core::event::EventType::Decision
+                {
+                    anyhow::bail!(
+                        "`alternatives` is only valid on a `decision` event (got `{}`)",
+                        p.event_type
+                    );
+                }
                 let mut event = tj_core::event::Event::new(
                     &p.task_id,
                     event_type,
@@ -521,6 +537,11 @@ impl TaskJournalServer {
                 );
                 event.corrects = p.corrects.clone();
                 event.supersedes = p.supersedes.clone();
+                if let Some(alts) = &p.alternatives {
+                    if let Some(obj) = event.meta.as_object_mut() {
+                        obj.insert("alternatives".into(), alts.clone());
+                    }
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     tj_core::session_id::session_id_from_env().as_deref(),
@@ -926,6 +947,88 @@ mod tests {
 
         let cli = Cli::try_parse_from(["task-journal-mcp"]).unwrap();
         assert!(cli.project_dir.is_none());
+    }
+
+    #[tokio::test]
+    async fn event_add_decision_stamps_alternatives_meta() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Alt task".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let alts = serde_json::json!([
+            {"option": "SQLite", "chosen": true, "rationale": "embedded"},
+            {"option": "Postgres", "chosen": false, "rationale": "too heavy"}
+        ]);
+        let res = server
+            .event_add(Parameters(EventAddParams {
+                task_id: task.clone(),
+                event_type: "decision".into(),
+                text: "Use SQLite".into(),
+                corrects: None,
+                supersedes: None,
+                alternatives: Some(alts.clone()),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let (_, events_path, _) = project_paths().unwrap();
+        let jsonl = std::fs::read_to_string(&events_path).unwrap();
+        let ev = jsonl
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v.get("event_id").and_then(|x| x.as_str()) == Some(res.event_id.as_str()))
+            .expect("decision event in jsonl");
+        assert_eq!(ev["meta"]["alternatives"], alts);
+    }
+
+    #[tokio::test]
+    async fn event_add_rejects_alternatives_on_non_decision() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Reject task".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let res = server
+            .event_add(Parameters(EventAddParams {
+                task_id: task,
+                event_type: "finding".into(),
+                text: "some finding".into(),
+                corrects: None,
+                supersedes: None,
+                alternatives: Some(serde_json::json!([{"option": "x", "chosen": true}])),
+            }))
+            .await;
+        let err = match res {
+            Ok(_) => panic!("alternatives on a finding must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("alternatives") && msg.contains("decision"),
+            "error should explain alternatives is decision-only: {msg}"
+        );
     }
 
     #[tokio::test]
