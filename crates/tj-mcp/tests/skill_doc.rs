@@ -10,8 +10,11 @@ use std::path::PathBuf;
 fn skill_md() -> String {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugin/skills/task-journal/SKILL.md");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("bundled skill missing at {}: {e}", path.display()))
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("bundled skill missing at {}: {e}", path.display()));
+    // Normalize line endings: on a Windows checkout git may convert LF -> CRLF
+    // (autocrlf), which would break the `\n`-anchored frontmatter assertions.
+    raw.replace("\r\n", "\n")
 }
 
 #[test]
