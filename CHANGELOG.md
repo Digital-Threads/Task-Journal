@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direct children (status, id, title). `list --tree` renders the hierarchy.
   Closing a parent with open children warns but proceeds. Additive — existing
   flat tasks are unaffected (`parent_id` NULL).
+- Structured decision alternatives: a `decision` event can now carry
+  `meta.alternatives` — a JSON array of `{option, chosen, rationale}` making the
+  options considered and the final choice explicit instead of implicit in the
+  hypothesis+rejection chain. Set via the MCP `event_add` `alternatives` param
+  (decision-only — rejected with an error on any other event type). Projected to
+  a new `decisions.alternatives` column (migration v7) and rendered under each
+  entry in the resume-pack's Active decisions section. MCP-only for v1; additive
+  — the JSONL source of truth is untouched and existing decisions stay NULL.
 
 ## [0.11.1] - 2026-06-08
 
