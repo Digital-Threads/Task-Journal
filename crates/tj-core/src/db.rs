@@ -100,6 +100,34 @@ const MIGRATION_004: &str = r#"
 DELETE FROM task_pack_cache;
 "#;
 
+/// v0.12.0 dream Pass A — per-project watermark of the last successful
+/// dream run. Sessions modified after this are in scope for the next run.
+const MIGRATION_005: &str = r#"
+CREATE TABLE IF NOT EXISTS dream_state (
+  project_hash    TEXT PRIMARY KEY,
+  last_dream_at   TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+"#;
+
+/// v0.12.0 subtask hierarchy — nullable `parent_id` carries the parent
+/// task on the `open` event's `meta.parent_id`. Existing flat tasks stay
+/// NULL. Index supports `children_of` lookups.
+const MIGRATION_006: &str = r#"
+ALTER TABLE tasks ADD COLUMN parent_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+"#;
+
+/// v0.12.0 structured decision alternatives — nullable `alternatives`
+/// carries the JSON array from a decision event's `meta.alternatives`
+/// (objects like `{option, chosen, rationale}`). Existing decisions stay
+/// NULL; the append-only log is untouched. Wipes the pack cache so packs
+/// re-render with the alternatives block once events carry it.
+const MIGRATION_007: &str = r#"
+ALTER TABLE decisions ADD COLUMN alternatives TEXT;
+DELETE FROM task_pack_cache;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -118,6 +146,18 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         sql: MIGRATION_004,
+    },
+    Migration {
+        version: 5,
+        sql: MIGRATION_005,
+    },
+    Migration {
+        version: 6,
+        sql: MIGRATION_006,
+    },
+    Migration {
+        version: 7,
+        sql: MIGRATION_007,
     },
 ];
 
@@ -179,11 +219,18 @@ pub fn upsert_task_from_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or(&event.text)
                 .to_string();
+            let parent_id = event
+                .meta
+                .get("parent_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // ON CONFLICT intentionally does not overwrite parent_id — parent
+            // is set once at creation; re-parenting is a separate future path.
             conn.execute(
-                "INSERT INTO tasks(task_id, title, status, project_hash, opened_at, last_event_at)
-                 VALUES (?1, ?2, 'open', ?3, ?4, ?4)
+                "INSERT INTO tasks(task_id, title, status, project_hash, opened_at, last_event_at, parent_id)
+                 VALUES (?1, ?2, 'open', ?3, ?4, ?4, ?5)
                  ON CONFLICT(task_id) DO UPDATE SET last_event_at = ?4",
-                rusqlite::params![event.task_id, title, project_hash, event.timestamp],
+                rusqlite::params![event.task_id, title, project_hash, event.timestamp, parent_id],
             )?;
         }
         EventType::Close => {
@@ -597,10 +644,7 @@ pub fn reclassify_task_artifacts(conn: &Connection, task_id: &str) -> anyhow::Re
             rusqlite::params![json, event_id],
         )?;
     }
-    conn.execute(
-        "DELETE FROM task_pack_cache WHERE task_id = ?1",
-        rusqlite::params![task_id],
-    )?;
+    invalidate_pack_cascade(conn, task_id)?;
     Ok(count)
 }
 
@@ -777,10 +821,17 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     )?;
 
     if event.event_type == EventType::Decision {
+        // v0.12.0: project structured alternatives (meta.alternatives) into
+        // a dedicated column so pack can render "considered A/B/C, chose X".
+        // Stored as the verbatim JSON of the meta value; NULL when absent.
+        let alternatives_json = match event.meta.get("alternatives") {
+            Some(v) if !v.is_null() => Some(serde_json::to_string(v)?),
+            _ => None,
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO decisions(decision_id, task_id, text, status)
-             VALUES (?1, ?2, ?3, 'active')",
-            rusqlite::params![event.event_id, event.task_id, event.text],
+            "INSERT OR REPLACE INTO decisions(decision_id, task_id, text, status, alternatives)
+             VALUES (?1, ?2, ?3, 'active', ?4)",
+            rusqlite::params![event.event_id, event.task_id, event.text, alternatives_json],
         )?;
     }
 
@@ -811,11 +862,9 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         )?;
     }
 
-    // Invalidate any cached pack for this task.
-    conn.execute(
-        "DELETE FROM task_pack_cache WHERE task_id=?1",
-        rusqlite::params![event.task_id],
-    )?;
+    // Invalidate any cached pack for this task — and its parent, whose
+    // Subtasks roll-up depends on this child.
+    invalidate_pack_cascade(conn, &event.task_id)?;
 
     Ok(())
 }
@@ -872,6 +921,121 @@ pub fn list_tasks_by_project(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Top-level tasks for a project (those with no parent), ordered like
+/// `list_tasks_by_project` — open first, then by recency. The roots of
+/// the `list --tree` view.
+pub fn top_level_tasks(conn: &Connection, project_hash: &str) -> anyhow::Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.task_id, t.title, t.status, t.last_event_at,
+                COALESCE(c.cnt, 0) AS event_count
+         FROM tasks t
+         LEFT JOIN (
+             SELECT task_id, COUNT(*) AS cnt FROM events_index GROUP BY task_id
+         ) c ON c.task_id = t.task_id
+         WHERE t.project_hash = ?1 AND t.parent_id IS NULL
+         ORDER BY (t.status = 'open') DESC, t.last_event_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![project_hash], |r| {
+            Ok(TaskRow {
+                task_id: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                status: r.get::<_, String>(2)?,
+                last_event_at: r.get::<_, String>(3)?,
+                event_count: r.get::<_, i64>(4)? as usize,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Direct children of a task (one level), newest activity first.
+pub fn children_of(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.task_id, t.title, t.status, t.last_event_at,
+                COALESCE(c.cnt, 0) AS event_count
+         FROM tasks t
+         LEFT JOIN (
+             SELECT task_id, COUNT(*) AS cnt FROM events_index GROUP BY task_id
+         ) c ON c.task_id = t.task_id
+         WHERE t.parent_id = ?1
+         ORDER BY (t.status = 'open') DESC, t.last_event_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![task_id], |r| {
+            Ok(TaskRow {
+                task_id: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                status: r.get::<_, String>(2)?,
+                last_event_at: r.get::<_, String>(3)?,
+                event_count: r.get::<_, i64>(4)? as usize,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The stored parent of a task, if any.
+pub fn parent_of(conn: &Connection, task_id: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT parent_id FROM tasks WHERE task_id = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![task_id])?;
+    Ok(match rows.next()? {
+        Some(r) => r.get::<_, Option<String>>(0)?,
+        None => None,
+    })
+}
+
+/// True if setting `new_parent` as the parent of `task_id` would create a
+/// cycle (i.e. `new_parent` is `task_id` itself or a descendant of it).
+/// Walks ancestors of `new_parent`; a depth cap guards against pre-existing
+/// corrupt cycles.
+pub fn would_create_cycle(
+    conn: &Connection,
+    task_id: &str,
+    new_parent: &str,
+) -> anyhow::Result<bool> {
+    if task_id == new_parent {
+        return Ok(true);
+    }
+    let mut cursor = Some(new_parent.to_string());
+    for _ in 0..64 {
+        let Some(cur) = cursor else {
+            return Ok(false);
+        };
+        if cur == task_id {
+            return Ok(true);
+        }
+        cursor = parent_of(conn, &cur)?;
+    }
+    // Depth cap exceeded — treat as a cycle to be safe.
+    Ok(true)
+}
+
+/// Number of direct children of `task_id` whose status is still open.
+pub fn count_open_children(conn: &Connection, task_id: &str) -> anyhow::Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE parent_id = ?1 AND status = 'open'",
+        rusqlite::params![task_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+/// Clear the pack cache for a task and its parent (roll-up depends on both).
+pub fn invalidate_pack_cascade(conn: &Connection, task_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM task_pack_cache WHERE task_id = ?1",
+        rusqlite::params![task_id],
+    )?;
+    if let Some(parent) = parent_of(conn, task_id)? {
+        conn.execute(
+            "DELETE FROM task_pack_cache WHERE task_id = ?1",
+            rusqlite::params![parent],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1089,6 +1253,66 @@ mod tests {
         assert_eq!(id, dec.event_id);
         assert_eq!(text, "Adopt Rust");
         assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn index_event_projects_decision_alternatives_into_column() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        let mut dec = crate::event::Event::new(
+            "tj-alt",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Use SQLite".into(),
+        );
+        dec.meta = serde_json::json!({
+            "alternatives": [
+                {"option": "SQLite", "chosen": true, "rationale": "embedded, zero-ops"},
+                {"option": "Postgres", "chosen": false, "rationale": "too heavy for local tool"}
+            ]
+        });
+        upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        index_event(&conn, &dec).unwrap();
+
+        let alts: Option<String> = conn
+            .query_row(
+                "SELECT alternatives FROM decisions WHERE decision_id=?1",
+                rusqlite::params![dec.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let alts = alts.expect("alternatives column should be populated");
+        let parsed: serde_json::Value = serde_json::from_str(&alts).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert_eq!(parsed[0]["option"], "SQLite");
+        assert_eq!(parsed[0]["chosen"], true);
+    }
+
+    #[test]
+    fn index_event_decision_without_alternatives_leaves_column_null() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        let dec = crate::event::Event::new(
+            "tj-noalt",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Plain decision".into(),
+        );
+        upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        index_event(&conn, &dec).unwrap();
+
+        let alts: Option<String> = conn
+            .query_row(
+                "SELECT alternatives FROM decisions WHERE decision_id=?1",
+                rusqlite::params![dec.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(alts.is_none());
     }
 
     #[test]
@@ -1434,5 +1658,139 @@ mod tests {
         assert_eq!(id, "tj-7f3a");
         assert_eq!(title, "Add OAuth login");
         assert_eq!(status, "open");
+    }
+
+    #[test]
+    fn migration_adds_parent_id_column_nullable() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        // Seed a task via an open event (no parent).
+        let e = make_open_event("tj-a", "Top");
+        upsert_task_from_event(&conn, &e, "ph").unwrap();
+
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE task_id = ?1",
+                rusqlite::params!["tj-a"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn open_event_meta_parent_id_is_persisted() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        // Parent first.
+        upsert_task_from_event(&conn, &make_open_event("tj-parent", "Parent"), "ph").unwrap();
+
+        // Child carries meta.parent_id.
+        let mut child = make_open_event("tj-child", "Child");
+        child.meta = serde_json::json!({"title": "Child", "parent_id": "tj-parent"});
+        upsert_task_from_event(&conn, &child, "ph").unwrap();
+
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE task_id = ?1",
+                rusqlite::params!["tj-child"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent.as_deref(), Some("tj-parent"));
+    }
+
+    #[test]
+    fn children_of_and_parent_of_work() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("p", "Parent"), "ph").unwrap();
+
+        let mut c1 = make_open_event("c1", "Child1");
+        c1.meta = serde_json::json!({"title": "Child1", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c1, "ph").unwrap();
+        let mut c2 = make_open_event("c2", "Child2");
+        c2.meta = serde_json::json!({"title": "Child2", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c2, "ph").unwrap();
+
+        let kids = children_of(&conn, "p").unwrap();
+        let ids: Vec<&str> = kids.iter().map(|t| t.task_id.as_str()).collect();
+        assert!(ids.contains(&"c1") && ids.contains(&"c2"));
+        assert_eq!(kids.len(), 2);
+
+        assert_eq!(parent_of(&conn, "c1").unwrap().as_deref(), Some("p"));
+        assert_eq!(parent_of(&conn, "p").unwrap(), None);
+    }
+
+    #[test]
+    fn cycle_guard_rejects_self_and_ancestor() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("a", "A"), "ph").unwrap();
+        let mut b = make_open_event("b", "B");
+        b.meta = serde_json::json!({"title": "B", "parent_id": "a"});
+        upsert_task_from_event(&conn, &b, "ph").unwrap();
+
+        // a is b's ancestor → making a a child of b is a cycle.
+        assert!(would_create_cycle(&conn, "a", "b").unwrap());
+        // self-parent is a cycle.
+        assert!(would_create_cycle(&conn, "a", "a").unwrap());
+        // unrelated parent is fine.
+        upsert_task_from_event(&conn, &make_open_event("x", "X"), "ph").unwrap();
+        assert!(!would_create_cycle(&conn, "x", "a").unwrap());
+    }
+
+    #[test]
+    fn invalidate_cascade_clears_parent_pack() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("p", "P"), "ph").unwrap();
+        let mut c = make_open_event("c", "C");
+        c.meta = serde_json::json!({"title": "C", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c, "ph").unwrap();
+
+        // Seed pack cache rows for both.
+        for id in ["p", "c"] {
+            conn.execute(
+                "INSERT INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+                 VALUES (?1, 'compact', 'x', '2026-01-01T00:00:00Z', 1)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+
+        invalidate_pack_cascade(&conn, "c").unwrap();
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_pack_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "both child and parent pack caches cleared");
+    }
+
+    #[test]
+    fn count_open_children_counts_only_open() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("p", "P"), "ph").unwrap();
+        let mut c1 = make_open_event("c1", "C1");
+        c1.meta = serde_json::json!({"title": "C1", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c1, "ph").unwrap();
+        // Close c1.
+        let mut close = crate::event::Event::new(
+            "c1",
+            crate::event::EventType::Close,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "done".into(),
+        );
+        close.timestamp = "2026-01-02T00:00:00Z".into();
+        upsert_task_from_event(&conn, &close, "ph").unwrap();
+        let mut c2 = make_open_event("c2", "C2");
+        c2.meta = serde_json::json!({"title": "C2", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c2, "ph").unwrap();
+
+        assert_eq!(count_open_children(&conn, "p").unwrap(), 1); // only c2
     }
 }

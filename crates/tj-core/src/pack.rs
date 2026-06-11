@@ -116,12 +116,21 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
     // event the agent records just before close is now the FIRST line
     // of this section, surviving end-of-pack truncation.
     let mut stmt = conn.prepare(
-        "SELECT text FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id DESC",
+        "SELECT text, alternatives FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id DESC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
     let mut count = 0;
     for row in rows {
-        out.push_str(&format!("- {}\n", row?));
+        let (text, alternatives) = row?;
+        out.push_str(&format!("- {text}\n"));
+        // v0.12.0: structured alternatives render under the decision so the
+        // pack shows "considered A/B/C, chose X" without reconstructing it
+        // from the hypothesis+rejection chain.
+        if let Some(block) = render_alternatives(alternatives.as_deref()) {
+            out.push_str(&block);
+        }
         count += 1;
     }
     if count == 0 {
@@ -129,6 +138,35 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
     }
     out.push('\n');
     Ok(out)
+}
+
+/// Render a decision's `meta.alternatives` JSON as indented bullet lines.
+/// Returns `None` when absent or malformed (the decision still renders
+/// without the block — a bad alternatives payload never hides the choice).
+/// Each entry is `{option, chosen?, rationale?}`; the chosen option is
+/// marked so the final choice is unambiguous.
+fn render_alternatives(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let arr = parsed.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut block = String::from("  - considered:\n");
+    for entry in arr {
+        let option = entry.get("option").and_then(|v| v.as_str())?;
+        let chosen = entry
+            .get("chosen")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let marker = if chosen { "✓ chose" } else { "✗" };
+        let rationale = entry.get("rationale").and_then(|v| v.as_str());
+        match rationale {
+            Some(r) => block.push_str(&format!("    - {marker} {option} — {r}\n")),
+            None => block.push_str(&format!("    - {marker} {option}\n")),
+        }
+    }
+    Some(block)
 }
 
 fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
@@ -168,6 +206,20 @@ fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> 
 /// boundary and preferring the last newline within the kept prefix, then
 /// append `marker`. Char-boundary-safe: a raw `text[..budget]` byte slice
 /// panics when `budget` lands inside a multibyte char (Cyrillic/CJK/emoji).
+/// Render a compact one-level roll-up of a task's direct children, or None
+/// when it has no children. Each child: status, id, title. Bounded.
+fn render_subtasks(conn: &Connection, task_id: &str) -> anyhow::Result<Option<String>> {
+    let kids = crate::db::children_of(conn, task_id)?;
+    if kids.is_empty() {
+        return Ok(None);
+    }
+    let mut s = format!("\n## Subtasks ({})\n", kids.len());
+    for k in &kids {
+        s.push_str(&format!("- [{}] {} — {}\n", k.status, k.task_id, k.title));
+    }
+    Ok(Some(s))
+}
+
 fn truncate_to_budget(text: &mut String, budget: usize, marker: &str) {
     if text.len() <= budget {
         return;
@@ -337,6 +389,18 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
+    let report = crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
+    if let Some(section) = crate::completeness::render_section(&report) {
+        text.push_str(&section);
+    }
+
+    // One-level roll-up of direct children (parents only). Appended before
+    // truncation so it shares the pack budget. Task 5 busts the parent cache
+    // when a child changes, so the next assemble regenerates fresh.
+    if let Some(subtasks) = render_subtasks(conn, task_id)? {
+        text.push_str(&subtasks);
+    }
+
     // Token-budget truncation: cap pack size so it always fits an LLM context window.
     // v0.10.3: full bumped 10K → 24K. Real tasks accumulate 50-100 events
     // and the prior cap clipped final-summary decisions even after the
@@ -385,6 +449,90 @@ mod tests {
     fn pack_mode_round_trips_via_serde() {
         let s = serde_json::to_string(&PackMode::Compact).unwrap();
         assert_eq!(s, "\"Compact\"");
+    }
+
+    #[test]
+    fn parent_pack_contains_subtasks_section() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+
+        // Parent + one child, each with an open event.
+        let mut p = crate::event::Event::new(
+            "p",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "Parent".into(),
+        );
+        p.meta = serde_json::json!({"title": "Parent"});
+        crate::db::upsert_task_from_event(&conn, &p, "ph").unwrap();
+        crate::db::index_event(&conn, &p).unwrap();
+
+        let mut c = crate::event::Event::new(
+            "c",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "Child".into(),
+        );
+        c.meta = serde_json::json!({"title": "Child", "parent_id": "p"});
+        crate::db::upsert_task_from_event(&conn, &c, "ph").unwrap();
+        crate::db::index_event(&conn, &c).unwrap();
+
+        let parent_pack = assemble(&conn, "p", PackMode::Compact).unwrap();
+        assert!(parent_pack.text.contains("Subtasks"));
+        assert!(parent_pack.text.contains("Child"));
+        assert!(parent_pack.text.contains("c")); // child id
+
+        let child_pack = assemble(&conn, "c", PackMode::Compact).unwrap();
+        assert!(!child_pack.text.contains("Subtasks"));
+    }
+
+    #[test]
+    fn pack_shows_completeness_section_when_gaps() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        // Task with no goal → NoGoal gap.
+        let e = crate::event::Event::new(
+            "g1",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "T".into(),
+        );
+        crate::db::upsert_task_from_event(&conn, &e, "ph").unwrap();
+        crate::db::index_event(&conn, &e).unwrap();
+
+        let pack = assemble(&conn, "g1", PackMode::Compact).unwrap();
+        assert!(pack.text.contains("Completeness"));
+        assert!(pack.text.contains("no goal recorded"));
+    }
+
+    #[test]
+    fn pack_no_completeness_section_when_complete() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        let mut e = crate::event::Event::new(
+            "g2",
+            crate::event::EventType::Open,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "T".into(),
+        );
+        e.meta = serde_json::json!({"title": "T"});
+        crate::db::upsert_task_from_event(&conn, &e, "ph").unwrap();
+        crate::db::index_event(&conn, &e).unwrap();
+        // Give it a goal so NoGoal doesn't fire; open + no decisions → complete.
+        conn.execute("UPDATE tasks SET goal='g' WHERE task_id='g2'", [])
+            .unwrap();
+        // pending_count() resolves `<data_dir>/pending`. Point the data dir at
+        // the isolated tempdir (no pending/ child) so the PendingLeak rule
+        // stays silent regardless of the real dev environment.
+        std::env::set_var("TASK_JOURNAL_DATA_DIR", d.path());
+
+        let pack = assemble(&conn, "g2", PackMode::Compact).unwrap();
+        std::env::remove_var("TASK_JOURNAL_DATA_DIR");
+        assert!(!pack.text.contains("## Completeness"));
     }
 
     #[test]
@@ -608,11 +756,17 @@ mod tests {
         let mut s = String::from("x");
         s.push_str(&"я".repeat(2000)); // total = 1 + 4000 = 4001 bytes
         let budget = 100usize; // even → mid-char given the odd char starts
-        assert!(!s.is_char_boundary(budget), "precondition: budget must be mid-char");
+        assert!(
+            !s.is_char_boundary(budget),
+            "precondition: budget must be mid-char"
+        );
         truncate_to_budget(&mut s, budget, marker); // must NOT panic
         assert!(s.ends_with(marker));
         assert!(s.len() <= budget + marker.len());
-        assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "result must be valid UTF-8");
+        assert!(
+            std::str::from_utf8(s.as_bytes()).is_ok(),
+            "result must be valid UTF-8"
+        );
     }
 
     #[test]
@@ -855,6 +1009,66 @@ mod tests {
         assert!(
             pack.text.contains("Adopt Rust"),
             "decision text missing: {}",
+            pack.text
+        );
+    }
+
+    #[test]
+    fn pack_renders_decision_alternatives() {
+        use crate::db;
+        use crate::event::*;
+        use tempfile::TempDir;
+
+        let d = TempDir::new().unwrap();
+        let conn = db::open(d.path().join("s.sqlite")).unwrap();
+        let mut open_e = Event::new(
+            "tj-alt",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "x".into(),
+        );
+        open_e.meta = serde_json::json!({"title": "Alt test"});
+        db::upsert_task_from_event(&conn, &open_e, "feedface").unwrap();
+        db::index_event(&conn, &open_e).unwrap();
+
+        let mut dec = Event::new(
+            "tj-alt",
+            EventType::Decision,
+            Author::Agent,
+            Source::Chat,
+            "Use SQLite for storage".into(),
+        );
+        dec.meta = serde_json::json!({
+            "alternatives": [
+                {"option": "SQLite", "chosen": true, "rationale": "embedded, zero-ops"},
+                {"option": "Postgres", "chosen": false, "rationale": "too heavy for a local tool"}
+            ]
+        });
+        db::upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        db::index_event(&conn, &dec).unwrap();
+
+        let pack = assemble(&conn, "tj-alt", PackMode::Full).unwrap();
+        // The decision itself still renders.
+        assert!(
+            pack.text.contains("Use SQLite for storage"),
+            "decision text missing: {}",
+            pack.text
+        );
+        // Considered alternatives surface, both chosen and rejected, with rationale.
+        assert!(
+            pack.text.contains("considered"),
+            "alternatives header missing: {}",
+            pack.text
+        );
+        assert!(
+            pack.text.contains("SQLite") && pack.text.contains("Postgres"),
+            "both options missing: {}",
+            pack.text
+        );
+        assert!(
+            pack.text.contains("too heavy for a local tool"),
+            "rejected rationale missing: {}",
             pack.text
         );
     }

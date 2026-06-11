@@ -595,6 +595,15 @@ enum Commands {
         /// with `task-journal goal <id> "<text>"`.
         #[arg(long)]
         goal: Option<String>,
+        /// Parent task id — makes this a subtask of the given id.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// List tasks for the current project.
+    List {
+        /// Render tasks as a tree, children indented under parents.
+        #[arg(long)]
+        tree: bool,
     },
     /// Inspect events for a project.
     Events {
@@ -756,6 +765,22 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Offline memory backfill: re-read session transcripts and append
+    /// significant events the realtime classifier missed (dream Pass A).
+    Dream {
+        /// Only sessions in the last N days (overrides the watermark).
+        #[arg(long)]
+        since: Option<i64>,
+        /// Only this task's sessions.
+        #[arg(long)]
+        task: Option<String>,
+        /// Show scope without calling the API or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap sessions processed this run.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Export tasks as Markdown or JSON to stdout.
     Export {
         /// Output format: md, json.
@@ -869,6 +894,18 @@ enum Commands {
     /// Why-this-approach, Verification, Affected). Reuses event log +
     /// artifacts; introduces no new tables.
     ExportPr { task_id: String },
+    /// Export task knowledge as Claude-memory frontmatter files (feeds native dream).
+    ExportMemory {
+        /// Export a single task by id.
+        #[arg(long, conflicts_with = "all_closed")]
+        task: Option<String>,
+        /// Export all closed tasks (default scope when no flag is given).
+        #[arg(long)]
+        all_closed: bool,
+        /// Print target paths + content without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -910,6 +947,7 @@ fn main() -> Result<()> {
             title,
             context,
             goal,
+            parent,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -918,6 +956,23 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&events_dir)?;
 
             let task_id = tj_core::new_task_id();
+
+            // Validate --parent before writing the open event: the parent must
+            // already exist and the link must not introduce a cycle. Needs the
+            // derived SQLite state, so ingest the JSONL tail first.
+            if let Some(ref parent_id) = parent {
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                if !tj_core::db::task_exists(&conn, parent_id)? {
+                    anyhow::bail!("parent task {parent_id} does not exist");
+                }
+                if tj_core::db::would_create_cycle(&conn, &task_id, parent_id)? {
+                    anyhow::bail!("setting parent {parent_id} would create a cycle");
+                }
+            }
+
             let mut event = tj_core::event::Event::new(
                 task_id.clone(),
                 tj_core::event::EventType::Open,
@@ -925,7 +980,11 @@ fn main() -> Result<()> {
                 tj_core::event::Source::Cli,
                 context.clone().unwrap_or_else(|| title.clone()),
             );
-            event.meta = serde_json::json!({ "title": title });
+            let mut meta = serde_json::json!({ "title": title });
+            if let Some(ref parent_id) = parent {
+                meta["parent_id"] = serde_json::Value::String(parent_id.clone());
+            }
+            event.meta = meta;
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
@@ -944,6 +1003,28 @@ fn main() -> Result<()> {
             }
 
             println!("{}", task_id);
+        }
+        Commands::List { tree } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if tree {
+                for t in tj_core::db::top_level_tasks(&conn, &project_hash)? {
+                    println!("{} [{}] {}", t.task_id, t.status, t.title);
+                    for c in tj_core::db::children_of(&conn, &t.task_id)? {
+                        println!("  {} [{}] {}", c.task_id, c.status, c.title);
+                    }
+                }
+            } else {
+                for t in tj_core::db::list_tasks_by_project(&conn, &project_hash)? {
+                    println!("{} [{}] {}", t.task_id, t.status, t.title);
+                }
+            }
         }
         Commands::Events { action } => match action {
             EventsCmd::List { limit } => {
@@ -1072,6 +1153,7 @@ fn main() -> Result<()> {
             if let Some(o) = outcome.as_deref() {
                 tj_core::db::set_task_outcome(&conn, &task_id, o, outcome_tag.as_deref())?;
             }
+            let open_kids = tj_core::db::count_open_children(&conn, &task_id)?;
             drop(conn);
 
             let mut event = tj_core::event::Event::new(
@@ -1088,6 +1170,33 @@ fn main() -> Result<()> {
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
+            if open_kids > 0 {
+                eprintln!("note: {open_kids} open subtask(s) under {task_id}");
+            }
+
+            // Non-blocking completeness warning. The close above already
+            // succeeded; re-open, apply the close event to the index, then
+            // assess. Any error here must NOT fail the close — handle
+            // locally, never `?`-propagate.
+            if let Ok(conn) = tj_core::db::open(&state_path) {
+                let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
+                if let Ok(report) = tj_core::completeness::assess(
+                    &conn,
+                    &task_id,
+                    tj_core::completeness::pending_count(),
+                ) {
+                    if !report.is_complete() {
+                        eprintln!(
+                            "note: task {task_id} closed with {} completeness gap(s):",
+                            report.gaps.len()
+                        );
+                        for g in &report.gaps {
+                            eprintln!("  ⚠ {}", g.detail);
+                        }
+                    }
+                }
+            }
+
             println!("{}", event.event_id);
         }
         Commands::Stale { days } => {
@@ -1518,6 +1627,75 @@ fn main() -> Result<()> {
             // neither source is present (standalone behaviour unchanged).
             let live_session_id = tj_core::session_id::live_session_id(Some(&payload));
 
+            // Push-recall (claude-memory-60m). Best-effort, fail-open, read-only.
+            // After a (non-MCP) tool call, surface a relevant prior
+            // rejection/decision via an additionalContext envelope so the agent
+            // doesn't re-walk a ruled-out path. Gated by TJ_PUSH_RECALL=0.
+            //
+            // Dedup vs claude-memory-7km: skip MCP-tool turns — those are
+            // handled by 7km's updatedMCPToolOutput path, so emitting
+            // additionalContext here too would double-surface the same recall.
+            // The two paths are mutually exclusive by tool type (this =
+            // non-mcp tools; 7km = mcp__ tools). The block only adds a stdout
+            // envelope; it never touches the JSONL log or the pending flow
+            // below, and any error is swallowed so the hook can't break.
+            let tool_is_mcp = payload
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(|n| n.starts_with("mcp__"))
+                .unwrap_or(false);
+            if kind == "PostToolUse"
+                && !tool_is_mcp
+                && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0")
+                && events_path.exists()
+            {
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                if let Ok(conn) = tj_core::db::open(&state_path) {
+                    let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
+                    if let Ok(hits) = tj_core::recall::relevant_recall(
+                        &conn,
+                        &text,
+                        tj_core::recall::DEFAULT_MAX_HITS,
+                    ) {
+                        if !hits.is_empty() {
+                            let mut ctx = String::new();
+                            for h in &hits {
+                                let verb = match h.event_type {
+                                    tj_core::event::EventType::Rejection => "previously rejected",
+                                    _ => "previously decided",
+                                };
+                                ctx.push_str(&format!(
+                                    "⚠ recall: in task {} you {}: {}\n",
+                                    h.task_id, verb, h.text
+                                ));
+                            }
+                            let envelope = serde_json::json!({
+                                "hookSpecificOutput": {
+                                    "hookEventName": "PostToolUse",
+                                    "additionalContext": ctx.trim_end(),
+                                }
+                            });
+                            println!("{}", serde_json::to_string(&envelope)?);
+                        }
+                    }
+                }
+            }
+
+            // Push-recall via updatedMCPToolOutput (claude-memory-7km). For an
+            // MCP PostToolUse turn whose input echoes a prior rejection/decision,
+            // prepend a recall banner to what Claude sees of that tool's output.
+            // Best-effort, read-only: any miss or error emits nothing and the
+            // real output passes through unchanged. Complements 60m (which skips
+            // mcp__ tools) — gated MCP-only, falls through to the queue path so
+            // event capture is unaffected. Disabled by TJ_PUSH_RECALL=0.
+            if kind == "PostToolUse" && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0") {
+                if let Some(envelope) = push_recall_envelope(&payload, &events_path, &project_hash)
+                {
+                    println!("{}", serde_json::to_string(&envelope)?);
+                }
+            }
+
             // SessionStart: emit a JSON envelope with compact resume-packs of
             // open tasks so Claude Code injects them into its system context
             // automatically. This is the load-bearing UX for "the journal
@@ -1539,7 +1717,18 @@ fn main() -> Result<()> {
                 if recent.is_empty() {
                     return Ok(());
                 }
+                // After a compaction (source=="compact"), re-inject the
+                // active task + its in-force constraints so the rebuilt
+                // context doesn't lose what it was doing. Best-effort:
+                // any error → no reminder, never abort SessionStart.
+                let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
                 let mut bundle = String::new();
+                if source == "compact" {
+                    if let Ok(Some(reminder)) = tj_core::reminder::active_task_reminder(&conn) {
+                        bundle.push_str(&reminder);
+                        bundle.push_str("\n\n");
+                    }
+                }
                 for tc in &recent {
                     let pack = tj_core::pack::assemble(
                         &conn,
@@ -1957,7 +2146,14 @@ fn main() -> Result<()> {
                 .unwrap_or(false);
             let is_mock = mock_event_type.is_some() && mock_task_id.is_some();
             if !is_mock && !force_sync {
-                let _ = persist_pending_v2(&events_path, &kind, &text, &project_hash, &backend, live_session_id.as_deref())?;
+                let _ = persist_pending_v2(
+                    &events_path,
+                    &kind,
+                    &text,
+                    &project_hash,
+                    &backend,
+                    live_session_id.as_deref(),
+                )?;
                 // Fire-and-forget worker. Errors here are best-effort —
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
@@ -2179,6 +2375,78 @@ fn main() -> Result<()> {
         }
         Commands::ClassifyWorker { backend } => {
             run_classify_worker(&backend)?;
+        }
+        Commands::Dream {
+            since,
+            task,
+            dry_run,
+            limit,
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+
+            // 1. Resolve session files in scope.
+            let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+            let Some(project_dir) = project_dir else {
+                println!("dream: no Claude Code sessions found for this project");
+                return Ok(());
+            };
+            let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;
+
+            let since_time = if let Some(days) = since {
+                Some(
+                    std::time::SystemTime::now()
+                        - std::time::Duration::from_secs((days.max(0) as u64) * 86_400),
+                )
+            } else {
+                // Watermark → SystemTime. Absent watermark = all sessions.
+                match tj_core::dream::state::last_dream_at(&conn, &project_hash)? {
+                    Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
+                        .ok()
+                        .map(std::time::SystemTime::from),
+                    None => None,
+                }
+            };
+
+            let scoped: Vec<tj_core::dream::scope::SessionFile> = session_paths
+                .into_iter()
+                .filter_map(|p| {
+                    let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
+                    Some(tj_core::dream::scope::SessionFile { path: p, mtime })
+                })
+                .collect();
+            let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
+
+            // 2. Assemble (session_id, BackfillInput) per session.
+            let run_id = ulid::Ulid::new().to_string();
+            let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
+
+            // 3. Run.
+            let opts = tj_core::dream::DreamOptions {
+                project_hash: project_hash.clone(),
+                dry_run,
+            };
+            if dry_run {
+                println!("dream (dry-run): {} session(s) in scope", sessions.len());
+                return Ok(());
+            }
+            let backend = tj_core::dream::http::AnthropicDreamBackend::from_env()?;
+            let report =
+                tj_core::dream::run_dream(&conn, &events_path, &opts, &backend, sessions, &run_id)?;
+
+            // 4. Advance watermark to now (only reached on success).
+            tj_core::dream::state::set_last_dream_at(
+                &conn,
+                &project_hash,
+                &chrono::Utc::now().to_rfc3339(),
+            )?;
+            println!(
+                "dream: {} session(s) processed, {} event(s) backfilled",
+                report.sessions_processed, report.events_backfilled
+            );
         }
         Commands::Export {
             format,
@@ -2573,6 +2841,13 @@ fn main() -> Result<()> {
         }
         Commands::ExportPr { task_id } => {
             run_export_pr(&task_id)?;
+        }
+        Commands::ExportMemory {
+            task,
+            all_closed,
+            dry_run,
+        } => {
+            run_export_memory(task.as_deref(), all_closed, dry_run)?;
         }
     }
     Ok(())
@@ -2982,6 +3257,117 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_export_memory(task: Option<&str>, _all_closed: bool, dry_run: bool) -> Result<()> {
+    const MAX_ITEMS: usize = 10;
+
+    let cwd = std::env::current_dir()?;
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    }
+
+    // Resolve scope.
+    let task_ids: Vec<String> = match task {
+        Some(id) => {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM tasks WHERE task_id = ?1",
+                    rusqlite::params![id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !exists {
+                eprintln!("Error: task not found: {id}");
+                std::process::exit(1);
+            }
+            vec![id.to_string()]
+        }
+        None => {
+            // default + --all-closed → all closed tasks
+            let mut stmt =
+                conn.prepare("SELECT task_id FROM tasks WHERE status='closed' ORDER BY task_id")?;
+            let ids = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ids
+        }
+    };
+
+    if task_ids.is_empty() {
+        eprintln!("note: no closed tasks to export");
+        return Ok(());
+    }
+
+    // Memory dir: ~/.claude/projects/<encoded-cwd>/memory/
+    let memory_dir = tj_core::session::discovery::projects_dir()?
+        .join(tj_core::session::discovery::encode_project_path(&cwd_str))
+        .join("memory");
+
+    for id in &task_ids {
+        let title: String = conn.query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?;
+        let meta = tj_core::db::task_metadata(&conn, id)?.unwrap_or_default();
+
+        // decision + constraint one-liners, oldest-first (== run_export_pr style).
+        let mut stmt = conn.prepare(
+            "SELECT ei.type, sf.text FROM events_index ei
+             LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+             WHERE ei.task_id = ?1 AND ei.type IN ('decision','constraint')
+             ORDER BY ei.timestamp ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut decisions = Vec::new();
+        let mut constraints = Vec::new();
+        for row in rows {
+            let (ty, text) = row?;
+            let line = text.lines().next().unwrap_or("").trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            match ty.as_str() {
+                "decision" if decisions.len() < MAX_ITEMS => decisions.push(line),
+                "constraint" if constraints.len() < MAX_ITEMS => constraints.push(line),
+                _ => {}
+            }
+        }
+
+        let slug = tj_core::frontmatter::slugify(&title);
+        let content = tj_core::frontmatter::render_memory(&tj_core::frontmatter::MemoryInput {
+            title: &title,
+            meta: &meta,
+            decisions: &decisions,
+            constraints: &constraints,
+        });
+        let file_path = memory_dir.join(format!("tj-{id}-{slug}.md"));
+
+        if dry_run {
+            println!("# would write: {}", file_path.display());
+            println!("{content}");
+        } else {
+            std::fs::create_dir_all(&memory_dir)?;
+            std::fs::write(&file_path, content)?;
+            println!("wrote {}", file_path.display());
+        }
+    }
+    Ok(())
+}
+
+/// How many of a task's most-recent `constraint` events to surface in
+/// the classifier prompt. Kept small so the prompt stays bounded.
+const CONSTRAINT_CONTEXT_LIMIT: i64 = 5;
+
 fn recent_task_contexts(
     conn: &rusqlite::Connection,
     limit: usize,
@@ -3012,10 +3398,36 @@ fn recent_task_contexts(
                 ))
             })?
             .collect::<Result<_, _>>()?;
+
+        // Gather the task's most-recent `constraint` events so the
+        // classifier can recognise chunks that violate a known limit.
+        // Mirrors the last_events join, filtered to constraints and
+        // bounded to keep the prompt small.
+        let mut c_stmt = conn.prepare(
+            "SELECT sf.text FROM events_index ei
+             LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+             WHERE ei.task_id = ?1 AND ei.type = 'constraint'
+             ORDER BY ei.timestamp DESC LIMIT ?2",
+        )?;
+        let constraints: Vec<String> = c_stmt
+            .query_map(rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT], |r| {
+                let txt: Option<String> = r.get(0)?;
+                Ok(txt
+                    .unwrap_or_default()
+                    .chars()
+                    .take(120)
+                    .collect::<String>())
+            })?
+            .collect::<Result<Vec<String>, _>>()?
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+
         out.push(tj_core::classifier::TaskContext {
             task_id,
             title,
             last_events,
+            constraints,
         });
     }
     Ok(out)
@@ -3094,6 +3506,7 @@ fn auto_open_task_from_prompt(
         task_id,
         title,
         last_events: vec![],
+        constraints: vec![],
     })
 }
 
@@ -3631,6 +4044,86 @@ fn drain_pending(
 /// piping), we silently return ("Stop", "") so the hook becomes a no-op
 /// instead of erroring — matches the `|| true` safety net in the
 /// installed hook command.
+/// Build a PostToolUse `updatedMCPToolOutput` envelope when an MCP tool call
+/// echoes a prior rejection/decision (claude-memory-7km). Returns None
+/// (pass through, emit nothing) for non-MCP tools, no hits, or any error.
+/// Never panics, never mutates the journal.
+///
+/// Dedup vs claude-memory-60m: this fires ONLY for `mcp__` tools; 60m's
+/// `additionalContext` path skips those. The two are mutually exclusive by
+/// tool type so a single recall is never double-surfaced.
+fn push_recall_envelope(
+    payload: &serde_json::Value,
+    events_path: &std::path::Path,
+    project_hash: &str,
+) -> Option<serde_json::Value> {
+    // MCP-only gate: Claude Code prefixes MCP tools `mcp__<server>__<tool>`.
+    let tool_name = payload.get("tool_name").and_then(|v| v.as_str())?;
+    if !tool_name.starts_with("mcp__") {
+        return None;
+    }
+    if !events_path.exists() {
+        return None;
+    }
+    let query_text = payload
+        .get("tool_input")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    if query_text.trim().is_empty() {
+        return None;
+    }
+    let original = payload
+        .get("tool_response")
+        .map(render_tool_response)
+        .unwrap_or_default();
+
+    let state_path = tj_core::paths::state_dir()
+        .ok()?
+        .join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path).ok()?;
+    let _ = tj_core::db::ingest_new_events(&conn, events_path, project_hash);
+    // Reuse 60m's recall engine + threshold — no recall logic lives here.
+    let hits =
+        tj_core::recall::relevant_recall(&conn, &query_text, tj_core::recall::DEFAULT_MAX_HITS)
+            .ok()?;
+    if hits.is_empty() {
+        return None;
+    }
+    let updated = format!("{}\n\n{}", render_recall_banner(&hits), original);
+    Some(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedMCPToolOutput": updated,
+        }
+    }))
+}
+
+/// One ⚠ line per recall hit (mirrors the close-gate / SessionStart convention).
+fn render_recall_banner(hits: &[tj_core::recall::RecallHit]) -> String {
+    let mut s = String::from("\u{26a0} Task Journal recall — you may be repeating a prior path:");
+    for h in hits {
+        let verb = match h.event_type {
+            tj_core::event::EventType::Rejection => "rejected",
+            _ => "decided on",
+        };
+        s.push_str(&format!(
+            "\n  \u{26a0} in task {} you previously {} this: {}",
+            h.task_id, verb, h.text
+        ));
+    }
+    s
+}
+
+/// Collapse a `tool_response` JSON value to the text Claude would have seen.
+/// A bare string is used as-is; any other JSON is stringified (mirrors how
+/// `parse_hook_stdin` stringifies `tool_response`).
+fn render_tool_response(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn parse_hook_stdin() -> anyhow::Result<(String, String, serde_json::Value)> {
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
@@ -3698,6 +4191,152 @@ fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
     })
 }
 
+/// Flatten a parsed session transcript into role-tagged turns, in order.
+fn flatten_transcript(parsed: &tj_core::session::parser::ParsedSession) -> String {
+    use tj_core::session::parser::{extract_assistant_texts, extract_user_text, SessionEntry};
+    let mut s = String::new();
+    for entry in &parsed.entries {
+        match entry {
+            SessionEntry::User(u) => {
+                if let Some(text) = extract_user_text(u) {
+                    s.push_str("user: ");
+                    s.push_str(&text);
+                    s.push('\n');
+                }
+            }
+            SessionEntry::Assistant(a) => {
+                for text in extract_assistant_texts(a) {
+                    s.push_str("assistant: ");
+                    s.push_str(&text);
+                    s.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+/// True when any of `events` ties this task to the session: precise match
+/// on `meta.session_id`, or (for legacy events with no session_id) a
+/// timestamp falling inside the session's `[first_ts, last_ts]` window.
+fn task_matches_session(
+    events: &[tj_core::event::Event],
+    session_id: &str,
+    first_ts: Option<&str>,
+    last_ts: Option<&str>,
+) -> bool {
+    events.iter().any(|e| {
+        // Precise: event tagged with this session.
+        if e.meta.get("session_id").and_then(|v| v.as_str()) == Some(session_id) {
+            return true;
+        }
+        // Legacy fallback: timestamp inside the session window.
+        if e.meta.get("session_id").is_none() {
+            if let (Some(f), Some(l)) = (first_ts, last_ts) {
+                return e.timestamp.as_str() >= f && e.timestamp.as_str() <= l;
+            }
+        }
+        false
+    })
+}
+
+/// Read the project's events from `events_path`, group by `task_id`, and
+/// return candidate task contexts for sessions whose events match this
+/// session (precise session_id, or legacy time-window). Each context
+/// carries the task title and up to the last ~20 event texts (dedup
+/// context for the backend).
+fn candidate_tasks_for_session(
+    events_path: &std::path::Path,
+    session_id: &str,
+    first_ts: Option<&str>,
+    last_ts: Option<&str>,
+) -> anyhow::Result<Vec<tj_core::dream::backend::BackfillTaskContext>> {
+    use std::collections::BTreeMap;
+    use tj_core::dream::backend::BackfillTaskContext;
+    use tj_core::event::{Event, EventType};
+
+    if !events_path.exists() {
+        return Ok(Vec::new());
+    }
+    let body = std::fs::read_to_string(events_path)?;
+    let mut by_task: BTreeMap<String, Vec<Event>> = BTreeMap::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(e) = serde_json::from_str::<Event>(line) {
+            by_task.entry(e.task_id.clone()).or_default().push(e);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (task_id, events) in by_task {
+        if !task_matches_session(&events, session_id, first_ts, last_ts) {
+            continue;
+        }
+        // Title from the Open event when present, else the first event's text.
+        let title = events
+            .iter()
+            .find(|e| e.event_type == EventType::Open)
+            .or_else(|| events.first())
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        let existing_events: Vec<String> = events
+            .iter()
+            .rev()
+            .take(20)
+            .rev()
+            .map(|e| e.text.clone())
+            .collect();
+        out.push(BackfillTaskContext {
+            task_id,
+            title,
+            existing_events,
+        });
+    }
+    Ok(out)
+}
+
+/// Assemble per-session `(session_id, BackfillInput)` from the in-scope
+/// session transcripts and the project's existing events.
+fn build_dream_inputs(
+    events_path: &std::path::Path,
+    sessions: &[std::path::PathBuf],
+    task_filter: Option<&str>,
+) -> anyhow::Result<Vec<(String, tj_core::dream::backend::BackfillInput)>> {
+    use tj_core::dream::backend::BackfillInput;
+    use tj_core::session::parser::parse_session;
+
+    let mut out = Vec::new();
+    for path in sessions {
+        let session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let parsed = parse_session(path)?;
+
+        let candidates = candidate_tasks_for_session(
+            events_path,
+            &session_id,
+            parsed.first_timestamp.as_deref(),
+            parsed.last_timestamp.as_deref(),
+        )?;
+        let tasks: Vec<_> = candidates
+            .into_iter()
+            .filter(|t| task_filter.is_none_or(|f| f == t.task_id))
+            .collect();
+        if tasks.is_empty() {
+            continue;
+        }
+
+        let transcript = flatten_transcript(&parsed);
+        out.push((session_id, BackfillInput { tasks, transcript }));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod inline_tests {
     // Sits at the bottom of the file to satisfy
@@ -3706,12 +4345,71 @@ mod inline_tests {
     use super::*;
 
     #[test]
+    fn flatten_transcript_tags_roles_in_order() {
+        use tj_core::session::parser::parse_session;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sess-1.jsonl");
+        std::fs::write(&p,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"why?\"}}\n\
+             {\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"because X\"}]}}\n").unwrap();
+        let parsed = parse_session(&p).unwrap();
+        let t = flatten_transcript(&parsed);
+        let u = t.find("why?").unwrap();
+        let a = t.find("because X").unwrap();
+        assert!(u < a, "user turn should precede assistant turn");
+    }
+
+    #[test]
+    fn task_matches_by_session_id_or_time_window() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let mut tagged = Event::new(
+            "tj-1",
+            EventType::Finding,
+            Author::Agent,
+            Source::Hook,
+            "x".into(),
+        );
+        tagged.meta = serde_json::json!({"session_id": "sess-1"});
+        assert!(task_matches_session(&[tagged], "sess-1", None, None));
+
+        let mut legacy = Event::new(
+            "tj-2",
+            EventType::Finding,
+            Author::Agent,
+            Source::Hook,
+            "y".into(),
+        );
+        legacy.timestamp = "2026-01-01T00:00:30Z".into();
+        legacy.meta = serde_json::json!({}); // no session_id
+        assert!(task_matches_session(
+            &[legacy.clone()],
+            "sess-1",
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T00:01:00Z"),
+        ));
+        // Outside the window and no session id → no match.
+        assert!(!task_matches_session(
+            &[legacy],
+            "sess-1",
+            Some("2026-02-01T00:00:00Z"),
+            Some("2026-02-01T00:01:00Z"),
+        ));
+    }
+
+    #[test]
     fn persist_pending_v2_includes_session_id_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join("events").join("h.jsonl");
         std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
-        let p = persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", Some("sess-9"))
-            .unwrap();
+        let p = persist_pending_v2(
+            &events_path,
+            "PostToolUse",
+            "txt",
+            "h",
+            "hybrid",
+            Some("sess-9"),
+        )
+        .unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["session_id"], serde_json::json!("sess-9"));
@@ -3726,7 +4424,8 @@ mod inline_tests {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join("events").join("h.jsonl");
         std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
-        let p = persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
+        let p =
+            persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("session_id").is_none());
@@ -3752,6 +4451,124 @@ mod inline_tests {
         assert!(!is_rewind_prompt("hello /rewind"));
         assert!(!is_rewind_prompt(""));
         assert!(!is_rewind_prompt("/rewinder"));
+    }
+
+    #[test]
+    fn recent_task_contexts_gathers_constraints() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+        let project_hash = "h";
+
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        let mut open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task one".into(),
+        );
+        open.meta = serde_json::json!({ "title": "task one" });
+        open.timestamp = "2026-01-01T00:00:00Z".into();
+        writer.append(&open).unwrap();
+        let mut cons = Event::new(
+            "tj-1",
+            EventType::Constraint,
+            Author::Agent,
+            Source::Hook,
+            "API limit 100/min".into(),
+        );
+        cons.timestamp = "2026-01-01T00:00:01Z".into();
+        writer.append(&cons).unwrap();
+        let mut find = Event::new(
+            "tj-1",
+            EventType::Finding,
+            Author::Agent,
+            Source::Hook,
+            "read http.rs".into(),
+        );
+        find.timestamp = "2026-01-01T00:00:02Z".into();
+        writer.append(&find).unwrap();
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
+
+        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
+        assert!(
+            ctx.constraints
+                .iter()
+                .any(|s| s.contains("API limit 100/min")),
+            "constraints should include the constraint event, got {:?}",
+            ctx.constraints
+        );
+        assert!(
+            !ctx.constraints.iter().any(|s| s.contains("read http.rs")),
+            "constraints must exclude non-constraint events, got {:?}",
+            ctx.constraints
+        );
+    }
+
+    #[test]
+    fn recent_task_contexts_bounds_constraints_to_n() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+        let project_hash = "h";
+
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        let mut open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task one".into(),
+        );
+        open.meta = serde_json::json!({ "title": "task one" });
+        open.timestamp = "2026-01-01T00:00:00Z".into();
+        writer.append(&open).unwrap();
+        for i in 0..7 {
+            let mut cons = Event::new(
+                "tj-1",
+                EventType::Constraint,
+                Author::Agent,
+                Source::Hook,
+                format!("constraint number {i}"),
+            );
+            // Increasing timestamps so DESC ordering keeps the most recent.
+            cons.timestamp = format!("2026-01-01T00:00:1{i}Z");
+            writer.append(&cons).unwrap();
+        }
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
+
+        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
+        assert_eq!(
+            ctx.constraints.len(),
+            5,
+            "bounded to CONSTRAINT_CONTEXT_LIMIT"
+        );
+        // The 5 most recent are numbers 2..=6.
+        assert!(ctx
+            .constraints
+            .iter()
+            .any(|s| s.contains("constraint number 6")));
+        assert!(!ctx
+            .constraints
+            .iter()
+            .any(|s| s.contains("constraint number 0")));
+        assert!(!ctx
+            .constraints
+            .iter()
+            .any(|s| s.contains("constraint number 1")));
     }
 
     #[test]

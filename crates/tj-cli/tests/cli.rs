@@ -105,6 +105,45 @@ fn close_command_marks_task_closed_in_pack() {
 }
 
 #[test]
+fn close_warns_on_completeness_gap() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    // Create a task WITH a goal so the NoGoal gap won't fire.
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Gap me", "--goal", "ship it"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Close WITHOUT an outcome → ClosedNoOutcome gap. The close still succeeds
+    // and prints the gap to stderr.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["close", &task_id, "--reason", "done"])
+        .assert()
+        .success()
+        .stderr(contains("closed without a recorded outcome"));
+
+    // And the task is actually closed.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("status: closed"));
+}
+
+#[test]
 fn doctor_exits_zero_on_fresh_install() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
@@ -3747,4 +3786,900 @@ fn precompact_dedupes_marker_within_60s_window() {
         second_out.trim().is_empty(),
         "second PreCompact within DEDUP_WINDOW must NOT emit a new event id; got: {second_out:?}"
     );
+}
+
+/// Read the single events JSONL file under <xdg>/task-journal/events.
+fn read_events_jsonl(xdg: &std::path::Path) -> String {
+    let events_dir = xdg.join("task-journal").join("events");
+    let entry = std::fs::read_dir(&events_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .expect("an events jsonl file");
+    std::fs::read_to_string(entry.path()).unwrap()
+}
+
+#[test]
+fn create_with_parent_sets_parent_id() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    // Parent task.
+    let parent_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Parent"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Child with --parent.
+    let child_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Child", "--parent", &parent_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // The child's open event in the JSONL carries meta.parent_id == parent.
+    let jsonl = read_events_jsonl(xdg.path());
+    let child_open = jsonl
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| v.get("task_id").and_then(|x| x.as_str()) == Some(&child_id))
+        .expect("child open event");
+    assert_eq!(
+        child_open["meta"]["parent_id"].as_str(),
+        Some(parent_id.as_str())
+    );
+}
+
+#[test]
+fn create_with_missing_parent_is_rejected() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Child", "--parent", "tj-nope"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn list_tree_indents_children_under_parents() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let parent_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "ParentTask"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "ChildTask", "--parent", &parent_id])
+        .assert()
+        .success();
+
+    let out = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["list", "--tree"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    let parent_line = out
+        .lines()
+        .position(|l| l.contains("ParentTask"))
+        .expect("parent line present");
+    let child_idx = out
+        .lines()
+        .position(|l| l.contains("ChildTask"))
+        .expect("child line present");
+    // Child appears after the parent and is indented.
+    assert!(child_idx > parent_line, "child must come after parent");
+    let child_line = out.lines().nth(child_idx).unwrap();
+    assert!(
+        child_line.starts_with(char::is_whitespace),
+        "child line must be indented, got: {child_line:?}"
+    );
+}
+
+// --- Push-recall (claude-memory-60m) -----------------------------------
+
+/// Seed a confirmed rejection mentioning `axum` on a fresh task, returning
+/// the (TempDir, task_id). Mirrors the SessionStart-test seeding: `create`
+/// + `event --type rejection`.
+fn seed_axum_rejection() -> (assert_fs::TempDir, String) {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Push recall host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Tried switching the server to axum but it broke rmcp stdio.",
+        ])
+        .assert()
+        .success();
+    (dir, task_id)
+}
+
+#[test]
+fn post_tool_use_emits_recall_additional_context() {
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "let's switch the server to axum" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+
+    // The recall envelope is one of possibly several stdout lines (the
+    // mock path also prints the new event_id). Find the JSON line.
+    let env_line = body
+        .lines()
+        .find(|l| l.contains("additionalContext"))
+        .unwrap_or_else(|| panic!("no recall envelope on stdout, got: {body:?}"));
+    let v: serde_json::Value = serde_json::from_str(env_line.trim()).unwrap();
+    let ctx = v
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|s| s.as_str())
+        .expect("additionalContext missing");
+    assert!(ctx.contains("⚠ recall"), "ctx: {ctx}");
+    assert!(ctx.contains("axum"), "ctx: {ctx}");
+    assert_eq!(
+        v.get("hookSpecificOutput")
+            .and_then(|h| h.get("hookEventName"))
+            .and_then(|s| s.as_str()),
+        Some("PostToolUse"),
+    );
+}
+
+#[test]
+fn post_tool_use_no_recall_when_no_match() {
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "update the frontend stylesheet colors" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("additionalContext"),
+        "must not emit recall envelope for a non-matching tool turn, got: {body:?}"
+    );
+}
+
+#[test]
+fn tj_push_recall_env_disables() {
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "let's switch the server to axum" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_PUSH_RECALL", "0")
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("additionalContext"),
+        "TJ_PUSH_RECALL=0 must suppress the recall envelope, got: {body:?}"
+    );
+}
+
+#[test]
+fn post_tool_use_skips_recall_for_mcp_tools() {
+    // Dedup gate vs claude-memory-7km: mcp__ tool turns are 7km's territory
+    // (updatedMCPToolOutput). This path must stay silent for them.
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__task-journal__task_search",
+        "tool_input": { "query": "let's switch the server to axum" },
+        "tool_response": { "output": "" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("additionalContext"),
+        "mcp__ tool turns must not emit a recall envelope (7km owns them), got: {body:?}"
+    );
+}
+
+// --- Push-recall via updatedMCPToolOutput (claude-memory-7km) ----------
+
+#[test]
+fn post_tool_use_mcp_prepends_recall_banner() {
+    // An MCP tool call whose input echoes a prior rejection must have a recall
+    // banner PREPENDED to what Claude sees of its output, with the real output
+    // preserved below the banner (7km's updatedMCPToolOutput path).
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__some-server__do_thing",
+        "tool_input": { "approach": "let's switch the server to axum" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+
+    let env_line = body
+        .lines()
+        .find(|l| l.contains("updatedMCPToolOutput"))
+        .unwrap_or_else(|| panic!("no updatedMCPToolOutput envelope on stdout, got: {body:?}"));
+    let v: serde_json::Value = serde_json::from_str(env_line.trim()).unwrap();
+    let updated = v
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("updatedMCPToolOutput"))
+        .and_then(|s| s.as_str())
+        .expect("updatedMCPToolOutput missing");
+    assert!(
+        updated.starts_with('\u{26a0}'),
+        "must start with banner: {updated}"
+    );
+    assert!(
+        updated.contains("axum"),
+        "banner must mention the recall: {updated}"
+    );
+    assert!(
+        updated.contains("REAL TOOL OUTPUT 12345"),
+        "original tool output must be preserved: {updated}"
+    );
+    assert_eq!(
+        v.get("hookSpecificOutput")
+            .and_then(|h| h.get("hookEventName"))
+            .and_then(|s| s.as_str()),
+        Some("PostToolUse"),
+    );
+}
+
+#[test]
+fn post_tool_use_non_mcp_tool_emits_no_mcp_output() {
+    // The 7km path is MCP-only: a non-MCP tool (Bash) must never emit
+    // updatedMCPToolOutput, even when its input echoes a rejection.
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "Bash",
+        "tool_input": { "command": "let's switch the server to axum" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("updatedMCPToolOutput"),
+        "non-MCP tool turns must not emit updatedMCPToolOutput, got: {body:?}"
+    );
+}
+
+#[test]
+fn post_tool_use_mcp_no_recall_passes_through() {
+    // MCP tool, but its input matches no rejection: emit nothing, pass through.
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__some-server__do_thing",
+        "tool_input": { "approach": "update the frontend stylesheet colors" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    assert!(
+        !body.contains("updatedMCPToolOutput"),
+        "no-hit MCP turn must pass through (no envelope), got: {body:?}"
+    );
+}
+
+#[test]
+fn push_recall_mcp_does_not_drop_capture() {
+    // The push-recall block must fall through to the normal capture path:
+    // the MCP tool call is still ingested as an event (mock path emits the
+    // new event_id on stdout).
+    let (dir, task_id) = seed_axum_rejection();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-recall",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "tool_name": "mcp__some-server__do_thing",
+        "tool_input": { "approach": "let's switch the server to axum" },
+        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--backend",
+            "cli",
+            "--mock-event-type",
+            "finding",
+            "--mock-task-id",
+            &task_id,
+            "--mock-confidence",
+            "0.9",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    // The captured finding lands in the task pack — capture is unaffected by
+    // the push-recall envelope.
+    let pack = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["pack", &task_id, "--mode", "full"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        pack.contains("do_thing"),
+        "MCP tool call must still be captured into the journal, pack: {pack}"
+    );
+}
+
+// Seed a task with a goal + one constraint, run SessionStart with the
+// given `source`, and return the parsed `additionalContext` string.
+fn session_start_additional_context(source: &str) -> String {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args([
+                "create",
+                "Ship the widget",
+                "--goal",
+                "Ship the dashboard widget",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "constraint",
+            "--text",
+            "Must ship before Friday",
+        ])
+        .assert()
+        .success();
+
+    let stdin_payload = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": source,
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|e| panic!("SessionStart stdout must be JSON; got {body:?}; err {e}"));
+    v.get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|s| s.as_str())
+        .expect("additionalContext must be present")
+        .to_string()
+}
+
+#[test]
+fn session_start_compact_prepends_active_task_reminder() {
+    let ctx = session_start_additional_context("compact");
+    assert!(
+        ctx.starts_with("[Active task after compaction]"),
+        "compact SessionStart must lead with the reminder: {ctx}"
+    );
+    assert!(
+        ctx.contains("Ship the widget"),
+        "reminder must include the task title: {ctx}"
+    );
+    assert!(
+        ctx.contains("Goal: Ship the dashboard widget"),
+        "reminder must include the goal: {ctx}"
+    );
+    assert!(
+        ctx.contains("Must ship before Friday"),
+        "reminder must include the in-force constraint: {ctx}"
+    );
+}
+
+#[test]
+fn session_start_startup_has_no_reminder() {
+    let ctx = session_start_additional_context("startup");
+    assert!(
+        !ctx.contains("[Active task after compaction]"),
+        "non-compact SessionStart must NOT inject the reminder: {ctx}"
+    );
+}
+
+/// Recursively collect file names under `dir` that match a predicate.
+/// Used to locate the sandboxed Claude-memory file without reconstructing
+/// the exact `encode_project_path` transform of the test's cwd.
+fn find_files_recursive(
+    dir: &std::path::Path,
+    pred: &dyn Fn(&str) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let mut hits = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                hits.extend(find_files_recursive(&path, pred));
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if pred(name) {
+                    hits.push(path.clone());
+                }
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn export_memory_dry_run_prints_path_and_content_no_write() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Ship X", "--goal", "Ship X"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "close",
+            &task_id,
+            "--outcome",
+            "done",
+            "--outcome-tag",
+            "done",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(proj.path())
+        .args(["export-memory", "--task", &task_id, "--dry-run"])
+        .assert()
+        .success()
+        // Separator-agnostic: Windows prints `memory\tj-...` not `memory/tj-...`.
+        .stdout(contains(format!("tj-{task_id}-ship-x.md")))
+        .stdout(contains("memory"))
+        .stdout(contains("name: ship-x"));
+
+    // Nothing written under the sandboxed Claude config dir.
+    let written = find_files_recursive(claude.path(), &|n| {
+        n.starts_with("tj-") && n.ends_with(".md")
+    });
+    assert!(written.is_empty(), "dry-run must not write: {written:?}");
+}
+
+#[test]
+fn export_memory_writes_one_idempotent_file() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Ship X", "--goal", "Ship X"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "close",
+            &task_id,
+            "--outcome",
+            "done",
+            "--outcome-tag",
+            "done",
+        ])
+        .assert()
+        .success();
+
+    for _ in 0..2 {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("CLAUDE_CONFIG_DIR", claude.path())
+            .current_dir(proj.path())
+            .args(["export-memory", "--task", &task_id])
+            .assert()
+            .success();
+    }
+
+    let prefix = format!("tj-{task_id}-");
+    let files = find_files_recursive(claude.path(), &|n| {
+        n.starts_with(&prefix) && n.ends_with(".md")
+    });
+    assert_eq!(files.len(), 1, "exactly one idempotent file: {files:?}");
+
+    let body = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(body.starts_with("---\n"), "frontmatter fence: {body}");
+    assert!(body.contains("type: project"), "metadata type: {body}");
+}
+
+#[test]
+fn export_memory_all_closed_skips_open() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    let task_a = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Closed A", "--goal", "A"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "close",
+            &task_a,
+            "--outcome",
+            "done",
+            "--outcome-tag",
+            "done",
+        ])
+        .assert()
+        .success();
+
+    let task_b = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Open B", "--goal", "B"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(proj.path())
+        .args(["export-memory", "--all-closed"])
+        .assert()
+        .success();
+
+    let for_a = find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_a}-")));
+    let for_b = find_files_recursive(claude.path(), &|n| n.starts_with(&format!("tj-{task_b}-")));
+    assert_eq!(for_a.len(), 1, "closed task A exported: {for_a:?}");
+    assert!(for_b.is_empty(), "open task B must be skipped: {for_b:?}");
+}
+
+#[test]
+fn export_memory_missing_task_exits_1() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(proj.path())
+        .args(["export-memory", "--task", "tj-nope"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("task not found"));
 }

@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0]
+
+### Added
+- `export-memory` command: distills a task's goal, outcome, and key
+  decisions/constraints into a Claude-memory frontmatter file under
+  `~/.claude/projects/<encoded>/memory/tj-<id>-<slug>.md`, feeding Claude's
+  native long-term memory + dream. Scope: `--task <id>`, `--all-closed`
+  (default = all closed tasks); `--dry-run` prints without writing.
+  One-directional and idempotent; never reads Claude's memory or mutates the
+  append-only JSONL.
+- Active-task reminder after compaction: when Claude Code reconstructs context
+  via a SessionStart with `source="compact"`, the journal now prepends the
+  most-recent open task's title + goal + up to 3 in-force `constraint` texts to
+  `additionalContext` — so the post-compaction agent doesn't lose what it was
+  doing or its hard constraints. Pure, read-only, best-effort (never breaks the
+  hook). New `tj_core::reminder::active_task_reminder`. Copies the mechanic of
+  the experimental `criticalSystemReminder` without depending on that unstable
+  field.
+- Constraint-as-context: the event classifier now sees each active task's most
+  recent `constraint` events (≤ 5) in its prompt, under a "Known constraints for
+  <task>" block, with an instruction to prefer `rejection`/`correction` when a
+  chunk violates a constraint. Additive — tasks without constraints get the exact
+  prior prompt.
+- Push-recall: after a tool call, the PostToolUse hook surfaces a relevant prior
+  `rejection`/`decision` via `additionalContext` ("⚠ recall: in task X you
+  previously rejected …"), so the agent doesn't re-walk a ruled-out path.
+  Conservative (≤2 hits above a relevance threshold), read-only, best-effort
+  (errors never break the hook). New `tj_core::recall::relevant_recall` engine.
+  Disable with `TJ_PUSH_RECALL=0`.
+- Push-recall via `updatedMCPToolOutput`: when Claude calls an **MCP** tool whose
+  input echoes a prior rejection/decision (same `recall::relevant_recall` engine),
+  the PostToolUse hook prepends a `⚠` recall banner to what Claude sees of that
+  tool's output. MCP tools only — complements the `additionalContext` path above,
+  which skips `mcp__` tools, so a recall is never double-surfaced. The real output
+  is preserved below the banner; any miss or error passes it through unchanged.
+  Read-only, best-effort; also gated by `TJ_PUSH_RECALL=0`.
+- Close gate: closing a task now surfaces its completeness gaps (from
+  `completeness::assess`) — CLI prints them to stderr, MCP `task_close` returns
+  them in a new `completeness_gaps` field. Non-blocking: the close always
+  succeeds.
+- Capture-completeness flagging: a task's resume-pack now shows a `Completeness`
+  section listing structural gaps (closed without outcome, decisions without
+  evidence, unconfirmed suggested events, missing goal, unclassified pending
+  entries) — shown only when gaps exist. Read-only; reusable
+  `completeness::assess` API for the upcoming close-gate.
+- `task-journal dream` — offline memory backfill (Pass A). Re-reads session
+  transcripts and appends significant typed events the realtime classifier
+  missed, stamped `source=dream`, `status=suggested` (visible, prunable).
+  Manual trigger; `--dry-run`, `--since`, `--task`, `--limit`. Reuses the
+  Anthropic HTTP backend via `TJ_DREAM_MODEL` / `TJ_DREAM_MAX_TOKENS`.
+  Additive — the JSONL source of truth is never mutated.
+- Subtask hierarchy: tasks can have a `parent_id`. Set at creation via
+  `task-journal create --parent <id>` or the MCP `task_create` `parent` param
+  (validated: parent must exist, no cycles). A parent's resume-pack rolls up its
+  direct children (status, id, title). `list --tree` renders the hierarchy.
+  Closing a parent with open children warns but proceeds. Additive — existing
+  flat tasks are unaffected (`parent_id` NULL).
+- Structured decision alternatives: a `decision` event can now carry
+  `meta.alternatives` — a JSON array of `{option, chosen, rationale}` making the
+  options considered and the final choice explicit instead of implicit in the
+  hypothesis+rejection chain. Set via the MCP `event_add` `alternatives` param
+  (decision-only — rejected with an error on any other event type). Projected to
+  a new `decisions.alternatives` column (migration v7) and rendered under each
+  entry in the resume-pack's Active decisions section. MCP-only for v1; additive
+  — the JSONL source of truth is untouched and existing decisions stay NULL.
+
 ## [0.11.1] - 2026-06-08
 
 **Fix: `pack` panicked on multibyte UTF-8.** Pack truncation sliced the

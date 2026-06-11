@@ -50,7 +50,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.100
+        # The action tag IS the toolchain version installed; @1.88 pins MSRV.
+        # (Dependabot bumped this to @1.100 in #17, which tries to install a
+        # non-existent rust 1.100.0 — revert to the real MSRV.)
+        uses: dtolnay/rust-toolchain@1.88
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

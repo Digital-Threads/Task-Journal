@@ -49,12 +49,17 @@ mod task_id_tests {
 
 pub mod artifacts;
 pub mod classifier;
+pub mod completeness;
 pub mod db;
+pub mod dream;
 pub mod event;
+pub mod frontmatter;
 pub mod fts;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;
+pub mod recall;
+pub mod reminder;
 pub mod session;
 pub mod session_id;
 pub mod storage;

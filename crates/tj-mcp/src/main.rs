@@ -202,6 +202,9 @@ pub struct TaskCreateParams {
     /// "why was this done?" answers weeks later. Optional only for
     /// backwards compat; agents should always pass it.
     pub goal: Option<String>,
+    /// Parent task id — makes this a subtask of the given id. Validated: the
+    /// parent must exist and the link must not introduce a cycle.
+    pub parent: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskCreateResult {
@@ -216,6 +219,11 @@ pub struct EventAddParams {
     pub text: String,
     pub corrects: Option<String>,
     pub supersedes: Option<String>,
+    /// v0.12.0: structured alternatives for a `decision` event — a JSON
+    /// array of `{option, chosen, rationale}` objects making the considered
+    /// options and the final choice explicit. Stamped onto
+    /// `meta.alternatives`. Rejected with an error on any non-decision type.
+    pub alternatives: Option<serde_json::Value>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct EventAddResult {
@@ -237,6 +245,16 @@ pub struct TaskCloseParams {
 pub struct TaskCloseResult {
     pub task_id: String,
     pub closed: bool,
+    /// Optional advisory note — e.g. "note: N open subtask(s)" when the
+    /// closed task still has open children. `None` when there's nothing
+    /// to flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Completeness gaps surfaced at close time (from `completeness::assess`).
+    /// Non-blocking advisory — the close always succeeds. Empty when the task
+    /// has no detected gaps; omitted from the wire shape in that case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completeness_gaps: Vec<String>,
 }
 
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
@@ -423,6 +441,24 @@ impl TaskJournalServer {
                 std::fs::create_dir_all(events_path.parent().unwrap())?;
 
                 let task_id = tj_core::new_task_id();
+
+                // Validate --parent before writing the open event: the parent
+                // must exist and the link must not introduce a cycle. Needs the
+                // derived SQLite state, so ingest the JSONL tail first.
+                if let Some(ref parent_id) = p.parent {
+                    let conn_arc = cached_open(&state_path)?;
+                    let conn = conn_arc
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                    if !tj_core::db::task_exists(&conn, parent_id)? {
+                        anyhow::bail!("parent task {parent_id} does not exist");
+                    }
+                    if tj_core::db::would_create_cycle(&conn, &task_id, parent_id)? {
+                        anyhow::bail!("setting parent {parent_id} would create a cycle");
+                    }
+                }
+
                 let mut event = tj_core::event::Event::new(
                     task_id.clone(),
                     tj_core::event::EventType::Open,
@@ -431,6 +467,9 @@ impl TaskJournalServer {
                     p.initial_context.clone().unwrap_or_else(|| p.title.clone()),
                 );
                 event.meta = serde_json::json!({"title": p.title.clone()});
+                if let Some(ref parent_id) = p.parent {
+                    event.meta["parent_id"] = serde_json::Value::String(parent_id.clone());
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     tj_core::session_id::session_id_from_env().as_deref(),
@@ -478,6 +517,15 @@ impl TaskJournalServer {
                 std::fs::create_dir_all(events_path.parent().unwrap())?;
 
                 let event_type = parse_event_type(&p.event_type)?;
+                // v0.12.0: structured alternatives are decision-only. Reject
+                // them on any other type with a clear error rather than
+                // silently dropping the payload.
+                if p.alternatives.is_some() && event_type != tj_core::event::EventType::Decision {
+                    anyhow::bail!(
+                        "`alternatives` is only valid on a `decision` event (got `{}`)",
+                        p.event_type
+                    );
+                }
                 let mut event = tj_core::event::Event::new(
                     &p.task_id,
                     event_type,
@@ -487,6 +535,11 @@ impl TaskJournalServer {
                 );
                 event.corrects = p.corrects.clone();
                 event.supersedes = p.supersedes.clone();
+                if let Some(alts) = &p.alternatives {
+                    if let Some(obj) = event.meta.as_object_mut() {
+                        obj.insert("alternatives".into(), alts.clone());
+                    }
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     tj_core::session_id::session_id_from_env().as_deref(),
@@ -518,10 +571,11 @@ impl TaskJournalServer {
     ) -> Result<Json<TaskCloseResult>, McpError> {
         traced_tool("task_close", async move {
             let task_id = p.task_id.clone();
-            run_blocking(move || {
+            let (open_kids, gaps) = run_blocking(move || {
                 let (project_hash, events_path, state_path) = project_paths()?;
 
                 let conn_arc = cached_open(&state_path)?;
+                let open_kids;
                 {
                     let conn = conn_arc
                         .lock()
@@ -547,6 +601,7 @@ impl TaskJournalServer {
                     if let Some(o) = p.outcome.as_deref() {
                         tj_core::db::set_task_outcome(&conn, &p.task_id, o, p.outcome_tag.as_deref())?;
                     }
+                    open_kids = tj_core::db::count_open_children(&conn, &p.task_id)?;
                 } // release the connection lock before doing the JSONL append
 
                 let mut event = tj_core::event::Event::new(
@@ -573,12 +628,35 @@ impl TaskJournalServer {
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
-                Ok(())
+
+                // Non-blocking completeness check. The close above already
+                // succeeded; re-open, apply the close event to the index, then
+                // assess. Any error here must NOT fail the close — handle
+                // locally, never `?`-propagate.
+                let mut gaps: Vec<String> = Vec::new();
+                if let Ok(conn) = tj_core::db::open(&state_path) {
+                    let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
+                    if let Ok(report) = tj_core::completeness::assess(
+                        &conn,
+                        &p.task_id,
+                        tj_core::completeness::pending_count(),
+                    ) {
+                        gaps = report.gaps.into_iter().map(|g| g.detail).collect();
+                    }
+                }
+                Ok((open_kids, gaps))
             })
             .await?;
+            let note = if open_kids > 0 {
+                Some(format!("note: {open_kids} open subtask(s)"))
+            } else {
+                None
+            };
             Ok(Json(TaskCloseResult {
                 task_id,
                 closed: true,
+                note,
+                completeness_gaps: gaps,
             }))
         })
         .await
@@ -665,7 +743,32 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // The handler tests intentionally hold the handler_env() mutex across
+    // `.await` to serialize access to the process-global PROJECT_DIR_OVERRIDE
+    // and XDG_DATA_HOME. On a current-thread runtime this is safe.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
+
+    /// Handler tests touch process-global state (PROJECT_DIR_OVERRIDE OnceLock
+    /// and the XDG_DATA_HOME env var), so they must run one at a time and share
+    /// a single project dir. This guard serializes them and lazily pins the
+    /// override and XDG to a single persistent tempdir for the whole test binary.
+    fn handler_env() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+        static PROJ: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = HOME.get_or_init(|| tempfile::TempDir::new().unwrap());
+        let proj = PROJ.get_or_init(|| tempfile::TempDir::new().unwrap());
+        std::env::set_var("XDG_DATA_HOME", home.path());
+        let _ = PROJECT_DIR_OVERRIDE.set(proj.path().to_path_buf());
+        guard
+    }
 
     fn keys_of(v: &serde_json::Value) -> Vec<String> {
         v.as_object()
@@ -713,6 +816,8 @@ mod tests {
         let close = TaskCloseResult {
             task_id: "tj-x".into(),
             closed: true,
+            note: None,
+            completeness_gaps: Vec::new(),
         };
         assert!(!keys_of(&serde_json::to_value(&close).unwrap()).contains(&"stub".to_string()));
     }
@@ -850,6 +955,215 @@ mod tests {
         assert!(cli.project_dir.is_none());
     }
 
+    #[tokio::test]
+    async fn event_add_decision_stamps_alternatives_meta() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Alt task".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let alts = serde_json::json!([
+            {"option": "SQLite", "chosen": true, "rationale": "embedded"},
+            {"option": "Postgres", "chosen": false, "rationale": "too heavy"}
+        ]);
+        let res = server
+            .event_add(Parameters(EventAddParams {
+                task_id: task.clone(),
+                event_type: "decision".into(),
+                text: "Use SQLite".into(),
+                corrects: None,
+                supersedes: None,
+                alternatives: Some(alts.clone()),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let (_, events_path, _) = project_paths().unwrap();
+        let jsonl = std::fs::read_to_string(&events_path).unwrap();
+        let ev = jsonl
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v.get("event_id").and_then(|x| x.as_str()) == Some(res.event_id.as_str()))
+            .expect("decision event in jsonl");
+        assert_eq!(ev["meta"]["alternatives"], alts);
+    }
+
+    #[tokio::test]
+    async fn event_add_rejects_alternatives_on_non_decision() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Reject task".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let res = server
+            .event_add(Parameters(EventAddParams {
+                task_id: task,
+                event_type: "finding".into(),
+                text: "some finding".into(),
+                corrects: None,
+                supersedes: None,
+                alternatives: Some(serde_json::json!([{"option": "x", "chosen": true}])),
+            }))
+            .await;
+        let err = match res {
+            Ok(_) => panic!("alternatives on a finding must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("alternatives") && msg.contains("decision"),
+            "error should explain alternatives is decision-only: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_create_with_parent_stamps_meta() {
+        // Isolate state under a temp XDG home and a unique project dir
+        // (set once via PROJECT_DIR_OVERRIDE). Create a parent, then a child
+        // with parent = Some(parent_id); assert the child's open event in the
+        // JSONL carries meta.parent_id.
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let parent = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Parent".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let child = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Child".into(),
+                initial_context: None,
+                goal: None,
+                parent: Some(parent.clone()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let (_, events_path, _) = project_paths().unwrap();
+        let jsonl = std::fs::read_to_string(&events_path).unwrap();
+        let child_open = jsonl
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v.get("task_id").and_then(|x| x.as_str()) == Some(child.as_str()))
+            .expect("child open event");
+        assert_eq!(
+            child_open["meta"]["parent_id"].as_str(),
+            Some(parent.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn task_close_notes_open_subtasks() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let parent = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Parent".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        // One open child under the parent.
+        server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Child".into(),
+                initial_context: None,
+                goal: None,
+                parent: Some(parent.clone()),
+            }))
+            .await
+            .unwrap();
+
+        let res = server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: parent.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res.note.as_deref(), Some("note: 1 open subtask(s)"));
+    }
+
+    #[tokio::test]
+    async fn task_close_reports_completeness_gaps() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        // Create a task WITH a goal so NoGoal won't fire.
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Gap me".into(),
+                initial_context: None,
+                goal: Some("ship it".into()),
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        // Close WITHOUT an outcome → ClosedNoOutcome gap.
+        let res = server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: task.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(res.closed);
+        assert!(
+            res.completeness_gaps
+                .iter()
+                .any(|g| g.contains("closed without a recorded outcome")),
+            "gaps: {:?}",
+            res.completeness_gaps
+        );
+    }
+
     #[test]
     fn into_mcp_error_carries_full_anyhow_chain() {
         // Down-stream callers rely on McpError.message containing the full
@@ -864,6 +1178,12 @@ mod tests {
 
     #[test]
     fn task_pack_returns_rpc_error_when_state_dir_is_unusable() {
+        // This test mutates the process-global XDG_DATA_HOME, which the
+        // task_create/task_close handler tests read. Hold the same lock so
+        // it is serialized with them — otherwise it poisons their env mid-run
+        // and they fail with an unrelated path error (flaky under parallel CI).
+        let _env = handler_env();
+
         // Force tj_core::paths::state_dir to fail by pointing it at a path
         // that cannot be created. We do this through XDG_DATA_HOME pointing
         // at /dev/null which directories crate refuses. The handler must
@@ -875,9 +1195,6 @@ mod tests {
         // path via project_paths() and verify the conversion does the
         // right thing.
         let prev = std::env::var("XDG_DATA_HOME").ok();
-        // SAFETY: this test does not run concurrently with other tests
-        // that read XDG_DATA_HOME — see the env-var test in tj-core for
-        // the same pattern.
         unsafe {
             std::env::set_var("XDG_DATA_HOME", "/dev/null/cannot-create-here");
         }

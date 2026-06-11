@@ -14,3 +14,6 @@
 # Token Pilot local cache
 .token-pilot/
 .token-pilot-fingerprint.json
+
+# Local design specs & plans (not versioned)
+.docs/
