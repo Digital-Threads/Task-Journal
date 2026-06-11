@@ -202,6 +202,9 @@ pub struct TaskCreateParams {
     /// "why was this done?" answers weeks later. Optional only for
     /// backwards compat; agents should always pass it.
     pub goal: Option<String>,
+    /// Parent task id — makes this a subtask of <id>. Validated: the
+    /// parent must exist and the link must not introduce a cycle.
+    pub parent: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskCreateResult {
@@ -423,6 +426,24 @@ impl TaskJournalServer {
                 std::fs::create_dir_all(events_path.parent().unwrap())?;
 
                 let task_id = tj_core::new_task_id();
+
+                // Validate --parent before writing the open event: the parent
+                // must exist and the link must not introduce a cycle. Needs the
+                // derived SQLite state, so ingest the JSONL tail first.
+                if let Some(ref parent_id) = p.parent {
+                    let conn_arc = cached_open(&state_path)?;
+                    let conn = conn_arc
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                    if !tj_core::db::task_exists(&conn, parent_id)? {
+                        anyhow::bail!("parent task {parent_id} does not exist");
+                    }
+                    if tj_core::db::would_create_cycle(&conn, &task_id, parent_id)? {
+                        anyhow::bail!("setting parent {parent_id} would create a cycle");
+                    }
+                }
+
                 let mut event = tj_core::event::Event::new(
                     task_id.clone(),
                     tj_core::event::EventType::Open,
@@ -431,6 +452,9 @@ impl TaskJournalServer {
                     p.initial_context.clone().unwrap_or_else(|| p.title.clone()),
                 );
                 event.meta = serde_json::json!({"title": p.title.clone()});
+                if let Some(ref parent_id) = p.parent {
+                    event.meta["parent_id"] = serde_json::Value::String(parent_id.clone());
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     tj_core::session_id::session_id_from_env().as_deref(),
@@ -848,6 +872,59 @@ mod tests {
 
         let cli = Cli::try_parse_from(["task-journal-mcp"]).unwrap();
         assert!(cli.project_dir.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_create_with_parent_stamps_meta() {
+        // Isolate state under a temp XDG home and a unique project dir
+        // (set once via PROJECT_DIR_OVERRIDE). Create a parent, then a child
+        // with parent = Some(parent_id); assert the child's open event in the
+        // JSONL carries meta.parent_id.
+        let xdg = tempfile::TempDir::new().unwrap();
+        let proj = tempfile::TempDir::new().unwrap();
+        std::env::set_var("XDG_DATA_HOME", xdg.path());
+        // OnceLock — only this test sets it; ignore if a prior test already did.
+        let _ = PROJECT_DIR_OVERRIDE.set(proj.path().to_path_buf());
+
+        let server = TaskJournalServer;
+
+        let parent = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Parent".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let child = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Child".into(),
+                initial_context: None,
+                goal: None,
+                parent: Some(parent.clone()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let (_, events_path, _) = resolve_project_paths(proj.path()).unwrap();
+        let jsonl = std::fs::read_to_string(&events_path).unwrap();
+        let child_open = jsonl
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v.get("task_id").and_then(|x| x.as_str()) == Some(child.as_str()))
+            .expect("child open event");
+        assert_eq!(
+            child_open["meta"]["parent_id"].as_str(),
+            Some(parent.as_str())
+        );
+
+        std::env::remove_var("XDG_DATA_HOME");
     }
 
     #[test]
