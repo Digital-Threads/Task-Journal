@@ -100,6 +100,16 @@ const MIGRATION_004: &str = r#"
 DELETE FROM task_pack_cache;
 "#;
 
+/// v0.12.0 dream Pass A — per-project watermark of the last successful
+/// dream run. Sessions modified after this are in scope for the next run.
+const MIGRATION_005: &str = r#"
+CREATE TABLE IF NOT EXISTS dream_state (
+  project_hash    TEXT PRIMARY KEY,
+  last_dream_at   TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -118,6 +128,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         sql: MIGRATION_004,
+    },
+    Migration {
+        version: 5,
+        sql: MIGRATION_005,
     },
 ];
 
