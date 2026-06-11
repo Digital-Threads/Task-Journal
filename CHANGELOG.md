@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Self-tagging is now the primary capture path.** Rewrote the bundled
+  `task-journal` skill (`plugin/skills/task-journal/SKILL.md`) around explicit
+  agent self-tagging: open a task with a `goal`, append typed events at the
+  moment of commitment (with `alternatives` on decisions), and `task_close`
+  with a written `outcome` + `outcome_tag` so packs render Goal → Decisions →
+  Outcome without relying on the classifier. Auto-capture is reframed as a
+  best-effort backstop that degrades to heuristic-only without an LLM backend.
+  Removed the stale `evidence_strength` reference (no such param) and added the
+  real `goal` / `alternatives` / `outcome_tag` params. README "How it works"
+  updated to match. Plugin minor bump (plugin.json + marketplace 0.12.0 →
+  0.13.0).
+- `task_create` MCP tool description now nudges passing `goal` (expected-always)
+  instead of only mentioning title + initial context. No behavior change.
+
 ## [0.12.0]
 
 ### Added

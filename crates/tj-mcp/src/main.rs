@@ -429,7 +429,7 @@ impl TaskJournalServer {
 
     #[tool(
         name = "task_create",
-        description = "Open a new task with title and optional initial context."
+        description = "Open a new task. Always pass `goal` (one sentence: what the user is trying to accomplish) — it is the first line of every resume pack and the anchor for \"why was this done?\" weeks later. `title` is a short label; `initial_context` is optional."
     )]
     async fn task_create(
         &self,
