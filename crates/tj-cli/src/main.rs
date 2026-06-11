@@ -3257,6 +3257,7 @@ fn recent_task_contexts(
             task_id,
             title,
             last_events,
+            constraints: vec![],
         });
     }
     Ok(out)
@@ -3335,6 +3336,7 @@ fn auto_open_task_from_prompt(
         task_id,
         title,
         last_events: vec![],
+        constraints: vec![],
     })
 }
 

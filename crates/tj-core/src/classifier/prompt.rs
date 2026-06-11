@@ -97,6 +97,7 @@ mod tests {
                 task_id: "tj-7f3a".into(),
                 title: "OAuth login".into(),
                 last_events: vec!["[hypothesis] PKCE vs implicit".into()],
+                constraints: vec![],
             }],
         };
         let p = build(&input);
@@ -118,6 +119,7 @@ mod tests {
                     last_events: (0..30)
                         .map(|j| format!("[finding] very long evidence text {i}/{j} ").repeat(20))
                         .collect(),
+                    constraints: vec![],
                 })
                 .collect(),
         };

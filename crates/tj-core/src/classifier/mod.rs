@@ -16,6 +16,9 @@ pub struct TaskContext {
     pub task_id: String,
     pub title: String,
     pub last_events: Vec<String>,
+    /// The task's most-recent `constraint` events (≤ N). Empty when the
+    /// task has no constraints — the prompt is then unchanged.
+    pub constraints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -95,6 +98,17 @@ mod tests {
                 None => std::env::remove_var("ANTHROPIC_API_KEY"),
             }
         }
+    }
+
+    #[test]
+    fn task_context_has_constraints_field() {
+        let c = TaskContext {
+            task_id: "tj-1".into(),
+            title: "t".into(),
+            last_events: vec![],
+            constraints: vec!["must support PHP 7.4".into()],
+        };
+        assert_eq!(c.constraints, vec!["must support PHP 7.4".to_string()]);
     }
 
     #[test]

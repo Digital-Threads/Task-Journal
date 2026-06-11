@@ -84,6 +84,7 @@ mod tests {
                 task_id: "tj-abc".into(),
                 title: "test".into(),
                 last_events: vec![],
+                constraints: vec![],
             }],
         }
     }
