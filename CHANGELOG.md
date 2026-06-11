@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.12.0]
 
 ### Added
+- Close gate: closing a task now surfaces its completeness gaps (from
+  `completeness::assess`) — CLI prints them to stderr, MCP `task_close` returns
+  them in a new `completeness_gaps` field. Non-blocking: the close always
+  succeeds.
 - Capture-completeness flagging: a task's resume-pack now shows a `Completeness`
   section listing structural gaps (closed without outcome, decisions without
   evidence, unconfirmed suggested events, missing goal, unclassified pending
