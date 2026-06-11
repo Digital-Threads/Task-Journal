@@ -3942,6 +3942,48 @@ mod inline_tests {
     use super::*;
 
     #[test]
+    fn flatten_transcript_tags_roles_in_order() {
+        use tj_core::session::parser::parse_session;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sess-1.jsonl");
+        std::fs::write(&p,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"why?\"}}\n\
+             {\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"because X\"}]}}\n").unwrap();
+        let parsed = parse_session(&p).unwrap();
+        let t = flatten_transcript(&parsed);
+        let u = t.find("why?").unwrap();
+        let a = t.find("because X").unwrap();
+        assert!(u < a, "user turn should precede assistant turn");
+    }
+
+    #[test]
+    fn task_matches_by_session_id_or_time_window() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let mut tagged =
+            Event::new("tj-1", EventType::Finding, Author::Agent, Source::Hook, "x".into());
+        tagged.meta = serde_json::json!({"session_id": "sess-1"});
+        assert!(task_matches_session(&[tagged], "sess-1", None, None));
+
+        let mut legacy =
+            Event::new("tj-2", EventType::Finding, Author::Agent, Source::Hook, "y".into());
+        legacy.timestamp = "2026-01-01T00:00:30Z".into();
+        legacy.meta = serde_json::json!({}); // no session_id
+        assert!(task_matches_session(
+            &[legacy.clone()],
+            "sess-1",
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T00:01:00Z"),
+        ));
+        // Outside the window and no session id → no match.
+        assert!(!task_matches_session(
+            &[legacy],
+            "sess-1",
+            Some("2026-02-01T00:00:00Z"),
+            Some("2026-02-01T00:01:00Z"),
+        ));
+    }
+
+    #[test]
     fn persist_pending_v2_includes_session_id_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join("events").join("h.jsonl");
