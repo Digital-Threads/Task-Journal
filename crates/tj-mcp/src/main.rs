@@ -520,9 +520,7 @@ impl TaskJournalServer {
                 // v0.12.0: structured alternatives are decision-only. Reject
                 // them on any other type with a clear error rather than
                 // silently dropping the payload.
-                if p.alternatives.is_some()
-                    && event_type != tj_core::event::EventType::Decision
-                {
+                if p.alternatives.is_some() && event_type != tj_core::event::EventType::Decision {
                     anyhow::bail!(
                         "`alternatives` is only valid on a `decision` event (got `{}`)",
                         p.event_type
@@ -756,7 +754,10 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
         static PROJ: OnceLock<tempfile::TempDir> = OnceLock::new();
-        let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = HOME.get_or_init(|| tempfile::TempDir::new().unwrap());
         let proj = PROJ.get_or_init(|| tempfile::TempDir::new().unwrap());
         std::env::set_var("XDG_DATA_HOME", home.path());
@@ -1172,6 +1173,12 @@ mod tests {
 
     #[test]
     fn task_pack_returns_rpc_error_when_state_dir_is_unusable() {
+        // This test mutates the process-global XDG_DATA_HOME, which the
+        // task_create/task_close handler tests read. Hold the same lock so
+        // it is serialized with them — otherwise it poisons their env mid-run
+        // and they fail with an unrelated path error (flaky under parallel CI).
+        let _env = handler_env();
+
         // Force tj_core::paths::state_dir to fail by pointing it at a path
         // that cannot be created. We do this through XDG_DATA_HOME pointing
         // at /dev/null which directories crate refuses. The handler must
@@ -1183,9 +1190,6 @@ mod tests {
         // path via project_paths() and verify the conversion does the
         // right thing.
         let prev = std::env::var("XDG_DATA_HOME").ok();
-        // SAFETY: this test does not run concurrently with other tests
-        // that read XDG_DATA_HOME — see the env-var test in tj-core for
-        // the same pattern.
         unsafe {
             std::env::set_var("XDG_DATA_HOME", "/dev/null/cannot-create-here");
         }
