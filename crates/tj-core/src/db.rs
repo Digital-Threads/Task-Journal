@@ -943,6 +943,32 @@ pub fn parent_of(conn: &Connection, task_id: &str) -> anyhow::Result<Option<Stri
     })
 }
 
+/// True if setting `new_parent` as the parent of `task_id` would create a
+/// cycle (i.e. `new_parent` is `task_id` itself or a descendant of it).
+/// Walks ancestors of `new_parent`; a depth cap guards against pre-existing
+/// corrupt cycles.
+pub fn would_create_cycle(
+    conn: &Connection,
+    task_id: &str,
+    new_parent: &str,
+) -> anyhow::Result<bool> {
+    if task_id == new_parent {
+        return Ok(true);
+    }
+    let mut cursor = Some(new_parent.to_string());
+    for _ in 0..64 {
+        let Some(cur) = cursor else {
+            return Ok(false);
+        };
+        if cur == task_id {
+            return Ok(true);
+        }
+        cursor = parent_of(conn, &cur)?;
+    }
+    // Depth cap exceeded — treat as a cycle to be safe.
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1567,5 +1593,23 @@ mod tests {
 
         assert_eq!(parent_of(&conn, "c1").unwrap().as_deref(), Some("p"));
         assert_eq!(parent_of(&conn, "p").unwrap(), None);
+    }
+
+    #[test]
+    fn cycle_guard_rejects_self_and_ancestor() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("a", "A"), "ph").unwrap();
+        let mut b = make_open_event("b", "B");
+        b.meta = serde_json::json!({"title": "B", "parent_id": "a"});
+        upsert_task_from_event(&conn, &b, "ph").unwrap();
+
+        // a is b's ancestor → making a a child of b is a cycle.
+        assert!(would_create_cycle(&conn, "a", "b").unwrap());
+        // self-parent is a cycle.
+        assert!(would_create_cycle(&conn, "a", "a").unwrap());
+        // unrelated parent is fine.
+        upsert_task_from_event(&conn, &make_open_event("x", "X"), "ph").unwrap();
+        assert!(!would_create_cycle(&conn, "x", "a").unwrap());
     }
 }
