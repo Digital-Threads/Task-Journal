@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.12.0]
 
 ### Added
+- Constraint-as-context: the event classifier now sees each active task's most
+  recent `constraint` events (≤ 5) in its prompt, under a "Known constraints for
+  <task>" block, with an instruction to prefer `rejection`/`correction` when a
+  chunk violates a constraint. Additive — tasks without constraints get the exact
+  prior prompt.
 - Push-recall: after a tool call, the PostToolUse hook surfaces a relevant prior
   `rejection`/`decision` via `additionalContext` ("⚠ recall: in task X you
   previously rejected …"), so the agent doesn't re-walk a ruled-out path.
