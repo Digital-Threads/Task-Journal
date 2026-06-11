@@ -49,6 +49,7 @@ mod task_id_tests {
 
 pub mod artifacts;
 pub mod classifier;
+pub mod completeness;
 pub mod db;
 pub mod event;
 pub mod fts;
