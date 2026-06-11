@@ -118,6 +118,16 @@ ALTER TABLE tasks ADD COLUMN parent_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
 "#;
 
+/// v0.12.0 structured decision alternatives — nullable `alternatives`
+/// carries the JSON array from a decision event's `meta.alternatives`
+/// (objects like `{option, chosen, rationale}`). Existing decisions stay
+/// NULL; the append-only log is untouched. Wipes the pack cache so packs
+/// re-render with the alternatives block once events carry it.
+const MIGRATION_007: &str = r#"
+ALTER TABLE decisions ADD COLUMN alternatives TEXT;
+DELETE FROM task_pack_cache;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -144,6 +154,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 6,
         sql: MIGRATION_006,
+    },
+    Migration {
+        version: 7,
+        sql: MIGRATION_007,
     },
 ];
 
@@ -807,10 +821,17 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     )?;
 
     if event.event_type == EventType::Decision {
+        // v0.12.0: project structured alternatives (meta.alternatives) into
+        // a dedicated column so pack can render "considered A/B/C, chose X".
+        // Stored as the verbatim JSON of the meta value; NULL when absent.
+        let alternatives_json = match event.meta.get("alternatives") {
+            Some(v) if !v.is_null() => Some(serde_json::to_string(v)?),
+            _ => None,
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO decisions(decision_id, task_id, text, status)
-             VALUES (?1, ?2, ?3, 'active')",
-            rusqlite::params![event.event_id, event.task_id, event.text],
+            "INSERT OR REPLACE INTO decisions(decision_id, task_id, text, status, alternatives)
+             VALUES (?1, ?2, ?3, 'active', ?4)",
+            rusqlite::params![event.event_id, event.task_id, event.text, alternatives_json],
         )?;
     }
 
@@ -1232,6 +1253,66 @@ mod tests {
         assert_eq!(id, dec.event_id);
         assert_eq!(text, "Adopt Rust");
         assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn index_event_projects_decision_alternatives_into_column() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        let mut dec = crate::event::Event::new(
+            "tj-alt",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Use SQLite".into(),
+        );
+        dec.meta = serde_json::json!({
+            "alternatives": [
+                {"option": "SQLite", "chosen": true, "rationale": "embedded, zero-ops"},
+                {"option": "Postgres", "chosen": false, "rationale": "too heavy for local tool"}
+            ]
+        });
+        upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        index_event(&conn, &dec).unwrap();
+
+        let alts: Option<String> = conn
+            .query_row(
+                "SELECT alternatives FROM decisions WHERE decision_id=?1",
+                rusqlite::params![dec.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let alts = alts.expect("alternatives column should be populated");
+        let parsed: serde_json::Value = serde_json::from_str(&alts).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert_eq!(parsed[0]["option"], "SQLite");
+        assert_eq!(parsed[0]["chosen"], true);
+    }
+
+    #[test]
+    fn index_event_decision_without_alternatives_leaves_column_null() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        let dec = crate::event::Event::new(
+            "tj-noalt",
+            crate::event::EventType::Decision,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            "Plain decision".into(),
+        );
+        upsert_task_from_event(&conn, &dec, "feedface").unwrap();
+        index_event(&conn, &dec).unwrap();
+
+        let alts: Option<String> = conn
+            .query_row(
+                "SELECT alternatives FROM decisions WHERE decision_id=?1",
+                rusqlite::params![dec.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(alts.is_none());
     }
 
     #[test]
