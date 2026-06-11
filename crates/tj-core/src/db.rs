@@ -630,10 +630,7 @@ pub fn reclassify_task_artifacts(conn: &Connection, task_id: &str) -> anyhow::Re
             rusqlite::params![json, event_id],
         )?;
     }
-    conn.execute(
-        "DELETE FROM task_pack_cache WHERE task_id = ?1",
-        rusqlite::params![task_id],
-    )?;
+    invalidate_pack_cascade(conn, task_id)?;
     Ok(count)
 }
 
@@ -844,11 +841,9 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         )?;
     }
 
-    // Invalidate any cached pack for this task.
-    conn.execute(
-        "DELETE FROM task_pack_cache WHERE task_id=?1",
-        rusqlite::params![event.task_id],
-    )?;
+    // Invalidate any cached pack for this task — and its parent, whose
+    // Subtasks roll-up depends on this child.
+    invalidate_pack_cascade(conn, &event.task_id)?;
 
     Ok(())
 }
@@ -967,6 +962,21 @@ pub fn would_create_cycle(
     }
     // Depth cap exceeded — treat as a cycle to be safe.
     Ok(true)
+}
+
+/// Clear the pack cache for a task and its parent (roll-up depends on both).
+pub fn invalidate_pack_cascade(conn: &Connection, task_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM task_pack_cache WHERE task_id = ?1",
+        rusqlite::params![task_id],
+    )?;
+    if let Some(parent) = parent_of(conn, task_id)? {
+        conn.execute(
+            "DELETE FROM task_pack_cache WHERE task_id = ?1",
+            rusqlite::params![parent],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1611,5 +1621,32 @@ mod tests {
         // unrelated parent is fine.
         upsert_task_from_event(&conn, &make_open_event("x", "X"), "ph").unwrap();
         assert!(!would_create_cycle(&conn, "x", "a").unwrap());
+    }
+
+    #[test]
+    fn invalidate_cascade_clears_parent_pack() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("p", "P"), "ph").unwrap();
+        let mut c = make_open_event("c", "C");
+        c.meta = serde_json::json!({"title": "C", "parent_id": "p"});
+        upsert_task_from_event(&conn, &c, "ph").unwrap();
+
+        // Seed pack cache rows for both.
+        for id in ["p", "c"] {
+            conn.execute(
+                "INSERT INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+                 VALUES (?1, 'compact', 'x', '2026-01-01T00:00:00Z', 1)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+
+        invalidate_pack_cascade(&conn, "c").unwrap();
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_pack_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "both child and parent pack caches cleared");
     }
 }
