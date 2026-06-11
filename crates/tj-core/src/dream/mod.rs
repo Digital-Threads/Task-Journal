@@ -5,6 +5,7 @@
 //! the JSONL source of truth is never mutated.
 
 pub mod backend;
+pub mod backfill;
 pub mod http;
 pub mod prompt;
 pub mod scope;
