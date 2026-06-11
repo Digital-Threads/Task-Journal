@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Conservative (≤2 hits above a relevance threshold), read-only, best-effort
   (errors never break the hook). New `tj_core::recall::relevant_recall` engine.
   Disable with `TJ_PUSH_RECALL=0`.
+- Push-recall via `updatedMCPToolOutput`: when Claude calls an **MCP** tool whose
+  input echoes a prior rejection/decision (same `recall::relevant_recall` engine),
+  the PostToolUse hook prepends a `⚠` recall banner to what Claude sees of that
+  tool's output. MCP tools only — complements the `additionalContext` path above,
+  which skips `mcp__` tools, so a recall is never double-surfaced. The real output
+  is preserved below the banner; any miss or error passes it through unchanged.
+  Read-only, best-effort; also gated by `TJ_PUSH_RECALL=0`.
 - Close gate: closing a task now surfaces its completeness gaps (from
   `completeness::assess`) — CLI prints them to stderr, MCP `task_close` returns
   them in a new `completeness_gaps` field. Non-blocking: the close always
