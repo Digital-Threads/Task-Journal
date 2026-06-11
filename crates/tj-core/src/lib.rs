@@ -51,6 +51,7 @@ pub mod artifacts;
 pub mod classifier;
 pub mod completeness;
 pub mod db;
+pub mod dream;
 pub mod event;
 pub mod fts;
 pub mod pack;
