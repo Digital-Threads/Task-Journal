@@ -1706,7 +1706,18 @@ fn main() -> Result<()> {
                 if recent.is_empty() {
                     return Ok(());
                 }
+                // After a compaction (source=="compact"), re-inject the
+                // active task + its in-force constraints so the rebuilt
+                // context doesn't lose what it was doing. Best-effort:
+                // any error → no reminder, never abort SessionStart.
+                let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
                 let mut bundle = String::new();
+                if source == "compact" {
+                    if let Ok(Some(reminder)) = tj_core::reminder::active_task_reminder(&conn) {
+                        bundle.push_str(&reminder);
+                        bundle.push_str("\n\n");
+                    }
+                }
                 for tc in &recent {
                     let pack = tj_core::pack::assemble(
                         &conn,

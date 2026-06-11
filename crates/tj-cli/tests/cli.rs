@@ -4358,3 +4358,92 @@ fn push_recall_mcp_does_not_drop_capture() {
         "MCP tool call must still be captured into the journal, pack: {pack}"
     );
 }
+
+// Seed a task with a goal + one constraint, run SessionStart with the
+// given `source`, and return the parsed `additionalContext` string.
+fn session_start_additional_context(source: &str) -> String {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Ship the widget", "--goal", "Ship the dashboard widget"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "constraint",
+            "--text",
+            "Must ship before Friday",
+        ])
+        .assert()
+        .success();
+
+    let stdin_payload = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": source,
+    })
+    .to_string();
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(stdin_payload)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|e| panic!("SessionStart stdout must be JSON; got {body:?}; err {e}"));
+    v.get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|s| s.as_str())
+        .expect("additionalContext must be present")
+        .to_string()
+}
+
+#[test]
+fn session_start_compact_prepends_active_task_reminder() {
+    let ctx = session_start_additional_context("compact");
+    assert!(
+        ctx.starts_with("[Active task after compaction]"),
+        "compact SessionStart must lead with the reminder: {ctx}"
+    );
+    assert!(
+        ctx.contains("Ship the widget"),
+        "reminder must include the task title: {ctx}"
+    );
+    assert!(
+        ctx.contains("Goal: Ship the dashboard widget"),
+        "reminder must include the goal: {ctx}"
+    );
+    assert!(
+        ctx.contains("Must ship before Friday"),
+        "reminder must include the in-force constraint: {ctx}"
+    );
+}
+
+#[test]
+fn session_start_startup_has_no_reminder() {
+    let ctx = session_start_additional_context("startup");
+    assert!(
+        !ctx.contains("[Active task after compaction]"),
+        "non-compact SessionStart must NOT inject the reminder: {ctx}"
+    );
+}
