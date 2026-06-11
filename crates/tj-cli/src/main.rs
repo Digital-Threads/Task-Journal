@@ -595,6 +595,9 @@ enum Commands {
         /// with `task-journal goal <id> "<text>"`.
         #[arg(long)]
         goal: Option<String>,
+        /// Parent task id — makes this a subtask of <id>.
+        #[arg(long)]
+        parent: Option<String>,
     },
     /// Inspect events for a project.
     Events {
@@ -926,6 +929,7 @@ fn main() -> Result<()> {
             title,
             context,
             goal,
+            parent,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -934,6 +938,23 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&events_dir)?;
 
             let task_id = tj_core::new_task_id();
+
+            // Validate --parent before writing the open event: the parent must
+            // already exist and the link must not introduce a cycle. Needs the
+            // derived SQLite state, so ingest the JSONL tail first.
+            if let Some(ref parent_id) = parent {
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                if !tj_core::db::task_exists(&conn, parent_id)? {
+                    anyhow::bail!("parent task {parent_id} does not exist");
+                }
+                if tj_core::db::would_create_cycle(&conn, &task_id, parent_id)? {
+                    anyhow::bail!("setting parent {parent_id} would create a cycle");
+                }
+            }
+
             let mut event = tj_core::event::Event::new(
                 task_id.clone(),
                 tj_core::event::EventType::Open,
@@ -941,7 +962,11 @@ fn main() -> Result<()> {
                 tj_core::event::Source::Cli,
                 context.clone().unwrap_or_else(|| title.clone()),
             );
-            event.meta = serde_json::json!({ "title": title });
+            let mut meta = serde_json::json!({ "title": title });
+            if let Some(ref parent_id) = parent {
+                meta["parent_id"] = serde_json::Value::String(parent_id.clone());
+            }
+            event.meta = meta;
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;

@@ -3748,3 +3748,79 @@ fn precompact_dedupes_marker_within_60s_window() {
         "second PreCompact within DEDUP_WINDOW must NOT emit a new event id; got: {second_out:?}"
     );
 }
+
+/// Read the single events JSONL file under <xdg>/task-journal/events.
+fn read_events_jsonl(xdg: &std::path::Path) -> String {
+    let events_dir = xdg.join("task-journal").join("events");
+    let entry = std::fs::read_dir(&events_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .expect("an events jsonl file");
+    std::fs::read_to_string(entry.path()).unwrap()
+}
+
+#[test]
+fn create_with_parent_sets_parent_id() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    // Parent task.
+    let parent_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Parent"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Child with --parent.
+    let child_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Child", "--parent", &parent_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // The child's open event in the JSONL carries meta.parent_id == parent.
+    let jsonl = read_events_jsonl(xdg.path());
+    let child_open = jsonl
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| v.get("task_id").and_then(|x| x.as_str()) == Some(&child_id))
+        .expect("child open event");
+    assert_eq!(
+        child_open["meta"]["parent_id"].as_str(),
+        Some(parent_id.as_str())
+    );
+}
+
+#[test]
+fn create_with_missing_parent_is_rejected() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Child", "--parent", "tj-nope"])
+        .assert()
+        .failure();
+}
