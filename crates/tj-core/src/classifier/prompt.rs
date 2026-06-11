@@ -17,19 +17,42 @@ pub fn build(input: &ClassifyInput) -> String {
                     .take(3)
                     .map(|s| s.chars().take(120).collect::<String>())
                     .collect();
+                let constraints_line = if t.constraints.is_empty() {
+                    String::new()
+                } else {
+                    let cs: Vec<String> = t
+                        .constraints
+                        .iter()
+                        .map(|s| s.chars().take(120).collect::<String>())
+                        .collect();
+                    format!("\n  Known constraints for {}: {}", t.task_id, cs.join("; "))
+                };
                 format!(
-                    "- {} \"{}\": {}",
+                    "- {} \"{}\": {}{}",
                     t.task_id,
                     t.title,
                     if trimmed_events.is_empty() {
                         "(no events)".into()
                     } else {
                         trimmed_events.join("; ")
-                    }
+                    },
+                    constraints_line
                 )
             })
             .collect::<Vec<_>>()
             .join("\n")
+    };
+
+    // When any active task carries constraints, append a weigh-constraints
+    // instruction so the classifier prefers rejection/correction for chunks
+    // that violate them. Empty constraint sets expand to "" → prompt unchanged.
+    let any_constraints = input.recent_tasks.iter().any(|t| !t.constraints.is_empty());
+    let constraint_rule = if any_constraints {
+        "\n         - constraint awareness: When a chunk contradicts or violates a \
+         listed constraint for its task, prefer rejection (ruled out by the \
+         constraint) or correction (revises an earlier event that ignored it)."
+    } else {
+        ""
     };
 
     format!(
@@ -49,7 +72,7 @@ pub fn build(input: &ClassifyInput) -> String {
          IMPORTANT DISTINCTIONS:\n\
          - hypothesis vs finding: hypothesis = \"I think\"/\"maybe\"/\"could be\"; finding = \"I see\"/\"the code shows\"/\"confirmed that\"\n\
          - finding vs evidence: finding = discovered a fact; evidence = ran a test/experiment that PROVES something\n\
-         - decision vs hypothesis: decision = committed choice; hypothesis = exploring an option\n\n\
+         - decision vs hypothesis: decision = committed choice; hypothesis = exploring an option{constraint_rule}\n\n\
          ## Examples\n\
          The dashed lines separate Input (assistant or user chunk) from Output (the JSON you must produce). Use them as anchors for the boundary calls above.\n\n\
          Input: \"I think the timeout is happening because the Anthropic SDK keeps the socket open after the read.\"\n\
@@ -79,7 +102,7 @@ pub fn build(input: &ClassifyInput) -> String {
          5. A 1-2 sentence suggested_text capturing the essence. Be specific: include file names, function names, IDs when present.\n\n\
          Respond ONLY with strict JSON, no commentary:\n\
          {{\"event_type\":\"...\",\"task_id_guess\":\"...\"|null,\"confidence\":0.0,\"evidence_strength\":\"...\"|null,\"suggested_text\":\"...\"}}",
-        author=input.author_hint, text=input.text
+        author=input.author_hint, text=input.text, constraint_rule=constraint_rule
     )
 }
 
@@ -152,6 +175,42 @@ mod tests {
             json_count >= 6,
             "expected at least 6 example outputs, got {json_count}"
         );
+    }
+
+    #[test]
+    fn prompt_renders_constraints_block_when_present() {
+        let input = ClassifyInput {
+            text: "switch to async I/O".into(),
+            author_hint: "assistant".into(),
+            recent_tasks: vec![TaskContext {
+                task_id: "tj-9".into(),
+                title: "HTTP client".into(),
+                last_events: vec!["[decision] use ureq".into()],
+                constraints: vec!["must stay sync (no tokio)".into()],
+            }],
+        };
+        let p = build(&input);
+        assert!(p.contains("Known constraints for tj-9:"));
+        assert!(p.contains("must stay sync (no tokio)"));
+        // the weigh-constraints instruction appears because a task has constraints
+        assert!(p.contains("contradicts or violates a listed constraint"));
+    }
+
+    #[test]
+    fn prompt_unchanged_when_no_constraints() {
+        let input = ClassifyInput {
+            text: "x".into(),
+            author_hint: "user".into(),
+            recent_tasks: vec![TaskContext {
+                task_id: "tj-9".into(),
+                title: "t".into(),
+                last_events: vec!["[finding] y".into()],
+                constraints: vec![],
+            }],
+        };
+        let p = build(&input);
+        assert!(!p.contains("Known constraints"));
+        assert!(!p.contains("contradicts or violates a listed constraint"));
     }
 
     #[test]
