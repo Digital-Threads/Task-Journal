@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.12.0]
 
 ### Added
+- `export-memory` command: distills a task's goal, outcome, and key
+  decisions/constraints into a Claude-memory frontmatter file under
+  `~/.claude/projects/<encoded>/memory/tj-<id>-<slug>.md`, feeding Claude's
+  native long-term memory + dream. Scope: `--task <id>`, `--all-closed`
+  (default = all closed tasks); `--dry-run` prints without writing.
+  One-directional and idempotent; never reads Claude's memory or mutates the
+  append-only JSONL.
 - Active-task reminder after compaction: when Claude Code reconstructs context
   via a SessionStart with `source="compact"`, the journal now prepends the
   most-recent open task's title + goal + up to 3 in-force `constraint` texts to
