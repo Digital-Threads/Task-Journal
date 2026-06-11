@@ -245,6 +245,11 @@ pub struct TaskCloseResult {
     /// to flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Completeness gaps surfaced at close time (from `completeness::assess`).
+    /// Non-blocking advisory — the close always succeeds. Empty when the task
+    /// has no detected gaps; omitted from the wire shape in that case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completeness_gaps: Vec<String>,
 }
 
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
@@ -547,7 +552,7 @@ impl TaskJournalServer {
     ) -> Result<Json<TaskCloseResult>, McpError> {
         traced_tool("task_close", async move {
             let task_id = p.task_id.clone();
-            let open_kids = run_blocking(move || {
+            let (open_kids, gaps) = run_blocking(move || {
                 let (project_hash, events_path, state_path) = project_paths()?;
 
                 let conn_arc = cached_open(&state_path)?;
@@ -604,7 +609,23 @@ impl TaskJournalServer {
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
-                Ok(open_kids)
+
+                // Non-blocking completeness check. The close above already
+                // succeeded; re-open, apply the close event to the index, then
+                // assess. Any error here must NOT fail the close — handle
+                // locally, never `?`-propagate.
+                let mut gaps: Vec<String> = Vec::new();
+                if let Ok(conn) = tj_core::db::open(&state_path) {
+                    let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
+                    if let Ok(report) = tj_core::completeness::assess(
+                        &conn,
+                        &p.task_id,
+                        tj_core::completeness::pending_count(),
+                    ) {
+                        gaps = report.gaps.into_iter().map(|g| g.detail).collect();
+                    }
+                }
+                Ok((open_kids, gaps))
             })
             .await?;
             let note = if open_kids > 0 {
@@ -616,6 +637,7 @@ impl TaskJournalServer {
                 task_id,
                 closed: true,
                 note,
+                completeness_gaps: gaps,
             }))
         })
         .await
@@ -768,6 +790,7 @@ mod tests {
             task_id: "tj-x".into(),
             closed: true,
             note: None,
+            completeness_gaps: Vec::new(),
         };
         assert!(!keys_of(&serde_json::to_value(&close).unwrap()).contains(&"stub".to_string()));
     }
@@ -990,6 +1013,46 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(res.note.as_deref(), Some("note: 1 open subtask(s)"));
+    }
+
+    #[tokio::test]
+    async fn task_close_reports_completeness_gaps() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        // Create a task WITH a goal so NoGoal won't fire.
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Gap me".into(),
+                initial_context: None,
+                goal: Some("ship it".into()),
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        // Close WITHOUT an outcome → ClosedNoOutcome gap.
+        let res = server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: task.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(res.closed);
+        assert!(
+            res.completeness_gaps
+                .iter()
+                .any(|g| g.contains("closed without a recorded outcome")),
+            "gaps: {:?}",
+            res.completeness_gaps
+        );
     }
 
     #[test]
