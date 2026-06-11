@@ -599,6 +599,12 @@ enum Commands {
         #[arg(long)]
         parent: Option<String>,
     },
+    /// List tasks for the current project.
+    List {
+        /// Render tasks as a tree, children indented under parents.
+        #[arg(long)]
+        tree: bool,
+    },
     /// Inspect events for a project.
     Events {
         #[command(subcommand)]
@@ -985,6 +991,28 @@ fn main() -> Result<()> {
             }
 
             println!("{}", task_id);
+        }
+        Commands::List { tree } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let conn = tj_core::db::open(&state_path)?;
+            if events_path.exists() {
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            }
+            if tree {
+                for t in tj_core::db::top_level_tasks(&conn, &project_hash)? {
+                    println!("{} [{}] {}", t.task_id, t.status, t.title);
+                    for c in tj_core::db::children_of(&conn, &t.task_id)? {
+                        println!("  {} [{}] {}", c.task_id, c.status, c.title);
+                    }
+                }
+            } else {
+                for t in tj_core::db::list_tasks_by_project(&conn, &project_hash)? {
+                    println!("{} [{}] {}", t.task_id, t.status, t.title);
+                }
+            }
         }
         Commands::Events { action } => match action {
             EventsCmd::List { limit } => {

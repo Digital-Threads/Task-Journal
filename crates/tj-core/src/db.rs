@@ -902,6 +902,34 @@ pub fn list_tasks_by_project(
     Ok(rows)
 }
 
+/// Top-level tasks for a project (those with no parent), ordered like
+/// `list_tasks_by_project` — open first, then by recency. The roots of
+/// the `list --tree` view.
+pub fn top_level_tasks(conn: &Connection, project_hash: &str) -> anyhow::Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.task_id, t.title, t.status, t.last_event_at,
+                COALESCE(c.cnt, 0) AS event_count
+         FROM tasks t
+         LEFT JOIN (
+             SELECT task_id, COUNT(*) AS cnt FROM events_index GROUP BY task_id
+         ) c ON c.task_id = t.task_id
+         WHERE t.project_hash = ?1 AND t.parent_id IS NULL
+         ORDER BY (t.status = 'open') DESC, t.last_event_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![project_hash], |r| {
+            Ok(TaskRow {
+                task_id: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                status: r.get::<_, String>(2)?,
+                last_event_at: r.get::<_, String>(3)?,
+                event_count: r.get::<_, i64>(4)? as usize,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Direct children of a task (one level), newest activity first.
 pub fn children_of(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<TaskRow>> {
     let mut stmt = conn.prepare(

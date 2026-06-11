@@ -3824,3 +3824,63 @@ fn create_with_missing_parent_is_rejected() {
         .assert()
         .failure();
 }
+
+#[test]
+fn list_tree_indents_children_under_parents() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let parent_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "ParentTask"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "ChildTask", "--parent", &parent_id])
+        .assert()
+        .success();
+
+    let out = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["list", "--tree"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    let parent_line = out
+        .lines()
+        .position(|l| l.contains("ParentTask"))
+        .expect("parent line present");
+    let child_idx = out
+        .lines()
+        .position(|l| l.contains("ChildTask"))
+        .expect("child line present");
+    // Child appears after the parent and is indented.
+    assert!(child_idx > parent_line, "child must come after parent");
+    let child_line = out.lines().nth(child_idx).unwrap();
+    assert!(
+        child_line.starts_with(char::is_whitespace),
+        "child line must be indented, got: {child_line:?}"
+    );
+}
