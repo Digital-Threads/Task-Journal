@@ -54,6 +54,22 @@ pub fn decide_status(confidence: f64) -> EventStatus {
     }
 }
 
+/// Parse a model's raw text reply into a strict-JSON `ClassifyOutput`,
+/// tolerating ```json code-fence wrapping. Shared by the HTTP and agent-sdk
+/// backends so the two never diverge on how they read the verdict.
+pub(crate) fn parse_verdict(text: &str) -> anyhow::Result<ClassifyOutput> {
+    use anyhow::Context;
+    let json_str = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    serde_json::from_str(json_str)
+        .with_context(|| format!("classifier JSON parse failed; got: {json_str}"))
+}
+
+pub mod agent_sdk;
 pub mod heuristic;
 pub mod http;
 pub mod hybrid;

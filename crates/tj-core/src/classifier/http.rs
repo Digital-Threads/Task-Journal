@@ -87,15 +87,7 @@ impl Classifier for AnthropicClassifier {
             .map(|b| b.text.clone())
             .ok_or_else(|| anyhow!("no text content in response"))?;
 
-        let json_str = text
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-        let out: ClassifyOutput = serde_json::from_str(json_str)
-            .with_context(|| format!("classifier JSON parse failed; got: {json_str}"))?;
-        Ok(out)
+        super::parse_verdict(&text)
     }
 }
 

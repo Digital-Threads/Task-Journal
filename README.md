@@ -166,7 +166,7 @@ task-journal pack tj-x9rz1f --mode full
 | `doctor` | Self-check the install |
 | `rebuild-state` | Rebuild SQLite from JSONL |
 | `migrate-project` | Re-key data when a project moves on disk |
-| `install-hooks [--scope user\|project]` | Wire Claude Code auto-capture hooks |
+| `install-hooks [--scope user\|project] [--backend hybrid\|agent-sdk\|api\|heuristic]` | Wire Claude Code auto-capture hooks |
 
 ## MCP tools
 
@@ -182,10 +182,32 @@ The MCP server exposes five tools to Claude Code (and any MCP client):
 
 ## Configuration
 
+### Classifier backends
+
+The auto-capture classifier (a best-effort backstop — explicit self-tagging via the
+MCP tools is the primary path) has a heuristic stage plus an optional LLM stage. The
+LLM stage has **two** ways to reach a model, pick via `--backend` on `install-hooks`
+or `ingest-hook`:
+
+- **`agent-sdk`** — classify via the local, already-logged-in `claude` binary. **No
+  `ANTHROPIC_API_KEY` needed** — it rides your Claude subscription. Pinned to Haiku.
+  ⚠️ Since **2026-06-15** a headless `claude -p` run draws from the separate **Agent
+  SDK** monthly credit pool (~$20 Pro / $100 Max 5x / $200 Max 20x, at API rates),
+  not the interactive pool. Classification is Haiku-class and tiny (a few hundred
+  tokens per chunk), so the credit lasts a long time — but it is not strictly free.
+- **`api`** — call the Anthropic API directly. Requires `ANTHROPIC_API_KEY`.
+
+`--backend=hybrid` (the default) runs the heuristic first, then falls through the LLM
+chain `agent-sdk → api`, using whichever backends are available. Reorder the chain
+with `TJ_HYBRID_LLM_ORDER` (e.g. `api,agent-sdk` to prefer the API key). With no LLM
+backend available, the heuristic still runs and ambiguous chunks queue in `pending/`.
+
 | Env var | Effect | Default |
 |---------|--------|---------|
-| `ANTHROPIC_API_KEY` | Powers the API stage of `--backend=hybrid` (default) and is required for `--backend=api`. Without it, only the offline heuristic runs and ambiguous chunks land in the local pending queue. | _unset_ |
-| `TJ_CLASSIFIER_MODEL` | Override the Anthropic model used by the API stage. | `claude-haiku-4-5-20251001` |
+| `ANTHROPIC_API_KEY` | Enables the `api` LLM backend (and the `api` link of the hybrid chain). Optional — the `agent-sdk` backend needs no key. | _unset_ |
+| `TJ_AGENT_SDK_MODEL` | Override the model the `agent-sdk` backend passes to `claude --model`. | `claude-haiku-4-5` |
+| `TJ_HYBRID_LLM_ORDER` | Comma-separated fallback order for `--backend=hybrid`. | `agent-sdk,api` |
+| `TJ_CLASSIFIER_MODEL` | Override the Anthropic model used by the `api` backend. | `claude-haiku-4-5-20251001` |
 | `TJ_AUTO_OPEN_TASKS` | Set to `0` / `false` to disable auto-opening a task from `UserPromptSubmit` when no open task exists. | `1` |
 
 ## Event types
