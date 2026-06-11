@@ -4527,7 +4527,7 @@ fn export_memory_dry_run_prints_path_and_content_no_write() {
         .args(["export-memory", "--task", &task_id, "--dry-run"])
         .assert()
         .success()
-        .stdout(contains(&format!("memory/tj-{task_id}-ship-x.md")))
+        .stdout(contains(format!("memory/tj-{task_id}-ship-x.md")))
         .stdout(contains("name: ship-x"));
 
     // Nothing written under the sandboxed Claude config dir.

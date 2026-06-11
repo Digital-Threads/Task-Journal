@@ -4325,7 +4325,7 @@ fn build_dream_inputs(
         )?;
         let tasks: Vec<_> = candidates
             .into_iter()
-            .filter(|t| task_filter.map_or(true, |f| f == t.task_id))
+            .filter(|t| task_filter.is_none_or(|f| f == t.task_id))
             .collect();
         if tasks.is_empty() {
             continue;

@@ -743,12 +743,17 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // The handler tests intentionally hold the handler_env() mutex across
+    // `.await` to serialize access to the process-global PROJECT_DIR_OVERRIDE
+    // and XDG_DATA_HOME. On a current-thread runtime this is safe.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
 
     /// Handler tests touch process-global state (PROJECT_DIR_OVERRIDE OnceLock
-    /// + XDG_DATA_HOME env), so they must run one at a time and share a single
-    /// project dir. This guard serializes them and lazily pins the override +
-    /// XDG to a single persistent tempdir for the whole test binary.
+    /// and the XDG_DATA_HOME env var), so they must run one at a time and share
+    /// a single project dir. This guard serializes them and lazily pins the
+    /// override and XDG to a single persistent tempdir for the whole test binary.
     fn handler_env() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
