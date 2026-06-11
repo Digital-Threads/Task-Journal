@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Manual trigger; `--dry-run`, `--since`, `--task`, `--limit`. Reuses the
   Anthropic HTTP backend via `TJ_DREAM_MODEL` / `TJ_DREAM_MAX_TOKENS`.
   Additive — the JSONL source of truth is never mutated.
+- Subtask hierarchy: tasks can have a `parent_id`. Set at creation via
+  `task-journal create --parent <id>` or the MCP `task_create` `parent` param
+  (validated: parent must exist, no cycles). A parent's resume-pack rolls up its
+  direct children (status, id, title). `list --tree` renders the hierarchy.
+  Closing a parent with open children warns but proceeds. Additive — existing
+  flat tasks are unaffected (`parent_id` NULL).
 
 ## [0.11.1] - 2026-06-08
 
