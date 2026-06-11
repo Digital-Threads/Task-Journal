@@ -205,11 +205,18 @@ pub fn upsert_task_from_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or(&event.text)
                 .to_string();
+            let parent_id = event
+                .meta
+                .get("parent_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // ON CONFLICT intentionally does not overwrite parent_id — parent
+            // is set once at creation; re-parenting is a separate future path.
             conn.execute(
-                "INSERT INTO tasks(task_id, title, status, project_hash, opened_at, last_event_at)
-                 VALUES (?1, ?2, 'open', ?3, ?4, ?4)
+                "INSERT INTO tasks(task_id, title, status, project_hash, opened_at, last_event_at, parent_id)
+                 VALUES (?1, ?2, 'open', ?3, ?4, ?4, ?5)
                  ON CONFLICT(task_id) DO UPDATE SET last_event_at = ?4",
-                rusqlite::params![event.task_id, title, project_hash, event.timestamp],
+                rusqlite::params![event.task_id, title, project_hash, event.timestamp, parent_id],
             )?;
         }
         EventType::Close => {
@@ -1479,5 +1486,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn open_event_meta_parent_id_is_persisted() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        // Parent first.
+        upsert_task_from_event(&conn, &make_open_event("tj-parent", "Parent"), "ph").unwrap();
+
+        // Child carries meta.parent_id.
+        let mut child = make_open_event("tj-child", "Child");
+        child.meta = serde_json::json!({"title": "Child", "parent_id": "tj-parent"});
+        upsert_task_from_event(&conn, &child, "ph").unwrap();
+
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE task_id = ?1",
+                rusqlite::params!["tj-child"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent.as_deref(), Some("tj-parent"));
     }
 }
