@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-06-12
+
+### Added (reliability — no model, no cost)
+- **Hardened MCP server instructions.** `task-journal-mcp` delivers a sharper,
+  non-negotiable "you are the recorder" ritual to the agent every session
+  (open/resume a task → log decisions/rejections/findings at the moment →
+  self-check before finishing → close with an outcome). Strongest always-on
+  lever for "every session records" — it rides the MCP connection, so it works
+  regardless of hooks.
+- **`task-journal nudge`** — a tiny read-only hook that prints a UserPromptSubmit
+  `additionalContext` reminder to keep recording via the MCP tools. **No model,
+  never spawns `claude -p`, zero cost.** `install-hooks` now wires it on
+  `UserPromptSubmit` by **default** (alongside the SessionStart resume) so the
+  reminder stays fresh deep into a session.
+- `install-hooks --uninstall` now also removes the `nudge` hook.
+
+Default install stays model-free: SessionStart resume + UserPromptSubmit nudge,
+both no-`claude -p`. The per-message classifier remains opt-in via
+`--auto-capture`.
+
 ## [0.14.0] - 2026-06-12
 
 ### Changed (breaking default)

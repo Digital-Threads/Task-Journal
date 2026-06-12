@@ -836,19 +836,26 @@ fn install_hooks_writes_to_settings_json() {
     let settings_path = dir.path().join(".claude").join("settings.json");
     assert!(settings_path.exists());
     let content = std::fs::read_to_string(&settings_path).unwrap();
-    assert!(content.contains("task-journal ingest-hook"));
+    assert!(content.contains("task-journal ingest-hook")); // SessionStart resume
     assert!(
         content.contains("SessionStart"),
         "install-hooks must wire SessionStart so resume-pack injection works"
     );
-    // v0.14.0 — self-tagging-first: the default install does NOT wire the
-    // per-message classifier hooks (those spawn `claude -p`); they are opt-in
-    // via `--auto-capture`.
+    // v0.14.x — self-tagging-first: the default wires the no-model UserPromptSubmit
+    // nudge, but NOT the per-message classifier hooks (those spawn `claude -p`);
+    // the classifier is opt-in via `--auto-capture`.
     assert!(
-        !content.contains("UserPromptSubmit"),
-        "default install must not wire the per-message classifier hooks"
+        content.contains("task-journal nudge"),
+        "default must wire the no-model UserPromptSubmit nudge"
     );
-    assert!(!content.contains("PostToolUse"));
+    assert!(
+        !content.contains("PostToolUse"),
+        "default must not wire the per-message classifier hooks"
+    );
+    assert!(
+        !content.contains("\"Stop\""),
+        "default must not wire the classifier Stop hook"
+    );
 }
 
 #[test]

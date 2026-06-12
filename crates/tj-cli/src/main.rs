@@ -895,6 +895,12 @@ enum Commands {
     /// Hidden from --help; not a human command.
     #[command(hide = true)]
     Statusline,
+    /// Read-only reminder hook (no model, never spawns `claude -p`). Emits a
+    /// UserPromptSubmit additionalContext line nudging the agent to record
+    /// reasoning via the MCP tools as it goes. Wired by `install-hooks` by
+    /// default. Hidden from --help; not a human command.
+    #[command(hide = true)]
+    Nudge,
     /// Cross-task search for `rejection` events matching a topic. Helpful
     /// when the agent is about to repeat a path that was already turned
     /// down — query the topic, see the prior rejection.
@@ -1454,7 +1460,10 @@ fn main() -> Result<()> {
                             inner.retain(|h| {
                                 h.get("command")
                                     .and_then(|c| c.as_str())
-                                    .map(|c| !c.contains("task-journal ingest-hook"))
+                                    .map(|c| {
+                                        !(c.contains("task-journal ingest-hook")
+                                            || c.contains("task-journal nudge"))
+                                    })
                                     .unwrap_or(true)
                             });
                         }
@@ -1515,19 +1524,30 @@ fn main() -> Result<()> {
                     format!("task-journal ingest-hook --backend={backend} || true")
                 };
                 let cmd = cmd_string.as_str();
-                // v0.14.0 — self-tagging-first. By DEFAULT only the cheap,
-                // read-only SessionStart hook is wired: ingest-hook short-circuits
-                // on that kind, injects the resume pack + a nudge, and spawns no
-                // model. The per-message hooks (UserPromptSubmit/PostToolUse/Stop)
-                // and PreCompact are what spawn the classifier (`claude -p`); they
-                // are opt-in via `--auto-capture`. Primary capture is the agent
-                // self-tagging through the MCP tools.
+                let nudge_cmd = "task-journal nudge || true";
+                // v0.14.x — self-tagging-first. The DEFAULT wires only no-model
+                // hooks: SessionStart → ingest-hook short-circuits to inject the
+                // read-only resume pack (no classifier); UserPromptSubmit → `nudge`
+                // prints a reminder to keep recording (no model, no spawn). The
+                // per-message classifier (`claude -p`) is opt-in via
+                // `--auto-capture`, which appends `ingest-hook` to the message
+                // events. Primary capture is the agent self-tagging via the MCP
+                // tools.
                 let mut entries = serde_json::json!({
-                    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                    "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": nudge_cmd }] }],
                 });
                 if auto_capture {
                     let obj = entries.as_object_mut().expect("entries is an object");
-                    for ev in ["UserPromptSubmit", "PostToolUse", "Stop", "PreCompact"] {
+                    // UserPromptSubmit keeps the nudge AND gains the classifier.
+                    obj.insert(
+                        "UserPromptSubmit".into(),
+                        serde_json::json!([{ "matcher": "", "hooks": [
+                            { "type": "command", "command": nudge_cmd },
+                            { "type": "command", "command": cmd },
+                        ]}]),
+                    );
+                    for ev in ["PostToolUse", "Stop", "PreCompact"] {
                         obj.insert(
                             ev.to_string(),
                             serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }]),
@@ -2902,6 +2922,18 @@ fn main() -> Result<()> {
             // would visibly break the bottom strip. Better to look
             // empty than to look broken.
             print!("{}", run_statusline().unwrap_or_default());
+        }
+        Commands::Nudge => {
+            // No model, no spawn, never touches the classifier — just prints a
+            // UserPromptSubmit additionalContext reminder so the agent keeps
+            // recording via the MCP tools deep into a session.
+            let env = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "📓 task-journal — record as you go: the moment you commit to a decision, rule an approach out, or verify a fact, call event_add (open or resume a task first). Don't batch it to the end. This memory only works if you log it now."
+                }
+            });
+            print!("{env}");
         }
         Commands::Rejected {
             topic,
