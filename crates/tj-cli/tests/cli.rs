@@ -4931,3 +4931,80 @@ fn ask_with_model2vec_handles_paraphrase() {
         "model2vec must rank the refund decision first for a paraphrase; got: {first:?}"
     );
 }
+
+#[test]
+fn recall_surfaces_decision_from_another_project() {
+    // Pillar B: a decision made in project A must be recallable while working
+    // anywhere, via the shared global index. Two distinct cwds => two
+    // project_hashes => one XDG_DATA_HOME (one memory.sqlite). Hash embedder
+    // for determinism.
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+
+    let seed = |cwd: &std::path::Path, title: &str, decision: &str| {
+        let tid = String::from_utf8(
+            Command::cargo_bin("task-journal")
+                .unwrap()
+                .current_dir(cwd)
+                .env("XDG_DATA_HOME", xdg.path())
+                .args(["create", title])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(cwd)
+            .env("XDG_DATA_HOME", xdg.path())
+            .args(["event", &tid, "--type", "decision", "--text", decision])
+            .assert()
+            .success();
+        // embed --backfill syncs this project's decisions into the global index.
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(cwd)
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_EMBED", "hash")
+            .args(["embed", "--backfill"])
+            .assert()
+            .success();
+    };
+
+    seed(
+        proj_a.path(),
+        "Payments",
+        "chose to route refunds through the idempotent payment ledger",
+    );
+    seed(
+        proj_b.path(),
+        "Scheduler",
+        "use postgres advisory locks for cron leader election",
+    );
+
+    // Recall from a third location — global, cwd-independent.
+    let out = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_EMBED", "hash")
+            .args(["recall", "refund ledger idempotent", "--k", "3"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    let first = out.lines().next().unwrap_or("");
+    assert!(
+        first.contains("refund") || first.contains("ledger"),
+        "cross-project recall must surface project A's refund decision first; got: {first:?}\nfull:\n{out}"
+    );
+}

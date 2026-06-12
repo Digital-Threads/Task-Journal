@@ -38,6 +38,12 @@ pub fn metrics_dir() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join("metrics"))
 }
 
+/// Global cross-project memory index (Pillar B). One SQLite file aggregating
+/// high-signal events + embeddings from every project.
+pub fn memory_db() -> anyhow::Result<PathBuf> {
+    Ok(data_dir()?.join("memory.sqlite"))
+}
+
 pub fn project_storage_dir(project_hash: &str) -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join(project_hash))
 }

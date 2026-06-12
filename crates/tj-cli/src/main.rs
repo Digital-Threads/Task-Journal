@@ -632,6 +632,16 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         k: usize,
     },
+    /// Cross-project recall (Pillar B): search EVERY project's decisions,
+    /// rejections and constraints for reasoning relevant to the query —
+    /// prior choices and dead-ends from your whole history, not just this repo.
+    Recall {
+        /// The topic / approach to check against prior reasoning.
+        query: String,
+        /// Maximum number of results.
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+    },
     /// Render and print the resume pack for a task.
     Pack {
         /// Task id (e.g. tj-7f3a).
@@ -1162,6 +1172,7 @@ fn main() -> Result<()> {
                     break;
                 }
             }
+            sync_global_memory(&conn, &project_hash);
             println!(
                 "embedded {total} event(s) with model {} ({} dim)",
                 embedder.model_id(),
@@ -1184,6 +1195,7 @@ fn main() -> Result<()> {
             // latest events without the user running `embed` first.
             let now = chrono::Utc::now().to_rfc3339();
             tj_core::db::embed_pending(&conn, &project_hash, embedder.as_ref(), &now, 512)?;
+            sync_global_memory(&conn, &project_hash);
 
             let qv = embedder.embed_one(&query)?;
             let hits =
@@ -1196,6 +1208,29 @@ fn main() -> Result<()> {
                     println!(
                         "{:.3}  [{}] {}  ({})",
                         h.score, h.event_type, snippet, h.task_id
+                    );
+                }
+            }
+        }
+        Commands::Recall { query, k } => {
+            let global_path = tj_core::paths::memory_db()?;
+            if !global_path.exists() {
+                println!("global memory is empty — run `ask` or `embed` in a project first");
+                return Ok(());
+            }
+            let global = tj_core::memory::open(&global_path)?;
+            let embedder = tj_core::embed::default_embedder();
+            let qv = embedder.embed_one(&query)?;
+            let hits = tj_core::memory::search(&global, &qv, embedder.model_id(), k)?;
+            if hits.is_empty() {
+                println!("no relevant prior reasoning found");
+            } else {
+                for h in hits {
+                    let snippet: String = h.text.chars().take(100).collect();
+                    let proj: String = h.project_hash.chars().take(8).collect();
+                    println!(
+                        "{:.3}  [{}] {}  ({}/{})",
+                        h.score, h.event_type, snippet, proj, h.task_id
                     );
                 }
             }
@@ -3645,6 +3680,18 @@ fn recent_task_contexts(
 /// the first line trimmed to 80 chars; goal is the prompt trimmed to
 /// 200 chars. Returns a TaskContext so the classifier has somewhere
 /// to attach the same prompt as the first real event.
+/// Best-effort sync of a project's high-signal events into the global
+/// cross-project memory index. Never fails the caller — a slightly stale recall
+/// index is fine; a broken `ask`/`embed` is not.
+fn sync_global_memory(project_conn: &rusqlite::Connection, project_hash: &str) {
+    let result = tj_core::paths::memory_db()
+        .and_then(tj_core::memory::open)
+        .and_then(|g| tj_core::memory::sync_from_project(&g, project_conn, project_hash));
+    if let Err(e) = result {
+        tracing::debug!("global memory sync skipped: {e:#}");
+    }
+}
+
 fn auto_open_task_from_prompt(
     events_path: &std::path::Path,
     project_hash: &str,
