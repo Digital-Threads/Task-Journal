@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-12
+
+### Added
+- **User preferences — Pillar C (part 1).** The journal now has user-level
+  memory: durable preferences that persist across every project and session —
+  the "remember me" parity with mem0/claude-mem.
+  - `task-journal remember "<text>"` — store a preference ("respond in Russian,
+    terse", "run the full test suite before tagging"). De-duplicated.
+  - `task-journal preferences` — list them.
+  - Preferences are injected into **every session** via the SessionStart hook —
+    even in a fresh project with no events of its own — so the agent works the
+    way you want without being re-told. Capped so it never floods the prompt.
+  - Stored in the global `memory.sqlite` (`preferences` table), so they're
+    shared across all your projects.
+
+### Internal
+- `tj-core::memory`: `add_preference` / `list_preferences`. CLI
+  `remember` / `preferences`; SessionStart preference injection.
+
 ## [0.16.0] - 2026-06-12
 
 ### Added

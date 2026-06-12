@@ -5139,3 +5139,54 @@ fn recall_hook_injects_relevant_prior_reasoning() {
         "TJ_PROACTIVE_RECALL=0 must suppress injection; got: {gated:?}"
     );
 }
+
+#[test]
+fn remembered_preference_lists_and_injects_at_session_start() {
+    // Pillar C: a user preference is stored cross-project and injected into
+    // every session — even a fresh project with no events of its own.
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["remember", "respond in Russian, terse"])
+        .assert()
+        .success()
+        .stdout(contains("remembered"));
+
+    // Duplicate is a no-op.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["remember", "respond in Russian, terse"])
+        .assert()
+        .success()
+        .stdout(contains("already remembered"));
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["preferences"])
+        .assert()
+        .success()
+        .stdout(contains("respond in Russian, terse"));
+
+    // SessionStart injects the preference with no project events present.
+    let body = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("respond in Russian, terse"),
+        "SessionStart must inject standing preferences; got: {body:?}"
+    );
+    assert!(body.contains("additionalContext"));
+}

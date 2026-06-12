@@ -642,6 +642,16 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         k: usize,
     },
+    /// Record a durable user preference (Pillar C) — e.g. "prefer terse output",
+    /// "respond in Russian", "always run the full test suite before tagging".
+    /// Stored user-level (across all projects) and injected into every session
+    /// so the agent remembers how you work without being re-told.
+    Remember {
+        /// The preference text to remember.
+        text: String,
+    },
+    /// List your stored user preferences.
+    Preferences,
     /// Render and print the resume pack for a task.
     Pack {
         /// Task id (e.g. tj-7f3a).
@@ -1247,6 +1257,30 @@ fn main() -> Result<()> {
                         "{:.3}  [{}] {}  ({}/{})",
                         h.score, h.event_type, snippet, proj, h.task_id
                     );
+                }
+            }
+        }
+        Commands::Remember { text } => {
+            let global = tj_core::memory::open(tj_core::paths::memory_db()?)?;
+            let now = chrono::Utc::now().to_rfc3339();
+            if tj_core::memory::add_preference(&global, &text, &now)? {
+                println!("remembered: {}", text.trim());
+            } else {
+                println!("already remembered");
+            }
+        }
+        Commands::Preferences => {
+            let path = tj_core::paths::memory_db()?;
+            let prefs = if path.exists() {
+                tj_core::memory::list_preferences(&tj_core::memory::open(&path)?)?
+            } else {
+                Vec::new()
+            };
+            if prefs.is_empty() {
+                println!("no preferences yet — add one with `task-journal remember \"...\"`");
+            } else {
+                for p in prefs {
+                    println!("- {p}");
                 }
             }
         }
@@ -1965,10 +1999,17 @@ fn main() -> Result<()> {
             // manually each session. Empty stdout when no open tasks → no
             // injection, keeps system prompt clean for fresh projects.
             if kind == "SessionStart" {
+                // User preferences are global, so they surface even in a fresh
+                // project with no events of its own (Pillar C "remember me").
+                let prefs_block = session_preferences_block();
                 // Skip early on a clean machine: nothing to surface, and we
                 // don't want SessionStart to spawn empty SQLite files in
-                // every project Claude Code is opened in.
+                // every project Claude Code is opened in. Preferences still go
+                // out if there are any.
                 if !events_path.exists() {
+                    if !prefs_block.is_empty() {
+                        emit_session_context(&prefs_block);
+                    }
                     return Ok(());
                 }
                 let state_path =
@@ -1977,6 +2018,9 @@ fn main() -> Result<()> {
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 let recent = recent_task_contexts(&conn, 3)?;
                 if recent.is_empty() {
+                    if !prefs_block.is_empty() {
+                        emit_session_context(&prefs_block);
+                    }
                     return Ok(());
                 }
                 // After a compaction (source=="compact"), re-inject the
@@ -1985,6 +2029,12 @@ fn main() -> Result<()> {
                 // any error → no reminder, never abort SessionStart.
                 let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
                 let mut bundle = String::new();
+                // Preferences lead the bundle — they're the smallest, most
+                // durable signal about how the user wants to be worked with.
+                if !prefs_block.is_empty() {
+                    bundle.push_str(&prefs_block);
+                    bundle.push_str("\n\n");
+                }
                 if source == "compact" {
                     if let Ok(Some(reminder)) = tj_core::reminder::active_task_reminder(&conn) {
                         bundle.push_str(&reminder);
@@ -3807,6 +3857,38 @@ fn run_recall_hook() -> anyhow::Result<()> {
     });
     print!("{env}");
     Ok(())
+}
+
+/// Render the user's standing preferences as a SessionStart context block, or
+/// "" when there are none. Capped so it never floods the system prompt.
+fn session_preferences_block() -> String {
+    let prefs = match tj_core::paths::memory_db()
+        .and_then(tj_core::memory::open)
+        .and_then(|c| tj_core::memory::list_preferences(&c))
+    {
+        Ok(p) if !p.is_empty() => p,
+        _ => return String::new(),
+    };
+    let mut s = String::from("## Your standing preferences (remember these across sessions):\n");
+    for p in prefs {
+        let line = format!("- {p}\n");
+        if s.len() + line.len() > 800 {
+            break;
+        }
+        s.push_str(&line);
+    }
+    s.trim_end().to_string()
+}
+
+/// Emit a SessionStart `additionalContext` envelope and nothing else.
+fn emit_session_context(ctx: &str) {
+    let env = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": ctx.trim_end(),
+        }
+    });
+    println!("{env}");
 }
 
 fn auto_open_task_from_prompt(
