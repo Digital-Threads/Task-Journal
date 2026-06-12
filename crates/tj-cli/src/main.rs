@@ -1629,7 +1629,7 @@ fn main() -> Result<()> {
             // subscription auth (claude-memory-0kk), so the classifier
             // now sets TJ_IN_CLASSIFIER=1 in the child env and we bail
             // here when we see it.
-            if std::env::var("TJ_IN_CLASSIFIER").is_ok() {
+            if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
                 return Ok(());
             }
 
@@ -3734,7 +3734,7 @@ fn spawn_classify_worker(backend: &str) -> anyhow::Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .env("TJ_CLASSIFIER_BUMP", "1")
-        .env_remove("TJ_IN_CLASSIFIER");
+        .env_remove(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV);
     let _child = cmd.spawn().context("spawn classify-worker")?;
     // Drop child intentionally — Linux init reaps when parent exits.
     Ok(())
