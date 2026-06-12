@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-12
+
+### Changed (breaking default)
+- **Self-tagging-first: realtime auto-capture is now OFF by default.** A fresh
+  `install-hooks` wires only the cheap, read-only SessionStart resume hook — no
+  per-message classifier, no `claude -p` spawned, nothing charged. The agent
+  records reasoning directly via the MCP tools (the bundled skill drives this);
+  that is the capture mechanism. This removes the whole class of failures the
+  per-chunk `claude -p` design caused: each classification booted a full Claude
+  Code instance (CLAUDE.md + every plugin + hooks + MCP + plugin-marketplace
+  `git pull`) just to label one line — a recursion fork bomb (fixed 0.13.1), a
+  `git pull origin HEAD` storm, a runaway pending backlog, and burned Agent SDK
+  credit.
+- **Per-message auto-capture is opt-in** via `install-hooks --auto-capture`,
+  which wires the `UserPromptSubmit` / `PostToolUse` / `Stop` / `PreCompact`
+  ingest hooks (honoring `--backend`). The classifier backends
+  (`heuristic` / `agent-sdk` / `api` / `hybrid`) and the recursion guard remain
+  in the codebase, unchanged, for users who explicitly want them.
+- `dream` offline backfill is unchanged — a manual, batched LLM pass you run on
+  demand.
+
 ## [0.13.1] - 2026-06-12
 
 ### Fixed

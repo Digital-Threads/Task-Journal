@@ -743,6 +743,14 @@ enum Commands {
         /// ANTHROPIC_API_KEY (see `ingest-hook --help` for the credit note).
         #[arg(long, default_value = "hybrid")]
         backend: String,
+        /// v0.14.0: opt in to realtime auto-capture. Without it, install-hooks
+        /// wires ONLY the cheap, read-only SessionStart resume hook — no
+        /// per-message classifier, no `claude -p`, no cost. Primary capture is
+        /// the agent self-tagging via the MCP tools. With `--auto-capture` the
+        /// per-message + PreCompact ingest hooks are installed too (they spawn
+        /// the classifier, honoring `--backend`).
+        #[arg(long)]
+        auto_capture: bool,
     },
     /// Show local classifier and journal statistics.
     Stats,
@@ -1392,6 +1400,7 @@ fn main() -> Result<()> {
             uninstall,
             backfill,
             backend,
+            auto_capture,
         } => {
             let settings_path = match scope.as_str() {
                 "user" => {
@@ -1506,20 +1515,25 @@ fn main() -> Result<()> {
                     format!("task-journal ingest-hook --backend={backend} || true")
                 };
                 let cmd = cmd_string.as_str();
-                let entries = serde_json::json!({
-                    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
-                    "PostToolUse":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
-                    "Stop":            [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
-                    // SessionStart drives the auto resume-pack injection:
-                    // ingest-hook short-circuits on this kind, queries open
-                    // tasks for the current project, and emits the
-                    // additionalContext envelope Claude Code expects.
-                    "SessionStart":    [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
-                    // PreCompact: drop a marker decision event on the most-recent
-                    // open task so the post-compact agent sees a clear boundary
-                    // in the journal between pre- and post-compaction reasoning.
-                    "PreCompact":      [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
+                // v0.14.0 — self-tagging-first. By DEFAULT only the cheap,
+                // read-only SessionStart hook is wired: ingest-hook short-circuits
+                // on that kind, injects the resume pack + a nudge, and spawns no
+                // model. The per-message hooks (UserPromptSubmit/PostToolUse/Stop)
+                // and PreCompact are what spawn the classifier (`claude -p`); they
+                // are opt-in via `--auto-capture`. Primary capture is the agent
+                // self-tagging through the MCP tools.
+                let mut entries = serde_json::json!({
+                    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
                 });
+                if auto_capture {
+                    let obj = entries.as_object_mut().expect("entries is an object");
+                    for ev in ["UserPromptSubmit", "PostToolUse", "Stop", "PreCompact"] {
+                        obj.insert(
+                            ev.to_string(),
+                            serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }]),
+                        );
+                    }
+                }
                 hooks_obj.insert("hooks".into(), entries);
             }
             std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
