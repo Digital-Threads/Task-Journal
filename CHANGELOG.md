@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.14.3] - 2026-06-12
+## [0.14.4] - 2026-06-12
+
+### Fixed
+- **The bundled plugin no longer auto-captures on every tool call.** The 0.14.0
+  redesign made realtime auto-capture opt-in — but only in the `settings.json`
+  hooks written by `install-hooks`. The plugin's *own* bundled
+  `plugin/hooks/hooks.json` still wired `PostToolUse → task-journal ingest-hook`
+  (with `asyncRewake` + `rewakeSummary: "Task Journal backlog forming"`), plus
+  `PreCompact` and `Stop` capture. So merely **enabling** the plugin re-armed the
+  exact behaviour the redesign removed: every tool call enqueued a `pending/`
+  chunk, nothing drained it (the `claude -p` backend is gone by design), the queue
+  grew unbounded, and once it crossed the overflow threshold the asyncRewake signal
+  fired on *every* PostToolUse — surfacing "Task Journal backlog forming" dozens of
+  times in a row. The bundled hooks file is now empty; the enabled plugin is quiet
+  by default (resume + nudge + MCP tools come from `install-hooks`). Realtime
+  capture remains available, explicitly, via `install-hooks --auto-capture`. If you
+  already have a backed-up queue, drain it with `task-journal pending-gc --days 0`.
 
 ### Fixed
 - **SessionStart no longer hijacks the Claude Code session name.** The v0.10.1
