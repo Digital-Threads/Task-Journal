@@ -15,8 +15,15 @@ readme = "../../README.md"
 name = "task-journal"
 path = "src/main.rs"
 
+[features]
+# `embed` (on by default) turns on tj-core's model2vec semantic backend. The
+# lean build (`--no-default-features`) keeps the dependency-free lexical
+# fallback and a lower MSRV — the CI msrv job builds that configuration.
+default = ["embed"]
+embed = ["tj-core/embed"]
+
 [dependencies]
-tj-core = { package = "task-journal-core", version = "0.14.2", path = "../tj-core" }
+tj-core = { package = "task-journal-core", version = "0.15.0", path = "../tj-core", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

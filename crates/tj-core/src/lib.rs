@@ -52,6 +52,7 @@ pub mod classifier;
 pub mod completeness;
 pub mod db;
 pub mod dream;
+pub mod embed;
 pub mod event;
 pub mod frontmatter;
 pub mod fts;
