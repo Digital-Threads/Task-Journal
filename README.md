@@ -202,12 +202,18 @@ chain `agent-sdk → api`, using whichever backends are available. Reorder the c
 with `TJ_HYBRID_LLM_ORDER` (e.g. `api,agent-sdk` to prefer the API key). With no LLM
 backend available, the heuristic still runs and ambiguous chunks queue in `pending/`.
 
+The offline **`dream`** backfill (re-mining old transcripts for missed reasoning) uses
+the same `agent-sdk` path: it prefers the local `claude` CLI pinned to Haiku and only
+falls back to the `api` backend when no `claude` is on PATH — so dreaming over your
+history needs no API key either. Override its model with `TJ_DREAM_MODEL`.
+
 | Env var | Effect | Default |
 |---------|--------|---------|
 | `ANTHROPIC_API_KEY` | Enables the `api` LLM backend (and the `api` link of the hybrid chain). Optional — the `agent-sdk` backend needs no key. | _unset_ |
 | `TJ_AGENT_SDK_MODEL` | Override the model the `agent-sdk` backend passes to `claude --model`. | `claude-haiku-4-5` |
 | `TJ_HYBRID_LLM_ORDER` | Comma-separated fallback order for `--backend=hybrid`. | `agent-sdk,api` |
 | `TJ_CLASSIFIER_MODEL` | Override the Anthropic model used by the `api` backend. | `claude-haiku-4-5-20251001` |
+| `TJ_DREAM_MODEL` | Override the model used by `dream` backfill (both agent-sdk and api). | `claude-haiku-4-5` (agent-sdk) |
 | `TJ_AUTO_OPEN_TASKS` | Set to `0` / `false` to disable auto-opening a task from `UserPromptSubmit` when no open task exists. | `1` |
 
 ## Event types
