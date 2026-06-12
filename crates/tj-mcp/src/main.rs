@@ -260,6 +260,20 @@ pub struct TaskCloseResult {
     pub completeness_gaps: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryNoteParams {
+    /// The durable user preference or standing fact to remember across all
+    /// projects and sessions — e.g. "respond in Russian, terse", "this team
+    /// always squash-merges". Keep it one short sentence.
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MemoryNoteResult {
+    pub remembered: bool,
+    pub text: String,
+}
+
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
     use tj_core::event::EventType::*;
     Ok(match s {
@@ -661,6 +675,29 @@ impl TaskJournalServer {
                 note,
                 completeness_gaps: gaps,
             }))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "memory_note",
+        description = "Remember a durable user preference or standing fact across ALL projects and sessions — how the user wants to be worked with (\"respond in Russian, terse\"), or a stable team/project rule. Injected into every future session's context. Use it when you learn something about the user or their workflow that should outlive this task. De-duplicated."
+    )]
+    async fn memory_note(
+        &self,
+        Parameters(p): Parameters<MemoryNoteParams>,
+    ) -> Result<Json<MemoryNoteResult>, McpError> {
+        traced_tool("memory_note", async move {
+            run_blocking(move || {
+                let global = tj_core::memory::open(tj_core::paths::memory_db()?)?;
+                let now = chrono::Utc::now().to_rfc3339();
+                let remembered = tj_core::memory::add_preference(&global, &p.text, &now)?;
+                Ok(Json(MemoryNoteResult {
+                    remembered,
+                    text: p.text.trim().to_string(),
+                }))
+            })
+            .await
         })
         .await
     }
