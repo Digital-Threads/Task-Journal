@@ -21,12 +21,41 @@ use std::process::Command;
 /// `TJ_AGENT_SDK_MODEL`.
 pub const DEFAULT_MODEL: &str = "claude-haiku-4-5";
 
+/// Env var stamped onto every spawned classifier `claude -p` subprocess. That
+/// subprocess is a full Claude Code instance, so on startup it re-runs the
+/// user's SessionStart hooks — including `task-journal ingest-hook`, which
+/// would spawn yet another classifier `claude -p`, and so on: an unbounded
+/// fork bomb. `ingest-hook` checks for this marker and no-ops when it is set,
+/// breaking the recursion. The CLI guard and the worker's `env_remove` both
+/// reference this constant so the setter and the checker can never drift
+/// (which is exactly the bug that let the fork bomb through: the guard checked
+/// `TJ_IN_CLASSIFIER` but no spawn site ever set it).
+pub const IN_CLASSIFIER_ENV: &str = "TJ_IN_CLASSIFIER";
+
 /// "Run the classifier command and hand back its raw stdout." The production
 /// impl shells out to `claude`; tests inject a fake returning canned JSON.
 pub trait CommandRunner: Send + Sync {
     /// Run the classification for `prompt` against `model`, returning the raw
     /// stdout (the `--output-format json` wrapper) on success.
     fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String>;
+}
+
+/// Build the base `claude` invocation shared by both runners: print mode, the
+/// pinned model, the JSON envelope, an isolated MCP config, and — critically —
+/// the [`IN_CLASSIFIER_ENV`] recursion marker. The argv runner appends the
+/// prompt as a positional arg; the stdin runner feeds it on stdin. Extracted so
+/// a unit test can assert the marker is present without spawning `claude` (the
+/// missing marker is exactly what let the fork bomb through before).
+fn base_claude_command(model: &str) -> Command {
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p")
+        .arg("--model")
+        .arg(model)
+        .arg("--output-format")
+        .arg("json")
+        .arg("--strict-mcp-config")
+        .env(IN_CLASSIFIER_ENV, "1");
+    cmd
 }
 
 /// Production runner: invokes the local `claude` binary in print mode, pinned
@@ -37,14 +66,8 @@ pub struct ClaudeBinaryRunner;
 
 impl CommandRunner for ClaudeBinaryRunner {
     fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
-        let output = Command::new("claude")
-            .arg("-p")
+        let output = base_claude_command(model)
             .arg(prompt)
-            .arg("--model")
-            .arg(model)
-            .arg("--output-format")
-            .arg("json")
-            .arg("--strict-mcp-config")
             .output()
             .context("failed to spawn `claude` (is Claude Code installed and on PATH?)")?;
         if !output.status.success() {
@@ -70,13 +93,7 @@ impl CommandRunner for ClaudeBinaryStdinRunner {
     fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
         use std::io::Write;
         use std::process::Stdio;
-        let mut child = Command::new("claude")
-            .arg("-p")
-            .arg("--model")
-            .arg(model)
-            .arg("--output-format")
-            .arg("json")
-            .arg("--strict-mcp-config")
+        let mut child = base_claude_command(model)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -238,6 +255,22 @@ mod tests {
             "result": result_json,
         })
         .to_string()
+    }
+
+    #[test]
+    fn base_command_carries_recursion_marker() {
+        use std::ffi::OsStr;
+        // The tj-cli ingest-hook guard short-circuits on this exact var; if the
+        // const and the spawn site ever drift, the fork bomb returns.
+        assert_eq!(IN_CLASSIFIER_ENV, "TJ_IN_CLASSIFIER");
+        let cmd = base_claude_command("claude-haiku-4-5");
+        let marker = cmd
+            .get_envs()
+            .any(|(k, v)| k == OsStr::new(IN_CLASSIFIER_ENV) && v == Some(OsStr::new("1")));
+        assert!(
+            marker,
+            "every spawned `claude -p` must set {IN_CLASSIFIER_ENV}=1 to break ingest-hook recursion"
+        );
     }
 
     #[test]
