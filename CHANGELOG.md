@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-06-12
+
+### Fixed
+- **Classifier `claude -p` recursion fork bomb.** The `ingest-hook` recursion
+  guard checked `TJ_IN_CLASSIFIER`, but no spawn site ever set it — so every
+  classifier `claude -p` (a full Claude Code instance) re-ran the user's
+  SessionStart hooks, including `ingest-hook`, which spawned another classifier
+  `claude -p`, unbounded. On machines with git-touching SessionStart hooks (or
+  an agent multiplexer like aimux) this also hammered git with dozens of
+  concurrent `git pull origin HEAD` and stray commits to `main`. Both runners
+  now stamp the marker via a shared `base_claude_command`; the guard and the
+  worker's `env_remove` reference one `tj_core` constant so the setter and
+  checker can't drift again; a regression test asserts the spawned command
+  carries the marker.
+
 ### Added
 - **`dream` backfill runs on the subscription via agent-sdk (Haiku).** The
   offline dream Pass A backend can now reach an LLM through the local `claude`
