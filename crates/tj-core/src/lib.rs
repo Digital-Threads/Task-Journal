@@ -56,6 +56,7 @@ pub mod embed;
 pub mod event;
 pub mod frontmatter;
 pub mod fts;
+pub mod memory;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;
