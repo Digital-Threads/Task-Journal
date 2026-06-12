@@ -4,6 +4,7 @@
 //! significant typed events the realtime classifier missed. Additive —
 //! the JSONL source of truth is never mutated.
 
+pub mod agent_sdk;
 pub mod backend;
 pub mod backfill;
 pub mod http;

@@ -2470,9 +2470,30 @@ fn main() -> Result<()> {
                 println!("dream (dry-run): {} session(s) in scope", sessions.len());
                 return Ok(());
             }
-            let backend = tj_core::dream::http::AnthropicDreamBackend::from_env()?;
-            let report =
-                tj_core::dream::run_dream(&conn, &events_path, &opts, &backend, sessions, &run_id)?;
+            // Prefer the subscription-native agent-sdk backend (local `claude`
+            // CLI, pinned to Haiku — cheap, no ANTHROPIC_API_KEY). Fall back to
+            // the Anthropic API backend only when no `claude` is on PATH.
+            let backend: Box<dyn tj_core::dream::backend::DreamBackend> =
+                match tj_core::dream::agent_sdk::ClaudeCliDreamBackend::from_env() {
+                    Some(b) => {
+                        eprintln!("dream: backend=agent-sdk (claude CLI, Haiku)");
+                        Box::new(b)
+                    }
+                    None => {
+                        eprintln!(
+                            "dream: no `claude` on PATH — backend=api (needs ANTHROPIC_API_KEY)"
+                        );
+                        Box::new(tj_core::dream::http::AnthropicDreamBackend::from_env()?)
+                    }
+                };
+            let report = tj_core::dream::run_dream(
+                &conn,
+                &events_path,
+                &opts,
+                backend.as_ref(),
+                sessions,
+                &run_id,
+            )?;
 
             // 4. Advance watermark to now (only reached on success).
             tj_core::dream::state::set_last_dream_at(

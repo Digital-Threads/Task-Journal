@@ -59,6 +59,52 @@ impl CommandRunner for ClaudeBinaryRunner {
     }
 }
 
+/// Like [`ClaudeBinaryRunner`] but feeds the prompt on **stdin** instead of as
+/// an argv argument. Use for large prompts (e.g. a whole session transcript in
+/// dream backfill) that would otherwise blow the per-argument size limit
+/// (`E2BIG`, ~128 KiB on Linux). `claude -p` with no positional prompt reads
+/// the prompt from stdin.
+pub struct ClaudeBinaryStdinRunner;
+
+impl CommandRunner for ClaudeBinaryStdinRunner {
+    fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new("claude")
+            .arg("-p")
+            .arg("--model")
+            .arg(model)
+            .arg("--output-format")
+            .arg("json")
+            .arg("--strict-mcp-config")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn `claude` (is Claude Code installed and on PATH?)")?;
+        // Write the prompt, then drop the handle to close stdin so `claude`
+        // sees EOF and starts working.
+        child
+            .stdin
+            .take()
+            .context("claude stdin was not captured")?
+            .write_all(prompt.as_bytes())
+            .context("failed to write prompt to claude stdin")?;
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for `claude`")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "`claude -p` exited with {}: {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
 pub struct ClaudeCliClassifier {
     model: String,
     runner: Box<dyn CommandRunner>,
@@ -105,29 +151,41 @@ struct CliEnvelope {
 impl Classifier for ClaudeCliClassifier {
     fn classify(&self, input: &ClassifyInput) -> anyhow::Result<ClassifyOutput> {
         let prompt = crate::classifier::prompt::build(input);
-        let stdout = self.runner.run(&self.model, &prompt)?;
-        let envelope: CliEnvelope = serde_json::from_str(stdout.trim()).with_context(|| {
-            format!(
-                "claude --output-format json wrapper parse failed; got: {}",
-                stdout.trim()
-            )
-        })?;
-        if envelope.is_error {
-            return Err(anyhow!(
-                "claude reported an error (subtype={})",
-                envelope.subtype.as_deref().unwrap_or("unknown")
-            ));
-        }
-        let verdict = envelope
-            .result
-            .ok_or_else(|| anyhow!("claude json wrapper had no `result` field"))?;
+        let verdict = run_claude_json(self.runner.as_ref(), &self.model, &prompt)?;
         super::parse_verdict(&verdict)
     }
 }
 
+/// Run `prompt` through the claude CLI (via `runner`) and return the model's
+/// reply text — the `result` field of the `--output-format json` envelope.
+/// Shared by the classifier and the dream agent-sdk backend so the envelope
+/// handling lives in one place.
+pub fn run_claude_json(
+    runner: &dyn CommandRunner,
+    model: &str,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let stdout = runner.run(model, prompt)?;
+    let envelope: CliEnvelope = serde_json::from_str(stdout.trim()).with_context(|| {
+        format!(
+            "claude --output-format json wrapper parse failed; got: {}",
+            stdout.trim()
+        )
+    })?;
+    if envelope.is_error {
+        return Err(anyhow!(
+            "claude reported an error (subtype={})",
+            envelope.subtype.as_deref().unwrap_or("unknown")
+        ));
+    }
+    envelope
+        .result
+        .ok_or_else(|| anyhow!("claude json wrapper had no `result` field"))
+}
+
 /// Probe whether `claude` resolves on PATH and runs. Cheap (`--version` does
 /// no network) and tolerant — any spawn/exec failure means "not available".
-fn claude_on_path() -> bool {
+pub fn claude_on_path() -> bool {
     Command::new("claude")
         .arg("--version")
         .output()

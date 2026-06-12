@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`dream` backfill runs on the subscription via agent-sdk (Haiku).** The
+  offline dream Pass A backend can now reach an LLM through the local `claude`
+  CLI pinned to Haiku — no `ANTHROPIC_API_KEY` required — so subscription-only
+  users can re-mine old transcripts for the reasoning the realtime classifier
+  missed. `tj_core::dream::agent_sdk::ClaudeCliDreamBackend` reuses the shared
+  `classifier::agent_sdk` plumbing; `dream` prefers it and falls back to the
+  API backend only when no `claude` is on PATH. Model overridable with
+  `TJ_DREAM_MODEL`. Large transcripts are passed on stdin (new
+  `ClaudeBinaryStdinRunner`) to avoid the argv size limit. Same Agent SDK
+  credit caveat as the classifier agent-sdk backend applies (post-2026-06-15).
+
 ## [0.13.0] - 2026-06-11
 
 ### Added

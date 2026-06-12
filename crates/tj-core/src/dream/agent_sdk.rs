@@ -14,7 +14,9 @@
 //! headless `claude -p` run draws from the separate Agent SDK monthly credit
 //! pool. Haiku keeps each backfill call cheap.
 
-use crate::classifier::agent_sdk::{claude_on_path, run_claude_json, ClaudeBinaryStdinRunner, CommandRunner};
+use crate::classifier::agent_sdk::{
+    claude_on_path, run_claude_json, ClaudeBinaryStdinRunner, CommandRunner,
+};
 use crate::dream::backend::{BackfillEvent, BackfillInput, DreamBackend};
 use crate::dream::prompt::build_prompt;
 use anyhow::Context;
