@@ -4743,3 +4743,59 @@ fn export_memory_missing_task_exits_1() {
         .code(1)
         .stderr(contains("task not found"));
 }
+
+#[test]
+fn embed_backfill_vectorises_events_then_idempotent() {
+    // Pillar A / Phase 0: `embed --backfill` computes a vector per event using
+    // the dependency-free hash embedder and stores it; a second run finds
+    // nothing new. Fully offline — no model, no network.
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Implement semantic memory retrieval"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "decision",
+            "--text",
+            "Use model2vec static embeddings for offline semantic recall.",
+        ])
+        .assert()
+        .success();
+
+    // First backfill: embeds the open + decision events.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["embed", "--backfill"])
+        .assert()
+        .success()
+        .stdout(contains("hash-v1"))
+        .stdout(contains("embedded 2"));
+
+    // Second run without --backfill: nothing new to embed.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["embed"])
+        .assert()
+        .success()
+        .stdout(contains("embedded 0"));
+}

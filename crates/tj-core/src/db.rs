@@ -128,6 +128,28 @@ ALTER TABLE decisions ADD COLUMN alternatives TEXT;
 DELETE FROM task_pack_cache;
 "#;
 
+/// v0.15.0 semantic-memory substrate (Pillar A). `embeddings` stores one
+/// vector per event as a little-endian f32 BLOB, tagged with the model id +
+/// dim so we never compare across models and can re-embed on a model change.
+/// `memory_tier` is denormalised onto `events_index` for cheap tier filtering
+/// (episodic by default; semantic/procedural/preference added in Phase 3).
+/// Purely additive — existing rows default to `episodic`, the append-only log
+/// is untouched, and an absent embedder simply leaves `embeddings` empty.
+const MIGRATION_008: &str = r#"
+CREATE TABLE IF NOT EXISTS embeddings (
+  event_id     TEXT PRIMARY KEY,
+  task_id      TEXT NOT NULL,
+  project_hash TEXT NOT NULL,
+  tier         TEXT NOT NULL DEFAULT 'episodic',
+  model        TEXT NOT NULL,
+  dim          INTEGER NOT NULL,
+  vec          BLOB NOT NULL,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_emb_project_tier ON embeddings(project_hash, tier);
+ALTER TABLE events_index ADD COLUMN memory_tier TEXT NOT NULL DEFAULT 'episodic';
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -158,6 +180,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 7,
         sql: MIGRATION_007,
+    },
+    Migration {
+        version: 8,
+        sql: MIGRATION_008,
     },
 ];
 
@@ -1038,6 +1064,125 @@ pub fn invalidate_pack_cascade(conn: &Connection, task_id: &str) -> anyhow::Resu
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Semantic-memory substrate (Pillar A / schema v008).
+// ---------------------------------------------------------------------------
+
+/// One event awaiting an embedding: its id, task, and the text to embed.
+pub struct PendingEmbed {
+    pub event_id: String,
+    pub task_id: String,
+    pub text: String,
+}
+
+/// Events that have no up-to-date embedding for `model` — either never embedded
+/// or embedded by a different model. Pulls the text straight from `search_fts`.
+/// `limit` bounds the batch; pass a large value to drain.
+pub fn events_needing_embedding(
+    conn: &Connection,
+    model: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<PendingEmbed>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.event_id, f.task_id, f.text
+           FROM search_fts f
+           LEFT JOIN embeddings e ON e.event_id = f.event_id AND e.model = ?1
+          WHERE e.event_id IS NULL
+          LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![model, limit as i64], |r| {
+        Ok(PendingEmbed {
+            event_id: r.get(0)?,
+            task_id: r.get(1)?,
+            text: r.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Upsert one vector. Keyed on `event_id`, so re-embedding (e.g. after a model
+/// change) replaces the prior row idempotently across `rebuild_state` replays.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_embedding(
+    conn: &Connection,
+    event_id: &str,
+    task_id: &str,
+    project_hash: &str,
+    tier: &str,
+    model: &str,
+    dim: usize,
+    vec: &[f32],
+    created_at: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO embeddings(event_id, task_id, project_hash, tier, model, dim, vec, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            event_id,
+            task_id,
+            project_hash,
+            tier,
+            model,
+            dim as i64,
+            crate::embed::to_blob(vec),
+            created_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// Number of stored embeddings for a project (test/stats helper).
+pub fn count_embeddings(conn: &Connection, project_hash: &str) -> anyhow::Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM embeddings WHERE project_hash = ?1",
+        rusqlite::params![project_hash],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+/// Embed up to `limit` events that still need a vector for the embedder's model,
+/// and store them. Returns how many were embedded this call. Shared by
+/// embed-on-ingest (small batch after `ingest_new_events`) and
+/// `embed --backfill` (looped until it returns 0). Every pending text gets a
+/// vector — including short boilerplate — so nothing is re-scanned next pass;
+/// retrieval-side filtering ([`crate::embed::is_embeddable`]) decides what's
+/// worth surfacing.
+pub fn embed_pending(
+    conn: &Connection,
+    project_hash: &str,
+    embedder: &dyn crate::embed::Embedder,
+    created_at: &str,
+    limit: usize,
+) -> anyhow::Result<usize> {
+    let pending = events_needing_embedding(conn, embedder.model_id(), limit)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = pending.iter().map(|p| p.text.as_str()).collect();
+    let vecs = embedder.embed(&texts)?;
+    let mut done = 0usize;
+    for (p, v) in pending.iter().zip(vecs.iter()) {
+        upsert_embedding(
+            conn,
+            &p.event_id,
+            &p.task_id,
+            project_hash,
+            "episodic",
+            embedder.model_id(),
+            embedder.dim(),
+            v,
+            created_at,
+        )?;
+        done += 1;
+    }
+    Ok(done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1238,49 @@ mod tests {
             count,
             MIGRATIONS.len() as i64,
             "schema_migrations must contain exactly one row per declared migration after repeated opens"
+        );
+    }
+
+    fn make_text_event(text: &str) -> crate::event::Event {
+        crate::event::Event::new(
+            "tj-x",
+            crate::event::EventType::Finding,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            text.into(),
+        )
+    }
+
+    #[test]
+    fn embed_pending_embeds_all_then_is_idempotent() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+
+        for text in [
+            "implement payment refund deduplication",
+            "add validation for negative order amounts",
+        ] {
+            index_event(&conn, &make_text_event(text)).unwrap();
+        }
+
+        let emb = crate::embed::HashEmbedder::new(64);
+        let at = "2026-06-12T00:00:00Z";
+
+        let n = embed_pending(&conn, ph, &emb, at, 100).unwrap();
+        assert_eq!(n, 2, "both events embedded on first pass");
+        assert_eq!(count_embeddings(&conn, ph).unwrap(), 2);
+
+        // Idempotent: nothing left for this model on a second pass.
+        assert_eq!(embed_pending(&conn, ph, &emb, at, 100).unwrap(), 0);
+
+        // Model-scoped: a different model id sees them as un-embedded
+        // (so a model change triggers a re-embed).
+        assert_eq!(
+            events_needing_embedding(&conn, "other-model", 100)
+                .unwrap()
+                .len(),
+            2
         );
     }
 

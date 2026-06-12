@@ -613,6 +613,15 @@ enum Commands {
     },
     /// Rebuild SQLite state from the JSONL log.
     RebuildState,
+    /// Embed events for semantic search (Pillar A). Computes a vector per event
+    /// and stores it in the v008 `embeddings` table. `--backfill` drains the
+    /// whole project; without it, only newly-unembedded events are processed.
+    /// Uses the dependency-free hash embedder by default — fully offline.
+    Embed {
+        /// Vectorise the entire project history, not just new events.
+        #[arg(long)]
+        backfill: bool,
+    },
     /// Render and print the resume pack for a task.
     Pack {
         /// Task id (e.g. tj-7f3a).
@@ -1112,6 +1121,42 @@ fn main() -> Result<()> {
             let conn = tj_core::db::open(&state_path)?;
             let n = tj_core::db::rebuild_state(&conn, &events_path, &project_hash)?;
             println!("rebuilt {n} events into {state_path:?}");
+        }
+        Commands::Embed { backfill } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            if !events_path.exists() {
+                anyhow::bail!("no events file at {events_path:?}");
+            }
+            let conn = tj_core::db::open(&state_path)?;
+            // search_fts must be current before we embed from it.
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+
+            let embedder = tj_core::embed::default_embedder();
+            let now = chrono::Utc::now().to_rfc3339();
+            let batch = if backfill { 256 } else { 64 };
+            let mut total = 0usize;
+            loop {
+                let n = tj_core::db::embed_pending(
+                    &conn,
+                    &project_hash,
+                    embedder.as_ref(),
+                    &now,
+                    batch,
+                )?;
+                total += n;
+                // Without --backfill, one batch of newly-unembedded events is enough.
+                if n == 0 || !backfill {
+                    break;
+                }
+            }
+            println!(
+                "embedded {total} event(s) with model {} ({} dim)",
+                embedder.model_id(),
+                embedder.dim()
+            );
         }
         Commands::Event {
             task_id,
