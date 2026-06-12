@@ -4799,3 +4799,67 @@ fn embed_backfill_vectorises_events_then_idempotent() {
         .success()
         .stdout(contains("embedded 0"));
 }
+
+#[test]
+fn ask_ranks_semantically_relevant_event_first() {
+    // Pillar A / Phase 1: `ask` embeds the query and returns events by meaning.
+    // The query's terms overlap one event strongly and the others not at all,
+    // so vector ranking must surface it first. (The hash embedder is lexical;
+    // true paraphrase/morphology robustness is the model2vec backend's job.)
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Payments hardening"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    for (ty, text) in [
+        (
+            "decision",
+            "Route refunds through the idempotent payment ledger to stop double writes.",
+        ),
+        (
+            "finding",
+            "The frontend button hover color is wrong in dark mode.",
+        ),
+        (
+            "finding",
+            "Added a composite index on users email and tenant for lookup speed.",
+        ),
+    ] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["event", &task_id, "--type", ty, "--text", text])
+            .assert()
+            .success();
+    }
+
+    let out = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["ask", "idempotent refunds ledger double writes", "--k", "3"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    let first = out.lines().next().unwrap_or("");
+    assert!(
+        first.contains("refund") || first.contains("ledger"),
+        "top hit must be the refund decision; got first line: {first:?}\nfull:\n{out}"
+    );
+}

@@ -1183,9 +1183,77 @@ pub fn embed_pending(
     Ok(done)
 }
 
+/// A retrieval hit: the event, its task, and the relevance score.
+pub struct ScoredHit {
+    pub event_id: String,
+    pub task_id: String,
+    pub task_title: String,
+    pub event_type: String,
+    pub tier: String,
+    pub text: String,
+    pub score: f32,
+}
+
+/// Semantic search over a project's embeddings. Scores every stored vector for
+/// `model` against `query_vec` by cosine, returns the top `k` by score. The
+/// caller embeds the query with the same embedder so the model ids match.
+/// Pure vector ranking for now; recency / tier / contradiction weighting layer
+/// on top in later phases.
+pub fn semantic_search(
+    conn: &Connection,
+    project_hash: &str,
+    query_vec: &[f32],
+    model: &str,
+    k: usize,
+) -> anyhow::Result<Vec<ScoredHit>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.event_id, e.task_id, e.tier, e.vec, f.text, f.type,
+                COALESCE(t.title, '')
+           FROM embeddings e
+           JOIN search_fts f ON f.event_id = e.event_id
+           LEFT JOIN tasks t ON t.task_id = e.task_id
+          WHERE e.project_hash = ?1 AND e.model = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![project_hash, model], |r| {
+        let blob: Vec<u8> = r.get(3)?;
+        Ok((
+            r.get::<_, String>(0)?, // event_id
+            r.get::<_, String>(1)?, // task_id
+            r.get::<_, String>(2)?, // tier
+            blob,
+            r.get::<_, String>(4)?, // text
+            r.get::<_, String>(5)?, // type
+            r.get::<_, String>(6)?, // title
+        ))
+    })?;
+
+    let mut hits: Vec<ScoredHit> = Vec::new();
+    for row in rows {
+        let (event_id, task_id, tier, blob, text, event_type, task_title) = row?;
+        let score = crate::embed::cosine(query_vec, &crate::embed::from_blob(&blob));
+        hits.push(ScoredHit {
+            event_id,
+            task_id,
+            task_title,
+            event_type,
+            tier,
+            text,
+            score,
+        });
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(k);
+    Ok(hits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::Embedder;
     use tempfile::TempDir;
 
     #[test]
@@ -1281,6 +1349,37 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn semantic_search_ranks_relevant_event_first() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+
+        for text in [
+            "fix duplicate payment refund write on partial refund",
+            "update the frontend button hover color",
+            "add a database index for faster user lookup",
+        ] {
+            index_event(&conn, &make_text_event(text)).unwrap();
+        }
+        let emb = crate::embed::HashEmbedder::new(256);
+        embed_pending(&conn, ph, &emb, "t", 100).unwrap();
+
+        let q = emb.embed_one("payment refund duplicated").unwrap();
+        let hits = semantic_search(&conn, ph, &q, emb.model_id(), 3).unwrap();
+
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits[0].text.contains("refund"),
+            "the refund event must rank first, got: {}",
+            hits[0].text
+        );
+        assert!(
+            hits[0].score >= hits[1].score,
+            "hits must be sorted by score desc"
         );
     }
 
