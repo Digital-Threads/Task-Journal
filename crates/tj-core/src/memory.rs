@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS global_memory (
 );
 CREATE INDEX IF NOT EXISTS idx_gm_type ON global_memory(type);
 CREATE INDEX IF NOT EXISTS idx_gm_model ON global_memory(model);
+CREATE VIRTUAL TABLE IF NOT EXISTS global_fts USING fts5(event_id UNINDEXED, text);
 "#;
 
 /// Open (creating + migrating) the global memory database at `path`.
@@ -107,9 +108,66 @@ pub fn sync_from_project(
                 event_id, project_hash, task_id, ty, tier, text, model, dim, vec, created_at, superseded
             ],
         )?;
+        // Mirror into FTS5 for the fast keyword path (proactive hook).
+        global.execute(
+            "DELETE FROM global_fts WHERE event_id = ?1",
+            rusqlite::params![event_id],
+        )?;
+        global.execute(
+            "INSERT INTO global_fts(event_id, text) VALUES (?1, ?2)",
+            rusqlite::params![event_id, text],
+        )?;
         n += 1;
     }
     Ok(n)
+}
+
+/// Fast keyword (FTS5) search over the global index — no embedding, so it's
+/// cheap enough to run on every prompt in the proactive hook (loading a model
+/// per prompt would be too slow). Builds an OR query from the prompt's
+/// alphanumeric tokens (≥4 chars) and ranks by BM25.
+pub fn keyword_search(conn: &Connection, prompt: &str, k: usize) -> anyhow::Result<Vec<GlobalHit>> {
+    let mut seen = std::collections::HashSet::new();
+    let terms: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 4)
+        .map(|t| t.to_lowercase())
+        .filter(|t| seen.insert(t.clone()))
+        .collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = terms.join(" OR ");
+    let mut stmt = conn.prepare(
+        "SELECT g.event_id, g.project_hash, g.task_id, g.type, g.tier, g.text, g.superseded,
+                bm25(global_fts)
+           FROM global_fts
+           JOIN global_memory g ON g.event_id = global_fts.event_id
+          WHERE global_fts MATCH ?1
+          ORDER BY bm25(global_fts)
+          LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![query, k as i64], |r| {
+        let bm: f64 = r.get(7)?;
+        let superseded: i64 = r.get(6)?;
+        // BM25 is lower-is-better; negate so higher == more relevant, then
+        // nudge contradicted reasoning down.
+        let score = (-bm) as f32 - if superseded != 0 { 0.5 } else { 0.0 };
+        Ok(GlobalHit {
+            event_id: r.get(0)?,
+            project_hash: r.get(1)?,
+            task_id: r.get(2)?,
+            event_type: r.get(3)?,
+            tier: r.get(4)?,
+            text: r.get(5)?,
+            score,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// Semantic search across the whole global index for the embedder's `model`.
@@ -214,6 +272,38 @@ mod tests {
             hits[0].text
         );
         assert_eq!(hits[0].project_hash, "projhash");
+    }
+
+    #[test]
+    fn keyword_search_matches_prompt_terms() {
+        let d = tempfile::TempDir::new().unwrap();
+        let proj = crate::db::open(d.path().join("p.sqlite")).unwrap();
+        let global = open(d.path().join("memory.sqlite")).unwrap();
+        let emb = crate::embed::HashEmbedder::new(64);
+        crate::db::index_event(
+            &proj,
+            &finding("chose the idempotent payment ledger for refunds"),
+        )
+        .unwrap();
+        crate::db::index_event(
+            &proj,
+            &finding("rejected kafka for the audit log; too heavy"),
+        )
+        .unwrap();
+        crate::db::embed_pending(&proj, "ph", &emb, "t", 100).unwrap();
+        sync_from_project(&global, &proj, "ph").unwrap();
+
+        let hits = keyword_search(&global, "should we add a refund ledger here?", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "prompt terms must match the ledger decision"
+        );
+        assert!(hits[0].text.contains("ledger"));
+
+        // No overlapping ≥4-char term => no hit.
+        assert!(keyword_search(&global, "tiny ui css fix", 5)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

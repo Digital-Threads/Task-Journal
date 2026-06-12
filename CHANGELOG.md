@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-12
+
+### Added
+- **Cross-project memory — Pillar B.** The journal now recalls relevant prior
+  reasoning across your *entire* history, not just the current repo — something
+  single-project memory tools can't do.
+  - `task-journal recall "<query>"` — semantic search over **every** project's
+    decisions, rejections and constraints. Surfaces prior choices and
+    dead-ends from anywhere you've worked.
+  - A global index (`data_dir/memory.sqlite`) mirrors high-signal events +
+    embeddings from all projects; `ask`/`embed` keep it current automatically
+    (best-effort, never failing the command). Contradicted (superseded)
+    decisions are down-ranked.
+  - **Opt-in proactive recall** (`install-hooks --proactive-recall`): a
+    UserPromptSubmit hook that injects a budgeted block of relevant prior
+    decisions/rejections/constraints **before you act** — a guardrail against
+    re-deciding or repeating a dead-end. Off by default; uses a fast keyword
+    path (no model load on the prompt path); gated by `TJ_PROACTIVE_RECALL=0`,
+    budgeted by `TJ_RECALL_BUDGET_CHARS` / `TJ_RECALL_K`.
+
+### Internal
+- `tj-core::memory` — global index schema (+ FTS5), `sync_from_project`,
+  semantic `search`, fast `keyword_search`. `paths::memory_db()`. CLI
+  `recall` / `recall-hook`; `install-hooks --proactive-recall` wiring.
+
 ## [0.15.0] - 2026-06-12
 
 ### Added

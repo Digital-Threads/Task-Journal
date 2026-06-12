@@ -780,6 +780,13 @@ enum Commands {
         /// the classifier, honoring `--backend`).
         #[arg(long)]
         auto_capture: bool,
+        /// Opt in to proactive cross-project recall (Pillar B). Adds a
+        /// UserPromptSubmit hook that injects relevant prior decisions/
+        /// rejections/constraints from any project before you act. Off by
+        /// default (it surfaces extra context on every prompt). Fast keyword
+        /// path, no model; gated at runtime by TJ_PROACTIVE_RECALL=0.
+        #[arg(long)]
+        proactive_recall: bool,
     },
     /// Show local classifier and journal statistics.
     Stats,
@@ -930,6 +937,14 @@ enum Commands {
     /// default. Hidden from --help; not a human command.
     #[command(hide = true)]
     Nudge,
+    /// Opt-in proactive recall hook (Pillar B). On UserPromptSubmit, injects a
+    /// budgeted additionalContext block of prior decisions/rejections/
+    /// constraints from ANY project relevant to the prompt — a guardrail
+    /// against re-deciding or repeating a dead-end. Fast keyword path, no
+    /// model. Wired only by `install-hooks --proactive-recall`. Gated by
+    /// TJ_PROACTIVE_RECALL=0. Hidden from --help; not a human command.
+    #[command(hide = true)]
+    RecallHook,
     /// Cross-task search for `rejection` events matching a topic. Helpful
     /// when the agent is about to repeat a path that was already turned
     /// down — query the topic, see the prior rejection.
@@ -1529,6 +1544,7 @@ fn main() -> Result<()> {
             backfill,
             backend,
             auto_capture,
+            proactive_recall,
         } => {
             let settings_path = match scope.as_str() {
                 "user" => {
@@ -1676,13 +1692,35 @@ fn main() -> Result<()> {
                         );
                     }
                 }
+                if proactive_recall {
+                    // Append the recall injector to the UserPromptSubmit hooks,
+                    // keeping whatever is already there (nudge, and ingest when
+                    // --auto-capture is also set).
+                    let obj = entries.as_object_mut().expect("entries is an object");
+                    let ups = obj
+                        .entry("UserPromptSubmit")
+                        .or_insert_with(|| serde_json::json!([{ "matcher": "", "hooks": [] }]));
+                    if let Some(hooks) = ups
+                        .as_array_mut()
+                        .and_then(|a| a.get_mut(0))
+                        .and_then(|e| e.get_mut("hooks"))
+                        .and_then(|h| h.as_array_mut())
+                    {
+                        hooks.push(serde_json::json!({
+                            "type": "command",
+                            "command": "task-journal recall-hook || true",
+                        }));
+                    }
+                }
                 // MERGE our entries into the existing `hooks` block — touch ONLY
                 // task-journal hooks, never clobber other plugins' hooks. For each
                 // event we (a) strip any prior task-journal entry (idempotent
                 // re-install) then (b) append ours, leaving foreign hooks and
                 // untouched events intact.
                 let is_tj = |c: &str| {
-                    c.contains("task-journal ingest-hook") || c.contains("task-journal nudge")
+                    c.contains("task-journal ingest-hook")
+                        || c.contains("task-journal nudge")
+                        || c.contains("task-journal recall-hook")
                 };
                 let hooks_block = hooks_obj
                     .entry("hooks".to_string())
@@ -3073,6 +3111,9 @@ fn main() -> Result<()> {
             });
             print!("{env}");
         }
+        Commands::RecallHook => {
+            run_recall_hook()?;
+        }
         Commands::Rejected {
             topic,
             all_projects,
@@ -3690,6 +3731,82 @@ fn sync_global_memory(project_conn: &rusqlite::Connection, project_hash: &str) {
     if let Err(e) = result {
         tracing::debug!("global memory sync skipped: {e:#}");
     }
+}
+
+/// Proactive recall injector (opt-in hook). Reads the UserPromptSubmit payload
+/// from stdin, keyword-searches the global index for relevant prior
+/// decisions/rejections/constraints across all projects, and emits a budgeted
+/// `additionalContext` block. Never blocks the prompt: any miss, empty result,
+/// or error exits silently with no output.
+fn run_recall_hook() -> anyhow::Result<()> {
+    // Opt-out and recursion guard (never inject into our own classifier spawn).
+    if std::env::var("TJ_PROACTIVE_RECALL").as_deref() == Ok("0") {
+        return Ok(());
+    }
+    if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
+        return Ok(());
+    }
+    let global_path = tj_core::paths::memory_db()?;
+    if !global_path.exists() {
+        return Ok(());
+    }
+
+    use std::io::Read;
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        return Ok(());
+    }
+    // The UserPromptSubmit payload carries the prompt under `prompt`; fall back
+    // to the raw stdin if it isn't JSON.
+    let prompt = serde_json::from_str::<serde_json::Value>(&buf)
+        .ok()
+        .and_then(|v| {
+            v.get("prompt")
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or(buf);
+    if prompt.trim().is_empty() {
+        return Ok(());
+    }
+
+    let conn = tj_core::memory::open(&global_path)?;
+    let k: usize = std::env::var("TJ_RECALL_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let hits = tj_core::memory::keyword_search(&conn, &prompt, k)?;
+    if hits.is_empty() {
+        return Ok(());
+    }
+
+    let budget: usize = std::env::var("TJ_RECALL_BUDGET_CHARS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
+    let mut ctx = String::from(
+        "📓 task-journal — relevant prior reasoning from your history (you may have decided this before):\n",
+    );
+    for h in &hits {
+        let snippet: String = h.text.chars().take(160).collect();
+        let proj: String = h.project_hash.chars().take(8).collect();
+        let line = format!(
+            "⚠ [{}] {} (project {proj}, {})\n",
+            h.event_type, snippet, h.task_id
+        );
+        if ctx.len() + line.len() > budget {
+            break;
+        }
+        ctx.push_str(&line);
+    }
+    let env = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": ctx.trim_end(),
+        }
+    });
+    print!("{env}");
+    Ok(())
 }
 
 fn auto_open_task_from_prompt(

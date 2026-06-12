@@ -5008,3 +5008,134 @@ fn recall_surfaces_decision_from_another_project() {
         "cross-project recall must surface project A's refund decision first; got: {first:?}\nfull:\n{out}"
     );
 }
+
+#[test]
+fn install_hooks_proactive_recall_wires_recall_hook() {
+    // --proactive-recall adds the recall injector to UserPromptSubmit alongside
+    // the nudge; the default install must NOT wire it (off by default).
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--proactive-recall"])
+        .assert()
+        .success();
+    let content =
+        std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+    assert!(
+        content.contains("task-journal recall-hook"),
+        "--proactive-recall must wire the recall-hook; got: {content}"
+    );
+    assert!(
+        content.contains("task-journal nudge"),
+        "nudge must remain alongside recall-hook"
+    );
+
+    let dir2 = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir2.path())
+        .args(["install-hooks", "--scope", "user"])
+        .assert()
+        .success();
+    let c2 = std::fs::read_to_string(dir2.path().join(".claude").join("settings.json")).unwrap();
+    assert!(
+        !c2.contains("recall-hook"),
+        "default install must not wire proactive recall"
+    );
+}
+
+#[test]
+fn recall_hook_injects_relevant_prior_reasoning() {
+    // Pillar B proactive injection: a decision recorded in a project must be
+    // surfaced as additionalContext when a later prompt (anywhere) shares its
+    // terms. Gated by TJ_PROACTIVE_RECALL=0.
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let tid = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", xdg.path())
+            .args(["create", "Payments"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "event",
+            &tid,
+            "--type",
+            "decision",
+            "--text",
+            "chose the idempotent payment ledger for refunds",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_EMBED", "hash")
+        .args(["embed", "--backfill"])
+        .assert()
+        .success();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "should we add a refund ledger to billing?"
+    })
+    .to_string();
+
+    let body = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .args(["recall-hook"])
+            .write_stdin(payload.clone())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("additionalContext"),
+        "recall-hook must emit additionalContext; got: {body:?}"
+    );
+    assert!(
+        body.contains("ledger"),
+        "must surface the ledger decision; got: {body}"
+    );
+
+    // Gate: TJ_PROACTIVE_RECALL=0 suppresses all output.
+    let gated = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_PROACTIVE_RECALL", "0")
+            .args(["recall-hook"])
+            .write_stdin(payload)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        gated.trim().is_empty(),
+        "TJ_PROACTIVE_RECALL=0 must suppress injection; got: {gated:?}"
+    );
+}
