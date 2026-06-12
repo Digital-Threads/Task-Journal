@@ -1849,6 +1849,19 @@ fn main() -> Result<()> {
                 let ratio = confirmed as f64 / total as f64 * 100.0;
                 println!("  confirmed ratio: {ratio:.1}%");
             }
+            // Memory platform (Pillars A/B/C): the global cross-project index.
+            let mem_path = tj_core::paths::memory_db()?;
+            if mem_path.exists() {
+                if let Ok(g) = tj_core::memory::open(&mem_path) {
+                    let entries = tj_core::memory::count(&g).unwrap_or(0);
+                    let prefs = tj_core::memory::list_preferences(&g)
+                        .map(|p| p.len())
+                        .unwrap_or(0);
+                    println!("memory (global cross-project recall index):");
+                    println!("  recall entries: {entries}");
+                    println!("  preferences: {prefs}");
+                }
+            }
         }
         Commands::Doctor { json } => {
             let report = run_doctor()?;

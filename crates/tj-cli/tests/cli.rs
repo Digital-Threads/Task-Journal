@@ -5190,3 +5190,22 @@ fn remembered_preference_lists_and_injects_at_session_start() {
     );
     assert!(body.contains("additionalContext"));
 }
+
+#[test]
+fn stats_reports_memory_preferences_count() {
+    // stats surfaces the global memory state (Pillar A/B/C metrics).
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["remember", "respond in Russian"])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["stats"])
+        .assert()
+        .success()
+        .stdout(contains("preferences: 1"));
+}

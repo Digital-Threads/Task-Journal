@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-12
+
+### Added
+- **MCP `memory_note` tool** — the agent can now record a durable user
+  preference or standing fact itself (not just the user via the CLI), so it
+  learns how you work over time. De-duplicated; injected into every future
+  session like CLI-added preferences.
+- **`stats` now reports memory metrics** — the global cross-project recall
+  index size and the number of stored preferences, so the memory platform's
+  state is visible at a glance.
+
+### Notes
+- Consolidation (clustering episodic events into durable semantic/procedural
+  facts) is intentionally deferred: a good version needs the offline LLM
+  backend for quality, and a pure heuristic would manufacture noise. Tracked
+  separately. claude-mem/mem0 *import* likewise awaits their on-disk format +
+  sample data rather than being guessed at.
+
 ## [0.17.0] - 2026-06-12
 
 ### Added
