@@ -1868,34 +1868,20 @@ fn main() -> Result<()> {
                     Vec::new()
                 };
 
-                // v0.10.1 X2: extend SessionStart envelope with the
-                // undocumented `sessionTitle` + `initialUserMessage`
-                // fields verified in Claude Code 2.1.160's K45 Zod
-                // schema. additionalContext already injects the full
-                // pack into the system prompt; these two extras give
-                // the model a sharper "where were we" signal so it
-                // doesn't have to grep the pack to find the active
-                // task ID.
-                //
-                // sessionTitle: terminal tab / window label. Always
-                // emitted when there are open tasks — the count alone
-                // is useful even with no primary activity.
-                //
-                // initialUserMessage: prepended to the user's first
-                // real prompt this session. We only emit it when the
-                // primary task already has events — otherwise it's an
-                // unsolicited "resuming" preamble on a hollow task and
-                // adds noise. Gated by TJ_INITIAL_USER_MESSAGE=0 for
-                // tests / users who'd rather not see it.
-                let primary = &recent[0];
+                // We deliberately DO NOT emit `sessionTitle` or
+                // `initialUserMessage` here. The v0.10.1 X2 experiment set
+                // `sessionTitle` to "TJ — <task_id> (<n> open)", which
+                // OVERRODE Claude Code's native session name with our task id
+                // — users saw "TJ — tj-qqay98cpc2" instead of a name derived
+                // from their own prompt. `initialUserMessage` injected a
+                // "[Task Journal resumed: …]" banner into the next prompt,
+                // which the auto-open path then captured as a garbage task
+                // title. The resume context the model actually needs already
+                // rides in `additionalContext`; the tab label belongs to
+                // Claude Code, not to us. (0.14.3)
                 let mut hook_specific = serde_json::json!({
                     "hookEventName": "SessionStart",
                     "additionalContext": bundle.trim_end(),
-                    "sessionTitle": format!(
-                        "TJ — {} ({} open)",
-                        primary.task_id,
-                        recent.len(),
-                    ),
                 });
                 if !watch_paths.is_empty() {
                     hook_specific["watchPaths"] = serde_json::Value::Array(
@@ -1904,20 +1890,6 @@ fn main() -> Result<()> {
                             .map(serde_json::Value::String)
                             .collect(),
                     );
-                }
-                let allow_initial_user_msg =
-                    std::env::var("TJ_INITIAL_USER_MESSAGE").as_deref() != Ok("0");
-                // `task-journal create` writes an [open] event, so
-                // last_events is never literally empty even for a
-                // freshly created task. Require at least one non-open
-                // event so we don't inject "Resuming task X" the moment
-                // it was just opened with nothing to resume yet.
-                let has_real_events = primary.last_events.iter().any(|e| !e.starts_with("[open]"));
-                if allow_initial_user_msg && has_real_events {
-                    hook_specific["initialUserMessage"] = serde_json::Value::String(format!(
-                        "[Task Journal resumed: {} — {}]",
-                        primary.task_id, primary.title,
-                    ));
                 }
                 let envelope = serde_json::json!({
                     "hookSpecificOutput": hook_specific,
@@ -2327,8 +2299,12 @@ fn main() -> Result<()> {
                     if auto_open_disabled || !kind.contains("UserPrompt") {
                         return Ok(());
                     }
-                    let new_task =
-                        auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?;
+                    let Some(new_task) =
+                        auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?
+                    else {
+                        // Prompt was only machine noise — nothing worth a task.
+                        return Ok(());
+                    };
                     recent.push(new_task);
                 }
 
@@ -3587,18 +3563,17 @@ fn auto_open_task_from_prompt(
     project_hash: &str,
     conn: &rusqlite::Connection,
     prompt: &str,
-) -> anyhow::Result<tj_core::classifier::TaskContext> {
-    let cleaned = prompt.trim();
-    // Title: first non-empty line, ≤80 chars. Falls back to "(empty
-    // prompt)" so we never write a NULL title — the classifier and
-    // the TUI both display titles directly.
-    let title: String = cleaned
-        .lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .map(|l| l.chars().take(80).collect())
-        .unwrap_or_else(|| "(auto-opened: empty prompt)".to_string());
-    let goal: String = cleaned.chars().take(200).collect();
+) -> anyhow::Result<Option<tj_core::classifier::TaskContext>> {
+    // Title/goal must read like a human wrote them on purpose. When the
+    // prompt is only machine noise — session-start scrollback
+    // (`685] INFO: Mapped {…}`), a shell prompt, the journal's own resume
+    // banner — `humanize_title` returns None and we decline to auto-open.
+    // Better no task than a task labelled with a log line that then leaks
+    // into the task list and the Claude Code session name.
+    let Some(title) = tj_core::title::humanize_title(prompt) else {
+        return Ok(None);
+    };
+    let goal: String = tj_core::title::humanize_goal(prompt, 200).unwrap_or_else(|| title.clone());
 
     let task_id = tj_core::new_task_id();
     let mut event = tj_core::event::Event::new(
@@ -3646,12 +3621,12 @@ fn auto_open_task_from_prompt(
         }
     }
 
-    Ok(tj_core::classifier::TaskContext {
+    Ok(Some(tj_core::classifier::TaskContext {
         task_id,
         title,
         last_events: vec![],
         constraints: vec![],
-    })
+    }))
 }
 
 fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyhow::Result<()> {
@@ -3989,7 +3964,12 @@ fn process_pending_entry(
             std::fs::remove_file(path)?;
             return Ok(());
         }
-        let new_task = auto_open_task_from_prompt(events_path, project_hash, &conn, &text)?;
+        let Some(new_task) = auto_open_task_from_prompt(events_path, project_hash, &conn, &text)?
+        else {
+            // Prompt was only machine noise — drop the entry silently.
+            std::fs::remove_file(path)?;
+            return Ok(());
+        };
         recent.push(new_task);
     }
 

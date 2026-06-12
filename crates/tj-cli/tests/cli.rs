@@ -1293,43 +1293,26 @@ fn ingest_hook_session_start_emits_resume_pack_json() {
         ctx.contains("Adopt Rust"),
         "additionalContext must include event text: {ctx}"
     );
-    // v0.10.1 X2: sessionTitle is the Claude Code tab/window label.
-    // Always emitted when there are open tasks. Format: "TJ — <id> (<n> open)".
-    let title = hso
-        .get("sessionTitle")
-        .and_then(|s| s.as_str())
-        .expect("sessionTitle key missing in v0.10.1+");
+    // 0.14.3: sessionTitle / initialUserMessage are no longer emitted —
+    // they overrode Claude Code's native session name and seeded garbage
+    // task titles. The resume context rides in additionalContext alone.
     assert!(
-        title.starts_with("TJ — "),
-        "sessionTitle must lead with 'TJ — ' marker: {title}"
+        hso.get("sessionTitle").is_none(),
+        "sessionTitle must NOT be emitted — it overrides Claude's session name; got: {hso}"
     );
     assert!(
-        title.contains("(1 open)"),
-        "sessionTitle must include the open-task count: {title}"
-    );
-    // initialUserMessage emitted only when the primary task has at
-    // least one event — this task has the decision event, so we
-    // expect it. Format: "[Task Journal resumed: <id> — <title>]".
-    let initial = hso
-        .get("initialUserMessage")
-        .and_then(|s| s.as_str())
-        .expect("initialUserMessage key missing when primary task has events");
-    assert!(
-        initial.contains("Task Journal resumed"),
-        "initialUserMessage must announce resume: {initial}"
-    );
-    assert!(
-        initial.contains("Wire SessionStart pack"),
-        "initialUserMessage must include primary task title: {initial}"
+        hso.get("initialUserMessage").is_none(),
+        "initialUserMessage must NOT be emitted; got: {hso}"
     );
 }
 
 #[test]
-fn session_start_emits_no_initial_user_message_for_hollow_task() {
-    // v0.10.1 X2: hollow task (created but no events) should NOT
-    // trigger initialUserMessage — that would inject an unsolicited
-    // "resuming" preamble into the user's first prompt on a task
-    // that has nothing to resume. sessionTitle still emitted.
+fn session_start_emits_neither_session_title_nor_initial_message() {
+    // 0.14.3: the SessionStart envelope carries ONLY additionalContext
+    // (+ optional watchPaths). It must never set sessionTitle (which
+    // overrode Claude Code's own session name with our task id) nor
+    // initialUserMessage (which seeded garbage "[Task Journal resumed: …]"
+    // task titles).
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
         .unwrap()
@@ -1353,71 +1336,12 @@ fn session_start_emits_no_initial_user_message_for_hollow_task() {
     let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
     let hso = v.get("hookSpecificOutput").unwrap();
     assert!(
-        hso.get("sessionTitle").is_some(),
-        "sessionTitle still emitted on hollow task"
+        hso.get("sessionTitle").is_none(),
+        "sessionTitle must NOT be emitted; got: {hso}"
     );
     assert!(
         hso.get("initialUserMessage").is_none(),
-        "initialUserMessage MUST NOT be set when primary task has no events; got: {hso}"
-    );
-}
-
-#[test]
-fn session_start_initial_user_message_disabled_via_env() {
-    // TJ_INITIAL_USER_MESSAGE=0 opt-out for users who don't want
-    // the resume preamble injected into their first prompt.
-    let dir = assert_fs::TempDir::new().unwrap();
-    let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .args(["create", "Env-disabled initial message"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .args([
-            "event",
-            &task_id,
-            "--type",
-            "finding",
-            "--text",
-            "Sanity event so the task is not hollow.",
-        ])
-        .assert()
-        .success();
-
-    let body = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .env("TJ_INITIAL_USER_MESSAGE", "0")
-            .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap();
-    let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
-    let hso = v.get("hookSpecificOutput").unwrap();
-    assert!(
-        hso.get("initialUserMessage").is_none(),
-        "TJ_INITIAL_USER_MESSAGE=0 must suppress initialUserMessage"
-    );
-    assert!(
-        hso.get("additionalContext").is_some(),
-        "additionalContext must still be present — env var only gates initialUserMessage"
+        "initialUserMessage must NOT be emitted; got: {hso}"
     );
 }
 
@@ -2085,6 +2009,52 @@ fn ingest_hook_auto_opens_task_when_no_open_tasks() {
         .assert()
         .success()
         .stdout(contains("**Goal**: implement FIN-868 paygate fee dedup"));
+}
+
+#[test]
+fn ingest_hook_does_not_auto_open_for_log_scrollback() {
+    // 0.14.3: a UserPromptSubmit whose text is only terminal scrollback —
+    // here a framework log line — must NOT auto-open a task, otherwise the
+    // journal fills with garbage titles like "685] INFO: Mapped {…}" that
+    // then leak into the task list and the Claude Code session name.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-noise",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "685] INFO: Mapped {/rest-api/paymentlnk-notify, POST} route"
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_CLASSIFIER_CLI", "/bin/false")
+        .env("TJ_INGEST_SYNC", "1")
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    // Nothing should have been indexed — search for a token from the log
+    // line must surface no task id.
+    let body = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["search", "paymentlnk"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        !body.lines().any(|l| l.trim().starts_with("tj-")),
+        "log-scrollback prompt must NOT auto-open a task; got: {body:?}"
+    );
 }
 
 #[test]
@@ -3358,8 +3328,8 @@ fn session_start_omits_watch_paths_when_disabled_via_env() {
         "TJ_WATCH_PATHS=0 must suppress watchPaths emission"
     );
     assert!(
-        v["hookSpecificOutput"]["sessionTitle"].is_string(),
-        "sessionTitle still emitted independently"
+        v["hookSpecificOutput"]["additionalContext"].is_string(),
+        "additionalContext still emitted independently of watchPaths"
     );
 }
 

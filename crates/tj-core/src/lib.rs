@@ -63,6 +63,7 @@ pub mod reminder;
 pub mod session;
 pub mod session_id;
 pub mod storage;
+pub mod title;
 
 #[cfg(test)]
 mod schema_version_tests {
