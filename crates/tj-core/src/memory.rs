@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS global_memory (
 CREATE INDEX IF NOT EXISTS idx_gm_type ON global_memory(type);
 CREATE INDEX IF NOT EXISTS idx_gm_model ON global_memory(model);
 CREATE VIRTUAL TABLE IF NOT EXISTS global_fts USING fts5(event_id UNINDEXED, text);
+CREATE TABLE IF NOT EXISTS preferences (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  text       TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
 "#;
 
 /// Open (creating + migrating) the global memory database at `path`.
@@ -228,6 +233,36 @@ pub fn count(conn: &Connection) -> anyhow::Result<usize> {
     Ok(n as usize)
 }
 
+// ---------------------------------------------------------------------------
+// Preference tier (Pillar C): user-level, cross-project memory injected every
+// session — "I prefer terse output", "always use X here", etc.
+// ---------------------------------------------------------------------------
+
+/// Record a durable user preference. De-duplicated on text (a repeat is a
+/// no-op). Returns whether a new preference was stored.
+pub fn add_preference(conn: &Connection, text: &str, created_at: &str) -> anyhow::Result<bool> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("preference text is empty");
+    }
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO preferences(text, created_at) VALUES (?1, ?2)",
+        rusqlite::params![trimmed, created_at],
+    )?;
+    Ok(changed > 0)
+}
+
+/// All stored preferences, oldest first.
+pub fn list_preferences(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT text FROM preferences ORDER BY id")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +339,23 @@ mod tests {
         assert!(keyword_search(&global, "tiny ui css fix", 5)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn preferences_store_dedup_and_list_in_order() {
+        let d = tempfile::TempDir::new().unwrap();
+        let g = open(d.path().join("memory.sqlite")).unwrap();
+        assert!(add_preference(&g, "prefer terse output", "t1").unwrap());
+        assert!(add_preference(&g, "respond in Russian", "t2").unwrap());
+        // Duplicate is a no-op.
+        assert!(!add_preference(&g, "prefer terse output", "t3").unwrap());
+        assert_eq!(
+            list_preferences(&g).unwrap(),
+            vec![
+                "prefer terse output".to_string(),
+                "respond in Russian".to_string()
+            ]
+        );
     }
 
     #[test]
