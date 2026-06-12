@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-06-12
+
+### Fixed
+- **SessionStart no longer hijacks the Claude Code session name.** The v0.10.1
+  "X2" experiment emitted a `sessionTitle` field (`TJ — <task_id> (<n> open)`)
+  that overrode Claude Code's native, prompt-derived session name with our
+  internal task id — users saw `TJ — tj-qqay98cpc2` instead of a readable
+  name. It also emitted `initialUserMessage` (`[Task Journal resumed: …]`),
+  which the auto-open path then captured as a *new* garbage task title. Both
+  fields are removed; the resume context still rides in `additionalContext`,
+  and the tab label belongs to Claude Code again. (`TJ_INITIAL_USER_MESSAGE`
+  is gone with the feature.)
+- **Auto-opened tasks get human-readable titles.** `auto_open_task_from_prompt`
+  used to take the prompt's first non-empty line verbatim, so a session that
+  began with terminal scrollback was titled `685] INFO: Mapped {/rest-api/…}`.
+  Titles now run through `humanize_title`, which skips log lines, timestamps,
+  shell prompts, JSON/paths and the resume banner, and picks the first line
+  that reads like human intent. When the prompt is *only* machine noise the
+  journal declines to auto-open at all rather than create a junk-titled task.
+
 ## [0.14.2] - 2026-06-12
 
 ### Fixed
