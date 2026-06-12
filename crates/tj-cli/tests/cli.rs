@@ -836,13 +836,42 @@ fn install_hooks_writes_to_settings_json() {
     let settings_path = dir.path().join(".claude").join("settings.json");
     assert!(settings_path.exists());
     let content = std::fs::read_to_string(&settings_path).unwrap();
-    assert!(content.contains("UserPromptSubmit"));
-    assert!(content.contains("PostToolUse"));
     assert!(content.contains("task-journal ingest-hook"));
     assert!(
         content.contains("SessionStart"),
         "install-hooks must wire SessionStart so resume-pack injection works"
     );
+    // v0.14.0 — self-tagging-first: the default install does NOT wire the
+    // per-message classifier hooks (those spawn `claude -p`); they are opt-in
+    // via `--auto-capture`.
+    assert!(
+        !content.contains("UserPromptSubmit"),
+        "default install must not wire the per-message classifier hooks"
+    );
+    assert!(!content.contains("PostToolUse"));
+}
+
+#[test]
+fn install_hooks_auto_capture_wires_all_events() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--auto-capture"])
+        .assert()
+        .success();
+
+    let content =
+        std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+    for ev in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PostToolUse",
+        "Stop",
+        "PreCompact",
+    ] {
+        assert!(content.contains(ev), "--auto-capture must wire {ev}");
+    }
 }
 
 #[test]
@@ -875,7 +904,7 @@ fn install_hooks_is_idempotent_and_uninstall_works() {
             || after_install.contains("\"theme\": \"dark\""),
         "must preserve unrelated keys"
     );
-    assert!(after_install.contains("UserPromptSubmit"));
+    assert!(after_install.contains("SessionStart"));
 
     Command::cargo_bin("task-journal")
         .unwrap()
@@ -2891,13 +2920,13 @@ fn install_hooks_wires_precompact_event() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user"])
+        .args(["install-hooks", "--scope", "user", "--auto-capture"])
         .assert()
         .success();
     let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
     assert!(
         s.contains("PreCompact"),
-        "settings.json must wire PreCompact: {s}"
+        "settings.json must wire PreCompact under --auto-capture: {s}"
     );
 }
 

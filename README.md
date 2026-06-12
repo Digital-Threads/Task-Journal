@@ -76,7 +76,7 @@ That's it. Restart Claude Code, start working, and the journal fills itself.
 ## How it works
 
 - **Self-tagging is the primary path (recommended).** You — the agent in the live session — record reasoning directly via the five MCP tools: open a task with a `goal`, append a typed `decision` / `finding` / `rejection` / `evidence` event at the moment of commitment, and `task_close` with a written `outcome`. This is free (it rides the interactive session), language-agnostic, and higher-fidelity than any after-the-fact classifier. The bundled `task-journal` skill drives this automatically. See [MCP tools](#mcp-tools).
-- **Auto-capture is a best-effort backstop.** Claude Code hooks also run every prompt, tool call, and reply through a two-stage classifier that lands typed events on its own. Stage 1 is a fast in-process heuristic — pattern-matches obvious EN+RU phrasing for zero cost. Stage 2 falls back to an LLM only when the heuristic is uncertain. Without an LLM backend it **degrades to heuristic-only**: it reliably catches keyword-obvious lines but misses real reasoning — especially non-English prose. Treat it as a safety net under your explicit self-tagging, not the main capture mechanism. Hook returns in <100 ms — both stages run in a detached background worker, never blocking your session.
+- **Auto-capture is an opt-in backstop — OFF by default (v0.14.0).** A fresh `install-hooks` wires only a cheap, read-only SessionStart resume hook: no per-message classifier runs, no `claude -p` is ever spawned, nothing is charged. Self-tagging is the capture mechanism. Opt in with `install-hooks --auto-capture` and Claude Code hooks also run every prompt, tool call, and reply through a two-stage classifier that lands typed events on its own: Stage 1 is a fast in-process heuristic (obvious EN+RU phrasing, zero cost); Stage 2 falls back to an LLM only when the heuristic is uncertain (and only if you pick `--backend agent-sdk` / `api`). Even opted in it is a safety net under your explicit self-tagging, not the main mechanism, and it misses real reasoning — especially non-English prose.
 - **Artifact extraction.** Each event scans its text for commit hashes, PR URLs, file paths, issue IDs, and branch names. Aggregated artifacts are how Task Journal links related tasks: when you start a new task touching the same issue or file, the prior task is surfaced automatically.
 - **Resume packs.** `task_pack` (MCP tool or CLI) renders a task into a compact Markdown briefing — Goal, Outcome, decisions, rejections, evidence, artifacts — that fits in a fresh agent's context window without dumping the raw event log.
 - **Auto-capture boundaries.** Beyond per-event capture, two extra hooks mark *reasoning boundaries* automatically. On `PreCompact`, Task Journal reads the transcript JSONL tail (entries newer than the active task's last event) and enqueues anything the synchronous hooks missed before the compact — then drops a marker decision so the post-compact agent sees a clear cut. A `/rewind`-prefixed prompt appends a single correction event so pack readers see where the user rolled back. No mass-rejection of prior events — the boundary is a sentinel, not a rewrite.
@@ -166,7 +166,7 @@ task-journal pack tj-x9rz1f --mode full
 | `doctor` | Self-check the install |
 | `rebuild-state` | Rebuild SQLite from JSONL |
 | `migrate-project` | Re-key data when a project moves on disk |
-| `install-hooks [--scope user\|project] [--backend hybrid\|agent-sdk\|api\|heuristic]` | Wire Claude Code auto-capture hooks |
+| `install-hooks [--scope user\|project] [--auto-capture] [--backend hybrid\|agent-sdk\|api\|heuristic]` | Wire Claude Code hooks. Default: only the read-only SessionStart resume hook. `--auto-capture` adds the per-message classifier (spawns `claude -p` unless `--backend heuristic`). |
 
 ## MCP tools
 
@@ -253,10 +253,15 @@ Wire the MCP server into Claude Code (`~/.claude/settings.json`):
 }
 ```
 
-Wire auto-capture hooks (one-shot):
+Wire hooks (one-shot). Default installs only the read-only SessionStart resume
+hook — no classifier, no `claude -p`:
 
 ```bash
 task-journal install-hooks --scope user
+
+# Opt in to per-message auto-capture (spawns `claude -p` per uncertain chunk
+# unless you pin --backend heuristic):
+task-journal install-hooks --scope user --auto-capture --backend heuristic
 ```
 
 ### Updating
