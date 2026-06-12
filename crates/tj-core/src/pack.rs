@@ -402,11 +402,11 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     }
 
     // Token-budget truncation: cap pack size so it always fits an LLM context window.
-    // v0.10.3: full bumped 10K → 24K. Real tasks accumulate 50-100 events
+    // v0.10.3: full bumped 10K → 24K → 32K. Real tasks accumulate 50-100 events
     // and the prior cap clipped final-summary decisions even after the
-    // ORDER BY DESC reshuffle. 24K still fits comfortably inside any
+    // ORDER BY DESC reshuffle. 32K still fits comfortably inside any
     // modern LLM context budget.
-    const FULL_BUDGET: usize = 24 * 1024;
+    const FULL_BUDGET: usize = 32 * 1024;
     const COMPACT_BUDGET: usize = 2 * 1024;
     const TRUNC_MARKER: &str = "\n\n_(truncated to fit pack budget)_\n";
     let budget = match mode {
@@ -738,10 +738,10 @@ mod tests {
             db::index_event(&conn, &ev).unwrap();
         }
         let pack = assemble(&conn, "tj-big", PackMode::Full).unwrap();
-        // v0.10.3: FULL_BUDGET bumped 10K → 24K + truncation slack.
+        // v0.10.3: FULL_BUDGET bumped 10K → 24K → 32K + truncation slack.
         assert!(
-            pack.text.len() <= 26 * 1024,
-            "pack must stay under ~26KB; got {} bytes",
+            pack.text.len() <= 34 * 1024,
+            "pack must stay under ~34KB; got {} bytes",
             pack.text.len()
         );
         assert!(pack.metadata.truncated, "metadata.truncated must be true");
