@@ -15,6 +15,15 @@ readme = "../../README.md"
 name = "tj_core"
 path = "src/lib.rs"
 
+[features]
+# `embed` pulls the real semantic backend (model2vec, pure-Rust). It is ON by
+# default so out-of-the-box `ask` is genuinely semantic; build with
+# `--no-default-features` for the lean, dependency-free lexical fallback. We
+# pin model2vec-rs to fancy-regex (pure Rust) instead of its default `onig`
+# (native oniguruma C lib) so the build stays C-toolchain-free.
+default = ["embed"]
+embed = ["dep:model2vec-rs"]
+
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -31,6 +40,10 @@ ureq = { workspace = true }
 tracing = { workspace = true }
 fd-lock = { workspace = true }
 regex = { workspace = true }
+model2vec-rs = { version = "0.2", optional = true, default-features = false, features = [
+    "hf-hub",
+    "fancy-regex",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-12
+
+### Added
+- **Semantic memory — Pillar A** (epic to make the journal a drop-in
+  replacement for claude-mem/mem0). The journal can now retrieve events by
+  *meaning*, not just keyword.
+  - `task-journal ask "<query>" [--k N]` — semantic search over the project's
+    journal. Embeds the query, embeds any new events on the fly (so the index
+    self-maintains), and returns the most relevant events by score.
+  - `task-journal embed [--backfill]` — vectorise new events, or the whole
+    project history.
+  - **model2vec backend, on by default.** A pure-Rust static embedding model
+    (`minishlab/potion-multilingual-128M`, multilingual so RU/EN both work, no
+    onnxruntime) gives true paraphrase/morphology-robust recall. The model is
+    downloaded once from HuggingFace and cached. Override the model with
+    `TJ_EMBED_MODEL`.
+  - **Always-works fallback.** If the model can't load — offline first run,
+    download failure, or `TJ_EMBED=hash` — the journal falls back to a
+    dependency-free lexical embedder, so retrieval never breaks. Build with
+    `--no-default-features` for the lean, lexical-only configuration.
+  - Schema **v008**: an additive `embeddings` table (one little-endian f32 BLOB
+    per event, tagged with model + dim so a model change re-embeds cleanly) and
+    an `events_index.memory_tier` column for the tiers landing in a later phase.
+
+### Internal
+- `tj-core::embed` — `Embedder` trait, cosine, f32↔BLOB codec, `HashEmbedder`
+  (lexical default/fallback), `Model2VecEmbedder` (behind the default `embed`
+  feature), and `db::semantic_search` / `embed_pending`.
+- The MSRV (1.88) guarantee now covers the lean build; the `embed` feature
+  tracks a newer toolchain and is exercised by the stable CI jobs.
+
 ## [0.14.4] - 2026-06-12
 
 ### Fixed

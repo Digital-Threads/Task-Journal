@@ -60,11 +60,14 @@ jobs:
         with:
           key: msrv-1.88
 
-      - name: cargo build (MSRV)
-        run: cargo build --workspace --all-targets
+      # MSRV is guaranteed only for the lean build. The model2vec `embed`
+      # feature (on by default) pulls tokenizers/hf-hub, which track a newer
+      # toolchain; it's exercised by the stable `test` jobs instead.
+      - name: cargo build (MSRV, lean)
+        run: cargo build --workspace --all-targets --no-default-features
 
-      - name: cargo test (MSRV)
-        run: cargo test --workspace --all-targets
+      - name: cargo test (MSRV, lean)
+        run: cargo test --workspace --all-targets --no-default-features
 
   audit:
     name: cargo-audit (security advisories)

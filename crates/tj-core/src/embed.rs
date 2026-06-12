@@ -142,14 +142,83 @@ impl Embedder for HashEmbedder {
     }
 }
 
-/// The embedder the journal uses unless overridden. Today this is the
-/// dependency-free [`HashEmbedder`] (lexical, works everywhere, zero install
-/// cost). The model2vec backend — true semantic embeddings — will plug in here
-/// behind the `embed` feature as a quality upgrade, falling back to the hash
-/// embedder when its model isn't available so the default stays offline and
-/// install-free.
+/// Default model2vec repo — multilingual so RU/EN prose both embed well.
+/// Overridable via `TJ_EMBED_MODEL`.
+#[cfg(feature = "embed")]
+pub const DEFAULT_EMBED_MODEL: &str = "minishlab/potion-multilingual-128M";
+
+/// The embedder the journal uses unless overridden. With the `embed` feature
+/// (on by default) it loads the model2vec static model for true semantic
+/// recall; if that can't load — offline first run, download failure, or
+/// `TJ_EMBED=hash` — it falls back to the dependency-free lexical
+/// [`HashEmbedder`] so the journal never breaks.
 pub fn default_embedder() -> Box<dyn Embedder> {
+    // Test/escape hatch: force the deterministic lexical embedder.
+    if std::env::var("TJ_EMBED").as_deref() == Ok("hash") {
+        return Box::new(HashEmbedder::default());
+    }
+    #[cfg(feature = "embed")]
+    {
+        let repo =
+            std::env::var("TJ_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_EMBED_MODEL.to_string());
+        match Model2VecEmbedder::load(&repo) {
+            Ok(m) => return Box::new(m),
+            Err(e) => {
+                tracing::warn!("model2vec load failed ({e:#}); using hash embedder fallback");
+            }
+        }
+    }
     Box::new(HashEmbedder::default())
+}
+
+/// True semantic embedder backed by a model2vec static model (pure-Rust, no
+/// onnxruntime). The model is downloaded once via the HuggingFace hub and
+/// cached locally; later loads read the cache. Behind the `embed` feature.
+#[cfg(feature = "embed")]
+pub struct Model2VecEmbedder {
+    model: model2vec_rs::model::StaticModel,
+    model_id: String,
+    dim: usize,
+}
+
+#[cfg(feature = "embed")]
+impl Model2VecEmbedder {
+    /// Load `repo` (a HuggingFace model id or a local directory). Probes the
+    /// model once to discover its output dimension.
+    pub fn load(repo: &str) -> anyhow::Result<Self> {
+        let model = model2vec_rs::model::StaticModel::from_pretrained(
+            repo,
+            None,       // no auth token
+            Some(true), // L2-normalise outputs
+            None,       // no subfolder
+        )?;
+        let dim = model.encode_single("probe").len();
+        anyhow::ensure!(
+            dim > 0,
+            "model2vec model {repo} produced a zero-dim embedding"
+        );
+        Ok(Self {
+            model,
+            model_id: format!("model2vec:{repo}"),
+            dim,
+        })
+    }
+}
+
+#[cfg(feature = "embed")]
+impl Embedder for Model2VecEmbedder {
+    fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
+        Ok(self.model.encode(&owned))
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
 }
 
 #[cfg(test)]

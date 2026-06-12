@@ -4780,10 +4780,12 @@ fn embed_backfill_vectorises_events_then_idempotent() {
         .assert()
         .success();
 
-    // First backfill: embeds the open + decision events.
+    // First backfill: embeds the open + decision events. TJ_EMBED=hash forces
+    // the deterministic lexical embedder so the assertion is model-independent.
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_EMBED", "hash")
         .args(["embed", "--backfill"])
         .assert()
         .success()
@@ -4794,6 +4796,7 @@ fn embed_backfill_vectorises_events_then_idempotent() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_EMBED", "hash")
         .args(["embed"])
         .assert()
         .success()
@@ -4848,6 +4851,7 @@ fn ask_ranks_semantically_relevant_event_first() {
         Command::cargo_bin("task-journal")
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_EMBED", "hash")
             .args(["ask", "idempotent refunds ledger double writes", "--k", "3"])
             .assert()
             .success()
@@ -4861,5 +4865,69 @@ fn ask_ranks_semantically_relevant_event_first() {
     assert!(
         first.contains("refund") || first.contains("ledger"),
         "top hit must be the refund decision; got first line: {first:?}\nfull:\n{out}"
+    );
+}
+
+#[test]
+#[ignore = "downloads the model2vec model from HuggingFace; run manually with --ignored"]
+fn ask_with_model2vec_handles_paraphrase() {
+    // True semantic recall: a paraphrase that shares NO exact term with the
+    // target event must still rank it first. The lexical hash embedder fails
+    // this; the model2vec backend (default) passes. Needs network on first run.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Payments hardening"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    for (ty, text) in [
+        (
+            "decision",
+            "Route refunds through the idempotent payment ledger to stop double writes.",
+        ),
+        (
+            "finding",
+            "The frontend button hover color is wrong in dark mode.",
+        ),
+        (
+            "finding",
+            "Added a composite index on users email and tenant for lookup speed.",
+        ),
+    ] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["event", &task_id, "--type", ty, "--text", text])
+            .assert()
+            .success();
+    }
+
+    // "duplicate refund payments" shares no exact token with the ledger event.
+    let out = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["ask", "duplicate refund payments", "--k", "3"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let first = out.lines().next().unwrap_or("");
+    assert!(
+        first.contains("refund") || first.contains("ledger"),
+        "model2vec must rank the refund decision first for a paraphrase; got: {first:?}"
     );
 }
