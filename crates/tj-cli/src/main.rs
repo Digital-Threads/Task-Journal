@@ -1554,7 +1554,47 @@ fn main() -> Result<()> {
                         );
                     }
                 }
-                hooks_obj.insert("hooks".into(), entries);
+                // MERGE our entries into the existing `hooks` block — touch ONLY
+                // task-journal hooks, never clobber other plugins' hooks. For each
+                // event we (a) strip any prior task-journal entry (idempotent
+                // re-install) then (b) append ours, leaving foreign hooks and
+                // untouched events intact.
+                let is_tj = |c: &str| {
+                    c.contains("task-journal ingest-hook") || c.contains("task-journal nudge")
+                };
+                let hooks_block = hooks_obj
+                    .entry("hooks".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                let hooks_block = hooks_block
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("settings `hooks` is not an object"))?;
+                for (event, our_arr) in entries.as_object().expect("entries is an object") {
+                    let existing = hooks_block
+                        .entry(event.clone())
+                        .or_insert_with(|| serde_json::json!([]));
+                    let existing = existing
+                        .as_array_mut()
+                        .ok_or_else(|| anyhow::anyhow!("hooks.{event} is not an array"))?;
+                    for entry in existing.iter_mut() {
+                        if let Some(inner) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                            inner.retain(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|c| !is_tj(c))
+                                    .unwrap_or(true)
+                            });
+                        }
+                    }
+                    existing.retain(|e| {
+                        e.get("hooks")
+                            .and_then(|v| v.as_array())
+                            .map(|a| !a.is_empty())
+                            .unwrap_or(true)
+                    });
+                    for our_entry in our_arr.as_array().expect("event entry is an array") {
+                        existing.push(our_entry.clone());
+                    }
+                }
             }
             std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
             println!("{}", settings_path.display());

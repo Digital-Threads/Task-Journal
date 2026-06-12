@@ -882,6 +882,60 @@ fn install_hooks_auto_capture_wires_all_events() {
 }
 
 #[test]
+fn install_hooks_merges_and_preserves_third_party_hooks() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    // Pre-existing foreign hooks (another plugin) on the same events we touch.
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{ "matcher": "", "hooks": [
+                    { "type": "command", "command": "other-plugin do-thing" }
+                ]}],
+                "SessionStart": [{ "matcher": "", "hooks": [
+                    { "type": "command", "command": "other-plugin start" }
+                ]}]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let run = || {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("HOME", dir.path())
+            .args(["install-hooks", "--scope", "user"])
+            .assert()
+            .success();
+    };
+    run();
+    run(); // idempotent: second install must not duplicate task-journal entries
+
+    let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    // Foreign hooks survive.
+    assert!(
+        content.contains("other-plugin do-thing"),
+        "must preserve a third-party UserPromptSubmit hook: {content}"
+    );
+    assert!(
+        content.contains("other-plugin start"),
+        "must preserve a third-party SessionStart hook"
+    );
+    // Ours got added.
+    assert!(content.contains("task-journal nudge"));
+    assert!(content.contains("task-journal ingest-hook"));
+    // Idempotent — exactly one nudge, not two.
+    assert_eq!(
+        content.matches("task-journal nudge").count(),
+        1,
+        "re-install must not duplicate the nudge hook: {content}"
+    );
+}
+
+#[test]
 fn install_hooks_is_idempotent_and_uninstall_works() {
     let dir = assert_fs::TempDir::new().unwrap();
     let claude_dir = dir.path().join(".claude");

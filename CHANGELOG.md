@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-06-12
+
+### Fixed
+- **`install-hooks` no longer clobbers other plugins' hooks.** It used to
+  replace the entire `hooks` block in settings.json, wiping any co-located
+  third-party hooks (token-pilot, context-mode, …). It now **merges**: for each
+  event it touches, it strips only prior task-journal entries (idempotent
+  re-install) and appends its own, leaving foreign hooks and untouched events
+  intact. Makes re-running `install-hooks` safe on a multi-plugin setup —
+  needed to wire the 0.14.1 nudge without nuking everything else.
+
 ## [0.14.1] - 2026-06-12
 
 ### Added (reliability — no model, no cost)
