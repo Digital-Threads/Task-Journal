@@ -4149,14 +4149,17 @@ fn compute_savings(
     })
 }
 
-/// Format a token count compactly: 980 → "980", 3_240 → "3.2k", 88_000 → "88k".
+/// Format a token count compactly: 980 → "980", 3_240 → "3.2k", 88_000 → "88k",
+/// 2_760_000 → "2.8M".
 fn fmt_tokens(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
     } else if n < 100_000 {
         format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
+    } else if n < 1_000_000 {
         format!("{}k", n / 1_000)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
 
@@ -4164,16 +4167,16 @@ fn fmt_tokens(n: u64) -> String {
 /// " | spent 3.2k tok ($0.0012) · saved ~88k→1.5k tok (59×)".
 fn stats_suffix(spent: &tj_core::llm::LlmUsage, saved: &Option<Savings>) -> String {
     let mut parts = Vec::new();
-    if spent.total_tokens() > 0 {
-        let cost = match spent.cost_usd {
-            Some(c) if c > 0.0 => format!(" (${c:.4})"),
-            _ => String::new(),
-        };
-        parts.push(format!(
-            "spent {} tok{}",
-            fmt_tokens(spent.total_tokens()),
-            cost
-        ));
+    // claude -p reports a (notional) dollar cost but muddy token counts — its
+    // big prompt lands in `cache_creation`, not `input_tokens` — so lead with
+    // the cost there. API backends report no cost but clean tokens, so show
+    // those instead.
+    match spent.cost_usd {
+        Some(c) if c > 0.0 => parts.push(format!("cost ${c:.4}")),
+        _ if spent.total_tokens() > 0 => {
+            parts.push(format!("spent {} tok", fmt_tokens(spent.total_tokens())))
+        }
+        _ => {}
     }
     if let Some(s) = saved {
         if s.pack_tokens > 0 && s.raw_tokens > s.pack_tokens {
@@ -4395,6 +4398,21 @@ fn finalize_one_task(
     Ok(out)
 }
 
+/// A one-line nudge shown when a cost-reporting backend (claude -p) was used:
+/// the same Haiku via a direct API skips Claude Code's harness overhead. Only
+/// claude -p reports a non-zero `cost_usd`, so this fires for it alone.
+fn backend_cost_tip(cost: Option<f64>) -> Option<String> {
+    match cost {
+        Some(c) if c > 0.0 => Some(
+            "tip: that cost is claude -p's Claude Code overhead (notional under a \
+subscription). For ~50× cheaper per task, use --backend anthropic (direct Haiku API, \
+needs ANTHROPIC_API_KEY) — or --backend ollama for free, local."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// Human-readable one-liner for a finalize result.
 fn print_finalize_outcome(task_id: &str, out: &FinalizeOutcome) {
     if out.skipped_no_backend {
@@ -4458,6 +4476,9 @@ fn run_complete_single(
     };
     let out = finalize_one_task(&ctx, task_id, enrich, dry_run, backend)?;
     print_finalize_outcome(task_id, &out);
+    if let Some(tip) = backend_cost_tip(out.spent.cost_usd) {
+        eprintln!("{tip}");
+    }
     Ok(())
 }
 
@@ -4603,6 +4624,9 @@ fn run_complete_batch(
             "\nTotals across {done_count} task(s): {}",
             totals.trim_start_matches(" | ")
         );
+    }
+    if let Some(tip) = backend_cost_tip(total_spent.cost_usd) {
+        eprintln!("{tip}");
     }
 
     if !left_open.is_empty() {
@@ -5682,8 +5706,24 @@ mod inline_tests {
             pack_tokens: 1_500,
         });
         let s = stats_suffix(&spent, &saved);
-        assert!(s.contains("spent 1.5k tok ($0.0012)"), "{s}");
+        // Cost-reporting backend (claude -p) → lead with cost, not muddy tokens.
+        assert!(s.contains("cost $0.0012"), "{s}");
         assert!(s.contains("saved ~90.0k→1.5k tok (60×)"), "{s}");
+    }
+
+    #[test]
+    fn stats_suffix_shows_tokens_for_costless_backend() {
+        // API backend reports clean tokens, no cost → show the token count.
+        let spent = tj_core::llm::LlmUsage {
+            input_tokens: 1800,
+            output_tokens: 200,
+            cost_usd: None,
+        };
+        assert_eq!(
+            stats_suffix(&spent, &None),
+            " | spent 2.0k tok",
+            "API backend should show tokens"
+        );
     }
 
     #[test]

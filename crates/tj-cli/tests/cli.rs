@@ -5621,7 +5621,7 @@ fn complete_retitles_and_closes_via_fake_backend() {
         .args(["complete", &task_id])
         .assert()
         .success()
-        .stdout(contains("spent 1.5k tok ($0.0012)"))
+        .stdout(contains("cost $0.0012"))
         .stdout(contains("retitled"))
         .stdout(contains("closed"));
 

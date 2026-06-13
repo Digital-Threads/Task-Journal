@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-06-13
+
+### Changed
+- **Cheaper, honest `complete` stats.** One-shot `claude -p` calls now pass
+  `--disallowed-tools` (we never use tools), keeping the built-in tool schemas
+  out of the prompt and roughly halving the harness overhead. The stats line now
+  leads with the real dollar cost for `claude -p` (whose token counts are muddy —
+  a big prompt lands in `cache_creation`, not `input_tokens`) and shows clean
+  token counts only for API backends; token sizes scale to `M`. When a
+  cost-reporting backend is used, a one-line tip points at `--backend anthropic`
+  (direct Haiku API, ~50× cheaper per task by skipping Claude Code's overhead)
+  or `--backend ollama` (free, local).
+
 ## [0.24.0] - 2026-06-13
 
 ### Added
