@@ -5364,3 +5364,60 @@ fn consolidate_skips_without_api_key_and_spends_nothing() {
         .success()
         .stdout(contains("skipped"));
 }
+
+#[test]
+fn capture_off_marker_no_ops_ingest_hook_capture() {
+    // `capture off` writes a marker that makes ingest-hook skip the capture
+    // path — so an auto-opening prompt records nothing. `capture on` clears it.
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["capture", "off"])
+        .assert()
+        .success()
+        .stdout(contains("OFF"));
+
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-cap",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "implement FIN-868 paygate fee dedup"
+    })
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_INGEST_SYNC", "1")
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let body = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["search", "paygate"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        !body.lines().any(|l| l.trim().starts_with("tj-")),
+        "capture off must no-op ingest-hook capture; got: {body:?}"
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["capture", "on"])
+        .assert()
+        .success()
+        .stdout(contains("ON"));
+}

@@ -652,6 +652,14 @@ enum Commands {
     },
     /// List your stored user preferences.
     Preferences,
+    /// Turn realtime hook capture on or off via a `.capture-disabled` marker.
+    /// `off` no-ops the capture path of `ingest-hook` immediately — even in an
+    /// already-running session — without touching the read-only SessionStart
+    /// resume. Use it to silence a stale auto-capture hook.
+    Capture {
+        /// "on" (remove the marker) or "off" (write it).
+        state: String,
+    },
     /// Distil this project's recurring decisions and constraints into durable
     /// semantic/procedural facts (Pillar C). MANUAL and opt-in — it makes ONE
     /// LLM call per run and is never wired to a hook, so it can't spend
@@ -1298,6 +1306,21 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Capture { state } => {
+            let marker = tj_core::paths::data_dir()?.join(".capture-disabled");
+            match state.trim().to_lowercase().as_str() {
+                "off" | "false" | "0" => {
+                    std::fs::create_dir_all(marker.parent().unwrap())?;
+                    std::fs::write(&marker, "")?;
+                    println!("realtime capture OFF — the marker no-ops ingest-hook capture now (resume still works).");
+                }
+                "on" | "true" | "1" => {
+                    let _ = std::fs::remove_file(&marker);
+                    println!("realtime capture ON.");
+                }
+                other => anyhow::bail!("expected `on` or `off`, got `{other}`"),
+            }
+        }
         Commands::Consolidate { max_facts, backend } => {
             run_consolidate(max_facts, backend.as_deref())?;
         }
@@ -1941,6 +1964,19 @@ fn main() -> Result<()> {
                 (Some(k), Some(t)) => (k, t, serde_json::Value::Null),
                 _ => parse_hook_stdin()?,
             };
+
+            // Emergency capture kill-switch: a `.capture-disabled` marker in the
+            // data dir no-ops realtime capture (the read-only SessionStart
+            // resume still runs). Because the hook re-invokes this binary on
+            // every event, dropping the marker stops a stale auto-capture hook
+            // in an already-running session immediately — no restart needed.
+            if kind != "SessionStart"
+                && tj_core::paths::data_dir()
+                    .map(|d| d.join(".capture-disabled").exists())
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
 
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
