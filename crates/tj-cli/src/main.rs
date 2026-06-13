@@ -4153,6 +4153,14 @@ fn enrich_task(
     if sessions.is_empty() {
         return Ok(0);
     }
+    // Enrich is the slow part — one (or more, for big transcripts) `claude -p`
+    // call per session. Announce it so a multi-minute run doesn't look hung;
+    // `--quick` skips this entirely.
+    eprintln!(
+        "complete: enriching {} session(s) via {} — can take a few minutes (or use --quick to skip)…",
+        sessions.len(),
+        llm.name()
+    );
     let run_id = ulid::Ulid::new().to_string();
     let dream_backend = tj_core::dream::llm_backend::LlmDreamBackend::new(llm);
     let opts = tj_core::dream::DreamOptions {
