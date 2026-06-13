@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-13
+
+### Added
+- **Consolidation — Pillar C complete.** `task-journal consolidate` distils a
+  project's recurring decisions and constraints into a handful of durable
+  **semantic** / **procedural** facts ("refunds always go through the ledger",
+  "PR into main, squash-merge"), stored as events in a per-project
+  *"Project conventions (consolidated)"* task with provenance
+  (`derived_from`), and surfaced in `ask`/`recall`.
+  - **Manual and opt-in.** It makes exactly **one direct Anthropic Haiku API
+    call per run, only when you run it** — never wired to a hook, so it can
+    never spend automatically. Roughly 1¢ per run.
+  - The **direct API** (not `claude -p`) is used on purpose: post-2026-06-15
+    both bill as extra usage, but `claude -p` also boots the whole environment
+    (~tens of k tokens) per call; the direct API sends only the ~7k-token
+    prompt.
+  - **No `ANTHROPIC_API_KEY` → it skips cleanly** with a message and writes
+    nothing. There is no heuristic fallback (it would manufacture low-trust
+    facts). Re-running de-duplicates.
+  - `--max-facts N` caps output; `TJ_CONSOLIDATE_MODEL` overrides the model.
+
+### Internal
+- `tj-core::consolidate` (prompt, parse, direct-API call, mockito-tested) +
+  `db::high_signal_events` / `find_task_by_title` / `task_event_texts`. CLI
+  `consolidate`.
+
 ## [0.18.0] - 2026-06-12
 
 ### Added

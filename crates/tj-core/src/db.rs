@@ -1135,6 +1135,52 @@ pub fn upsert_embedding(
     Ok(())
 }
 
+/// High-signal events (decisions, constraints, rejections) for consolidation —
+/// `(event_id, text)`, newest first, capped at `limit`.
+pub fn high_signal_events(
+    conn: &Connection,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.event_id, f.text
+           FROM search_fts f
+           JOIN events_index ei ON ei.event_id = f.event_id
+          WHERE f.type IN ('decision', 'constraint', 'rejection')
+          ORDER BY ei.timestamp DESC
+          LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// First task whose title exactly matches `title`, if any — used to find the
+/// reusable per-project consolidation task.
+pub fn find_task_by_title(conn: &Connection, title: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT task_id FROM tasks WHERE title = ?1 LIMIT 1")?;
+    let mut rows = stmt.query(rusqlite::params![title])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// Texts of all events under a task (for de-duplicating consolidated facts).
+pub fn task_event_texts(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT text FROM search_fts WHERE task_id = ?1")?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// Number of stored embeddings for a project (test/stats helper).
 pub fn count_embeddings(conn: &Connection, project_hash: &str) -> anyhow::Result<usize> {
     let n: i64 = conn.query_row(
