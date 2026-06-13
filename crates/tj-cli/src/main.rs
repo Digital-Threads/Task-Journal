@@ -2140,6 +2140,25 @@ fn main() -> Result<()> {
                         bundle.push_str(&reminder);
                         bundle.push_str("\n\n");
                     }
+                    // Advisory (the hook can't force it): suggest the main agent
+                    // delegate the just-compacted segment to the in-session
+                    // distiller subagent, which backfills missed reasoning from
+                    // the transcript file (which survives compaction) for the
+                    // active task(s). Background → never blocks. Gated off by
+                    // TJ_DISTILLER_HINT=0 for users who don't want it.
+                    if std::env::var("TJ_DISTILLER_HINT").as_deref() != Ok("0") {
+                        let transcript_hint = payload
+                            .get("transcript_path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| format!(" (transcript: {p})"))
+                            .unwrap_or_default();
+                        bundle.push_str(&format!(
+                            "[task-journal] A compaction just occurred. If decisions, rejections, \
+or findings from before it are not yet in the journal for the active task(s) above, delegate to \
+the `task-journal-distiller` subagent to capture them from the transcript{transcript_hint}. It \
+runs in the background and won't block you; it only fills gaps and never closes tasks.\n\n"
+                        ));
+                    }
                 }
                 for tc in &recent {
                     let pack = tj_core::pack::assemble(

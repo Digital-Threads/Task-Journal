@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.24.1] - 2026-06-13
+## [0.25.0] - 2026-06-13
+
+### Added
+- **In-session compaction distiller.** A new `task-journal-distiller` subagent
+  (Haiku, `background: true`) reads a just-compacted conversation segment from
+  the transcript file and backfills the decisions / rejections / findings that
+  weren't logged yet for the active task — via the journal MCP, never closing a
+  task. Because it runs as an in-session subagent it costs no separate `claude
+  -p` call (~5k token overhead vs ~46k) and doesn't block the main chat. After a
+  compaction, the `SessionStart` hook now adds a short advisory suggesting the
+  main agent delegate the segment to it (the platform doesn't let a hook spawn a
+  subagent, so this is advisory; the existing deterministic catch-up remains the
+  guaranteed safety net). Disable the hint with `TJ_DISTILLER_HINT=0`.
 
 ### Changed
 - **Cheaper, honest `complete` stats.** One-shot `claude -p` calls now pass
