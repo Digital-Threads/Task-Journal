@@ -652,6 +652,16 @@ enum Commands {
     },
     /// List your stored user preferences.
     Preferences,
+    /// Distil this project's recurring decisions and constraints into durable
+    /// semantic/procedural facts (Pillar C). MANUAL and opt-in — it makes ONE
+    /// direct Haiku API call per run (needs ANTHROPIC_API_KEY; ~1c/run) and is
+    /// never wired to a hook, so it can't spend automatically. Facts are stored
+    /// as events in a per-project "conventions" task and surface in ask/recall.
+    Consolidate {
+        /// Maximum number of facts to produce.
+        #[arg(long, default_value_t = 8)]
+        max_facts: usize,
+    },
     /// Render and print the resume pack for a task.
     Pack {
         /// Task id (e.g. tj-7f3a).
@@ -1283,6 +1293,9 @@ fn main() -> Result<()> {
                     println!("- {p}");
                 }
             }
+        }
+        Commands::Consolidate { max_facts } => {
+            run_consolidate(max_facts)?;
         }
         Commands::Event {
             task_id,
@@ -3902,6 +3915,112 @@ fn emit_session_context(ctx: &str) {
         }
     });
     println!("{env}");
+}
+
+const CONSOLIDATE_TASK_TITLE: &str = "Project conventions (consolidated)";
+
+/// Manual consolidation: read this project's recurring decisions/constraints,
+/// distil them into durable facts via one direct Haiku API call, and store the
+/// facts as events in a per-project conventions task. Skips cleanly (no spend)
+/// when ANTHROPIC_API_KEY is absent.
+fn run_consolidate(max_facts: usize) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    if !events_path.exists() {
+        anyhow::bail!("no events file at {events_path:?}");
+    }
+    let conn = tj_core::db::open(&state_path)?;
+    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+
+    let sources = tj_core::db::high_signal_events(&conn, 200)?;
+    if sources.is_empty() {
+        println!("nothing to consolidate — no decisions/constraints/rejections recorded yet");
+        return Ok(());
+    }
+    let texts: Vec<String> = sources.iter().map(|(_, t)| t.clone()).collect();
+    let source_ids: Vec<String> = sources.iter().map(|(id, _)| id.clone()).collect();
+
+    let consolidator = match tj_core::consolidate::Consolidator::from_env(max_facts) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("skipped: {e}. Set ANTHROPIC_API_KEY to enable consolidation (~1c/run).");
+            return Ok(());
+        }
+    };
+    eprintln!(
+        "consolidating {} high-signal event(s) via {} …",
+        texts.len(),
+        consolidator.model
+    );
+    let facts = consolidator.consolidate(&texts)?;
+    if facts.is_empty() {
+        println!("no durable facts found");
+        return Ok(());
+    }
+
+    // Reuse the per-project conventions task, or create it.
+    let task_id = match tj_core::db::find_task_by_title(&conn, CONSOLIDATE_TASK_TITLE)? {
+        Some(id) => id,
+        None => {
+            let id = tj_core::new_task_id();
+            let mut ev = tj_core::event::Event::new(
+                id.clone(),
+                tj_core::event::EventType::Open,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                CONSOLIDATE_TASK_TITLE.to_string(),
+            );
+            ev.meta = serde_json::json!({ "title": CONSOLIDATE_TASK_TITLE });
+            let mut w = tj_core::storage::JsonlWriter::open(&events_path)?;
+            w.append(&ev)?;
+            w.flush_durable()?;
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            id
+        }
+    };
+
+    // De-dup against facts already stored in the conventions task.
+    let existing: std::collections::HashSet<String> =
+        tj_core::db::task_event_texts(&conn, &task_id)?
+            .into_iter()
+            .collect();
+
+    let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+    let mut written = 0usize;
+    for f in &facts {
+        if existing.contains(&f.text) {
+            continue;
+        }
+        let mut ev = tj_core::event::Event::new(
+            task_id.clone(),
+            tj_core::event::EventType::Finding,
+            tj_core::event::Author::Agent,
+            tj_core::event::Source::Cli,
+            f.text.clone(),
+        );
+        ev.meta = serde_json::json!({
+            "memory_tier": f.tier,
+            "consolidated": true,
+            "derived_from": source_ids,
+        });
+        writer.append(&ev)?;
+        written += 1;
+    }
+    writer.flush_durable()?;
+
+    // Index the new facts and push them to the global recall index.
+    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    let embedder = tj_core::embed::default_embedder();
+    let now = chrono::Utc::now().to_rfc3339();
+    tj_core::db::embed_pending(&conn, &project_hash, embedder.as_ref(), &now, 512)?;
+    sync_global_memory(&conn, &project_hash);
+
+    println!(
+        "consolidated {written} new fact(s) into task {task_id} (\"{CONSOLIDATE_TASK_TITLE}\")"
+    );
+    Ok(())
 }
 
 fn auto_open_task_from_prompt(

@@ -50,6 +50,7 @@ mod task_id_tests {
 pub mod artifacts;
 pub mod classifier;
 pub mod completeness;
+pub mod consolidate;
 pub mod db;
 pub mod dream;
 pub mod embed;

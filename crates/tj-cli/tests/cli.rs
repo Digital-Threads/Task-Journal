@@ -5209,3 +5209,154 @@ fn stats_reports_memory_preferences_count() {
         .success()
         .stdout(contains("preferences: 1"));
 }
+
+#[test]
+fn consolidate_writes_facts_to_conventions_task_and_dedups() {
+    // Pillar C: `consolidate` distils decisions into durable facts via one
+    // (mocked) Haiku call and stores them in a per-project conventions task.
+    // Re-running de-dups. TJ_CONSOLIDATE_BASE_URL points at the mock; TJ_EMBED
+    // forces the deterministic embedder.
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "id": "m", "type": "message", "role": "assistant",
+                "content": [{"type": "text",
+                    "text": "[semantic] Refunds always route through the idempotent ledger\n[procedural] PR into main, squash-merge"}]
+            })
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let tid = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", xdg.path())
+            .args(["create", "Payments"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "event",
+            &tid,
+            "--type",
+            "decision",
+            "--text",
+            "chose the idempotent ledger for refunds",
+        ])
+        .assert()
+        .success();
+
+    let run = || {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("ANTHROPIC_API_KEY", "test-key")
+            .env("TJ_CONSOLIDATE_BASE_URL", server.url())
+            .env("TJ_EMBED", "hash")
+            .args(["consolidate"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+
+    let first = String::from_utf8(run()).unwrap();
+    assert!(
+        first.contains("consolidated 2 new fact(s)"),
+        "first run must store 2 facts; got: {first:?}"
+    );
+    // Second run: same facts already present -> de-duped to 0.
+    let second = String::from_utf8(run()).unwrap();
+    assert!(
+        second.contains("consolidated 0 new fact(s)"),
+        "second run must de-dup; got: {second:?}"
+    );
+    mock.assert();
+
+    // The fact is now recallable.
+    let recall = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_EMBED", "hash")
+            .args(["recall", "refund ledger idempotent", "--k", "3"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        recall.contains("ledger"),
+        "consolidated fact must surface in cross-project recall; got: {recall:?}"
+    );
+}
+
+#[test]
+fn consolidate_skips_without_api_key_and_spends_nothing() {
+    // Safety: with no ANTHROPIC_API_KEY, consolidate makes no call and creates
+    // no facts — it can never spend automatically.
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let tid = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", xdg.path())
+            .args(["create", "Scheduler"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "event",
+            &tid,
+            "--type",
+            "decision",
+            "--text",
+            "use postgres advisory locks for cron",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", xdg.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(["consolidate"])
+        .assert()
+        .success()
+        .stdout(contains("skipped"));
+}
