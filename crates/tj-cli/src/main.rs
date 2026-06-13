@@ -863,6 +863,23 @@ enum Commands {
         /// Cap sessions processed this run.
         #[arg(long)]
         limit: Option<usize>,
+        /// LLM backend override: claude-p (default) | anthropic | openai | ollama.
+        #[arg(long)]
+        backend: Option<String>,
+    },
+    /// Complete a task from its transcripts: re-read the sessions tied to a task
+    /// and append the decisions/findings the live capture missed. A friendly
+    /// alias for `dream --task <id>`. MANUAL, one LLM call per session via the
+    /// chosen backend (free with `--backend ollama`).
+    Complete {
+        /// The task id to complete.
+        task: String,
+        /// Show scope without calling the model or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// LLM backend override: claude-p (default) | anthropic | openai | ollama.
+        #[arg(long)]
+        backend: Option<String>,
     },
     /// Export tasks as Markdown or JSON to stdout.
     Export {
@@ -2744,93 +2761,17 @@ fn main() -> Result<()> {
             task,
             dry_run,
             limit,
+            backend,
         } => {
-            let cwd = std::env::current_dir()?;
-            let project_hash = tj_core::project_hash::from_path(&cwd)?;
-            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-            let conn = tj_core::db::open(&state_path)?;
-
-            // 1. Resolve session files in scope.
-            let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
-            let Some(project_dir) = project_dir else {
-                println!("dream: no Claude Code sessions found for this project");
-                return Ok(());
-            };
-            let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;
-
-            let since_time = if let Some(days) = since {
-                Some(
-                    std::time::SystemTime::now()
-                        - std::time::Duration::from_secs((days.max(0) as u64) * 86_400),
-                )
-            } else {
-                // Watermark → SystemTime. Absent watermark = all sessions.
-                match tj_core::dream::state::last_dream_at(&conn, &project_hash)? {
-                    Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
-                        .ok()
-                        .map(std::time::SystemTime::from),
-                    None => None,
-                }
-            };
-
-            let scoped: Vec<tj_core::dream::scope::SessionFile> = session_paths
-                .into_iter()
-                .filter_map(|p| {
-                    let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
-                    Some(tj_core::dream::scope::SessionFile { path: p, mtime })
-                })
-                .collect();
-            let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
-
-            // 2. Assemble (session_id, BackfillInput) per session.
-            let run_id = ulid::Ulid::new().to_string();
-            let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
-
-            // 3. Run.
-            let opts = tj_core::dream::DreamOptions {
-                project_hash: project_hash.clone(),
-                dry_run,
-            };
-            if dry_run {
-                println!("dream (dry-run): {} session(s) in scope", sessions.len());
-                return Ok(());
-            }
-            // Prefer the subscription-native agent-sdk backend (local `claude`
-            // CLI, pinned to Haiku — cheap, no ANTHROPIC_API_KEY). Fall back to
-            // the Anthropic API backend only when no `claude` is on PATH.
-            let backend: Box<dyn tj_core::dream::backend::DreamBackend> =
-                match tj_core::dream::agent_sdk::ClaudeCliDreamBackend::from_env() {
-                    Some(b) => {
-                        eprintln!("dream: backend=agent-sdk (claude CLI, Haiku)");
-                        Box::new(b)
-                    }
-                    None => {
-                        eprintln!(
-                            "dream: no `claude` on PATH — backend=api (needs ANTHROPIC_API_KEY)"
-                        );
-                        Box::new(tj_core::dream::http::AnthropicDreamBackend::from_env()?)
-                    }
-                };
-            let report = tj_core::dream::run_dream(
-                &conn,
-                &events_path,
-                &opts,
-                backend.as_ref(),
-                sessions,
-                &run_id,
-            )?;
-
-            // 4. Advance watermark to now (only reached on success).
-            tj_core::dream::state::set_last_dream_at(
-                &conn,
-                &project_hash,
-                &chrono::Utc::now().to_rfc3339(),
-            )?;
-            println!(
-                "dream: {} session(s) processed, {} event(s) backfilled",
-                report.sessions_processed, report.events_backfilled
-            );
+            run_dream_op(since, task, dry_run, limit, backend.as_deref())?;
+        }
+        Commands::Complete {
+            task,
+            dry_run,
+            backend,
+        } => {
+            // "complete this task" = dream scoped to that task's sessions.
+            run_dream_op(None, Some(task), dry_run, None, backend.as_deref())?;
         }
         Commands::Export {
             format,
@@ -4037,6 +3978,101 @@ fn emit_session_context(ctx: &str) {
 }
 
 const CONSOLIDATE_TASK_TITLE: &str = "Project conventions (consolidated)";
+
+/// Dream backfill, shared by `dream` and `complete`: re-read the in-scope
+/// session transcripts and append the events the live capture missed, via the
+/// chosen pluggable LLM backend. Skips cleanly when no backend is available.
+fn run_dream_op(
+    since: Option<i64>,
+    task: Option<String>,
+    dry_run: bool,
+    limit: Option<usize>,
+    backend: Option<&str>,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+
+    // 1. Resolve session files in scope.
+    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+    let Some(project_dir) = project_dir else {
+        println!("dream: no Claude Code sessions found for this project");
+        return Ok(());
+    };
+    let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;
+
+    let since_time = if let Some(days) = since {
+        Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs((days.max(0) as u64) * 86_400),
+        )
+    } else {
+        match tj_core::dream::state::last_dream_at(&conn, &project_hash)? {
+            Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
+                .ok()
+                .map(std::time::SystemTime::from),
+            None => None,
+        }
+    };
+
+    let scoped: Vec<tj_core::dream::scope::SessionFile> = session_paths
+        .into_iter()
+        .filter_map(|p| {
+            let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
+            Some(tj_core::dream::scope::SessionFile { path: p, mtime })
+        })
+        .collect();
+    let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
+
+    // 2. Assemble (session_id, BackfillInput) per session.
+    let run_id = ulid::Ulid::new().to_string();
+    let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
+
+    let opts = tj_core::dream::DreamOptions {
+        project_hash: project_hash.clone(),
+        dry_run,
+    };
+    if dry_run {
+        println!("dream (dry-run): {} session(s) in scope", sessions.len());
+        return Ok(());
+    }
+
+    // 3. Backend via the unified pluggable selector (default claude-p).
+    let llm = match tj_core::llm::backend_from_env(backend)? {
+        Some(l) => l,
+        None => {
+            println!(
+                "dream: no usable LLM backend. Default `claude-p` needs Claude Code on \
+PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, local)."
+            );
+            return Ok(());
+        }
+    };
+    let dream_backend = tj_core::dream::llm_backend::LlmDreamBackend::new(llm);
+    eprintln!("dream: backend={}", dream_backend.backend_name());
+    let report = tj_core::dream::run_dream(
+        &conn,
+        &events_path,
+        &opts,
+        &dream_backend,
+        sessions,
+        &run_id,
+    )?;
+
+    // 4. Advance watermark to now (only reached on success).
+    tj_core::dream::state::set_last_dream_at(
+        &conn,
+        &project_hash,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+    println!(
+        "dream: {} session(s) processed, {} event(s) backfilled",
+        report.sessions_processed, report.events_backfilled
+    );
+    Ok(())
+}
 
 /// Manual consolidation: read this project's recurring decisions/constraints,
 /// distil them into durable facts via one LLM call through the chosen backend,

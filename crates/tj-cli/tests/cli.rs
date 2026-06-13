@@ -5421,3 +5421,19 @@ fn capture_off_marker_no_ops_ingest_hook_capture() {
         .success()
         .stdout(contains("ON"));
 }
+
+#[test]
+fn complete_command_runs_and_skips_cleanly_without_sessions() {
+    // `complete <task>` is a friendly alias for `dream --task`; with no Claude
+    // Code sessions for the project it exits cleanly (no model call).
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete", "tj-x", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("dream"));
+}

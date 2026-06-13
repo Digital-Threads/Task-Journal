@@ -8,6 +8,7 @@ pub mod agent_sdk;
 pub mod backend;
 pub mod backfill;
 pub mod http;
+pub mod llm_backend;
 pub mod prompt;
 pub mod scope;
 pub mod state;
