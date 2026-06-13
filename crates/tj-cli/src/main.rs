@@ -871,21 +871,22 @@ enum Commands {
         #[arg(long)]
         backend: Option<String>,
     },
-    /// Finalize a task: enrich its memory from the sessions it touched, fix a
-    /// junk auto-title, and close it IF the events clearly show it is done —
-    /// the model decides from the content. Omit the id to finalize every open
-    /// task in the project (batch, with a reviewable list). One LLM call per
-    /// session for enrich + one judge call per task, via the chosen backend
-    /// (free with `--backend ollama`).
+    /// Finalize a task: fix a junk auto-title and close it IF the events
+    /// clearly show it is done — the model decides from the content, in
+    /// seconds. Omit the id to finalize every open task (batch, with a
+    /// reviewable list). Add `--enrich` to also re-read the task's sessions and
+    /// backfill missed events first — thorough but slow (one `claude -p` call
+    /// per session; minutes on a big multi-session task).
     Complete {
         /// The task id to finalize. Omit to finalize all open tasks (batch).
         task: Option<String>,
         /// Show scope and planned actions without calling the model or writing.
         #[arg(long)]
         dry_run: bool,
-        /// Skip the (heavy) enrich pass; judge/retitle/close from stored events only.
+        /// Also backfill missed events from the task's sessions before judging.
+        /// Thorough but slow (one `claude -p` call per session).
         #[arg(long)]
-        quick: bool,
+        enrich: bool,
         /// Required for batch finalize when stdin is not an interactive terminal.
         #[arg(long)]
         yes: bool,
@@ -2784,12 +2785,12 @@ fn main() -> Result<()> {
         Commands::Complete {
             task,
             dry_run,
-            quick,
+            enrich,
             yes,
             backend,
         } => match task {
-            Some(id) => run_complete_single(&id, dry_run, quick, backend.as_deref())?,
-            None => run_complete_batch(dry_run, quick, yes, backend.as_deref())?,
+            Some(id) => run_complete_single(&id, dry_run, enrich, backend.as_deref())?,
+            None => run_complete_batch(dry_run, enrich, yes, backend.as_deref())?,
         },
         Commands::Export {
             format,
@@ -4153,6 +4154,14 @@ fn enrich_task(
     if sessions.is_empty() {
         return Ok(0);
     }
+    // Enrich is the slow part — one (or more, for big transcripts) `claude -p`
+    // call per session. Announce it so a multi-minute run doesn't look hung;
+    // `--quick` skips this entirely.
+    eprintln!(
+        "complete: enriching {} session(s) via {} — can take a few minutes (or use --quick to skip)…",
+        sessions.len(),
+        llm.name()
+    );
     let run_id = ulid::Ulid::new().to_string();
     let dream_backend = tj_core::dream::llm_backend::LlmDreamBackend::new(llm);
     let opts = tj_core::dream::DreamOptions {
@@ -4206,7 +4215,7 @@ fn task_event_lines(conn: &rusqlite::Connection, task_id: &str) -> anyhow::Resul
 fn finalize_one_task(
     ctx: &ProjectCtx<'_>,
     task_id: &str,
-    quick: bool,
+    enrich: bool,
     dry_run: bool,
     backend: Option<&str>,
 ) -> anyhow::Result<FinalizeOutcome> {
@@ -4215,8 +4224,9 @@ fn finalize_one_task(
     let events_path = ctx.events_path;
     let project_hash = ctx.project_hash;
 
-    // 1. Enrich (unless quick / dry-run) — needs sessions and a backend.
-    if !quick && !dry_run {
+    // 1. Enrich (only when asked, and not on a dry-run) — needs sessions and a
+    // backend. Off by default because it is slow (one claude -p per session).
+    if enrich && !dry_run {
         if let Some(dir) = ctx.project_dir {
             if let Some(llm) = tj_core::llm::backend_from_env(backend)? {
                 out.enriched = enrich_task(conn, events_path, project_hash, dir, task_id, llm)?;
@@ -4331,7 +4341,7 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
 fn run_complete_single(
     task_id: &str,
     dry_run: bool,
-    quick: bool,
+    enrich: bool,
     backend: Option<&str>,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
@@ -4352,7 +4362,7 @@ fn run_complete_single(
         project_hash: &project_hash,
         project_dir: project_dir.as_deref(),
     };
-    let out = finalize_one_task(&ctx, task_id, quick, dry_run, backend)?;
+    let out = finalize_one_task(&ctx, task_id, enrich, dry_run, backend)?;
     print_finalize_outcome(task_id, &out);
     Ok(())
 }
@@ -4361,7 +4371,7 @@ fn run_complete_single(
 /// user can prune before confirming. Refuses without a TTY unless `--yes`.
 fn run_complete_batch(
     dry_run: bool,
-    quick: bool,
+    enrich: bool,
     yes: bool,
     backend: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -4417,7 +4427,7 @@ fn run_complete_batch(
     if dry_run {
         println!();
         for (id, _) in &open {
-            finalize_one_task(&ctx, id, quick, true, backend)?;
+            finalize_one_task(&ctx, id, enrich, true, backend)?;
         }
         return Ok(());
     }
@@ -4457,7 +4467,11 @@ fn run_complete_batch(
         println!(
             "\nWill finalize {} task(s){}. Proceed? [y/N]",
             targets.len(),
-            if quick { " (quick: no enrich)" } else { "" }
+            if enrich {
+                " (with --enrich: slow, reads sessions)"
+            } else {
+                ""
+            }
         );
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf)?;
@@ -4469,7 +4483,7 @@ fn run_complete_batch(
 
     let mut left_open: Vec<(String, String)> = Vec::new();
     for (id, _) in &targets {
-        let out = finalize_one_task(&ctx, id, quick, false, backend)?;
+        let out = finalize_one_task(&ctx, id, enrich, false, backend)?;
         print_finalize_outcome(id, &out);
         if out.skipped_no_backend {
             println!("complete: stopping batch — no LLM backend available.");

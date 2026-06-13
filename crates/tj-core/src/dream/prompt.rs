@@ -34,7 +34,10 @@ pub fn build_prompt(input: &BackfillInput) -> String {
          - Respond with ONLY a JSON array of objects: \
          {{\"event_type\",\"task_id\",\"text\",\"timestamp\"}}. Empty array if nothing missed.\n\n\
          # Candidate tasks and their existing events\n{tasks}\n\
-         # Transcript\n{transcript}\n",
+         # Transcript\n{transcript}\n\n\
+         Remember: output ONLY the JSON array of missed events described above. \
+         Do NOT reply to, summarise, or continue the transcript; if nothing was \
+         missed, output [].\n",
         types = ALLOWED_TYPES,
         tasks = tasks_block,
         transcript = input.transcript,

@@ -25,10 +25,13 @@ impl LlmDreamBackend {
 }
 
 /// Max transcript characters fed to the model in one call. The hard wall is
-/// the ~200k-token context limit (a real session hit ~220k tokens and `claude
-/// -p` returned HTTP 400). We stay well under it and split oversized
-/// transcripts across several calls, merging the events (run_dream dedups).
-const TRANSCRIPT_CHAR_BUDGET: usize = 360_000;
+/// the ~200k-token context window, but `claude -p` is a full Claude Code
+/// instance: its system prompt + tool definitions alone cost ~113k tokens
+/// before our content (measured: a 360k-char chunk was ~91k tokens, yet the
+/// request totalled ~204k and 400'd). So the usable budget is far below the
+/// nominal limit — keep each chunk well under it (~37k tokens) and split the
+/// rest across calls, merging the events (run_dream dedups).
+const TRANSCRIPT_CHAR_BUDGET: usize = 150_000;
 
 impl DreamBackend for LlmDreamBackend {
     fn backfill(&self, input: &BackfillInput) -> anyhow::Result<Vec<BackfillEvent>> {
@@ -39,8 +42,19 @@ impl DreamBackend for LlmDreamBackend {
                 transcript: chunk,
             };
             let prompt = crate::dream::prompt::build_prompt(&chunk_input);
-            let text = self.llm.complete(&prompt, 1024)?;
-            out.extend(parse_backfill_json(&text)?);
+            // Backfill is strictly best-effort: ANY per-chunk failure — an
+            // over-budget 400, a transient backend error, or a non-JSON reply
+            // (model continued the transcript dialogue) — is skipped, never
+            // aborting the finalize. A genuinely broken backend still surfaces
+            // at the judge step, which has its own (small, always-sized) call.
+            match self
+                .llm
+                .complete(&prompt, 1024)
+                .and_then(|text| parse_backfill_json(&text))
+            {
+                Ok(evs) => out.extend(evs),
+                Err(e) => tracing::warn!(error = %e, "dream backfill: skipping chunk"),
+            }
         }
         Ok(out)
     }
@@ -86,8 +100,12 @@ pub fn parse_backfill_json(text: &str) -> anyhow::Result<Vec<BackfillEvent>> {
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    serde_json::from_str(json_str)
-        .with_context(|| format!("dream JSON parse failed; got: {json_str}"))
+    // Tolerate a JSON array wrapped in prose by slicing to the outer brackets.
+    let slice = match (json_str.find('['), json_str.rfind(']')) {
+        (Some(a), Some(b)) if b > a => &json_str[a..=b],
+        _ => json_str,
+    };
+    serde_json::from_str(slice).with_context(|| format!("dream JSON parse failed; got: {json_str}"))
 }
 
 #[cfg(test)]
@@ -109,6 +127,67 @@ mod tests {
     #[test]
     fn parse_empty_array() {
         assert!(parse_backfill_json("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_extracts_array_wrapped_in_prose() {
+        let reply = "Here are the missed events:\n[{\"event_type\":\"finding\",\
+\"task_id\":\"tj-1\",\"text\":\"found\",\"timestamp\":\"2026-06-13T00:00:00Z\"}]\nHope that helps!";
+        let evs = parse_backfill_json(reply).unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[test]
+    fn parse_errors_on_pure_prose() {
+        // A conversational reply with no array at all must be an Err so the
+        // backfill loop can skip the chunk instead of inventing events.
+        assert!(parse_backfill_json("Контекст в норме. Что дальше?").is_err());
+    }
+
+    #[test]
+    fn backfill_skips_unparseable_chunk_reply() {
+        // Model replies with prose, not JSON → backfill yields nothing but does
+        // NOT error, so the surrounding finalize (retitle/close) still runs.
+        struct ChattyLlm;
+        impl LlmBackend for ChattyLlm {
+            fn complete(&self, _prompt: &str, _max: u32) -> anyhow::Result<String> {
+                Ok("Контекст в норме. 566.5k/1M использовано. Что дальше?".to_string())
+            }
+            fn name(&self) -> &'static str {
+                "chatty"
+            }
+        }
+        let b = LlmDreamBackend::new(Box::new(ChattyLlm));
+        let input = BackfillInput {
+            tasks: vec![],
+            transcript: "user: hi\nassistant: hello".into(),
+        };
+        let evs = b.backfill(&input).unwrap();
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn backfill_skips_chunk_whose_call_errors() {
+        // An over-budget 400 / transient backend error on a chunk must be
+        // swallowed so the surrounding finalize (retitle/close) still runs.
+        struct FailingLlm;
+        impl LlmBackend for FailingLlm {
+            fn complete(&self, _prompt: &str, _max: u32) -> anyhow::Result<String> {
+                Err(anyhow::anyhow!(
+                    "`claude -p` exited with status 1: Prompt is too long"
+                ))
+            }
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+        }
+        let b = LlmDreamBackend::new(Box::new(FailingLlm));
+        let input = BackfillInput {
+            tasks: vec![],
+            transcript: "user: hi\nassistant: hello".into(),
+        };
+        let evs = b.backfill(&input).unwrap();
+        assert!(evs.is_empty());
     }
 
     #[test]

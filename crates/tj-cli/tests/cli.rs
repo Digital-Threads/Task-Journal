@@ -5549,10 +5549,10 @@ fn complete_batch_dry_run_lists_open_tasks() {
 /// `claude` on PATH returning a canned judgment. Proves the wiring: junk
 /// title → Rename, done verdict → Close with a persisted outcome. Unix-only
 /// (shell-script stub); the logic itself is covered cross-platform by the
-/// finalize.rs unit tests.
+/// finalize.rs unit tests. Default mode (judge-only, no `--enrich`).
 #[cfg(unix)]
 #[test]
-fn complete_quick_retitles_and_closes_via_fake_backend() {
+fn complete_retitles_and_closes_via_fake_backend() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = assert_fs::TempDir::new().unwrap();
@@ -5609,14 +5609,14 @@ fn complete_quick_retitles_and_closes_via_fake_backend() {
     .trim()
     .to_string();
 
-    // --quick: skip enrich (no sessions), exercise judge → retitle → close.
+    // Default mode (judge-only): exercise judge → retitle → close.
     Command::cargo_bin("task-journal")
         .unwrap()
         .current_dir(proj.path())
         .env("XDG_DATA_HOME", dir.path())
         .env("PATH", &path_env)
         .env_remove("ANTHROPIC_API_KEY")
-        .args(["complete", &task_id, "--quick"])
+        .args(["complete", &task_id])
         .assert()
         .success()
         .stdout(contains("retitled"))

@@ -93,12 +93,71 @@ fn claude_exit_error(
     anyhow!("`claude -p` exited with {status}: {detail}")
 }
 
+/// Per-call wall-clock ceiling for a `claude -p` invocation. A spawned full
+/// Claude Code instance normally answers in seconds; this kills a wedged one so
+/// a multi-chunk enrich can't hang the whole `complete`. Override with
+/// `TJ_CLAUDE_TIMEOUT_SECS`.
+fn claude_timeout() -> std::time::Duration {
+    let secs = std::env::var("TJ_CLAUDE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(90);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Wait for `child` up to `timeout`, draining stdout/stderr concurrently so a
+/// full pipe can't deadlock the wait. On timeout the child is killed and an
+/// error returned; otherwise the captured output is handed back.
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    use std::io::Read;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let so = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut b);
+        }
+        b
+    });
+    let se = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut b);
+        }
+        b
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("`claude -p` timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: so.join().unwrap_or_default(),
+        stderr: se.join().unwrap_or_default(),
+    })
+}
+
 impl CommandRunner for ClaudeBinaryRunner {
     fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
-        let output = base_claude_command(model)
+        let child = base_claude_command(model)
             .arg(prompt)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .context("failed to spawn `claude` (is Claude Code installed and on PATH?)")?;
+        let output = wait_with_timeout(child, claude_timeout())?;
         if !output.status.success() {
             return Err(claude_exit_error(
                 output.status,
@@ -135,9 +194,7 @@ impl CommandRunner for ClaudeBinaryStdinRunner {
             .context("claude stdin was not captured")?
             .write_all(prompt.as_bytes())
             .context("failed to write prompt to claude stdin")?;
-        let output = child
-            .wait_with_output()
-            .context("failed to wait for `claude`")?;
+        let output = wait_with_timeout(child, claude_timeout())?;
         if !output.status.success() {
             return Err(claude_exit_error(
                 output.status,
