@@ -871,16 +871,24 @@ enum Commands {
         #[arg(long)]
         backend: Option<String>,
     },
-    /// Complete a task from its transcripts: re-read the sessions tied to a task
-    /// and append the decisions/findings the live capture missed. A friendly
-    /// alias for `dream --task <id>`. MANUAL, one LLM call per session via the
-    /// chosen backend (free with `--backend ollama`).
+    /// Finalize a task: enrich its memory from the sessions it touched, fix a
+    /// junk auto-title, and close it IF the events clearly show it is done —
+    /// the model decides from the content. Omit the id to finalize every open
+    /// task in the project (batch, with a reviewable list). One LLM call per
+    /// session for enrich + one judge call per task, via the chosen backend
+    /// (free with `--backend ollama`).
     Complete {
-        /// The task id to complete.
-        task: String,
-        /// Show scope without calling the model or writing anything.
+        /// The task id to finalize. Omit to finalize all open tasks (batch).
+        task: Option<String>,
+        /// Show scope and planned actions without calling the model or writing.
         #[arg(long)]
         dry_run: bool,
+        /// Skip the (heavy) enrich pass; judge/retitle/close from stored events only.
+        #[arg(long)]
+        quick: bool,
+        /// Required for batch finalize when stdin is not an interactive terminal.
+        #[arg(long)]
+        yes: bool,
         /// LLM backend override: claude-p (default) | anthropic | openai | ollama.
         #[arg(long)]
         backend: Option<String>,
@@ -2776,11 +2784,13 @@ fn main() -> Result<()> {
         Commands::Complete {
             task,
             dry_run,
+            quick,
+            yes,
             backend,
-        } => {
-            // "complete this task" = dream scoped to that task's sessions.
-            run_dream_op(None, Some(task), dry_run, None, backend.as_deref())?;
-        }
+        } => match task {
+            Some(id) => run_complete_single(&id, dry_run, quick, backend.as_deref())?,
+            None => run_complete_batch(dry_run, quick, yes, backend.as_deref())?,
+        },
         Commands::Export {
             format,
             task,
@@ -4079,6 +4089,408 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
         "dream: {} session(s) processed, {} event(s) backfilled",
         report.sessions_processed, report.events_backfilled
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// complete / finalize: enrich a task's memory, fix a junk title, and close it
+// if the events clearly show it is done. The model judges from content.
+// ---------------------------------------------------------------------------
+
+/// What `finalize_one_task` did, for the caller to report.
+#[derive(Default)]
+struct FinalizeOutcome {
+    enriched: usize,
+    retitled: Option<(String, String)>,
+    closed: bool,
+    done: bool,
+    reason: String,
+    /// True when no LLM backend was available — nothing was judged or written.
+    skipped_no_backend: bool,
+}
+
+/// Per-project handles threaded through the finalize helpers.
+struct ProjectCtx<'a> {
+    conn: &'a rusqlite::Connection,
+    events_path: &'a std::path::Path,
+    project_hash: &'a str,
+    project_dir: Option<&'a std::path::Path>,
+}
+
+/// The (session_id, BackfillInput) pairs for every session that touched
+/// `task_id`. No watermark: finalize scopes to the task, not to "since the
+/// last dream", so tasks can be finalized independently and repeatedly.
+fn task_sessions(
+    events_path: &std::path::Path,
+    project_dir: &std::path::Path,
+    task_id: &str,
+) -> anyhow::Result<Vec<(String, tj_core::dream::backend::BackfillInput)>> {
+    let session_paths = tj_core::session::discovery::list_sessions(project_dir)?;
+    let scoped: Vec<tj_core::dream::scope::SessionFile> = session_paths
+        .into_iter()
+        .filter_map(|p| {
+            let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
+            Some(tj_core::dream::scope::SessionFile { path: p, mtime })
+        })
+        .collect();
+    let in_scope = tj_core::dream::scope::in_scope(scoped, None, None);
+    build_dream_inputs(events_path, &in_scope, Some(task_id))
+}
+
+/// Enrich a single task from every session that touched it. Unlike `dream`,
+/// this is task-scoped and does NOT read or advance the project-global dream
+/// watermark. `dedup_guard` inside `run_dream` keeps re-runs from duplicating
+/// events. Returns the number of events appended.
+fn enrich_task(
+    conn: &rusqlite::Connection,
+    events_path: &std::path::Path,
+    project_hash: &str,
+    project_dir: &std::path::Path,
+    task_id: &str,
+    llm: Box<dyn tj_core::llm::LlmBackend>,
+) -> anyhow::Result<usize> {
+    let sessions = task_sessions(events_path, project_dir, task_id)?;
+    if sessions.is_empty() {
+        return Ok(0);
+    }
+    let run_id = ulid::Ulid::new().to_string();
+    let dream_backend = tj_core::dream::llm_backend::LlmDreamBackend::new(llm);
+    let opts = tj_core::dream::DreamOptions {
+        project_hash: project_hash.to_string(),
+        dry_run: false,
+    };
+    let report =
+        tj_core::dream::run_dream(conn, events_path, &opts, &dream_backend, sessions, &run_id)?;
+    Ok(report.events_backfilled)
+}
+
+/// Current title for a task ("" if somehow unset).
+fn task_title(conn: &rusqlite::Connection, task_id: &str) -> anyhow::Result<String> {
+    let mut stmt = conn.prepare("SELECT title FROM tasks WHERE task_id=?1")?;
+    let mut rows = stmt.query(rusqlite::params![task_id])?;
+    Ok(match rows.next()? {
+        Some(r) => r.get::<_, String>(0)?,
+        None => String::new(),
+    })
+}
+
+/// A task's events as `[type] text` lines, oldest first, capped so the judge
+/// prompt stays bounded on very long tasks.
+fn task_event_lines(conn: &rusqlite::Connection, task_id: &str) -> anyhow::Result<Vec<String>> {
+    const MAX_LINES: usize = 150;
+    let mut stmt = conn.prepare(
+        "SELECT ei.type, sf.text FROM events_index ei
+         LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
+         WHERE ei.task_id=?1 ORDER BY ei.timestamp ASC",
+    )?;
+    let all: Vec<String> = stmt
+        .query_map(rusqlite::params![task_id], |r| {
+            let ty: String = r.get(0)?;
+            let txt: Option<String> = r.get(1)?;
+            let one = txt
+                .unwrap_or_default()
+                .replace('\n', " ")
+                .chars()
+                .take(200)
+                .collect::<String>();
+            Ok(format!("[{ty}] {one}"))
+        })?
+        .collect::<Result<_, _>>()?;
+    let start = all.len().saturating_sub(MAX_LINES);
+    Ok(all[start..].to_vec())
+}
+
+/// Finalize one task: enrich → judge → retitle-if-junk → close-if-done.
+/// Writes Rename/Close events (which carry their metadata so a rebuild keeps
+/// them) and refreshes the index. Reports what happened via `FinalizeOutcome`.
+fn finalize_one_task(
+    ctx: &ProjectCtx<'_>,
+    task_id: &str,
+    quick: bool,
+    dry_run: bool,
+    backend: Option<&str>,
+) -> anyhow::Result<FinalizeOutcome> {
+    let mut out = FinalizeOutcome::default();
+    let conn = ctx.conn;
+    let events_path = ctx.events_path;
+    let project_hash = ctx.project_hash;
+
+    // 1. Enrich (unless quick / dry-run) — needs sessions and a backend.
+    if !quick && !dry_run {
+        if let Some(dir) = ctx.project_dir {
+            if let Some(llm) = tj_core::llm::backend_from_env(backend)? {
+                out.enriched = enrich_task(conn, events_path, project_hash, dir, task_id, llm)?;
+                tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
+            }
+        }
+    }
+
+    // 2. Gather the (now enriched) title + history.
+    let title = task_title(conn, task_id)?;
+    let lines = task_event_lines(conn, task_id)?;
+
+    if dry_run {
+        let sessions = match ctx.project_dir {
+            Some(dir) => task_sessions(events_path, dir, task_id)?.len(),
+            None => 0,
+        };
+        println!(
+            "complete (dry-run) {task_id}: {} event(s), {sessions} session(s) to enrich, title={title:?}",
+            lines.len()
+        );
+        return Ok(out);
+    }
+
+    // 3. Judge — essential, so a missing backend stops here.
+    let Some(judge_backend) = tj_core::llm::backend_from_env(backend)? else {
+        out.skipped_no_backend = true;
+        return Ok(out);
+    };
+    let j = tj_core::finalize::judge(&title, &lines, judge_backend.as_ref())?;
+    out.done = j.done;
+    out.reason = j.reason.clone();
+
+    let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+
+    // 4. Retitle only when the model flagged the current title as junk.
+    if j.should_apply_title(&title) {
+        let mut ev = tj_core::event::Event::new(
+            task_id,
+            tj_core::event::EventType::Rename,
+            tj_core::event::Author::Agent,
+            tj_core::event::Source::Cli,
+            j.title.clone(),
+        );
+        ev.meta = serde_json::json!({ "title": j.title, "was": title });
+        writer.append(&ev)?;
+        out.retitled = Some((title.clone(), j.title.clone()));
+    }
+
+    // 5. Close only when the events clearly show the task is done. The
+    // outcome rides on the event meta so it survives a rebuild_state replay.
+    if j.done {
+        let reason = if j.reason.is_empty() {
+            "(finalized)".to_string()
+        } else {
+            j.reason.clone()
+        };
+        let mut ev = tj_core::event::Event::new(
+            task_id,
+            tj_core::event::EventType::Close,
+            tj_core::event::Author::Agent,
+            tj_core::event::Source::Cli,
+            reason,
+        );
+        ev.meta = serde_json::json!({
+            "outcome": j.outcome,
+            "outcome_tag": j.normalized_tag(),
+            "reason": j.reason,
+        });
+        writer.append(&ev)?;
+        out.closed = true;
+    }
+
+    writer.flush_durable()?;
+    tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
+    Ok(out)
+}
+
+/// Human-readable one-liner for a finalize result.
+fn print_finalize_outcome(task_id: &str, out: &FinalizeOutcome) {
+    if out.skipped_no_backend {
+        println!(
+            "complete {task_id}: no usable LLM backend. Default `claude-p` needs Claude Code on \
+PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, local)."
+        );
+        return;
+    }
+    let mut parts = Vec::new();
+    if out.enriched > 0 {
+        parts.push(format!("{} event(s) backfilled", out.enriched));
+    }
+    if let Some((old, new)) = &out.retitled {
+        parts.push(format!("retitled {old:?} → {new:?}"));
+    }
+    if out.closed {
+        parts.push("closed".to_string());
+    } else {
+        let why = if out.reason.is_empty() {
+            "not clearly done".to_string()
+        } else {
+            out.reason.clone()
+        };
+        parts.push(format!("left open ({why})"));
+    }
+    if parts.is_empty() {
+        parts.push("no change".to_string());
+    }
+    println!("complete {task_id}: {}", parts.join("; "));
+}
+
+/// `complete <id>` — finalize a single task.
+fn run_complete_single(
+    task_id: &str,
+    dry_run: bool,
+    quick: bool,
+    backend: Option<&str>,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    }
+    if !tj_core::db::task_exists(&conn, task_id)? {
+        anyhow::bail!("task not found: {task_id}");
+    }
+    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+    let ctx = ProjectCtx {
+        conn: &conn,
+        events_path: &events_path,
+        project_hash: &project_hash,
+        project_dir: project_dir.as_deref(),
+    };
+    let out = finalize_one_task(&ctx, task_id, quick, dry_run, backend)?;
+    print_finalize_outcome(task_id, &out);
+    Ok(())
+}
+
+/// `complete` (no id) — finalize every open task, with a reviewable list the
+/// user can prune before confirming. Refuses without a TTY unless `--yes`.
+fn run_complete_batch(
+    dry_run: bool,
+    quick: bool,
+    yes: bool,
+    backend: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT task_id, title FROM tasks WHERE status='open' ORDER BY last_event_at DESC",
+    )?;
+    let open: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+    if open.is_empty() {
+        println!("complete: no open tasks in this project.");
+        return Ok(());
+    }
+
+    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+
+    // Show the numbered list with event/session counts so the user can judge
+    // what to keep before anything is touched.
+    println!("Open tasks ({}):", open.len());
+    for (i, (id, title)) in open.iter().enumerate() {
+        let events: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?;
+        let sessions = match project_dir.as_deref() {
+            Some(dir) => task_sessions(&events_path, dir, id)?.len(),
+            None => 0,
+        };
+        println!("  {}. {id}  [{events} ev, {sessions} sess]  {title}", i + 1);
+    }
+
+    let ctx = ProjectCtx {
+        conn: &conn,
+        events_path: &events_path,
+        project_hash: &project_hash,
+        project_dir: project_dir.as_deref(),
+    };
+
+    // Dry-run: report planned scope per task and stop — no prompts, no writes.
+    if dry_run {
+        println!();
+        for (id, _) in &open {
+            finalize_one_task(&ctx, id, quick, true, backend)?;
+        }
+        return Ok(());
+    }
+
+    let interactive = std::io::stdin().is_terminal();
+    if !interactive && !yes {
+        anyhow::bail!(
+            "batch complete needs an interactive terminal to confirm; pass --yes to run it non-interactively"
+        );
+    }
+
+    // Let the user exclude tasks, then confirm.
+    let mut excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if interactive && !yes {
+        println!("\nNumbers to EXCLUDE (space/comma separated), or Enter to finalize all:");
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        for tok in buf.split(|c: char| c.is_whitespace() || c == ',') {
+            if let Ok(n) = tok.trim().parse::<usize>() {
+                if n >= 1 && n <= open.len() {
+                    excluded.insert(n - 1);
+                }
+            }
+        }
+    }
+    let targets: Vec<&(String, String)> = open
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !excluded.contains(i))
+        .map(|(_, r)| r)
+        .collect();
+    if targets.is_empty() {
+        println!("complete: nothing selected.");
+        return Ok(());
+    }
+    if interactive && !yes {
+        println!(
+            "\nWill finalize {} task(s){}. Proceed? [y/N]",
+            targets.len(),
+            if quick { " (quick: no enrich)" } else { "" }
+        );
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        if !matches!(buf.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("aborted.");
+            return Ok(());
+        }
+    }
+
+    let mut left_open: Vec<(String, String)> = Vec::new();
+    for (id, _) in &targets {
+        let out = finalize_one_task(&ctx, id, quick, false, backend)?;
+        print_finalize_outcome(id, &out);
+        if out.skipped_no_backend {
+            println!("complete: stopping batch — no LLM backend available.");
+            return Ok(());
+        }
+        if !out.closed {
+            left_open.push((id.clone(), out.reason.clone()));
+        }
+    }
+
+    if !left_open.is_empty() {
+        println!("\nLeft open ({}):", left_open.len());
+        for (id, reason) in &left_open {
+            let why = if reason.is_empty() {
+                "not clearly done"
+            } else {
+                reason
+            };
+            println!("  {id} — {why}");
+        }
+    }
     Ok(())
 }
 

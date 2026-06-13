@@ -264,6 +264,16 @@ pub fn upsert_task_from_event(
                 "UPDATE tasks SET status='closed', closed_at=?2, last_event_at=?2 WHERE task_id=?1",
                 rusqlite::params![event.task_id, event.timestamp],
             )?;
+            // Restore closure metadata from the event so the recorded outcome
+            // survives a full rebuild_state replay — the tasks row is rebuilt
+            // from events, and set_task_outcome's direct DB write would be lost.
+            if let Some(outcome) = event.meta.get("outcome").and_then(|v| v.as_str()) {
+                let tag = event.meta.get("outcome_tag").and_then(|v| v.as_str());
+                conn.execute(
+                    "UPDATE tasks SET outcome=?2, outcome_tag=?3 WHERE task_id=?1",
+                    rusqlite::params![event.task_id, outcome, tag],
+                )?;
+            }
         }
         EventType::Reopen => {
             conn.execute(
@@ -1364,6 +1374,37 @@ mod tests {
             title,
             "Support BID 29683996 — voucher refund 50% vs promised 100%"
         );
+    }
+
+    #[test]
+    fn close_event_restores_outcome_from_meta() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-cl", "T");
+        upsert_task_from_event(&conn, &open_ev, ph).unwrap();
+
+        let mut close = crate::event::Event::new(
+            "tj-cl",
+            crate::event::EventType::Close,
+            crate::event::Author::Agent,
+            crate::event::Source::Cli,
+            "done".into(),
+        );
+        close.meta = serde_json::json!({"outcome": "Shipped the fix.", "outcome_tag": "done"});
+        upsert_task_from_event(&conn, &close, ph).unwrap();
+
+        let (status, outcome, tag): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, outcome, outcome_tag FROM tasks WHERE task_id='tj-cl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        assert_eq!(outcome.as_deref(), Some("Shipped the fix."));
+        assert_eq!(tag.as_deref(), Some("done"));
     }
 
     #[test]

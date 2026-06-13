@@ -5451,16 +5451,96 @@ fn capture_off_marker_no_ops_ingest_hook_capture() {
 
 #[test]
 fn complete_command_runs_and_skips_cleanly_without_sessions() {
-    // `complete <task>` is a friendly alias for `dream --task`; with no Claude
-    // Code sessions for the project it exits cleanly (no model call).
+    // `complete <id> --dry-run` reports scope without calling the model or
+    // writing anything. With no Claude Code sessions it shows 0 to enrich.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Finalize me", "--goal", "ship it"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete", &task_id, "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("complete (dry-run)"))
+        .stdout(contains("session(s) to enrich"));
+}
+
+#[test]
+fn complete_unknown_task_errors() {
+    // A non-existent id is a hard error, not a silent no-op.
     let dir = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
         .unwrap()
         .current_dir(proj.path())
         .env("XDG_DATA_HOME", dir.path())
-        .args(["complete", "tj-x", "--dry-run"])
+        .args(["complete", "tj-nope", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains("task not found"));
+}
+
+#[test]
+fn complete_batch_refuses_without_tty_or_yes() {
+    // No id = batch. Non-interactive stdin (test harness) without --yes must
+    // refuse rather than mass-close tasks unattended.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["create", "Batch me", "--goal", "g"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete"])
+        .assert()
+        .failure()
+        .stderr(contains("interactive terminal"));
+}
+
+#[test]
+fn complete_batch_dry_run_lists_open_tasks() {
+    // Batch dry-run lists open tasks and reports per-task scope, no prompts.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["create", "Listed task", "--goal", "g"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete", "--dry-run"])
         .assert()
         .success()
-        .stdout(contains("dream"));
+        .stdout(contains("Open tasks ("))
+        .stdout(contains("Listed task"));
 }
