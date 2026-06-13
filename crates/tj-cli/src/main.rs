@@ -3176,16 +3176,7 @@ fn main() -> Result<()> {
             print!("{}", run_statusline().unwrap_or_default());
         }
         Commands::Nudge => {
-            // No model, no spawn, never touches the classifier — just prints a
-            // UserPromptSubmit additionalContext reminder so the agent keeps
-            // recording via the MCP tools deep into a session.
-            let env = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": "📓 task-journal — record as you go: the moment you commit to a decision, rule an approach out, or verify a fact, call event_add (open or resume a task first). Don't batch it to the end. This memory only works if you log it now."
-                }
-            });
-            print!("{env}");
+            run_nudge()?;
         }
         Commands::RecallHook => {
             run_recall_hook()?;
@@ -3807,6 +3798,94 @@ fn sync_global_memory(project_conn: &rusqlite::Connection, project_hash: &str) {
     if let Err(e) = result {
         tracing::debug!("global memory sync skipped: {e:#}");
     }
+}
+
+const NUDGE_BASE: &str = "📓 task-journal — record as you go: the moment you commit to a decision, rule an approach out, or verify a fact, call event_add (open or resume a task first). Don't batch it to the end. This memory only works if you log it now.";
+/// A session whose transcript is at least this big counts as "substantial work".
+const NUDGE_WORK_THRESHOLD: u64 = 60_000;
+/// Below this many journal entries for a substantial session, escalate.
+const NUDGE_MIN_EVENTS: usize = 2;
+
+/// The escalation line, or `None` when no escalation is warranted. Pure so the
+/// thresholds are unit-testable without touching the filesystem.
+fn nudge_escalation_text(work_bytes: u64, recorded: usize) -> Option<String> {
+    if work_bytes < NUDGE_WORK_THRESHOLD || recorded >= NUDGE_MIN_EVENTS {
+        return None;
+    }
+    Some(format!(
+        "⚠ task-journal: this session has done substantial work but recorded only \
+{recorded} journal entr{} — log the key decisions, rejections, and findings NOW via \
+event_add before this reasoning is lost.",
+        if recorded == 1 { "y" } else { "ies" }
+    ))
+}
+
+/// Count events in the tail of `path` stamped with `sid`. A tail scan keeps this
+/// cheap even for a large journal; a session's events are always at the end.
+fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usize) -> usize {
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines.len().saturating_sub(tail_lines);
+    lines[start..]
+        .iter()
+        .filter(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|e| {
+                    e.get("meta")
+                        .and_then(|m| m.get("session_id"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s == sid)
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Adaptive UserPromptSubmit nudge (caveman pattern, non-blocking, free): always
+/// emit the base "record as you go" reminder, and — when the session has done
+/// substantial work but logged little — escalate. All signals are cheap (a file
+/// size + a tail scan); no model, never blocks the prompt.
+fn run_nudge() -> anyhow::Result<()> {
+    let mut ctx = NUDGE_BASE.to_string();
+    let escalation = (|| -> Option<String> {
+        use std::io::{IsTerminal, Read};
+        // Manual `task-journal nudge` in a terminal has no hook payload — don't
+        // block waiting on stdin.
+        if std::io::stdin().is_terminal() {
+            return None;
+        }
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+            return None;
+        }
+        let payload: serde_json::Value = serde_json::from_str(&buf).ok()?;
+        let sid = tj_core::session_id::live_session_id(Some(&payload))?;
+        let transcript = payload.get("transcript_path").and_then(|v| v.as_str())?;
+        let work_bytes = std::fs::metadata(transcript).map(|m| m.len()).unwrap_or(0);
+        let cwd = std::env::current_dir().ok()?;
+        let project_hash = tj_core::project_hash::from_path(&cwd).ok()?;
+        let events_path = tj_core::paths::events_dir()
+            .ok()?
+            .join(format!("{project_hash}.jsonl"));
+        let recorded = count_session_events_tail(&events_path, &sid, 400);
+        nudge_escalation_text(work_bytes, recorded)
+    })();
+    if let Some(extra) = escalation {
+        ctx.push('\n');
+        ctx.push_str(&extra);
+    }
+    let env = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": ctx,
+        }
+    });
+    print!("{env}");
+    Ok(())
 }
 
 /// Proactive recall injector (opt-in hook). Reads the UserPromptSubmit payload
@@ -4942,6 +5021,21 @@ mod inline_tests {
     // `clippy::items_after_test_module` — every other free fn must be
     // declared before this module begins.
     use super::*;
+
+    #[test]
+    fn nudge_escalates_only_for_substantial_thin_sessions() {
+        // Small session → never escalate, regardless of capture.
+        assert!(nudge_escalation_text(1_000, 0).is_none());
+        // Substantial session with enough capture → no escalation.
+        assert!(nudge_escalation_text(200_000, NUDGE_MIN_EVENTS).is_none());
+        // Substantial session, thin capture → escalate.
+        let e = nudge_escalation_text(200_000, 0).expect("should escalate");
+        assert!(e.contains("substantial work") && e.contains("event_add"));
+        // Singular grammar at exactly 1 entry.
+        assert!(nudge_escalation_text(200_000, 1)
+            .unwrap()
+            .contains("1 journal entry"));
+    }
 
     #[test]
     fn flatten_transcript_tags_roles_in_order() {
