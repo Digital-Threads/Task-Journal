@@ -5270,6 +5270,7 @@ fn consolidate_writes_facts_to_conventions_task_and_dedups() {
             .unwrap()
             .current_dir(proj.path())
             .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_BACKEND", "anthropic")
             .env("ANTHROPIC_API_KEY", "test-key")
             .env("TJ_CONSOLIDATE_BASE_URL", server.url())
             .env("TJ_EMBED", "hash")

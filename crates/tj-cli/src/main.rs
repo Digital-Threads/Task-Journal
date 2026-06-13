@@ -654,13 +654,17 @@ enum Commands {
     Preferences,
     /// Distil this project's recurring decisions and constraints into durable
     /// semantic/procedural facts (Pillar C). MANUAL and opt-in — it makes ONE
-    /// direct Haiku API call per run (needs ANTHROPIC_API_KEY; ~1c/run) and is
-    /// never wired to a hook, so it can't spend automatically. Facts are stored
-    /// as events in a per-project "conventions" task and surface in ask/recall.
+    /// LLM call per run and is never wired to a hook, so it can't spend
+    /// automatically. Facts are stored as events in a per-project "conventions"
+    /// task and surface in ask/recall.
     Consolidate {
         /// Maximum number of facts to produce.
         #[arg(long, default_value_t = 8)]
         max_facts: usize,
+        /// LLM backend override: claude-p (default) | anthropic | openai | ollama.
+        /// Defaults to TJ_BACKEND, then claude-p (subscription, no API key).
+        #[arg(long)]
+        backend: Option<String>,
     },
     /// Render and print the resume pack for a task.
     Pack {
@@ -1294,8 +1298,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Consolidate { max_facts } => {
-            run_consolidate(max_facts)?;
+        Commands::Consolidate { max_facts, backend } => {
+            run_consolidate(max_facts, backend.as_deref())?;
         }
         Commands::Event {
             task_id,
@@ -3999,10 +4003,10 @@ fn emit_session_context(ctx: &str) {
 const CONSOLIDATE_TASK_TITLE: &str = "Project conventions (consolidated)";
 
 /// Manual consolidation: read this project's recurring decisions/constraints,
-/// distil them into durable facts via one direct Haiku API call, and store the
-/// facts as events in a per-project conventions task. Skips cleanly (no spend)
-/// when ANTHROPIC_API_KEY is absent.
-fn run_consolidate(max_facts: usize) -> anyhow::Result<()> {
+/// distil them into durable facts via one LLM call through the chosen backend,
+/// and store the facts as events in a per-project conventions task. Skips
+/// cleanly (no spend) when no backend is available.
+fn run_consolidate(max_facts: usize, backend: Option<&str>) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -4021,19 +4025,20 @@ fn run_consolidate(max_facts: usize) -> anyhow::Result<()> {
     let texts: Vec<String> = sources.iter().map(|(_, t)| t.clone()).collect();
     let source_ids: Vec<String> = sources.iter().map(|(id, _)| id.clone()).collect();
 
-    let (backend, facts) = match tj_core::consolidate::summarize(&texts, max_facts)? {
+    let (backend_used, facts) = match tj_core::consolidate::summarize(&texts, max_facts, backend)? {
         Some(x) => x,
         None => {
             println!(
-                "skipped: no consolidation backend. Either set ANTHROPIC_API_KEY \
-(direct Haiku API, ~1c/run) or install Claude Code so `claude` is on PATH \
-(uses your subscription login, no API key needed)."
+                "skipped: no usable LLM backend. Default is `claude-p` (install Claude \
+Code so `claude` is on PATH — uses your subscription, no API key). Or pick \
+another via --backend / TJ_BACKEND: anthropic (ANTHROPIC_API_KEY), openai \
+(OPENAI_API_KEY), ollama (free, local)."
             );
             return Ok(());
         }
     };
     eprintln!(
-        "consolidating {} high-signal event(s) via {backend} …",
+        "consolidating {} high-signal event(s) via {backend_used} …",
         texts.len()
     );
     if facts.is_empty() {

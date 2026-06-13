@@ -57,6 +57,7 @@ pub mod embed;
 pub mod event;
 pub mod frontmatter;
 pub mod fts;
+pub mod llm;
 pub mod memory;
 pub mod pack;
 pub mod paths;
