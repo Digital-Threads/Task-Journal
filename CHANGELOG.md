@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.22.2] - 2026-06-13
+## [0.23.0] - 2026-06-13
 
-Hardening pass on `complete`'s enrich step, found by running it on a real
-12-session task. Enrich is now strictly best-effort and can never hang or sink
-the retitle/close; `--quick` skips it entirely for an instant judge-only finalize.
+Finalize, retuned after running `complete` on real 12-session tasks: the fast,
+reliable judge-only path is now the default, and the slow session-enrich pass is
+opt-in.
+
+### Changed
+- **`complete` is judge-only by default; enrich is opt-in via `--enrich`.**
+  Finalizing through the model's judgment (retitle + close + outcome) takes
+  seconds and is what gives ~90% of the value. The session-backfill pass — one
+  `claude -p` call per session, minutes on a big multi-session task — proved too
+  slow to be the default, so it now runs only with `--enrich`. (The old `--quick`
+  flag is gone: its behaviour is the default. Replace `complete <id> --quick`
+  with `complete <id>`, and `complete <id>` with `complete <id> --enrich` if you
+  want the old full behaviour.)
 
 ### Fixed
 - **`complete` survives a non-JSON enrich reply.** When the backfill model
