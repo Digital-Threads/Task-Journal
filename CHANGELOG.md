@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-13
+
+### Added
+- **Reliable, free, non-blocking capture.** The UserPromptSubmit nudge is now
+  adaptive: it always reminds you to record, and escalates when a session has
+  done substantial work (large transcript) but logged few journal entries —
+  same constant-context-injection trick that keeps caveman mode reliable, never
+  a blocking gate. No model, no cost.
+- **Capture kill-switch.** `task-journal capture off` writes a marker that
+  no-ops the realtime capture path of `ingest-hook` (the read-only SessionStart
+  resume still runs) — even in an already-running session, because the hook
+  re-invokes the on-disk binary each event. `capture on` clears it. Silences a
+  stale auto-capture hook without a restart.
+- **Pluggable LLM backend.** A small `LlmBackend` trait + adapters so this
+  public package grows new providers without touching callers. Default
+  **`claude-p`** (your Claude subscription, no API key); pick others with
+  `TJ_BACKEND` or a per-command `--backend`:
+  - `anthropic` (`ANTHROPIC_API_KEY`),
+  - `openai` — any OpenAI-compatible API, covering OpenAI and Codex
+    (`OPENAI_API_KEY`, `TJ_OPENAI_BASE_URL`, `TJ_OPENAI_MODEL`),
+  - `ollama` — a **free** local model via Ollama's OpenAI-compatible endpoint
+    (`TJ_OLLAMA_URL`, `TJ_OLLAMA_MODEL`).
+  `consolidate` and `dream` both route through it; the heuristic fallback is
+  gone (AI-only — when no backend is available the command skips, never
+  fabricates).
+- **`task-journal complete <task>`** — "make this task complete from its
+  transcripts": re-reads the sessions tied to a task and appends the
+  decisions/findings the live capture missed. A friendly alias for
+  `dream --task`; one LLM call per session via the chosen backend (free with
+  `--backend ollama`).
+- **Conventions → always-on.** `consolidate --write-claude-md` writes the
+  distilled project conventions into `./CLAUDE.md` as a managed, regenerable
+  block (`<!-- task-journal:conventions:start/end -->`), so every session sees
+  them on the same guaranteed path as your hand-written rules. Re-running
+  regenerates the block in place without touching anything else.
+
+### Internal
+- `tj-core::llm` (trait + claude-p/anthropic/openai/ollama adapters +
+  `backend_from_env`); `dream::llm_backend::LlmDreamBackend`; consolidate
+  conventions-block writer; adaptive-nudge escalation + capture marker.
+
 ## [0.20.0] - 2026-06-13
 
 ### Added
