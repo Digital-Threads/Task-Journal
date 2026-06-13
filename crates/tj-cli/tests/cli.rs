@@ -5563,6 +5563,8 @@ fn complete_retitles_and_closes_via_fake_backend() {
     // whose `result` field is the finalize JSON string.
     let envelope = serde_json::json!({
         "is_error": false,
+        "usage": {"input_tokens": 1200, "output_tokens": 300},
+        "total_cost_usd": 0.0012,
         "result": serde_json::json!({
             "retitle": true,
             "title": "Voucher refund: paid 100% but got 50%",
@@ -5619,6 +5621,7 @@ fn complete_retitles_and_closes_via_fake_backend() {
         .args(["complete", &task_id])
         .assert()
         .success()
+        .stdout(contains("spent 1.5k tok ($0.0012)"))
         .stdout(contains("retitled"))
         .stdout(contains("closed"));
 

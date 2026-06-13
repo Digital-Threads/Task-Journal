@@ -99,15 +99,16 @@ pub fn parse_judgment(text: &str) -> anyhow::Result<FinalizeJudgment> {
         .with_context(|| format!("finalize JSON parse failed; got: {json_str}"))
 }
 
-/// One judge call: prompt → model → parsed judgment.
+/// One judge call: prompt → model → parsed judgment, with the token usage the
+/// backend reported for the call.
 pub fn judge(
     current_title: &str,
     event_lines: &[String],
     backend: &dyn LlmBackend,
-) -> anyhow::Result<FinalizeJudgment> {
+) -> anyhow::Result<(FinalizeJudgment, crate::llm::LlmUsage)> {
     let prompt = build_prompt(current_title, event_lines);
-    let reply = backend.complete(&prompt, 512)?;
-    parse_judgment(&reply)
+    let (reply, usage) = backend.complete_usage(&prompt, 512)?;
+    Ok((parse_judgment(&reply)?, usage))
 }
 
 #[cfg(test)]
@@ -199,7 +200,7 @@ mod tests {
             r#"{"retitle":true,"title":"T","done":false,"outcome_tag":"","outcome":"","reason":"r"}"#
                 .into(),
         );
-        let j = judge("old", &["[open] old".into()], &backend).unwrap();
+        let (j, _usage) = judge("old", &["[open] old".into()], &backend).unwrap();
         assert_eq!(j.title, "T");
         assert!(!j.done);
     }

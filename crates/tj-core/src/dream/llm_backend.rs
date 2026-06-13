@@ -12,15 +12,25 @@ use crate::llm::LlmBackend;
 /// run one completion, parse the JSON array of missed events.
 pub struct LlmDreamBackend {
     llm: Box<dyn LlmBackend>,
+    /// Token usage accumulated across all chunk calls this backend made.
+    usage: std::sync::Mutex<crate::llm::LlmUsage>,
 }
 
 impl LlmDreamBackend {
     pub fn new(llm: Box<dyn LlmBackend>) -> Self {
-        Self { llm }
+        Self {
+            llm,
+            usage: std::sync::Mutex::new(crate::llm::LlmUsage::default()),
+        }
     }
 
     pub fn backend_name(&self) -> &'static str {
         self.llm.name()
+    }
+
+    /// Total token usage this backend reported across every backfill chunk.
+    pub fn usage(&self) -> crate::llm::LlmUsage {
+        *self.usage.lock().unwrap()
     }
 }
 
@@ -47,13 +57,17 @@ impl DreamBackend for LlmDreamBackend {
             // (model continued the transcript dialogue) — is skipped, never
             // aborting the finalize. A genuinely broken backend still surfaces
             // at the judge step, which has its own (small, always-sized) call.
-            match self
-                .llm
-                .complete(&prompt, 1024)
-                .and_then(|text| parse_backfill_json(&text))
-            {
-                Ok(evs) => out.extend(evs),
-                Err(e) => tracing::warn!(error = %e, "dream backfill: skipping chunk"),
+            match self.llm.complete_usage(&prompt, 1024) {
+                Ok((text, usage)) => {
+                    self.usage.lock().unwrap().add(usage);
+                    match parse_backfill_json(&text) {
+                        Ok(evs) => out.extend(evs),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "dream backfill: skipping unparseable chunk")
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "dream backfill: skipping failed chunk"),
             }
         }
         Ok(out)

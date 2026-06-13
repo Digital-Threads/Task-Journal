@@ -4108,6 +4108,89 @@ struct FinalizeOutcome {
     reason: String,
     /// True when no LLM backend was available — nothing was judged or written.
     skipped_no_backend: bool,
+    /// Exact token usage spent on this task (judge + any enrich calls).
+    spent: tj_core::llm::LlmUsage,
+    /// Estimated memory compression: raw session tokens → compact pack tokens.
+    saved: Option<Savings>,
+}
+
+/// Rough memory-compression estimate for a finalized task (≈ chars / 4).
+#[derive(Default, Clone, Copy)]
+struct Savings {
+    raw_tokens: u64,
+    pack_tokens: u64,
+}
+
+/// ~tokens from a char count (a rough 4-chars-per-token estimate — enough for
+/// an order-of-magnitude "how much memory this compresses" signal).
+fn est_tokens(chars: usize) -> u64 {
+    (chars as u64).div_ceil(4)
+}
+
+/// Estimate how much raw session material a task's compact pack stands in for:
+/// the summed transcript size of the sessions it touched vs the pack size.
+/// `None` when sessions aren't reachable (no project dir).
+fn compute_savings(
+    conn: &rusqlite::Connection,
+    events_path: &std::path::Path,
+    project_dir: Option<&std::path::Path>,
+    task_id: &str,
+) -> Option<Savings> {
+    let dir = project_dir?;
+    let sessions = task_sessions(events_path, dir, task_id).ok()?;
+    if sessions.is_empty() {
+        return None;
+    }
+    let raw_chars: usize = sessions.iter().map(|(_, inp)| inp.transcript.len()).sum();
+    let pack = tj_core::pack::assemble(conn, task_id, tj_core::pack::PackMode::Compact).ok()?;
+    Some(Savings {
+        raw_tokens: est_tokens(raw_chars),
+        pack_tokens: est_tokens(pack.text.len()),
+    })
+}
+
+/// Format a token count compactly: 980 → "980", 3_240 → "3.2k", 88_000 → "88k".
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 100_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{}k", n / 1_000)
+    }
+}
+
+/// Human spent/saved suffix for a finalize line, e.g.
+/// " | spent 3.2k tok ($0.0012) · saved ~88k→1.5k tok (59×)".
+fn stats_suffix(spent: &tj_core::llm::LlmUsage, saved: &Option<Savings>) -> String {
+    let mut parts = Vec::new();
+    if spent.total_tokens() > 0 {
+        let cost = match spent.cost_usd {
+            Some(c) if c > 0.0 => format!(" (${c:.4})"),
+            _ => String::new(),
+        };
+        parts.push(format!(
+            "spent {} tok{}",
+            fmt_tokens(spent.total_tokens()),
+            cost
+        ));
+    }
+    if let Some(s) = saved {
+        if s.pack_tokens > 0 && s.raw_tokens > s.pack_tokens {
+            let factor = s.raw_tokens as f64 / s.pack_tokens as f64;
+            parts.push(format!(
+                "saved ~{}→{} tok ({:.0}×)",
+                fmt_tokens(s.raw_tokens),
+                fmt_tokens(s.pack_tokens),
+                factor
+            ));
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", parts.join(" · "))
+    }
 }
 
 /// Per-project handles threaded through the finalize helpers.
@@ -4149,10 +4232,10 @@ fn enrich_task(
     project_dir: &std::path::Path,
     task_id: &str,
     llm: Box<dyn tj_core::llm::LlmBackend>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, tj_core::llm::LlmUsage)> {
     let sessions = task_sessions(events_path, project_dir, task_id)?;
     if sessions.is_empty() {
-        return Ok(0);
+        return Ok((0, tj_core::llm::LlmUsage::default()));
     }
     // Enrich is the slow part — one (or more, for big transcripts) `claude -p`
     // call per session. Announce it so a multi-minute run doesn't look hung;
@@ -4170,7 +4253,7 @@ fn enrich_task(
     };
     let report =
         tj_core::dream::run_dream(conn, events_path, &opts, &dream_backend, sessions, &run_id)?;
-    Ok(report.events_backfilled)
+    Ok((report.events_backfilled, dream_backend.usage()))
 }
 
 /// Current title for a task ("" if somehow unset).
@@ -4229,7 +4312,10 @@ fn finalize_one_task(
     if enrich && !dry_run {
         if let Some(dir) = ctx.project_dir {
             if let Some(llm) = tj_core::llm::backend_from_env(backend)? {
-                out.enriched = enrich_task(conn, events_path, project_hash, dir, task_id, llm)?;
+                let (n, enrich_usage) =
+                    enrich_task(conn, events_path, project_hash, dir, task_id, llm)?;
+                out.enriched = n;
+                out.spent.add(enrich_usage);
                 tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
             }
         }
@@ -4256,7 +4342,8 @@ fn finalize_one_task(
         out.skipped_no_backend = true;
         return Ok(out);
     };
-    let j = tj_core::finalize::judge(&title, &lines, judge_backend.as_ref())?;
+    let (j, judge_usage) = tj_core::finalize::judge(&title, &lines, judge_backend.as_ref())?;
+    out.spent.add(judge_usage);
     out.done = j.done;
     out.reason = j.reason.clone();
 
@@ -4302,6 +4389,9 @@ fn finalize_one_task(
 
     writer.flush_durable()?;
     tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
+
+    // 6. Estimate the memory compression this finalize represents.
+    out.saved = compute_savings(conn, events_path, ctx.project_dir, task_id);
     Ok(out)
 }
 
@@ -4334,7 +4424,11 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
     if parts.is_empty() {
         parts.push("no change".to_string());
     }
-    println!("complete {task_id}: {}", parts.join("; "));
+    println!(
+        "complete {task_id}: {}{}",
+        parts.join("; "),
+        stats_suffix(&out.spent, &out.saved)
+    );
 }
 
 /// `complete <id>` — finalize a single task.
@@ -4482,6 +4576,9 @@ fn run_complete_batch(
     }
 
     let mut left_open: Vec<(String, String)> = Vec::new();
+    let mut total_spent = tj_core::llm::LlmUsage::default();
+    let mut total_saved = Savings::default();
+    let mut done_count = 0usize;
     for (id, _) in &targets {
         let out = finalize_one_task(&ctx, id, enrich, false, backend)?;
         print_finalize_outcome(id, &out);
@@ -4489,9 +4586,23 @@ fn run_complete_batch(
             println!("complete: stopping batch — no LLM backend available.");
             return Ok(());
         }
+        total_spent.add(out.spent);
+        if let Some(s) = out.saved {
+            total_saved.raw_tokens += s.raw_tokens;
+            total_saved.pack_tokens += s.pack_tokens;
+        }
+        done_count += 1;
         if !out.closed {
             left_open.push((id.clone(), out.reason.clone()));
         }
+    }
+
+    let totals = stats_suffix(&total_spent, &Some(total_saved));
+    if !totals.is_empty() {
+        println!(
+            "\nTotals across {done_count} task(s): {}",
+            totals.trim_start_matches(" | ")
+        );
     }
 
     if !left_open.is_empty() {
@@ -5550,6 +5661,43 @@ mod inline_tests {
     // `clippy::items_after_test_module` — every other free fn must be
     // declared before this module begins.
     use super::*;
+
+    #[test]
+    fn fmt_tokens_scales_units() {
+        assert_eq!(fmt_tokens(980), "980");
+        assert_eq!(fmt_tokens(1_500), "1.5k");
+        assert_eq!(fmt_tokens(88_000), "88.0k");
+        assert_eq!(fmt_tokens(204_000), "204k");
+    }
+
+    #[test]
+    fn stats_suffix_shows_spent_and_saved() {
+        let spent = tj_core::llm::LlmUsage {
+            input_tokens: 1200,
+            output_tokens: 300,
+            cost_usd: Some(0.0012),
+        };
+        let saved = Some(Savings {
+            raw_tokens: 90_000,
+            pack_tokens: 1_500,
+        });
+        let s = stats_suffix(&spent, &saved);
+        assert!(s.contains("spent 1.5k tok ($0.0012)"), "{s}");
+        assert!(s.contains("saved ~90.0k→1.5k tok (60×)"), "{s}");
+    }
+
+    #[test]
+    fn stats_suffix_empty_when_nothing_to_report() {
+        let spent = tj_core::llm::LlmUsage::default();
+        assert_eq!(stats_suffix(&spent, &None), "");
+        // Cost omitted when zero/None; tokens still shown.
+        let spent = tj_core::llm::LlmUsage {
+            input_tokens: 500,
+            output_tokens: 0,
+            cost_usd: None,
+        };
+        assert_eq!(stats_suffix(&spent, &None), " | spent 500 tok");
+    }
 
     #[test]
     fn nudge_escalates_only_for_substantial_thin_sessions() {

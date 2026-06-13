@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.23.0] - 2026-06-13
+## [0.24.0] - 2026-06-13
+
+### Added
+- **`complete` reports tokens spent and saved.** Each finalize now prints what
+  it cost and what it compresses: `complete tj-x: … | spent 1.5k tok ($0.0012) ·
+  saved ~88k→1.5k tok (59×)`. **Spent** is exact, pulled from the backend's own
+  usage report (the `claude -p` JSON envelope's `usage`/`total_cost_usd`,
+  Anthropic/OpenAI `usage`), summed across the judge call and any `--enrich`
+  calls. **Saved** is an estimate of memory compression — the raw transcript
+  size of the task's sessions vs its compact pack (≈ chars/4). A batch run ends
+  with a `Totals across N task(s):` line. Backends expose usage via a new
+  `LlmBackend::complete_usage` method (default: no usage), so custom backends
+  keep working unchanged.
 
 Finalize, retuned after running `complete` on real 12-session tasks: the fast,
 reliable judge-only path is now the default, and the slow session-enrich pass is
