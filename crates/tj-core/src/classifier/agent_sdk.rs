@@ -236,9 +236,9 @@ impl ClaudeCliClassifier {
     }
 }
 
-/// The JSON wrapper emitted by `claude --output-format json`. We only need the
-/// error flag and the `result` string (the model's verdict text); the rest of
-/// the envelope (usage, cost, timings) is ignored.
+/// The JSON wrapper emitted by `claude --output-format json`. We read the error
+/// flag, the `result` string (the model's verdict text), and the usage/cost so
+/// callers can report what a call actually consumed.
 #[derive(serde::Deserialize)]
 struct CliEnvelope {
     #[serde(default)]
@@ -247,6 +247,22 @@ struct CliEnvelope {
     result: Option<String>,
     #[serde(default)]
     subtype: Option<String>,
+    #[serde(default)]
+    usage: Option<EnvelopeUsage>,
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct EnvelopeUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 impl Classifier for ClaudeCliClassifier {
@@ -266,6 +282,16 @@ pub fn run_claude_json(
     model: &str,
     prompt: &str,
 ) -> anyhow::Result<String> {
+    run_claude_json_usage(runner, model, prompt).map(|(text, _)| text)
+}
+
+/// Like [`run_claude_json`] but also returns the envelope's reported token
+/// usage and cost (zeros when the envelope omits them).
+pub fn run_claude_json_usage(
+    runner: &dyn CommandRunner,
+    model: &str,
+    prompt: &str,
+) -> anyhow::Result<(String, crate::llm::LlmUsage)> {
     let stdout = runner.run(model, prompt)?;
     let envelope: CliEnvelope = serde_json::from_str(stdout.trim()).with_context(|| {
         format!(
@@ -279,9 +305,17 @@ pub fn run_claude_json(
             envelope.subtype.as_deref().unwrap_or("unknown")
         ));
     }
-    envelope
+    let u = envelope.usage.unwrap_or_default();
+    let usage = crate::llm::LlmUsage {
+        // Count cache reads/writes as input so the total reflects real context.
+        input_tokens: u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens,
+        output_tokens: u.output_tokens,
+        cost_usd: envelope.total_cost_usd,
+    };
+    let result = envelope
         .result
-        .ok_or_else(|| anyhow!("claude json wrapper had no `result` field"))
+        .ok_or_else(|| anyhow!("claude json wrapper had no `result` field"))?;
+    Ok((result, usage))
 }
 
 /// Probe whether `claude` resolves on PATH and runs. Cheap (`--version` does

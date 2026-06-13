@@ -22,11 +22,44 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Token usage reported by a backend for one call. `cost_usd` is `None` when
+/// the backend doesn't report a price (most APIs report tokens, not dollars;
+/// `claude -p` reports `total_cost_usd`, which is 0 under a subscription).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LlmUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
+impl LlmUsage {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    /// Accumulate another call's usage into this one.
+    pub fn add(&mut self, other: LlmUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cost_usd = match (self.cost_usd, other.cost_usd) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, None) => a,
+            (None, b) => b,
+        };
+    }
+}
+
 /// One AI call: a prompt in, the model's text reply out.
 pub trait LlmBackend: Send + Sync {
     fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String>;
     /// Stable label for logs / provenance.
     fn name(&self) -> &'static str;
+    /// Like [`complete`](Self::complete) but also reports token usage when the
+    /// backend exposes it. Default: run `complete` and report no usage, so
+    /// mocks and minimal backends need not implement it.
+    fn complete_usage(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<(String, LlmUsage)> {
+        Ok((self.complete(prompt, max_tokens)?, LlmUsage::default()))
+    }
 }
 
 /// Resolve the backend from an explicit name (e.g. a `--backend` flag) or
@@ -82,15 +115,18 @@ impl ClaudeCliBackend {
 }
 
 impl LlmBackend for ClaudeCliBackend {
-    fn complete(&self, prompt: &str, _max_tokens: u32) -> anyhow::Result<String> {
-        crate::classifier::agent_sdk::run_claude_json(
+    fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
+        self.complete_usage(prompt, max_tokens).map(|(t, _)| t)
+    }
+    fn name(&self) -> &'static str {
+        "claude-p"
+    }
+    fn complete_usage(&self, prompt: &str, _max_tokens: u32) -> anyhow::Result<(String, LlmUsage)> {
+        crate::classifier::agent_sdk::run_claude_json_usage(
             &crate::classifier::agent_sdk::ClaudeBinaryStdinRunner,
             &self.model,
             prompt,
         )
-    }
-    fn name(&self) -> &'static str {
-        "claude-p"
     }
 }
 
@@ -134,6 +170,15 @@ struct AnthropicMsg<'a> {
 #[derive(Deserialize)]
 struct AnthropicResp {
     content: Vec<AnthropicBlock>,
+    #[serde(default)]
+    usage: AnthropicUsage,
+}
+#[derive(Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 #[derive(Deserialize)]
 struct AnthropicBlock {
@@ -145,6 +190,12 @@ struct AnthropicBlock {
 
 impl LlmBackend for AnthropicBackend {
     fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
+        self.complete_usage(prompt, max_tokens).map(|(t, _)| t)
+    }
+    fn name(&self) -> &'static str {
+        "anthropic"
+    }
+    fn complete_usage(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<(String, LlmUsage)> {
         let body = AnthropicReq {
             model: &self.model,
             max_tokens,
@@ -162,14 +213,18 @@ impl LlmBackend for AnthropicBackend {
             .context("Anthropic API request failed")?
             .into_json()
             .context("decode Anthropic response")?;
-        resp.content
+        let usage = LlmUsage {
+            input_tokens: resp.usage.input_tokens,
+            output_tokens: resp.usage.output_tokens,
+            cost_usd: None,
+        };
+        let text = resp
+            .content
             .iter()
             .find(|b| b.kind == "text")
             .map(|b| b.text.clone())
-            .ok_or_else(|| anyhow!("no text content in Anthropic response"))
-    }
-    fn name(&self) -> &'static str {
-        "anthropic"
+            .ok_or_else(|| anyhow!("no text content in Anthropic response"))?;
+        Ok((text, usage))
     }
 }
 
@@ -218,6 +273,15 @@ struct OpenAiReq<'a> {
 #[derive(Deserialize)]
 struct OpenAiResp {
     choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: OpenAiUsage,
+}
+#[derive(Deserialize, Default)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 #[derive(Deserialize)]
 struct OpenAiChoice {
@@ -231,6 +295,9 @@ struct OpenAiMsg {
 
 impl LlmBackend for OpenAiBackend {
     fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
+        self.complete_usage(prompt, max_tokens).map(|(t, _)| t)
+    }
+    fn complete_usage(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<(String, LlmUsage)> {
         let body = OpenAiReq {
             model: &self.model,
             max_tokens,
@@ -250,11 +317,18 @@ impl LlmBackend for OpenAiBackend {
             .with_context(|| format!("{} request failed", self.label))?
             .into_json()
             .context("decode OpenAI-compatible response")?;
-        resp.choices
+        let usage = LlmUsage {
+            input_tokens: resp.usage.prompt_tokens,
+            output_tokens: resp.usage.completion_tokens,
+            cost_usd: None,
+        };
+        let text = resp
+            .choices
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow!("no choices in {} response", self.label))
+            .ok_or_else(|| anyhow!("no choices in {} response", self.label))?;
+        Ok((text, usage))
     }
     fn name(&self) -> &'static str {
         self.label
