@@ -90,9 +90,86 @@ pub fn parse_facts(text: &str) -> Vec<ConsolidatedFact> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Promote conventions to always-on: a managed block in the project CLAUDE.md.
+// ---------------------------------------------------------------------------
+
+const CONV_START: &str = "<!-- task-journal:conventions:start -->";
+const CONV_END: &str = "<!-- task-journal:conventions:end -->";
+
+/// Render the consolidated facts as a managed CLAUDE.md block (delimited so it
+/// can be regenerated without disturbing hand-written content).
+pub fn render_conventions_block(facts: &[ConsolidatedFact]) -> String {
+    let mut s = String::from(CONV_START);
+    s.push_str(
+        "\n## Project conventions (auto-derived by task-journal)\n\
+_Regenerate with `task-journal consolidate --write-claude-md`. Lines between the \
+markers are overwritten — edit elsewhere._\n\n",
+    );
+    for f in facts {
+        s.push_str(&format!("- ({}) {}\n", f.tier, f.text));
+    }
+    s.push_str(CONV_END);
+    s
+}
+
+/// Insert or replace the managed conventions block in `existing` CLAUDE.md text.
+/// Replaces the block between the markers if present, else appends it. Never
+/// touches anything outside the markers.
+pub fn upsert_conventions_block(existing: &str, facts: &[ConsolidatedFact]) -> String {
+    let block = render_conventions_block(facts);
+    match (existing.find(CONV_START), existing.find(CONV_END)) {
+        (Some(start), Some(end_idx)) if end_idx >= start => {
+            let end = end_idx + CONV_END.len();
+            format!("{}{}{}", &existing[..start], block, &existing[end..])
+        }
+        _ => {
+            let mut out = existing.to_string();
+            if !out.is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+            out.push_str(&block);
+            out.push('\n');
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fact(tier: &str, text: &str) -> ConsolidatedFact {
+        ConsolidatedFact {
+            tier: tier.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn conventions_block_appends_then_replaces_idempotently() {
+        let facts = vec![fact("semantic", "always lock the DB for money")];
+        // Append into existing hand-written content.
+        let v1 = upsert_conventions_block("# My project\n\nHand rules.\n", &facts);
+        assert!(v1.contains("# My project"));
+        assert!(v1.contains("always lock the DB"));
+        assert!(v1.contains(CONV_START) && v1.contains(CONV_END));
+
+        // Re-run with new facts → replaces the block, keeps hand content, no dup.
+        let facts2 = vec![fact("procedural", "PR into main, squash")];
+        let v2 = upsert_conventions_block(&v1, &facts2);
+        assert!(v2.contains("# My project"), "hand content preserved");
+        assert!(v2.contains("PR into main, squash"));
+        assert!(!v2.contains("always lock the DB"), "old facts replaced");
+        assert_eq!(
+            v2.matches(CONV_START).count(),
+            1,
+            "exactly one managed block"
+        );
+    }
 
     #[test]
     fn parse_facts_extracts_tagged_lines() {

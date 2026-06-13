@@ -673,6 +673,10 @@ enum Commands {
         /// Defaults to TJ_BACKEND, then claude-p (subscription, no API key).
         #[arg(long)]
         backend: Option<String>,
+        /// Also write the conventions into ./CLAUDE.md as a managed block, so
+        /// they're always-on for every session (regenerated on each run).
+        #[arg(long)]
+        write_claude_md: bool,
     },
     /// Render and print the resume pack for a task.
     Pack {
@@ -1338,8 +1342,12 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("expected `on` or `off`, got `{other}`"),
             }
         }
-        Commands::Consolidate { max_facts, backend } => {
-            run_consolidate(max_facts, backend.as_deref())?;
+        Commands::Consolidate {
+            max_facts,
+            backend,
+            write_claude_md,
+        } => {
+            run_consolidate(max_facts, backend.as_deref(), write_claude_md)?;
         }
         Commands::Event {
             task_id,
@@ -4078,7 +4086,11 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
 /// distil them into durable facts via one LLM call through the chosen backend,
 /// and store the facts as events in a per-project conventions task. Skips
 /// cleanly (no spend) when no backend is available.
-fn run_consolidate(max_facts: usize, backend: Option<&str>) -> anyhow::Result<()> {
+fn run_consolidate(
+    max_facts: usize,
+    backend: Option<&str>,
+    write_claude_md: bool,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -4178,6 +4190,20 @@ another via --backend / TJ_BACKEND: anthropic (ANTHROPIC_API_KEY), openai \
     println!(
         "consolidated {written} new fact(s) into task {task_id} (\"{CONSOLIDATE_TASK_TITLE}\")"
     );
+
+    // Promote to always-on: regenerate the managed conventions block in
+    // ./CLAUDE.md from this run's full set of facts.
+    if write_claude_md {
+        let path = cwd.join("CLAUDE.md");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated = tj_core::consolidate::upsert_conventions_block(&existing, &facts);
+        std::fs::write(&path, updated)?;
+        println!(
+            "wrote {} convention(s) into the managed block in {}",
+            facts.len(),
+            path.display()
+        );
+    }
     Ok(())
 }
 

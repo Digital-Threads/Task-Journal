@@ -5295,6 +5295,25 @@ fn consolidate_writes_facts_to_conventions_task_and_dedups() {
     );
     mock.assert();
 
+    // --write-claude-md promotes the conventions into a managed CLAUDE.md block.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_BACKEND", "anthropic")
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("TJ_CONSOLIDATE_BASE_URL", server.url())
+        .env("TJ_EMBED", "hash")
+        .args(["consolidate", "--write-claude-md"])
+        .assert()
+        .success();
+    let claude_md = std::fs::read_to_string(proj.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        claude_md.contains("task-journal:conventions:start")
+            && claude_md.contains("idempotent ledger"),
+        "CLAUDE.md must hold the managed conventions block; got: {claude_md}"
+    );
+
     // The fact is now recallable.
     let recall = String::from_utf8(
         Command::cargo_bin("task-journal")
