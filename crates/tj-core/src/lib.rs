@@ -55,6 +55,7 @@ pub mod db;
 pub mod dream;
 pub mod embed;
 pub mod event;
+pub mod finalize;
 pub mod frontmatter;
 pub mod fts;
 pub mod llm;

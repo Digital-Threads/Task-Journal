@@ -264,11 +264,34 @@ pub fn upsert_task_from_event(
                 "UPDATE tasks SET status='closed', closed_at=?2, last_event_at=?2 WHERE task_id=?1",
                 rusqlite::params![event.task_id, event.timestamp],
             )?;
+            // Restore closure metadata from the event so the recorded outcome
+            // survives a full rebuild_state replay — the tasks row is rebuilt
+            // from events, and set_task_outcome's direct DB write would be lost.
+            if let Some(outcome) = event.meta.get("outcome").and_then(|v| v.as_str()) {
+                let tag = event.meta.get("outcome_tag").and_then(|v| v.as_str());
+                conn.execute(
+                    "UPDATE tasks SET outcome=?2, outcome_tag=?3 WHERE task_id=?1",
+                    rusqlite::params![event.task_id, outcome, tag],
+                )?;
+            }
         }
         EventType::Reopen => {
             conn.execute(
                 "UPDATE tasks SET status='open', closed_at=NULL, last_event_at=?2 WHERE task_id=?1",
                 rusqlite::params![event.task_id, event.timestamp],
+            )?;
+        }
+        EventType::Rename => {
+            // The new human-readable title is the event text. Replaying the
+            // JSONL in order means the last Rename wins — exactly what we want.
+            let title = event
+                .meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&event.text);
+            conn.execute(
+                "UPDATE tasks SET title=?2, last_event_at=?3 WHERE task_id=?1",
+                rusqlite::params![event.task_id, title, event.timestamp],
             )?;
         }
         _ => {
@@ -1315,6 +1338,73 @@ mod tests {
 
         assert!(task_exists(&conn, "tj-yes").unwrap());
         assert!(!task_exists(&conn, "tj-nope").unwrap());
+    }
+
+    #[test]
+    fn rename_event_updates_task_title() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-rn", "#: 5");
+        upsert_task_from_event(&conn, &open_ev, ph).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE task_id='tj-rn'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "#: 5");
+
+        let mut rename = crate::event::Event::new(
+            "tj-rn",
+            crate::event::EventType::Rename,
+            crate::event::Author::Agent,
+            crate::event::Source::Cli,
+            "Support BID 29683996 — voucher refund 50% vs promised 100%".into(),
+        );
+        rename.timestamp = "2099-01-01T00:00:00.000Z".into();
+        upsert_task_from_event(&conn, &rename, ph).unwrap();
+
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE task_id='tj-rn'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            title,
+            "Support BID 29683996 — voucher refund 50% vs promised 100%"
+        );
+    }
+
+    #[test]
+    fn close_event_restores_outcome_from_meta() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-cl", "T");
+        upsert_task_from_event(&conn, &open_ev, ph).unwrap();
+
+        let mut close = crate::event::Event::new(
+            "tj-cl",
+            crate::event::EventType::Close,
+            crate::event::Author::Agent,
+            crate::event::Source::Cli,
+            "done".into(),
+        );
+        close.meta = serde_json::json!({"outcome": "Shipped the fix.", "outcome_tag": "done"});
+        upsert_task_from_event(&conn, &close, ph).unwrap();
+
+        let (status, outcome, tag): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, outcome, outcome_tag FROM tasks WHERE task_id='tj-cl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        assert_eq!(outcome.as_deref(), Some("Shipped the fix."));
+        assert_eq!(tag.as_deref(), Some("done"));
     }
 
     #[test]

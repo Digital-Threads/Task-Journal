@@ -16,6 +16,7 @@ pub enum EventType {
     Supersede,
     Close,
     Redirect,
+    Rename,
 }
 
 impl EventType {
@@ -32,6 +33,7 @@ impl EventType {
         Self::Supersede,
         Self::Close,
         Self::Redirect,
+        Self::Rename,
     ];
 }
 

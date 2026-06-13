@@ -5451,16 +5451,186 @@ fn capture_off_marker_no_ops_ingest_hook_capture() {
 
 #[test]
 fn complete_command_runs_and_skips_cleanly_without_sessions() {
-    // `complete <task>` is a friendly alias for `dream --task`; with no Claude
-    // Code sessions for the project it exits cleanly (no model call).
+    // `complete <id> --dry-run` reports scope without calling the model or
+    // writing anything. With no Claude Code sessions it shows 0 to enrich.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Finalize me", "--goal", "ship it"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete", &task_id, "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("complete (dry-run)"))
+        .stdout(contains("session(s) to enrich"));
+}
+
+#[test]
+fn complete_unknown_task_errors() {
+    // A non-existent id is a hard error, not a silent no-op.
     let dir = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
         .unwrap()
         .current_dir(proj.path())
         .env("XDG_DATA_HOME", dir.path())
-        .args(["complete", "tj-x", "--dry-run"])
+        .args(["complete", "tj-nope", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains("task not found"));
+}
+
+#[test]
+fn complete_batch_refuses_without_tty_or_yes() {
+    // No id = batch. Non-interactive stdin (test harness) without --yes must
+    // refuse rather than mass-close tasks unattended.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["create", "Batch me", "--goal", "g"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete"])
+        .assert()
+        .failure()
+        .stderr(contains("interactive terminal"));
+}
+
+#[test]
+fn complete_batch_dry_run_lists_open_tasks() {
+    // Batch dry-run lists open tasks and reports per-task scope, no prompts.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["create", "Listed task", "--goal", "g"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete", "--dry-run"])
         .assert()
         .success()
-        .stdout(contains("dream"));
+        .stdout(contains("Open tasks ("))
+        .stdout(contains("Listed task"));
+}
+
+/// End-to-end finalize through the real claude-p backend path, with a fake
+/// `claude` on PATH returning a canned judgment. Proves the wiring: junk
+/// title → Rename, done verdict → Close with a persisted outcome. Unix-only
+/// (shell-script stub); the logic itself is covered cross-platform by the
+/// finalize.rs unit tests.
+#[cfg(unix)]
+#[test]
+fn complete_quick_retitles_and_closes_via_fake_backend() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let bindir = assert_fs::TempDir::new().unwrap();
+
+    // The judgment the fake model "returns" — wrapped in claude's JSON envelope
+    // whose `result` field is the finalize JSON string.
+    let envelope = serde_json::json!({
+        "is_error": false,
+        "result": serde_json::json!({
+            "retitle": true,
+            "title": "Voucher refund: paid 100% but got 50%",
+            "done": true,
+            "outcome_tag": "done",
+            "outcome": "Refunded the missing half to the customer.",
+            "reason": "Fix shipped and verified."
+        }).to_string()
+    })
+    .to_string();
+    let resp_path = bindir.path().join("resp.json");
+    std::fs::write(&resp_path, &envelope).unwrap();
+
+    // Fake `claude`: answer --version, drain stdin, print the envelope.
+    let claude = bindir.path().join("claude");
+    std::fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\ncat >/dev/null\ncat {}\n",
+            resp_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        bindir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "#: 5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // --quick: skip enrich (no sessions), exercise judge → retitle → close.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .env("PATH", &path_env)
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(["complete", &task_id, "--quick"])
+        .assert()
+        .success()
+        .stdout(contains("retitled"))
+        .stdout(contains("closed"));
+
+    // The task now carries the human title, closed status, and the outcome.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Voucher refund: paid 100% but got 50%"))
+        .stdout(contains("status: closed"))
+        .stdout(contains("Refunded the missing half"));
 }
