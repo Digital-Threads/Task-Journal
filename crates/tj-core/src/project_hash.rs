@@ -62,6 +62,11 @@ mod tests {
     fn different_paths_yield_different_hashes() {
         let d1 = TempDir::new().unwrap();
         let d2 = TempDir::new().unwrap();
+        // Make each temp dir its own project root, so the hash is of the temp
+        // dir itself — not of a shared ancestor that happens to carry a `.git`
+        // (which collapses both to one hash on some machines, e.g. WSL /tmp).
+        std::fs::create_dir(d1.path().join(".git")).unwrap();
+        std::fs::create_dir(d2.path().join(".git")).unwrap();
         let a = from_path(d1.path()).unwrap();
         let b = from_path(d2.path()).unwrap();
         assert_ne!(a, b);

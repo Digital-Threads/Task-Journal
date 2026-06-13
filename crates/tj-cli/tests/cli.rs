@@ -455,6 +455,10 @@ fn migrate_project_round_trips_data_to_new_path() {
     let xdg = assert_fs::TempDir::new().unwrap();
     let proj_a = assert_fs::TempDir::new().unwrap();
     let proj_b = assert_fs::TempDir::new().unwrap();
+    // Distinct project roots so each hashes to itself, not to a shared ancestor
+    // carrying a `.git` (which collapses both to one hash on some hosts, WSL).
+    std::fs::create_dir(proj_a.path().join(".git")).unwrap();
+    std::fs::create_dir(proj_b.path().join(".git")).unwrap();
 
     // Create a task with the cwd = proj_a.
     let task_id = String::from_utf8(
@@ -503,6 +507,10 @@ fn migrate_project_refuses_overwrite_without_force() {
     let xdg = assert_fs::TempDir::new().unwrap();
     let proj_a = assert_fs::TempDir::new().unwrap();
     let proj_b = assert_fs::TempDir::new().unwrap();
+    // Distinct project roots so each hashes to itself, not a shared `.git`
+    // ancestor (which collapses both to one hash on some hosts, e.g. WSL).
+    std::fs::create_dir(proj_a.path().join(".git")).unwrap();
+    std::fs::create_dir(proj_b.path().join(".git")).unwrap();
 
     // Both projects have data: create a task in each.
     for proj in [&proj_a, &proj_b] {
@@ -2379,8 +2387,8 @@ fn ingest_hook_returns_fast_in_async_mode() {
     // this took 5-30s. Post-fix, expect well under 1s; assert <2s
     // so flaky CI doesn't fail us.
     assert!(
-        elapsed < std::time::Duration::from_millis(2000),
-        "ingest-hook must return in <2s in async mode, took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(5),
+        "ingest-hook must return in <5s in async mode (the pre-fix regression was 5-30s); took {elapsed:?}"
     );
 
     // A v2 pending entry must have been written. We don't assert

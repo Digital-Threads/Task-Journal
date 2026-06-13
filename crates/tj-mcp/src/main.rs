@@ -873,6 +873,11 @@ mod tests {
         let b = tmp.path().join("beta");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
+        // Make each its own project root, so they don't both resolve up to the
+        // shared `tmp` ancestor (or a `.git` above it, which collapses the two
+        // hashes on some hosts, e.g. WSL /tmp).
+        std::fs::create_dir(a.join(".git")).unwrap();
+        std::fs::create_dir(b.join(".git")).unwrap();
 
         let (hash_a, _, _) = resolve_project_paths(&a).unwrap();
         let (hash_b, _, _) = resolve_project_paths(&b).unwrap();
