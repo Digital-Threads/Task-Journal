@@ -5544,3 +5544,93 @@ fn complete_batch_dry_run_lists_open_tasks() {
         .stdout(contains("Open tasks ("))
         .stdout(contains("Listed task"));
 }
+
+/// End-to-end finalize through the real claude-p backend path, with a fake
+/// `claude` on PATH returning a canned judgment. Proves the wiring: junk
+/// title → Rename, done verdict → Close with a persisted outcome. Unix-only
+/// (shell-script stub); the logic itself is covered cross-platform by the
+/// finalize.rs unit tests.
+#[cfg(unix)]
+#[test]
+fn complete_quick_retitles_and_closes_via_fake_backend() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let bindir = assert_fs::TempDir::new().unwrap();
+
+    // The judgment the fake model "returns" — wrapped in claude's JSON envelope
+    // whose `result` field is the finalize JSON string.
+    let envelope = serde_json::json!({
+        "is_error": false,
+        "result": serde_json::json!({
+            "retitle": true,
+            "title": "Voucher refund: paid 100% but got 50%",
+            "done": true,
+            "outcome_tag": "done",
+            "outcome": "Refunded the missing half to the customer.",
+            "reason": "Fix shipped and verified."
+        }).to_string()
+    })
+    .to_string();
+    let resp_path = bindir.path().join("resp.json");
+    std::fs::write(&resp_path, &envelope).unwrap();
+
+    // Fake `claude`: answer --version, drain stdin, print the envelope.
+    let claude = bindir.path().join("claude");
+    std::fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\ncat >/dev/null\ncat {}\n",
+            resp_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        bindir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "#: 5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // --quick: skip enrich (no sessions), exercise judge → retitle → close.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .env("PATH", &path_env)
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(["complete", &task_id, "--quick"])
+        .assert()
+        .success()
+        .stdout(contains("retitled"))
+        .stdout(contains("closed"));
+
+    // The task now carries the human title, closed status, and the outcome.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("Voucher refund: paid 100% but got 50%"))
+        .stdout(contains("status: closed"))
+        .stdout(contains("Refunded the missing half"));
+}
