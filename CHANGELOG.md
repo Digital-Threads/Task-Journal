@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-06-13
+
+### Fixed
+- **`complete` no longer fails on large sessions.** The enrich pass fed a whole
+  session transcript to the model in one call; a big multi-session task blew the
+  ~200k-token context limit and `claude -p` returned HTTP 400 ("Prompt is too
+  long"). The transcript is now split into line-aligned chunks under a safe
+  budget and the recovered events are merged (and deduped), so finalize works on
+  any session size. (`--quick` was unaffected — it skips enrich.)
+- **Legible `claude -p` errors.** A non-zero `claude -p` exit now surfaces the
+  JSON error it prints on **stdout** (with `--output-format json` the real cause
+  — invalid model, usage limit, context overflow — goes there, not stderr), so a
+  failure reads as "Prompt is too long · ~220310 tokens" instead of a bare
+  "exit status 1".
+
 ## [0.22.0] - 2026-06-13
 
 ### Added
