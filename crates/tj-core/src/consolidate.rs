@@ -1,14 +1,17 @@
 //! Memory consolidation (Pillar C): distil a project's recurring decisions and
-//! constraints into a handful of durable semantic/procedural facts via a direct
-//! Anthropic Haiku API call.
+//! constraints into a handful of durable semantic/procedural facts with a
+//! single LLM call.
 //!
-//! Direct API, not `claude -p`: post-2026-06-15 both bill as extra usage, but
-//! `claude -p` also boots the whole user environment (~tens of k tokens) on
-//! every call, while the direct API sends only our ~7k-token prompt — roughly
-//! 1c per run versus 5-10c. This is a MANUAL command (one call per run, only
-//! when the user asks), so it never resembles the per-prompt classifier burn.
-//! No `ANTHROPIC_API_KEY` → the caller skips cleanly; we never fall back to a
+//! Two backends, picked by [`summarize`]: the **direct Anthropic Haiku API**
+//! when `ANTHROPIC_API_KEY` is set (cheapest — only our ~7k-token prompt,
+//! ~1c/run), otherwise the local **`claude -p`** binary (subscription auth, no
+//! API key needed, but it boots the whole environment per call so it's
+//! pricier). With neither, the caller skips cleanly — we never fall back to a
 //! heuristic, which would manufacture low-trust "facts".
+//!
+//! Either way this is a MANUAL command: one call per run, only when the user
+//! asks, never wired to a hook — so it never resembles the per-prompt
+//! classifier burn.
 
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -89,6 +92,50 @@ impl Consolidator {
             .ok_or_else(|| anyhow!("no text content in response"))?;
         Ok(parse_facts(&text))
     }
+}
+
+/// Run whichever summarisation backend is available and return its label plus
+/// the facts it produced. Order: (1) `ANTHROPIC_API_KEY` set → direct Haiku API
+/// (cheapest, ~1c/run); (2) else `claude` on PATH → local `claude -p`
+/// (subscription auth, no API key, heavier per-call boot); (3) else `Ok(None)`,
+/// so the caller skips with a message — never a heuristic.
+/// `TJ_CONSOLIDATE_BACKEND=none` forces the no-backend path (disable / tests).
+pub fn summarize(
+    events: &[String],
+    max_facts: usize,
+) -> anyhow::Result<Option<(&'static str, Vec<ConsolidatedFact>)>> {
+    if std::env::var("TJ_CONSOLIDATE_BACKEND").as_deref() == Ok("none") {
+        return Ok(None);
+    }
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        let c = Consolidator::from_env(max_facts)?;
+        return Ok(Some(("haiku-api", c.consolidate(events)?)));
+    }
+    if crate::classifier::agent_sdk::claude_on_path() {
+        return Ok(Some(("claude -p", consolidate_via_cli(events, max_facts)?)));
+    }
+    Ok(None)
+}
+
+/// Summarise via the local `claude -p` binary (subscription auth). Reuses the
+/// classifier's command plumbing — including the recursion guard set by
+/// `base_claude_command` — and unwraps the `--output-format json` envelope.
+fn consolidate_via_cli(
+    events: &[String],
+    max_facts: usize,
+) -> anyhow::Result<Vec<ConsolidatedFact>> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prompt = build_prompt(events, max_facts);
+    let model = std::env::var("TJ_CONSOLIDATE_MODEL")
+        .unwrap_or_else(|_| crate::classifier::agent_sdk::DEFAULT_MODEL.to_string());
+    let text = crate::classifier::agent_sdk::run_claude_json(
+        &crate::classifier::agent_sdk::ClaudeBinaryStdinRunner,
+        &model,
+        &prompt,
+    )?;
+    Ok(parse_facts(&text))
 }
 
 /// The summarisation prompt. Deliberately strict: durable-only, fixed line

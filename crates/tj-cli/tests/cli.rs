@@ -5355,6 +5355,9 @@ fn consolidate_skips_without_api_key_and_spends_nothing() {
         .current_dir(proj.path())
         .env("XDG_DATA_HOME", xdg.path())
         .env_remove("ANTHROPIC_API_KEY")
+        // Force the no-backend path so the test is deterministic even where
+        // `claude` is on PATH (which would otherwise be tried).
+        .env("TJ_CONSOLIDATE_BACKEND", "none")
         .args(["consolidate"])
         .assert()
         .success()

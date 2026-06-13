@@ -23,7 +23,7 @@ default = ["embed"]
 embed = ["tj-core/embed"]
 
 [dependencies]
-tj-core = { package = "task-journal-core", version = "0.19.0", path = "../tj-core", default-features = false }
+tj-core = { package = "task-journal-core", version = "0.20.0", path = "../tj-core", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
