@@ -652,15 +652,31 @@ enum Commands {
     },
     /// List your stored user preferences.
     Preferences,
+    /// Turn realtime hook capture on or off via a `.capture-disabled` marker.
+    /// `off` no-ops the capture path of `ingest-hook` immediately — even in an
+    /// already-running session — without touching the read-only SessionStart
+    /// resume. Use it to silence a stale auto-capture hook.
+    Capture {
+        /// "on" (remove the marker) or "off" (write it).
+        state: String,
+    },
     /// Distil this project's recurring decisions and constraints into durable
     /// semantic/procedural facts (Pillar C). MANUAL and opt-in — it makes ONE
-    /// direct Haiku API call per run (needs ANTHROPIC_API_KEY; ~1c/run) and is
-    /// never wired to a hook, so it can't spend automatically. Facts are stored
-    /// as events in a per-project "conventions" task and surface in ask/recall.
+    /// LLM call per run and is never wired to a hook, so it can't spend
+    /// automatically. Facts are stored as events in a per-project "conventions"
+    /// task and surface in ask/recall.
     Consolidate {
         /// Maximum number of facts to produce.
         #[arg(long, default_value_t = 8)]
         max_facts: usize,
+        /// LLM backend override: claude-p (default) | anthropic | openai | ollama.
+        /// Defaults to TJ_BACKEND, then claude-p (subscription, no API key).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Also write the conventions into ./CLAUDE.md as a managed block, so
+        /// they're always-on for every session (regenerated on each run).
+        #[arg(long)]
+        write_claude_md: bool,
     },
     /// Render and print the resume pack for a task.
     Pack {
@@ -851,6 +867,23 @@ enum Commands {
         /// Cap sessions processed this run.
         #[arg(long)]
         limit: Option<usize>,
+        /// LLM backend override: claude-p (default) | anthropic | openai | ollama.
+        #[arg(long)]
+        backend: Option<String>,
+    },
+    /// Complete a task from its transcripts: re-read the sessions tied to a task
+    /// and append the decisions/findings the live capture missed. A friendly
+    /// alias for `dream --task <id>`. MANUAL, one LLM call per session via the
+    /// chosen backend (free with `--backend ollama`).
+    Complete {
+        /// The task id to complete.
+        task: String,
+        /// Show scope without calling the model or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// LLM backend override: claude-p (default) | anthropic | openai | ollama.
+        #[arg(long)]
+        backend: Option<String>,
     },
     /// Export tasks as Markdown or JSON to stdout.
     Export {
@@ -1294,8 +1327,27 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Consolidate { max_facts } => {
-            run_consolidate(max_facts)?;
+        Commands::Capture { state } => {
+            let marker = tj_core::paths::data_dir()?.join(".capture-disabled");
+            match state.trim().to_lowercase().as_str() {
+                "off" | "false" | "0" => {
+                    std::fs::create_dir_all(marker.parent().unwrap())?;
+                    std::fs::write(&marker, "")?;
+                    println!("realtime capture OFF — the marker no-ops ingest-hook capture now (resume still works).");
+                }
+                "on" | "true" | "1" => {
+                    let _ = std::fs::remove_file(&marker);
+                    println!("realtime capture ON.");
+                }
+                other => anyhow::bail!("expected `on` or `off`, got `{other}`"),
+            }
+        }
+        Commands::Consolidate {
+            max_facts,
+            backend,
+            write_claude_md,
+        } => {
+            run_consolidate(max_facts, backend.as_deref(), write_claude_md)?;
         }
         Commands::Event {
             task_id,
@@ -1937,6 +1989,19 @@ fn main() -> Result<()> {
                 (Some(k), Some(t)) => (k, t, serde_json::Value::Null),
                 _ => parse_hook_stdin()?,
             };
+
+            // Emergency capture kill-switch: a `.capture-disabled` marker in the
+            // data dir no-ops realtime capture (the read-only SessionStart
+            // resume still runs). Because the hook re-invokes this binary on
+            // every event, dropping the marker stops a stale auto-capture hook
+            // in an already-running session immediately — no restart needed.
+            if kind != "SessionStart"
+                && tj_core::paths::data_dir()
+                    .map(|d| d.join(".capture-disabled").exists())
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
 
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -2704,93 +2769,17 @@ fn main() -> Result<()> {
             task,
             dry_run,
             limit,
+            backend,
         } => {
-            let cwd = std::env::current_dir()?;
-            let project_hash = tj_core::project_hash::from_path(&cwd)?;
-            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-            let conn = tj_core::db::open(&state_path)?;
-
-            // 1. Resolve session files in scope.
-            let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
-            let Some(project_dir) = project_dir else {
-                println!("dream: no Claude Code sessions found for this project");
-                return Ok(());
-            };
-            let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;
-
-            let since_time = if let Some(days) = since {
-                Some(
-                    std::time::SystemTime::now()
-                        - std::time::Duration::from_secs((days.max(0) as u64) * 86_400),
-                )
-            } else {
-                // Watermark → SystemTime. Absent watermark = all sessions.
-                match tj_core::dream::state::last_dream_at(&conn, &project_hash)? {
-                    Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
-                        .ok()
-                        .map(std::time::SystemTime::from),
-                    None => None,
-                }
-            };
-
-            let scoped: Vec<tj_core::dream::scope::SessionFile> = session_paths
-                .into_iter()
-                .filter_map(|p| {
-                    let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
-                    Some(tj_core::dream::scope::SessionFile { path: p, mtime })
-                })
-                .collect();
-            let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
-
-            // 2. Assemble (session_id, BackfillInput) per session.
-            let run_id = ulid::Ulid::new().to_string();
-            let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
-
-            // 3. Run.
-            let opts = tj_core::dream::DreamOptions {
-                project_hash: project_hash.clone(),
-                dry_run,
-            };
-            if dry_run {
-                println!("dream (dry-run): {} session(s) in scope", sessions.len());
-                return Ok(());
-            }
-            // Prefer the subscription-native agent-sdk backend (local `claude`
-            // CLI, pinned to Haiku — cheap, no ANTHROPIC_API_KEY). Fall back to
-            // the Anthropic API backend only when no `claude` is on PATH.
-            let backend: Box<dyn tj_core::dream::backend::DreamBackend> =
-                match tj_core::dream::agent_sdk::ClaudeCliDreamBackend::from_env() {
-                    Some(b) => {
-                        eprintln!("dream: backend=agent-sdk (claude CLI, Haiku)");
-                        Box::new(b)
-                    }
-                    None => {
-                        eprintln!(
-                            "dream: no `claude` on PATH — backend=api (needs ANTHROPIC_API_KEY)"
-                        );
-                        Box::new(tj_core::dream::http::AnthropicDreamBackend::from_env()?)
-                    }
-                };
-            let report = tj_core::dream::run_dream(
-                &conn,
-                &events_path,
-                &opts,
-                backend.as_ref(),
-                sessions,
-                &run_id,
-            )?;
-
-            // 4. Advance watermark to now (only reached on success).
-            tj_core::dream::state::set_last_dream_at(
-                &conn,
-                &project_hash,
-                &chrono::Utc::now().to_rfc3339(),
-            )?;
-            println!(
-                "dream: {} session(s) processed, {} event(s) backfilled",
-                report.sessions_processed, report.events_backfilled
-            );
+            run_dream_op(since, task, dry_run, limit, backend.as_deref())?;
+        }
+        Commands::Complete {
+            task,
+            dry_run,
+            backend,
+        } => {
+            // "complete this task" = dream scoped to that task's sessions.
+            run_dream_op(None, Some(task), dry_run, None, backend.as_deref())?;
         }
         Commands::Export {
             format,
@@ -3176,16 +3165,7 @@ fn main() -> Result<()> {
             print!("{}", run_statusline().unwrap_or_default());
         }
         Commands::Nudge => {
-            // No model, no spawn, never touches the classifier — just prints a
-            // UserPromptSubmit additionalContext reminder so the agent keeps
-            // recording via the MCP tools deep into a session.
-            let env = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": "📓 task-journal — record as you go: the moment you commit to a decision, rule an approach out, or verify a fact, call event_add (open or resume a task first). Don't batch it to the end. This memory only works if you log it now."
-                }
-            });
-            print!("{env}");
+            run_nudge()?;
         }
         Commands::RecallHook => {
             run_recall_hook()?;
@@ -3809,6 +3789,94 @@ fn sync_global_memory(project_conn: &rusqlite::Connection, project_hash: &str) {
     }
 }
 
+const NUDGE_BASE: &str = "📓 task-journal — record as you go: the moment you commit to a decision, rule an approach out, or verify a fact, call event_add (open or resume a task first). Don't batch it to the end. This memory only works if you log it now.";
+/// A session whose transcript is at least this big counts as "substantial work".
+const NUDGE_WORK_THRESHOLD: u64 = 60_000;
+/// Below this many journal entries for a substantial session, escalate.
+const NUDGE_MIN_EVENTS: usize = 2;
+
+/// The escalation line, or `None` when no escalation is warranted. Pure so the
+/// thresholds are unit-testable without touching the filesystem.
+fn nudge_escalation_text(work_bytes: u64, recorded: usize) -> Option<String> {
+    if work_bytes < NUDGE_WORK_THRESHOLD || recorded >= NUDGE_MIN_EVENTS {
+        return None;
+    }
+    Some(format!(
+        "⚠ task-journal: this session has done substantial work but recorded only \
+{recorded} journal entr{} — log the key decisions, rejections, and findings NOW via \
+event_add before this reasoning is lost.",
+        if recorded == 1 { "y" } else { "ies" }
+    ))
+}
+
+/// Count events in the tail of `path` stamped with `sid`. A tail scan keeps this
+/// cheap even for a large journal; a session's events are always at the end.
+fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usize) -> usize {
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines.len().saturating_sub(tail_lines);
+    lines[start..]
+        .iter()
+        .filter(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|e| {
+                    e.get("meta")
+                        .and_then(|m| m.get("session_id"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s == sid)
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Adaptive UserPromptSubmit nudge (caveman pattern, non-blocking, free): always
+/// emit the base "record as you go" reminder, and — when the session has done
+/// substantial work but logged little — escalate. All signals are cheap (a file
+/// size + a tail scan); no model, never blocks the prompt.
+fn run_nudge() -> anyhow::Result<()> {
+    let mut ctx = NUDGE_BASE.to_string();
+    let escalation = (|| -> Option<String> {
+        use std::io::{IsTerminal, Read};
+        // Manual `task-journal nudge` in a terminal has no hook payload — don't
+        // block waiting on stdin.
+        if std::io::stdin().is_terminal() {
+            return None;
+        }
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+            return None;
+        }
+        let payload: serde_json::Value = serde_json::from_str(&buf).ok()?;
+        let sid = tj_core::session_id::live_session_id(Some(&payload))?;
+        let transcript = payload.get("transcript_path").and_then(|v| v.as_str())?;
+        let work_bytes = std::fs::metadata(transcript).map(|m| m.len()).unwrap_or(0);
+        let cwd = std::env::current_dir().ok()?;
+        let project_hash = tj_core::project_hash::from_path(&cwd).ok()?;
+        let events_path = tj_core::paths::events_dir()
+            .ok()?
+            .join(format!("{project_hash}.jsonl"));
+        let recorded = count_session_events_tail(&events_path, &sid, 400);
+        nudge_escalation_text(work_bytes, recorded)
+    })();
+    if let Some(extra) = escalation {
+        ctx.push('\n');
+        ctx.push_str(&extra);
+    }
+    let env = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": ctx,
+        }
+    });
+    print!("{env}");
+    Ok(())
+}
+
 /// Proactive recall injector (opt-in hook). Reads the UserPromptSubmit payload
 /// from stdin, keyword-searches the global index for relevant prior
 /// decisions/rejections/constraints across all projects, and emits a budgeted
@@ -3919,11 +3987,110 @@ fn emit_session_context(ctx: &str) {
 
 const CONSOLIDATE_TASK_TITLE: &str = "Project conventions (consolidated)";
 
+/// Dream backfill, shared by `dream` and `complete`: re-read the in-scope
+/// session transcripts and append the events the live capture missed, via the
+/// chosen pluggable LLM backend. Skips cleanly when no backend is available.
+fn run_dream_op(
+    since: Option<i64>,
+    task: Option<String>,
+    dry_run: bool,
+    limit: Option<usize>,
+    backend: Option<&str>,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+
+    // 1. Resolve session files in scope.
+    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+    let Some(project_dir) = project_dir else {
+        println!("dream: no Claude Code sessions found for this project");
+        return Ok(());
+    };
+    let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;
+
+    let since_time = if let Some(days) = since {
+        Some(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs((days.max(0) as u64) * 86_400),
+        )
+    } else {
+        match tj_core::dream::state::last_dream_at(&conn, &project_hash)? {
+            Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
+                .ok()
+                .map(std::time::SystemTime::from),
+            None => None,
+        }
+    };
+
+    let scoped: Vec<tj_core::dream::scope::SessionFile> = session_paths
+        .into_iter()
+        .filter_map(|p| {
+            let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
+            Some(tj_core::dream::scope::SessionFile { path: p, mtime })
+        })
+        .collect();
+    let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
+
+    // 2. Assemble (session_id, BackfillInput) per session.
+    let run_id = ulid::Ulid::new().to_string();
+    let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
+
+    let opts = tj_core::dream::DreamOptions {
+        project_hash: project_hash.clone(),
+        dry_run,
+    };
+    if dry_run {
+        println!("dream (dry-run): {} session(s) in scope", sessions.len());
+        return Ok(());
+    }
+
+    // 3. Backend via the unified pluggable selector (default claude-p).
+    let llm = match tj_core::llm::backend_from_env(backend)? {
+        Some(l) => l,
+        None => {
+            println!(
+                "dream: no usable LLM backend. Default `claude-p` needs Claude Code on \
+PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, local)."
+            );
+            return Ok(());
+        }
+    };
+    let dream_backend = tj_core::dream::llm_backend::LlmDreamBackend::new(llm);
+    eprintln!("dream: backend={}", dream_backend.backend_name());
+    let report = tj_core::dream::run_dream(
+        &conn,
+        &events_path,
+        &opts,
+        &dream_backend,
+        sessions,
+        &run_id,
+    )?;
+
+    // 4. Advance watermark to now (only reached on success).
+    tj_core::dream::state::set_last_dream_at(
+        &conn,
+        &project_hash,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+    println!(
+        "dream: {} session(s) processed, {} event(s) backfilled",
+        report.sessions_processed, report.events_backfilled
+    );
+    Ok(())
+}
+
 /// Manual consolidation: read this project's recurring decisions/constraints,
-/// distil them into durable facts via one direct Haiku API call, and store the
-/// facts as events in a per-project conventions task. Skips cleanly (no spend)
-/// when ANTHROPIC_API_KEY is absent.
-fn run_consolidate(max_facts: usize) -> anyhow::Result<()> {
+/// distil them into durable facts via one LLM call through the chosen backend,
+/// and store the facts as events in a per-project conventions task. Skips
+/// cleanly (no spend) when no backend is available.
+fn run_consolidate(
+    max_facts: usize,
+    backend: Option<&str>,
+    write_claude_md: bool,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -3942,19 +4109,20 @@ fn run_consolidate(max_facts: usize) -> anyhow::Result<()> {
     let texts: Vec<String> = sources.iter().map(|(_, t)| t.clone()).collect();
     let source_ids: Vec<String> = sources.iter().map(|(id, _)| id.clone()).collect();
 
-    let (backend, facts) = match tj_core::consolidate::summarize(&texts, max_facts)? {
+    let (backend_used, facts) = match tj_core::consolidate::summarize(&texts, max_facts, backend)? {
         Some(x) => x,
         None => {
             println!(
-                "skipped: no consolidation backend. Either set ANTHROPIC_API_KEY \
-(direct Haiku API, ~1c/run) or install Claude Code so `claude` is on PATH \
-(uses your subscription login, no API key needed)."
+                "skipped: no usable LLM backend. Default is `claude-p` (install Claude \
+Code so `claude` is on PATH — uses your subscription, no API key). Or pick \
+another via --backend / TJ_BACKEND: anthropic (ANTHROPIC_API_KEY), openai \
+(OPENAI_API_KEY), ollama (free, local)."
             );
             return Ok(());
         }
     };
     eprintln!(
-        "consolidating {} high-signal event(s) via {backend} …",
+        "consolidating {} high-signal event(s) via {backend_used} …",
         texts.len()
     );
     if facts.is_empty() {
@@ -4022,6 +4190,20 @@ fn run_consolidate(max_facts: usize) -> anyhow::Result<()> {
     println!(
         "consolidated {written} new fact(s) into task {task_id} (\"{CONSOLIDATE_TASK_TITLE}\")"
     );
+
+    // Promote to always-on: regenerate the managed conventions block in
+    // ./CLAUDE.md from this run's full set of facts.
+    if write_claude_md {
+        let path = cwd.join("CLAUDE.md");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated = tj_core::consolidate::upsert_conventions_block(&existing, &facts);
+        std::fs::write(&path, updated)?;
+        println!(
+            "wrote {} convention(s) into the managed block in {}",
+            facts.len(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -4942,6 +5124,21 @@ mod inline_tests {
     // `clippy::items_after_test_module` — every other free fn must be
     // declared before this module begins.
     use super::*;
+
+    #[test]
+    fn nudge_escalates_only_for_substantial_thin_sessions() {
+        // Small session → never escalate, regardless of capture.
+        assert!(nudge_escalation_text(1_000, 0).is_none());
+        // Substantial session with enough capture → no escalation.
+        assert!(nudge_escalation_text(200_000, NUDGE_MIN_EVENTS).is_none());
+        // Substantial session, thin capture → escalate.
+        let e = nudge_escalation_text(200_000, 0).expect("should escalate");
+        assert!(e.contains("substantial work") && e.contains("event_add"));
+        // Singular grammar at exactly 1 entry.
+        assert!(nudge_escalation_text(200_000, 1)
+            .unwrap()
+            .contains("1 journal entry"));
+    }
 
     #[test]
     fn flatten_transcript_tags_roles_in_order() {

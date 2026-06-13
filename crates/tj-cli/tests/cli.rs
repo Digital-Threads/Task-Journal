@@ -5270,6 +5270,7 @@ fn consolidate_writes_facts_to_conventions_task_and_dedups() {
             .unwrap()
             .current_dir(proj.path())
             .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_BACKEND", "anthropic")
             .env("ANTHROPIC_API_KEY", "test-key")
             .env("TJ_CONSOLIDATE_BASE_URL", server.url())
             .env("TJ_EMBED", "hash")
@@ -5293,6 +5294,25 @@ fn consolidate_writes_facts_to_conventions_task_and_dedups() {
         "second run must de-dup; got: {second:?}"
     );
     mock.assert();
+
+    // --write-claude-md promotes the conventions into a managed CLAUDE.md block.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_BACKEND", "anthropic")
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("TJ_CONSOLIDATE_BASE_URL", server.url())
+        .env("TJ_EMBED", "hash")
+        .args(["consolidate", "--write-claude-md"])
+        .assert()
+        .success();
+    let claude_md = std::fs::read_to_string(proj.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        claude_md.contains("task-journal:conventions:start")
+            && claude_md.contains("idempotent ledger"),
+        "CLAUDE.md must hold the managed conventions block; got: {claude_md}"
+    );
 
     // The fact is now recallable.
     let recall = String::from_utf8(
@@ -5362,4 +5382,77 @@ fn consolidate_skips_without_api_key_and_spends_nothing() {
         .assert()
         .success()
         .stdout(contains("skipped"));
+}
+
+#[test]
+fn capture_off_marker_no_ops_ingest_hook_capture() {
+    // `capture off` writes a marker that makes ingest-hook skip the capture
+    // path — so an auto-opening prompt records nothing. `capture on` clears it.
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["capture", "off"])
+        .assert()
+        .success()
+        .stdout(contains("OFF"));
+
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-cap",
+        "transcript_path": "/tmp/x",
+        "cwd": "/tmp",
+        "prompt": "implement FIN-868 paygate fee dedup"
+    })
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_INGEST_SYNC", "1")
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let body = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["search", "paygate"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        !body.lines().any(|l| l.trim().starts_with("tj-")),
+        "capture off must no-op ingest-hook capture; got: {body:?}"
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["capture", "on"])
+        .assert()
+        .success()
+        .stdout(contains("ON"));
+}
+
+#[test]
+fn complete_command_runs_and_skips_cleanly_without_sessions() {
+    // `complete <task>` is a friendly alias for `dream --task`; with no Claude
+    // Code sessions for the project it exits cleanly (no model call).
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["complete", "tj-x", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("dream"));
 }
