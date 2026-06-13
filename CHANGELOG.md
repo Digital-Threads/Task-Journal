@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-06-13
+
+### Fixed
+- **`complete` survives a non-JSON enrich reply.** When the backfill model
+  answered with prose instead of the requested JSON array — e.g. continuing the
+  transcript's own dialogue ("Контекст в норме… Что дальше?") — the parse error
+  aborted the whole `complete`, losing the retitle and close. Backfill is now
+  best-effort: an unparseable chunk reply is skipped (with a warning), the parser
+  extracts a JSON array even when wrapped in prose, and the prompt re-asserts
+  "output ONLY the JSON array, do not continue the transcript" after the
+  transcript. Retitle/close always run regardless of what enrich recovers.
+
 ## [0.22.1] - 2026-06-13
 
 ### Fixed
