@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-13
+
+### Added
+- **In-session compaction distiller.** A new `task-journal-distiller` subagent
+  (Haiku, `background: true`) reads a just-compacted conversation segment from
+  the transcript file and backfills the decisions / rejections / findings that
+  weren't logged yet for the active task — via the journal MCP, never closing a
+  task. Because it runs as an in-session subagent it costs no separate `claude
+  -p` call (~5k token overhead vs ~46k) and doesn't block the main chat. After a
+  compaction, the `SessionStart` hook now adds a short advisory suggesting the
+  main agent delegate the segment to it (the platform doesn't let a hook spawn a
+  subagent, so this is advisory; the existing deterministic catch-up remains the
+  guaranteed safety net). Disable the hint with `TJ_DISTILLER_HINT=0`.
+
+### Changed
+- **Cheaper, honest `complete` stats.** One-shot `claude -p` calls now pass
+  `--disallowed-tools` (we never use tools), keeping the built-in tool schemas
+  out of the prompt and roughly halving the harness overhead. The stats line now
+  leads with the real dollar cost for `claude -p` (whose token counts are muddy —
+  a big prompt lands in `cache_creation`, not `input_tokens`) and shows clean
+  token counts only for API backends; token sizes scale to `M`. When a
+  cost-reporting backend is used, a one-line tip points at `--backend anthropic`
+  (direct Haiku API, ~50× cheaper per task by skipping Claude Code's overhead)
+  or `--backend ollama` (free, local).
+
 ## [0.24.0] - 2026-06-13
 
 ### Added

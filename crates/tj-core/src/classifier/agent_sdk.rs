@@ -54,9 +54,20 @@ fn base_claude_command(model: &str) -> Command {
         .arg("--output-format")
         .arg("json")
         .arg("--strict-mcp-config")
+        // We never use tools in these one-shot text calls — denying the
+        // built-in toolset keeps their schemas out of the prompt, roughly
+        // halving the harness overhead. (The cache-creation cost floor
+        // remains; for true pennies use a direct API backend.)
+        .arg("--disallowed-tools")
+        .arg(DISABLED_TOOLS)
         .env(IN_CLASSIFIER_ENV, "1");
     cmd
 }
+
+/// Built-in tools denied in our one-shot `claude -p` calls (we only want a text
+/// completion, never tool use). Listed explicitly because there is no wildcard.
+const DISABLED_TOOLS: &str = "Bash Read Edit Write Glob Grep Task WebFetch \
+WebSearch NotebookEdit TodoWrite BashOutput KillBash";
 
 /// Production runner: invokes the local `claude` binary in print mode, pinned
 /// to the given model, asking for the JSON envelope and an isolated MCP config
@@ -259,10 +270,6 @@ struct EnvelopeUsage {
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: u64,
-    #[serde(default)]
-    cache_read_input_tokens: u64,
 }
 
 impl Classifier for ClaudeCliClassifier {
@@ -307,8 +314,14 @@ pub fn run_claude_json_usage(
     }
     let u = envelope.usage.unwrap_or_default();
     let usage = crate::llm::LlmUsage {
-        // Count cache reads/writes as input so the total reflects real context.
-        input_tokens: u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens,
+        // Only our *fresh* prompt tokens — NOT the cached Claude Code system
+        // prompt + tool schemas (cache_read/creation), which are harness
+        // overhead, not work the user asked for. The dollar `cost` below still
+        // reflects everything (claude computes it with the cache discount), so
+        // a small token count next to a few-cents cost is the honest signal
+        // that claude -p's overhead dominates — switch to a direct API backend
+        // to avoid it.
+        input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
         cost_usd: envelope.total_cost_usd,
     };

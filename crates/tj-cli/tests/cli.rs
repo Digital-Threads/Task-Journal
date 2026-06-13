@@ -4516,6 +4516,10 @@ fn session_start_compact_prepends_active_task_reminder() {
         ctx.contains("Must ship before Friday"),
         "reminder must include the in-force constraint: {ctx}"
     );
+    assert!(
+        ctx.contains("task-journal-distiller"),
+        "compact SessionStart must advise delegating to the distiller subagent: {ctx}"
+    );
 }
 
 #[test]
@@ -4524,6 +4528,10 @@ fn session_start_startup_has_no_reminder() {
     assert!(
         !ctx.contains("[Active task after compaction]"),
         "non-compact SessionStart must NOT inject the reminder: {ctx}"
+    );
+    assert!(
+        !ctx.contains("task-journal-distiller"),
+        "non-compact SessionStart must NOT advise the distiller: {ctx}"
     );
 }
 
@@ -5621,7 +5629,7 @@ fn complete_retitles_and_closes_via_fake_backend() {
         .args(["complete", &task_id])
         .assert()
         .success()
-        .stdout(contains("spent 1.5k tok ($0.0012)"))
+        .stdout(contains("cost $0.0012"))
         .stdout(contains("retitled"))
         .stdout(contains("closed"));
 
