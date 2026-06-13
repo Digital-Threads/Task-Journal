@@ -24,12 +24,57 @@ impl LlmDreamBackend {
     }
 }
 
+/// Max transcript characters fed to the model in one call. The hard wall is
+/// the ~200k-token context limit (a real session hit ~220k tokens and `claude
+/// -p` returned HTTP 400). We stay well under it and split oversized
+/// transcripts across several calls, merging the events (run_dream dedups).
+const TRANSCRIPT_CHAR_BUDGET: usize = 360_000;
+
 impl DreamBackend for LlmDreamBackend {
     fn backfill(&self, input: &BackfillInput) -> anyhow::Result<Vec<BackfillEvent>> {
-        let prompt = crate::dream::prompt::build_prompt(input);
-        let text = self.llm.complete(&prompt, 1024)?;
-        parse_backfill_json(&text)
+        let mut out = Vec::new();
+        for chunk in chunk_transcript(&input.transcript, TRANSCRIPT_CHAR_BUDGET) {
+            let chunk_input = BackfillInput {
+                tasks: input.tasks.clone(),
+                transcript: chunk,
+            };
+            let prompt = crate::dream::prompt::build_prompt(&chunk_input);
+            let text = self.llm.complete(&prompt, 1024)?;
+            out.extend(parse_backfill_json(&text)?);
+        }
+        Ok(out)
     }
+}
+
+/// Split a transcript into chunks of at most `budget` bytes, breaking on line
+/// boundaries where possible (a lone oversized line is hard-split on char
+/// boundaries). Always returns at least one chunk so an empty transcript still
+/// yields a single call.
+fn chunk_transcript(transcript: &str, budget: usize) -> Vec<String> {
+    if transcript.len() <= budget {
+        return vec![transcript.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for line in transcript.split_inclusive('\n') {
+        if !cur.is_empty() && cur.len() + line.len() > budget {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        if line.len() > budget {
+            for ch in line.chars() {
+                if !cur.is_empty() && cur.len() + ch.len_utf8() > budget {
+                    chunks.push(std::mem::take(&mut cur));
+                }
+                cur.push(ch);
+            }
+        } else {
+            cur.push_str(line);
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
 }
 
 /// Parse the model's reply (a JSON array of `BackfillEvent`, possibly wrapped in
@@ -64,6 +109,57 @@ mod tests {
     #[test]
     fn parse_empty_array() {
         assert!(parse_backfill_json("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn small_transcript_is_one_chunk() {
+        let c = chunk_transcript("a\nb\nc\n", 100);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0], "a\nb\nc\n");
+    }
+
+    #[test]
+    fn big_transcript_splits_on_lines_and_preserves_content() {
+        // 10 lines of 20 chars; budget 50 → multiple chunks, no loss.
+        let transcript: String = (0..10).map(|i| format!("line{i:015}\n")).collect();
+        let chunks = chunk_transcript(&transcript, 50);
+        assert!(chunks.len() > 1, "must split");
+        assert!(chunks.iter().all(|c| c.len() <= 50));
+        assert_eq!(chunks.concat(), transcript, "no content lost");
+    }
+
+    #[test]
+    fn oversized_single_line_is_hard_split() {
+        let line = "x".repeat(250);
+        let chunks = chunk_transcript(&line, 100);
+        assert!(chunks.len() >= 3);
+        assert!(chunks.iter().all(|c| c.len() <= 100));
+        assert_eq!(chunks.concat(), line);
+    }
+
+    #[test]
+    fn backfill_chunks_large_transcript_into_multiple_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingLlm(AtomicUsize);
+        impl LlmBackend for CountingLlm {
+            fn complete(&self, _prompt: &str, _max: u32) -> anyhow::Result<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("[]".to_string())
+            }
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+        }
+        let llm = Box::new(CountingLlm(AtomicUsize::new(0)));
+        // Build a transcript larger than the budget so it must split.
+        let transcript = "y\n".repeat(TRANSCRIPT_CHAR_BUDGET);
+        let b = LlmDreamBackend::new(llm);
+        let input = BackfillInput {
+            tasks: vec![],
+            transcript,
+        };
+        let evs = b.backfill(&input).unwrap();
+        assert!(evs.is_empty());
     }
 
     #[test]

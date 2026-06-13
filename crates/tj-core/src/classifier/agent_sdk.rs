@@ -64,6 +64,35 @@ fn base_claude_command(model: &str) -> Command {
 /// very journal — out of the classification subprocess).
 pub struct ClaudeBinaryRunner;
 
+/// Build the error for a non-zero `claude -p` exit. With `--output-format
+/// json` claude reports the real cause (invalid model, usage limit, auth) as
+/// JSON on **stdout**, not stderr — so surface both, capped, or the user just
+/// sees a bare "exit status 1".
+fn claude_exit_error(
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> anyhow::Error {
+    let cap = |b: &[u8]| {
+        let s = String::from_utf8_lossy(b);
+        let s = s.trim().to_string();
+        if s.chars().count() > 600 {
+            format!("{}…", s.chars().take(600).collect::<String>())
+        } else {
+            s
+        }
+    };
+    let out = cap(stdout);
+    let err = cap(stderr);
+    let detail = match (out.is_empty(), err.is_empty()) {
+        (true, true) => "(no output)".to_string(),
+        (false, true) => out,
+        (true, false) => err,
+        (false, false) => format!("{err} | stdout: {out}"),
+    };
+    anyhow!("`claude -p` exited with {status}: {detail}")
+}
+
 impl CommandRunner for ClaudeBinaryRunner {
     fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
         let output = base_claude_command(model)
@@ -71,11 +100,10 @@ impl CommandRunner for ClaudeBinaryRunner {
             .output()
             .context("failed to spawn `claude` (is Claude Code installed and on PATH?)")?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "`claude -p` exited with {}: {}",
+            return Err(claude_exit_error(
                 output.status,
-                stderr.trim()
+                &output.stdout,
+                &output.stderr,
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -111,11 +139,10 @@ impl CommandRunner for ClaudeBinaryStdinRunner {
             .wait_with_output()
             .context("failed to wait for `claude`")?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "`claude -p` exited with {}: {}",
+            return Err(claude_exit_error(
                 output.status,
-                stderr.trim()
+                &output.stdout,
+                &output.stderr,
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
