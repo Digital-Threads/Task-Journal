@@ -9,15 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.22.2] - 2026-06-13
 
+Hardening pass on `complete`'s enrich step, found by running it on a real
+12-session task. Enrich is now strictly best-effort and can never hang or sink
+the retitle/close; `--quick` skips it entirely for an instant judge-only finalize.
+
 ### Fixed
 - **`complete` survives a non-JSON enrich reply.** When the backfill model
   answered with prose instead of the requested JSON array — e.g. continuing the
   transcript's own dialogue ("Контекст в норме… Что дальше?") — the parse error
-  aborted the whole `complete`, losing the retitle and close. Backfill is now
-  best-effort: an unparseable chunk reply is skipped (with a warning), the parser
-  extracts a JSON array even when wrapped in prose, and the prompt re-asserts
-  "output ONLY the JSON array, do not continue the transcript" after the
-  transcript. Retitle/close always run regardless of what enrich recovers.
+  aborted the whole `complete`, losing the retitle and close. Backfill now skips
+  an unparseable chunk reply (with a warning), the parser extracts a JSON array
+  even when wrapped in prose, and the prompt re-asserts "output ONLY the JSON
+  array, do not continue the transcript" after the transcript.
+- **Enrich chunks are sized for `claude -p`'s overhead.** `claude -p` is a full
+  Claude Code instance whose system prompt + tool definitions cost ~113k tokens
+  before our content, so the earlier 360k-char chunk still 400'd at ~204k total.
+  The per-call transcript budget drops to 150k chars (~37k tokens), and **any**
+  per-chunk failure (over-budget 400, transient error, non-JSON) is skipped
+  rather than aborting — a genuinely broken backend still surfaces at the judge
+  step.
+- **No more apparent hang.** A big task makes many sequential `claude -p` calls;
+  without a timeout one wedged call hung the whole command with no output. Each
+  call now has a wall-clock timeout (90s, `TJ_CLAUDE_TIMEOUT_SECS`) that kills a
+  stuck `claude` (pipes drained in threads to avoid buffer deadlock), and enrich
+  prints an "enriching N session(s)…" progress line pointing at `--quick`.
+- **Legible `claude -p` errors** (carried from the same investigation): a
+  non-zero exit now surfaces the JSON error claude prints on stdout, so failures
+  read as "Prompt is too long · ~204261 tokens" instead of a bare "exit 1".
 
 ## [0.22.1] - 2026-06-13
 
