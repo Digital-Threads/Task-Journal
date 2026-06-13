@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-13
+
+### Added
+- **`complete` finalizes a task.** `task-journal complete <id>` now brings a
+  legacy task to the shape a live-journaled one would have had: it enriches the
+  task's memory from the sessions it touched (task-scoped — no dream watermark,
+  so tasks finalize independently), asks the model to judge a human-readable
+  title, a one-sentence outcome, and whether the events clearly show the task is
+  done, then writes a `Rename` event when the auto-title is junk and a `Close`
+  event **only when done** — the model decides from content; unclear tasks stay
+  open. Artifacts are picked up automatically as enriched events are indexed.
+- **Batch finalize.** `task-journal complete` with no id finalizes every open
+  task: it prints a numbered list (id · event/session counts · title), lets you
+  exclude tasks by number, shows the count and asks to confirm, then finalizes
+  the rest; tasks judged not-done are left open and listed at the end. `--quick`
+  skips the heavy enrich pass, `--dry-run` reports scope without calling the
+  model, and `--yes` is required to run the batch without an interactive
+  terminal (so a hook can't mass-close tasks unattended).
+- **`Rename` event type** — updates a task's title on replay (latest wins),
+  letting `complete` fix junk auto-titles without mutating the append-only log.
+
+### Fixed
+- **Close outcome survives a rebuild.** `Close` events now carry their
+  `outcome`/`outcome_tag` in metadata and `rebuild_state` restores them, so a
+  recorded outcome is no longer lost the next time the SQLite state is rebuilt
+  from the JSONL log.
+
 ## [0.21.0] - 2026-06-13
 
 ### Added
