@@ -271,6 +271,19 @@ pub fn upsert_task_from_event(
                 rusqlite::params![event.task_id, event.timestamp],
             )?;
         }
+        EventType::Rename => {
+            // The new human-readable title is the event text. Replaying the
+            // JSONL in order means the last Rename wins — exactly what we want.
+            let title = event
+                .meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&event.text);
+            conn.execute(
+                "UPDATE tasks SET title=?2, last_event_at=?3 WHERE task_id=?1",
+                rusqlite::params![event.task_id, title, event.timestamp],
+            )?;
+        }
         _ => {
             conn.execute(
                 "UPDATE tasks SET last_event_at=?2 WHERE task_id=?1",
@@ -1315,6 +1328,42 @@ mod tests {
 
         assert!(task_exists(&conn, "tj-yes").unwrap());
         assert!(!task_exists(&conn, "tj-nope").unwrap());
+    }
+
+    #[test]
+    fn rename_event_updates_task_title() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-rn", "#: 5");
+        upsert_task_from_event(&conn, &open_ev, ph).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE task_id='tj-rn'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "#: 5");
+
+        let mut rename = crate::event::Event::new(
+            "tj-rn",
+            crate::event::EventType::Rename,
+            crate::event::Author::Agent,
+            crate::event::Source::Cli,
+            "Support BID 29683996 — voucher refund 50% vs promised 100%".into(),
+        );
+        rename.timestamp = "2099-01-01T00:00:00.000Z".into();
+        upsert_task_from_event(&conn, &rename, ph).unwrap();
+
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE task_id='tj-rn'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            title,
+            "Support BID 29683996 — voucher refund 50% vs promised 100%"
+        );
     }
 
     #[test]
