@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-13
+
+### Added
+- **`consolidate` now works without an API key.** It picks a backend
+  automatically: the direct Haiku API when `ANTHROPIC_API_KEY` is set
+  (~1c/run), otherwise the local **`claude -p`** binary — your existing Claude
+  subscription login, **no API key needed** (post-2026-06-15 it bills as extra
+  usage and boots the environment per call, so it's pricier, but it requires no
+  key). With neither available it still skips cleanly, writing nothing.
+  `TJ_CONSOLIDATE_BACKEND=none` force-disables it.
+
+### Internal
+- `consolidate::summarize` (backend selection) + `consolidate_via_cli` reusing
+  the classifier's `run_claude_json` / `ClaudeBinaryStdinRunner` (recursion
+  guard intact).
+
 ## [0.19.0] - 2026-06-13
 
 ### Added

@@ -3942,19 +3942,21 @@ fn run_consolidate(max_facts: usize) -> anyhow::Result<()> {
     let texts: Vec<String> = sources.iter().map(|(_, t)| t.clone()).collect();
     let source_ids: Vec<String> = sources.iter().map(|(id, _)| id.clone()).collect();
 
-    let consolidator = match tj_core::consolidate::Consolidator::from_env(max_facts) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("skipped: {e}. Set ANTHROPIC_API_KEY to enable consolidation (~1c/run).");
+    let (backend, facts) = match tj_core::consolidate::summarize(&texts, max_facts)? {
+        Some(x) => x,
+        None => {
+            println!(
+                "skipped: no consolidation backend. Either set ANTHROPIC_API_KEY \
+(direct Haiku API, ~1c/run) or install Claude Code so `claude` is on PATH \
+(uses your subscription login, no API key needed)."
+            );
             return Ok(());
         }
     };
     eprintln!(
-        "consolidating {} high-signal event(s) via {} …",
-        texts.len(),
-        consolidator.model
+        "consolidating {} high-signal event(s) via {backend} …",
+        texts.len()
     );
-    let facts = consolidator.consolidate(&texts)?;
     if facts.is_empty() {
         println!("no durable facts found");
         return Ok(());
