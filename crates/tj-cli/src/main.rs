@@ -1076,7 +1076,25 @@ enum PendingCmd {
 
 const PENDING_MAX_ATTEMPTS: u32 = 3;
 
+/// Windows' default main-thread stack is 1 MiB and our command dispatch in
+/// [`real_main`] sits near that limit — a single added branch overflowed it
+/// (STATUS_STACK_OVERFLOW on every command; see `run_session_end_catchup`).
+/// Run the real work on a thread with a generous stack so the dispatch can
+/// grow safely and this can't recur. Errors and the panic case propagate so
+/// the process still exits non-zero on failure.
 fn main() -> Result<()> {
+    let handle = std::thread::Builder::new()
+        .name("tj-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .context("spawn main worker thread")?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("main worker thread panicked"),
+    }
+}
+
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Create {

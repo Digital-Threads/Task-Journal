@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.26.0] - 2026-06-14
+## [0.26.1] - 2026-06-14
+
+### Fixed
+- **No more Windows stack overflows from the CLI dispatch.** The command
+  dispatch sits near Windows' 1 MiB main-thread stack limit (a single added
+  branch overflowed it). `main` now runs the real work on a 16 MiB worker
+  thread, so the dispatch can grow safely and a `STATUS_STACK_OVERFLOW` at
+  startup can't recur. Exit codes and panics still propagate.
 
 ### Added
 - **`/clear` no longer drops the last segment.** A new `SessionEnd` hook (wired
