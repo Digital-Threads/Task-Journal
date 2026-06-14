@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-06-14
+
+### Added
+- **`/clear` no longer drops the last segment.** A new `SessionEnd` hook (wired
+  by `install-hooks --auto-capture`) runs the same transcript catch-up as `Stop`
+  when the session ends with reason `clear` — the last chance to capture the
+  final segment before `/clear` orphans the transcript. Gated to `clear` so it
+  doesn't re-process what `Stop` already handled on other exits.
+- **`recall --json`** — `task-journal recall "<context>" --json` emits the
+  cross-project memory hits as a JSON array (task_id, project_hash, event_type,
+  text, score) for machine consumers like the Loom host; empty/missing memory
+  yields `[]`.
+
 ## [0.25.1] - 2026-06-14
 
 ### Fixed

@@ -884,8 +884,35 @@ fn install_hooks_auto_capture_wires_all_events() {
         "PostToolUse",
         "Stop",
         "PreCompact",
+        "SessionEnd",
     ] {
         assert!(content.contains(ev), "--auto-capture must wire {ev}");
+    }
+}
+
+#[test]
+fn session_end_hook_is_clean_noop_without_journal() {
+    // SessionEnd(clear) with no journal yet must exit cleanly (it's the
+    // last-chance catch-up; nothing to catch when there's no project journal).
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    for reason in ["clear", "logout"] {
+        let payload = serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "reason": reason,
+            "session_id": "s-end",
+            "transcript_path": "/nonexistent/x.jsonl",
+            "cwd": proj.path().to_string_lossy(),
+        })
+        .to_string();
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["ingest-hook", "--backend", "hybrid"])
+            .write_stdin(payload)
+            .assert()
+            .success();
     }
 }
 
