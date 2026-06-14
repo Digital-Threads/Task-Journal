@@ -5401,6 +5401,36 @@ fn consolidate_skips_without_api_key_and_spends_nothing() {
 }
 
 #[test]
+fn capture_status_reports_current_state() {
+    // `capture status` reports ON/OFF without changing anything.
+    let dir = assert_fs::TempDir::new().unwrap();
+
+    // Fresh install → ON.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["capture", "status"])
+        .assert()
+        .success()
+        .stdout(contains("ON"));
+
+    // After `off` → OFF, and status must not flip it back.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["capture", "off"])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["capture", "status"])
+        .assert()
+        .success()
+        .stdout(contains("OFF"));
+}
+
+#[test]
 fn capture_off_marker_no_ops_ingest_hook_capture() {
     // `capture off` writes a marker that makes ingest-hook skip the capture
     // path — so an auto-opening prompt records nothing. `capture on` clears it.
