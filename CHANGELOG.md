@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.25.0] - 2026-06-13
+## [0.25.1] - 2026-06-14
+
+### Fixed
+- **Distiller subagent no longer pins fragile MCP tool names.** The
+  `task-journal-distiller` agent dropped its explicit `tools:` list (which named
+  the journal MCP tools under one marketplace-specific prefix and would have left
+  the agent unable to write events on any install with a different prefix). It
+  now inherits the session's tools, so it can always reach the journal MCP.
+
+### Added
+- **`task-journal capture status`** — reports whether realtime capture is ON or
+  OFF (the `.capture-disabled` marker) without changing it.
 
 ### Added
 - **In-session compaction distiller.** A new `task-journal-distiller` subagent

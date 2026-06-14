@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Lean: the MCP server doesn't embed yet, so it skips the model2vec backend.
-tj-core = { package = "task-journal-core", version = "0.25.0", path = "../tj-core", default-features = false }
+tj-core = { package = "task-journal-core", version = "0.25.1", path = "../tj-core", default-features = false }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

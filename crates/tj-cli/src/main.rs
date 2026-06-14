@@ -657,7 +657,7 @@ enum Commands {
     /// already-running session — without touching the read-only SessionStart
     /// resume. Use it to silence a stale auto-capture hook.
     Capture {
-        /// "on" (remove the marker) or "off" (write it).
+        /// "on" (remove the marker), "off" (write it), or "status" (report it).
         state: String,
     },
     /// Distil this project's recurring decisions and constraints into durable
@@ -1348,7 +1348,14 @@ fn main() -> Result<()> {
                     let _ = std::fs::remove_file(&marker);
                     println!("realtime capture ON.");
                 }
-                other => anyhow::bail!("expected `on` or `off`, got `{other}`"),
+                "status" => {
+                    if marker.exists() {
+                        println!("realtime capture OFF (.capture-disabled present).");
+                    } else {
+                        println!("realtime capture ON.");
+                    }
+                }
+                other => anyhow::bail!("expected `on`, `off`, or `status`, got `{other}`"),
             }
         }
         Commands::Consolidate {
