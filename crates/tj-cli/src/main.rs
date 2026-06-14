@@ -631,6 +631,9 @@ enum Commands {
         /// Maximum number of results.
         #[arg(long, default_value_t = 5)]
         k: usize,
+        /// Emit a JSON array instead of human lines (for tooling / the Loom host).
+        #[arg(long)]
+        json: bool,
     },
     /// Cross-project recall (Pillar B): search EVERY project's decisions,
     /// rejections and constraints for reasoning relevant to the query —
@@ -1277,7 +1280,7 @@ fn real_main() -> Result<()> {
                 embedder.dim()
             );
         }
-        Commands::Ask { query, k } => {
+        Commands::Ask { query, k, json } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -1298,7 +1301,21 @@ fn real_main() -> Result<()> {
             let qv = embedder.embed_one(&query)?;
             let hits =
                 tj_core::db::semantic_search(&conn, &project_hash, &qv, embedder.model_id(), k)?;
-            if hits.is_empty() {
+            if json {
+                let arr: Vec<serde_json::Value> = hits
+                    .iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "task_id": h.task_id,
+                            "project_hash": project_hash,
+                            "event_type": h.event_type,
+                            "text": h.text,
+                            "score": h.score,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string(&arr)?);
+            } else if hits.is_empty() {
                 println!("no matches");
             } else {
                 for h in hits {
