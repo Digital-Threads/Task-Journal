@@ -641,6 +641,9 @@ enum Commands {
         /// Maximum number of results.
         #[arg(long, default_value_t = 5)]
         k: usize,
+        /// Emit a JSON array instead of human lines (for tooling / the Loom host).
+        #[arg(long)]
+        json: bool,
     },
     /// Record a durable user preference (Pillar C) — e.g. "prefer terse output",
     /// "respond in Russian", "always run the full test suite before tagging".
@@ -1289,17 +1292,23 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Recall { query, k } => {
+        Commands::Recall { query, k, json } => {
             let global_path = tj_core::paths::memory_db()?;
             if !global_path.exists() {
-                println!("global memory is empty — run `ask` or `embed` in a project first");
+                if json {
+                    println!("[]");
+                } else {
+                    println!("global memory is empty — run `ask` or `embed` in a project first");
+                }
                 return Ok(());
             }
             let global = tj_core::memory::open(&global_path)?;
             let embedder = tj_core::embed::default_embedder();
             let qv = embedder.embed_one(&query)?;
             let hits = tj_core::memory::search(&global, &qv, embedder.model_id(), k)?;
-            if hits.is_empty() {
+            if json {
+                println!("{}", recall_hits_json(&hits));
+            } else if hits.is_empty() {
                 println!("no relevant prior reasoning found");
             } else {
                 for h in hits {
@@ -3990,6 +3999,24 @@ fn run_recall_hook() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Serialize recall hits to a compact JSON array for machine consumers (the Loom
+/// host). Pure — split out so the shape is unit-testable without touching stdout.
+fn recall_hits_json(hits: &[tj_core::memory::GlobalHit]) -> String {
+    let out: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "task_id": h.task_id,
+                "project_hash": h.project_hash,
+                "event_type": h.event_type,
+                "text": h.text,
+                "score": h.score,
+            })
+        })
+        .collect();
+    serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// Render the user's standing preferences as a SessionStart context block, or
 /// "" when there are none. Capped so it never floods the system prompt.
 fn session_preferences_block() -> String {
@@ -5711,6 +5738,28 @@ mod inline_tests {
     // `clippy::items_after_test_module` — every other free fn must be
     // declared before this module begins.
     use super::*;
+
+    #[test]
+    fn recall_hits_json_serializes_fields() {
+        let h = tj_core::memory::GlobalHit {
+            event_id: "e1".into(),
+            project_hash: "abc12345".into(),
+            task_id: "tj-1".into(),
+            event_type: "rejection".into(),
+            tier: "high".into(),
+            text: "ruled out the shared-table approach".into(),
+            score: 2.5,
+        };
+        let json = recall_hits_json(&[h]);
+        assert!(json.contains("\"task_id\":\"tj-1\""));
+        assert!(json.contains("\"event_type\":\"rejection\""));
+        assert!(json.contains("ruled out the shared-table approach"));
+    }
+
+    #[test]
+    fn recall_hits_json_empty_is_array() {
+        assert_eq!(recall_hits_json(&[]), "[]");
+    }
 
     #[test]
     fn fmt_tokens_scales_units() {
