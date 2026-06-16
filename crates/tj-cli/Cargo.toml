@@ -43,6 +43,6 @@ libc = "0.2"
 [dev-dependencies]
 assert_fs = { workspace = true }
 predicates = { workspace = true }
-assert_cmd = ">=2, <2.2.1"
+assert_cmd = ">=2, <2.2.3"
 rusqlite = { workspace = true }
 mockito = { workspace = true }
