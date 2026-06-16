@@ -1215,7 +1215,11 @@ fn real_main() -> Result<()> {
                 }
             }
         },
-        Commands::Pack { task_id, external, mode } => {
+        Commands::Pack {
+            task_id,
+            external,
+            mode,
+        } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));

@@ -2125,8 +2125,8 @@ mod tests {
         upsert_task_from_event(&conn, &make_open_event("tj-a", "A"), "ph").unwrap();
         upsert_task_from_event(&conn, &make_open_event("tj-b", "B"), "ph").unwrap();
         // tj-b carries two external refs incl. the loom one.
-        add_task_external(&conn, &"tj-b".to_string(), "github:#7").unwrap();
-        add_task_external(&conn, &"tj-b".to_string(), "loom:t-xyz").unwrap();
+        add_task_external(&conn, "tj-b", "github:#7").unwrap();
+        add_task_external(&conn, "tj-b", "loom:t-xyz").unwrap();
 
         assert_eq!(
             task_id_by_external(&conn, "loom:t-xyz").unwrap().as_deref(),

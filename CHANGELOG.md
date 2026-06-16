@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.3] - 2026-06-16
+
+### Added
+- **Loom spine — one journal per board task.** When the MCP runs inside a Loom
+  task session (`LOOM_TASK_ID` set), `task_create` resolves or creates a single
+  journal keyed by an `loom:<id>` external reference, so every `task_create`
+  call in the pipeline shares the same journal and the agent's reasoning lands
+  on the board task's history. Env-gated: without `LOOM_TASK_ID` behavior is
+  unchanged. Adds `db::task_id_by_external` for idempotent resolution.
+- **`pack --external`** — `task-journal pack --external loom:t-abc` renders a
+  task's resume pack by its external reference instead of its `tj` id, so a
+  consumer that only knows the board task id can fetch its journal. The
+  positional task id still works unchanged.
+
 ## [0.26.2] - 2026-06-16
 
 ### Added

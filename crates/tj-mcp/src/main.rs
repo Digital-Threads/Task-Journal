@@ -475,7 +475,10 @@ impl TaskJournalServer {
                         .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
                     tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     if let Some(existing) = tj_core::db::task_id_by_external(&conn, r)? {
-                        return Ok(TaskCreateResult { task_id: existing, title: p.title.clone() });
+                        return Ok(TaskCreateResult {
+                            task_id: existing,
+                            title: p.title.clone(),
+                        });
                     }
                 }
 
