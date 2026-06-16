@@ -459,6 +459,26 @@ impl TaskJournalServer {
 
                 let task_id = tj_core::new_task_id();
 
+                // Loom spine: when running inside a Loom task session
+                // (LOOM_TASK_ID set), the journal is keyed by that id via an
+                // `loom:<id>` external reference. Resolve it first so repeated
+                // task_create calls (and the whole pipeline) share ONE journal
+                // per board task. Without LOOM_TASK_ID this is a no-op.
+                let loom_ref = std::env::var("LOOM_TASK_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|t| format!("loom:{t}"));
+                if let Some(ref r) = loom_ref {
+                    let conn_arc = cached_open(&state_path)?;
+                    let conn = conn_arc
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                    if let Some(existing) = tj_core::db::task_id_by_external(&conn, r)? {
+                        return Ok(TaskCreateResult { task_id: existing, title: p.title.clone() });
+                    }
+                }
+
                 // Validate --parent before writing the open event: the parent
                 // must exist and the link must not introduce a cycle. Needs the
                 // derived SQLite state, so ingest the JSONL tail first.
@@ -507,6 +527,17 @@ impl TaskJournalServer {
                         .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
                     tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     tj_core::db::set_task_goal(&conn, &task_id, goal)?;
+                }
+
+                // Tag the new journal with its Loom task id so later resolves
+                // (and the board → journal link) find it.
+                if let Some(ref r) = loom_ref {
+                    let conn_arc = cached_open(&state_path)?;
+                    let conn = conn_arc
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                    tj_core::db::add_task_external(&conn, &task_id, r)?;
                 }
 
                 Ok(TaskCreateResult {

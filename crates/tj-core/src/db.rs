@@ -1,5 +1,5 @@
 use anyhow::Context;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -453,6 +453,22 @@ pub fn add_task_external(conn: &Connection, task_id: &str, reference: &str) -> a
         rusqlite::params![task_id],
     )?;
     Ok(())
+}
+
+/// Find the task whose `external` list contains exactly `reference` (one of the
+/// comma-separated tokens). Used to make a journal idempotent by external id —
+/// e.g. resolve `loom:t-abc` back to its task. Returns the most recently
+/// touched match, or None.
+pub fn task_id_by_external(conn: &Connection, reference: &str) -> anyhow::Result<Option<String>> {
+    let pattern = format!("%,{reference},%");
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT task_id FROM tasks WHERE ',' || external || ',' LIKE ?1 ORDER BY rowid DESC LIMIT 1",
+            rusqlite::params![pattern],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
 }
 
 /// Read-only metadata bundle used by pack rendering (and TUI list
@@ -2100,6 +2116,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn task_id_by_external_resolves_exact_token() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        upsert_task_from_event(&conn, &make_open_event("tj-a", "A"), "ph").unwrap();
+        upsert_task_from_event(&conn, &make_open_event("tj-b", "B"), "ph").unwrap();
+        // tj-b carries two external refs incl. the loom one.
+        add_task_external(&conn, &"tj-b".to_string(), "github:#7").unwrap();
+        add_task_external(&conn, &"tj-b".to_string(), "loom:t-xyz").unwrap();
+
+        assert_eq!(
+            task_id_by_external(&conn, "loom:t-xyz").unwrap().as_deref(),
+            Some("tj-b")
+        );
+        // exact token match: a different id does not match
+        assert_eq!(task_id_by_external(&conn, "loom:t-other").unwrap(), None);
+        // no false-positive on a substring of a token
+        assert_eq!(task_id_by_external(&conn, "loom:t-xy").unwrap(), None);
     }
 
     #[test]
