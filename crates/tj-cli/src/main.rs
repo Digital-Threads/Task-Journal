@@ -686,8 +686,12 @@ enum Commands {
     },
     /// Render and print the resume pack for a task.
     Pack {
-        /// Task id (e.g. tj-7f3a).
-        task_id: String,
+        /// Task id (e.g. tj-7f3a). Optional when --external is given.
+        task_id: Option<String>,
+        /// Resolve the task by an external reference instead of its id
+        /// (e.g. `loom:t-abc`). Mutually exclusive with a positional id.
+        #[arg(long)]
+        external: Option<String>,
         /// Output mode: compact|full.
         #[arg(long, default_value = "compact")]
         mode: String,
@@ -1211,7 +1215,11 @@ fn real_main() -> Result<()> {
                 }
             }
         },
-        Commands::Pack { task_id, mode } => {
+        Commands::Pack {
+            task_id,
+            external,
+            mode,
+        } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -1221,12 +1229,21 @@ fn real_main() -> Result<()> {
             if events_path.exists() {
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             }
+            // Resolve the target task: explicit id, else by external reference.
+            let resolved = match (task_id, external) {
+                (Some(id), _) => id,
+                (None, Some(ext)) => match tj_core::db::task_id_by_external(&conn, &ext)? {
+                    Some(id) => id,
+                    None => anyhow::bail!("no task with external reference: {ext}"),
+                },
+                (None, None) => anyhow::bail!("a task id or --external is required"),
+            };
             let pmode = match mode.as_str() {
                 "compact" => tj_core::pack::PackMode::Compact,
                 "full" => tj_core::pack::PackMode::Full,
                 other => anyhow::bail!("unknown mode: {other}"),
             };
-            let pack = tj_core::pack::assemble(&conn, &task_id, pmode)?;
+            let pack = tj_core::pack::assemble(&conn, &resolved, pmode)?;
             print!("{}", pack.text);
         }
         Commands::RebuildState => {
