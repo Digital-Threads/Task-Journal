@@ -1079,7 +1079,25 @@ enum PendingCmd {
 
 const PENDING_MAX_ATTEMPTS: u32 = 3;
 
+/// Windows' default main-thread stack is 1 MiB and our command dispatch in
+/// [`real_main`] sits near that limit — a single added branch overflowed it
+/// (STATUS_STACK_OVERFLOW on every command; see `run_session_end_catchup`).
+/// Run the real work on a thread with a generous stack so the dispatch can
+/// grow safely and this can't recur. Errors and the panic case propagate so
+/// the process still exits non-zero on failure.
 fn main() -> Result<()> {
+    let handle = std::thread::Builder::new()
+        .name("tj-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .context("spawn main worker thread")?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("main worker thread panicked"),
+    }
+}
+
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Create {
@@ -1826,7 +1844,7 @@ fn main() -> Result<()> {
                             { "type": "command", "command": cmd },
                         ]}]),
                     );
-                    for ev in ["PostToolUse", "Stop", "PreCompact"] {
+                    for ev in ["PostToolUse", "Stop", "PreCompact", "SessionEnd"] {
                         obj.insert(
                             ev.to_string(),
                             serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }]),
@@ -2508,6 +2526,21 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     }
                 }
                 return Ok(());
+            }
+
+            // SessionEnd with reason "clear": /clear discards the conversation
+            // and the transcript orphans, so this is the LAST chance to capture
+            // the final segment. Extracted to its own function so its locals do
+            // NOT bloat `main`'s already-huge stack frame — inlining it here
+            // overflowed the 1 MiB Windows main-thread stack on every command.
+            if kind == "SessionEnd" {
+                return run_session_end_catchup(
+                    &payload,
+                    &events_path,
+                    &project_hash,
+                    &backend,
+                    live_session_id.as_deref(),
+                );
             }
 
             // Drain any pending entries first (Task 10 fills the real-classifier branch).
@@ -3941,6 +3974,58 @@ fn run_nudge() -> anyhow::Result<()> {
 }
 
 /// Proactive recall injector (opt-in hook). Reads the UserPromptSubmit payload
+/// SessionEnd(reason=clear) catch-up: enqueue transcript chunks newer than the
+/// active task's last event, then spawn the classify-worker. Kept OUT of `main`
+/// so its locals don't grow `main`'s already-huge stack frame — inlining it
+/// overflowed the 1 MiB Windows main-thread stack on every command.
+fn run_session_end_catchup(
+    payload: &serde_json::Value,
+    events_path: &std::path::Path,
+    project_hash: &str,
+    backend: &str,
+    live_session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let reason = payload.get("reason").and_then(|x| x.as_str()).unwrap_or("");
+    if reason != "clear" || !events_path.exists() {
+        return Ok(());
+    }
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    let Some(tc) = recent_task_contexts(&conn, 1)?.into_iter().next() else {
+        return Ok(());
+    };
+    let last_event_ts: Option<String> = conn
+        .query_row(
+            "SELECT timestamp FROM events_index WHERE task_id=?1 ORDER BY timestamp DESC LIMIT 1",
+            rusqlite::params![&tc.task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+    let transcript_path = payload
+        .get("transcript_path")
+        .and_then(|x| x.as_str())
+        .map(std::path::PathBuf::from);
+    if let Some(tp) = transcript_path.as_ref() {
+        if tp.exists() {
+            let enq = enqueue_transcript_chunks_since_last_event(
+                tp,
+                events_path,
+                project_hash,
+                backend,
+                last_event_ts.as_deref(),
+                "SessionEndChunk",
+                live_session_id,
+            )
+            .unwrap_or(0);
+            if enq > 0 && std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
+                let _ = spawn_classify_worker(backend);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// from stdin, keyword-searches the global index for relevant prior
 /// decisions/rejections/constraints across all projects, and emits a budgeted
 /// `additionalContext` block. Never blocks the prompt: any miss, empty result,

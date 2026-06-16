@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.2] - 2026-06-16
+
+### Added
+- **`ask --json`** — `task-journal ask "<query>" --json` emits the semantic
+  search hits as a JSON array (task_id, project_hash, event_type, text, score)
+  for machine consumers like the Loom host; no matches yields `[]`. Mirrors the
+  existing `recall --json`.
+
+### Changed
+- **Resume packs read clean.** Auto-recorded compaction / session-continuation
+  markers (e.g. "This session is being continued…", "Conversation compacted
+  at…") are machine noise the classifier sometimes files as decisions. The pack
+  now drops them from the recent-events, rejected and active-decisions sections
+  and de-duplicates exact repeats, so the dossier reads as crisp reasoning. The
+  append-only journal still records every marker — only the rendered pack hides
+  them.
+
+## [0.26.1] - 2026-06-14
+
+### Fixed
+- **No more Windows stack overflows from the CLI dispatch.** The command
+  dispatch sits near Windows' 1 MiB main-thread stack limit (a single added
+  branch overflowed it). `main` now runs the real work on a 16 MiB worker
+  thread, so the dispatch can grow safely and a `STATUS_STACK_OVERFLOW` at
+  startup can't recur. Exit codes and panics still propagate.
+
+### Added
+- **`/clear` no longer drops the last segment.** A new `SessionEnd` hook (wired
+  by `install-hooks --auto-capture`) runs the same transcript catch-up as `Stop`
+  when the session ends with reason `clear` — the last chance to capture the
+  final segment before `/clear` orphans the transcript. Gated to `clear` so it
+  doesn't re-process what `Stop` already handled on other exits.
+- **`recall --json`** — `task-journal recall "<context>" --json` emits the
+  cross-project memory hits as a JSON array (task_id, project_hash, event_type,
+  text, score) for machine consumers like the Loom host; empty/missing memory
+  yields `[]`.
+
 ## [0.25.1] - 2026-06-14
 
 ### Fixed
