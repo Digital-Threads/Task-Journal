@@ -2660,6 +2660,32 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
         .assert()
         .success();
 
+    // The hook still appends the marker decision to the append-only journal…
+    let events_glob = dir.path().join("task-journal").join("events");
+    let mut marker_lines = 0;
+    for entry in std::fs::read_dir(&events_glob).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            let body = std::fs::read_to_string(&p).unwrap();
+            for line in body.lines() {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                if v["type"] == "decision"
+                    && v["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Conversation compacted at")
+                {
+                    marker_lines += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        marker_lines, 1,
+        "marker decision must be recorded in the journal"
+    );
+
+    // …but the pack filters it out as machine noise so the dossier reads clean.
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
@@ -2668,9 +2694,9 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
         .assert()
         .success()
         .stdout(
-            contains("[decision]")
-                .and(contains("Conversation compacted at"))
-                .and(contains("single reasoning unit")),
+            contains("Conversation compacted at")
+                .not()
+                .and(contains("single reasoning unit").not()),
         );
 }
 
