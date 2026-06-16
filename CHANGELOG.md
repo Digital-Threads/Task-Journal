@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.2] - 2026-06-16
+
+### Added
+- **`ask --json`** — `task-journal ask "<query>" --json` emits the semantic
+  search hits as a JSON array (task_id, project_hash, event_type, text, score)
+  for machine consumers like the Loom host; no matches yields `[]`. Mirrors the
+  existing `recall --json`.
+
+### Changed
+- **Resume packs read clean.** Auto-recorded compaction / session-continuation
+  markers (e.g. "This session is being continued…", "Conversation compacted
+  at…") are machine noise the classifier sometimes files as decisions. The pack
+  now drops them from the recent-events, rejected and active-decisions sections
+  and de-duplicates exact repeats, so the dossier reads as crisp reasoning. The
+  append-only journal still records every marker — only the rendered pack hides
+  them.
+
 ## [0.26.1] - 2026-06-14
 
 ### Fixed
