@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.4] - 2026-06-17
+
+### Fixed
+- **Auto-classifier no longer fails every chunk.** The `claude -p` classifier
+  passed the prompt as a positional arg right after `--disallowed-tools`, which
+  the current `claude` CLI parses greedily — it swallowed the prompt words as
+  bogus deny-rules (`Permission deny rule "You" matches no known tool`) and
+  failed every classification, silently piling chunks into the pending queue.
+  The classifier now feeds the prompt on **stdin** (like the `complete`/enrich
+  and dream backends already did), so chunks classify instead of dead-lettering.
+  Run `task-journal pending retry` once to drain a backlog accumulated by the
+  old behavior.
+
 ## [0.26.3] - 2026-06-16
 
 ### Added
