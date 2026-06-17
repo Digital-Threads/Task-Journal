@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.6] - 2026-06-17
+
+### Added
+- **Short PR references are captured too.** The artifact extractor now reads
+  `PR #51` / `PR#51` / `pull request #51` from event text (normalised to
+  `PR #51`), not just full `/pull/N` URLs — anchored to the PR keyword so a
+  bare `#3` in prose is not mistaken for a PR.
+- **Close harvest finds the merged PR even after the branch is gone.** When a
+  task is closed on `main` (the branch already deleted, so `gh pr view` finds
+  nothing), the harvest falls back to GitHub commit search
+  (`gh pr list --search <HEAD-sha> --state merged`) to recover the PR that
+  introduced the current commit. Still best-effort — no `gh`/match just yields
+  no PR.
+
 ## [0.26.5] - 2026-06-17
 
 ### Added

@@ -49,7 +49,13 @@ pub fn build(branch: Option<String>, commit: Option<String>, pr_url: Option<Stri
 pub fn harvest(dir: &Path) -> Artifacts {
     let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
     let commit = git(dir, &["rev-parse", "--short", "HEAD"]);
-    let pr_url = gh_pr_url(dir);
+    // PR resolution, best-effort and in order of reliability:
+    //   1. the open PR for the current branch (pre-merge close), else
+    //   2. the merged PR that contains HEAD (post-merge close, branch gone).
+    // The second covers the common case where the task is closed on `main`
+    // after the branch was deleted, so `gh pr view` finds nothing.
+    let pr_url = gh_pr_url(dir)
+        .or_else(|| git(dir, &["rev-parse", "HEAD"]).and_then(|sha| gh_pr_for_commit(dir, &sha)));
     build(branch, commit, pr_url)
 }
 
@@ -80,6 +86,29 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 fn gh_pr_url(dir: &Path) -> Option<String> {
     let out = Command::new("gh")
         .args(["pr", "view", "--json", "url", "-q", ".url"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.starts_with("http") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// Best-effort URL of the merged PR that introduced `sha`, via GitHub's commit
+/// search. Used as a fallback when the branch's open PR is gone (task closed on
+/// `main` after the branch was deleted). `None` on any failure.
+fn gh_pr_for_commit(dir: &Path, sha: &str) -> Option<String> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "list", "--state", "merged", "--search", sha, "--limit", "1", "--json", "url",
+            "-q", ".[0].url",
+        ])
         .current_dir(dir)
         .output()
         .ok()?;
