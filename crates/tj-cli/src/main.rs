@@ -1503,8 +1503,22 @@ fn real_main() -> Result<()> {
                 tj_core::event::Source::Cli,
                 reason.clone().unwrap_or_else(|| "(closed)".into()),
             );
+            let mut meta = serde_json::Map::new();
             if let Some(r) = reason {
-                event.meta = serde_json::json!({"reason": r});
+                meta.insert("reason".into(), serde_json::Value::String(r));
+            }
+            // Layer-2 close harvest: stamp deterministic git/gh refs (commit,
+            // branch, PR) so the closed pack reads as a clickable ledger of
+            // what shipped. Best-effort; structured artifacts are merged in
+            // db::index_event — never fails the close.
+            let arts = tj_core::harvest::harvest(&cwd);
+            if !arts.is_empty() {
+                if let Ok(v) = serde_json::to_value(&arts) {
+                    meta.insert("artifacts".into(), v);
+                }
+            }
+            if !meta.is_empty() {
+                event.meta = serde_json::Value::Object(meta);
             }
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;

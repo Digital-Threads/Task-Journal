@@ -58,6 +58,7 @@ pub mod event;
 pub mod finalize;
 pub mod frontmatter;
 pub mod fts;
+pub mod harvest;
 pub mod llm;
 pub mod memory;
 pub mod pack;

@@ -670,6 +670,18 @@ impl TaskJournalServer {
                 if let Some(t) = &p.outcome_tag {
                     meta.insert("outcome_tag".into(), serde_json::Value::String(t.clone()));
                 }
+                // Layer-2 close harvest: stamp deterministic git/gh refs
+                // (commit, branch, PR) into the close event so the resume pack
+                // reads as a clickable ledger of what shipped. Best-effort and
+                // structured (merged in db::index_event) — never fails close.
+                if let Ok(dir) = std::env::current_dir() {
+                    let arts = tj_core::harvest::harvest(&dir);
+                    if !arts.is_empty() {
+                        if let Ok(v) = serde_json::to_value(&arts) {
+                            meta.insert("artifacts".into(), v);
+                        }
+                    }
+                }
                 event.meta = serde_json::Value::Object(meta);
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
