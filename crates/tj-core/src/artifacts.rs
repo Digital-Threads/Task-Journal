@@ -27,6 +27,23 @@ pub struct Artifacts {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branch_names: Vec<String>,
+    /// Clickable, typed links for rendering a task card. Additive to the flat
+    /// token vectors above (which still power artifact search / relatedness):
+    /// `links` carries a ready-to-click `{kind,url,label}` so a host like the
+    /// Loom board doesn't reconstruct URLs. Harvested at close (PR/commit/
+    /// branch) or attached by the agent via `artifact_add` (doc/deploy/…).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<ArtifactLink>,
+}
+
+/// A typed, clickable reference. `kind` is a short tag (`pr`, `commit`,
+/// `branch`, `doc`, `deploy`, `issue`, …); `url` is the link; `label` is the
+/// human text shown on the card.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactLink {
+    pub kind: String,
+    pub url: String,
+    pub label: String,
 }
 
 impl Artifacts {
@@ -36,6 +53,7 @@ impl Artifacts {
             && self.linked_issues.is_empty()
             && self.files.is_empty()
             && self.branch_names.is_empty()
+            && self.links.is_empty()
     }
 
     /// Merge another `Artifacts` into self, preserving insertion order
@@ -54,7 +72,25 @@ impl Artifacts {
                 }
             }
         }
+        // links hold a struct, not a String, so they merge separately —
+        // deduped by full {kind,url,label} equality.
+        for l in other.links {
+            if !self.links.iter().any(|x| x == &l) {
+                self.links.push(l);
+            }
+        }
     }
+}
+
+/// Build the `event.meta` payload that attaches one [`ArtifactLink`] to an
+/// event. `db::index_event` merges `meta["artifacts"]` into the event's
+/// artifacts, so a `Finding` (or any) event carrying this meta surfaces the
+/// link in the task's pack. Shared by the CLI `artifact-add` command and the
+/// MCP `artifact_add` tool so they store identical shapes.
+pub fn link_event_meta(kind: &str, url: &str, label: &str) -> serde_json::Value {
+    serde_json::json!({
+        "artifacts": { "links": [ { "kind": kind, "url": url, "label": label } ] }
+    })
 }
 
 /// Extract artifacts from a single piece of text (event body, prompt,
@@ -250,6 +286,29 @@ mod tests {
     fn empty_text_yields_empty_artifacts() {
         let a = extract("");
         assert!(a.is_empty());
+    }
+
+    #[test]
+    fn merge_dedupes_links_by_full_identity() {
+        let link = |k: &str, u: &str, l: &str| ArtifactLink {
+            kind: k.into(),
+            url: u.into(),
+            label: l.into(),
+        };
+        let mut a = Artifacts {
+            links: vec![link("pr", "u/pull/1", "PR #1")],
+            ..Default::default()
+        };
+        assert!(!a.is_empty());
+        a.merge(Artifacts {
+            links: vec![
+                link("pr", "u/pull/1", "PR #1"),  // dup → dropped
+                link("doc", "u/spec.md", "Spec"), // new → kept
+            ],
+            ..Default::default()
+        });
+        assert_eq!(a.links.len(), 2);
+        assert_eq!(a.links[1].kind, "doc");
     }
 
     #[test]

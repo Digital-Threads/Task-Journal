@@ -11,52 +11,119 @@
 //! Layer-2 of the "perfect pack at close" design. The pure [`build`] decides
 //! what to keep so the filtering is unit-testable without a live repo.
 
-use crate::artifacts::Artifacts;
+use crate::artifacts::{ArtifactLink, Artifacts};
 use std::path::Path;
 use std::process::Command;
 
-/// Pure assembler: turn the raw `(branch, commit, pr_url)` git/gh outputs into
-/// a clean [`Artifacts`], dropping the values that aren't real refs — a
-/// detached HEAD (`"HEAD"`), empty strings, or a non-http PR line. Separated
-/// from the IO so the keep/drop rules can be tested without spawning git.
-pub fn build(branch: Option<String>, commit: Option<String>, pr_url: Option<String>) -> Artifacts {
+/// Raw git/gh outputs for one repo, before filtering. All optional and
+/// best-effort — [`build`] decides what survives.
+#[derive(Debug, Default, Clone)]
+pub struct Raw {
+    pub branch: Option<String>,
+    pub commit_short: Option<String>,
+    pub commit_full: Option<String>,
+    pub pr_url: Option<String>,
+    pub repo_url: Option<String>,
+}
+
+/// Pure assembler: turn raw git/gh outputs into a clean [`Artifacts`], dropping
+/// the values that aren't real refs — a detached HEAD (`"HEAD"`), empty
+/// strings, a non-http PR/repo line. Also emits clickable [`ArtifactLink`]s
+/// when the repo web URL is known (so a commit hash becomes a real link).
+/// Separated from the IO so the keep/drop rules are unit-testable without git.
+pub fn build(raw: Raw) -> Artifacts {
     let mut a = Artifacts::default();
-    if let Some(b) = branch {
-        let b = b.trim();
-        // "HEAD" means detached — not a branch name worth recording.
-        if !b.is_empty() && b != "HEAD" {
-            a.branch_names.push(b.to_string());
-        }
+
+    let branch = raw
+        .branch
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty() && b != "HEAD");
+    let commit_short = raw
+        .commit_short
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    let commit_full = raw
+        .commit_full
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    let pr_url = raw
+        .pr_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| u.starts_with("http"));
+    let repo = raw
+        .repo_url
+        .map(|r| r.trim().trim_end_matches('/').to_string())
+        .filter(|r| r.starts_with("http"));
+
+    // Flat token vectors (power artifact search / relatedness, unchanged).
+    if let Some(b) = &branch {
+        a.branch_names.push(b.clone());
     }
-    if let Some(c) = commit {
-        let c = c.trim();
-        if !c.is_empty() {
-            a.commit_hashes.push(c.to_string());
-        }
+    if let Some(c) = &commit_short {
+        a.commit_hashes.push(c.clone());
     }
-    if let Some(u) = pr_url {
-        let u = u.trim();
-        if u.starts_with("http") {
-            a.pr_urls.push(u.to_string());
-        }
+    if let Some(u) = &pr_url {
+        a.pr_urls.push(u.clone());
+    }
+
+    // Clickable typed links for the card.
+    if let Some(u) = &pr_url {
+        let label = pr_number(u)
+            .map(|n| format!("PR #{n}"))
+            .unwrap_or_else(|| "PR".into());
+        a.links.push(ArtifactLink {
+            kind: "pr".into(),
+            url: u.clone(),
+            label,
+        });
+    }
+    if let (Some(repo), Some(full), Some(short)) = (&repo, &commit_full, &commit_short) {
+        a.links.push(ArtifactLink {
+            kind: "commit".into(),
+            url: format!("{repo}/commit/{full}"),
+            label: short.clone(),
+        });
+    }
+    if let (Some(repo), Some(b)) = (&repo, &branch) {
+        a.links.push(ArtifactLink {
+            kind: "branch".into(),
+            url: format!("{repo}/tree/{b}"),
+            label: b.clone(),
+        });
     }
     a
+}
+
+/// Trailing PR/MR number from a GitHub/GitLab URL (`…/pull/54` → `54`).
+fn pr_number(url: &str) -> Option<&str> {
+    let tail = url.trim_end_matches('/').rsplit('/').next()?;
+    if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+        Some(tail)
+    } else {
+        None
+    }
 }
 
 /// Harvest commit/branch/PR refs from the git repo at `dir`. Best-effort;
 /// returns an empty [`Artifacts`] when `dir` is not a repo or the tools are
 /// absent. Used at task close to stamp deterministic refs onto the close event.
 pub fn harvest(dir: &Path) -> Artifacts {
-    let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    let commit = git(dir, &["rev-parse", "--short", "HEAD"]);
+    let commit_full = git(dir, &["rev-parse", "HEAD"]);
     // PR resolution, best-effort and in order of reliability:
     //   1. the open PR for the current branch (pre-merge close), else
     //   2. the merged PR that contains HEAD (post-merge close, branch gone).
-    // The second covers the common case where the task is closed on `main`
-    // after the branch was deleted, so `gh pr view` finds nothing.
-    let pr_url = gh_pr_url(dir)
-        .or_else(|| git(dir, &["rev-parse", "HEAD"]).and_then(|sha| gh_pr_for_commit(dir, &sha)));
-    build(branch, commit, pr_url)
+    let pr_url = gh_pr_url(dir).or_else(|| {
+        commit_full
+            .as_deref()
+            .and_then(|sha| gh_pr_for_commit(dir, sha))
+    });
+    build(Raw {
+        branch: git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        commit_short: git(dir, &["rev-parse", "--short", "HEAD"]),
+        commit_full,
+        pr_url,
+        repo_url: gh_repo_url(dir),
+    })
 }
 
 /// Run `git -C <dir> <args>` and return trimmed stdout, or `None` on any
@@ -123,37 +190,87 @@ fn gh_pr_for_commit(dir: &Path, sha: &str) -> Option<String> {
     }
 }
 
+/// Best-effort web URL of the repo (`https://github.com/owner/repo`), used to
+/// build clickable commit/branch links. `None` when `gh` is absent or the dir
+/// is not a GitHub repo.
+fn gh_repo_url(dir: &Path) -> Option<String> {
+    let out = Command::new("gh")
+        .args(["repo", "view", "--json", "url", "-q", ".url"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.starts_with("http") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn build_keeps_real_refs() {
-        let a = build(
-            Some("feat/clean-pack".into()),
-            Some("75f65e2".into()),
-            Some("https://github.com/o/r/pull/51".into()),
-        );
+    fn build_keeps_real_refs_and_emits_links() {
+        let a = build(Raw {
+            branch: Some("feat/clean-pack".into()),
+            commit_short: Some("75f65e2".into()),
+            commit_full: Some("75f65e2aaaa".into()),
+            pr_url: Some("https://github.com/o/r/pull/51".into()),
+            repo_url: Some("https://github.com/o/r".into()),
+        });
         assert_eq!(a.branch_names, vec!["feat/clean-pack"]);
         assert_eq!(a.commit_hashes, vec!["75f65e2"]);
         assert_eq!(a.pr_urls, vec!["https://github.com/o/r/pull/51"]);
+        // clickable links: PR (labelled by number), commit (full-sha url), branch
+        let kinds: Vec<_> = a.links.iter().map(|l| l.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["pr", "commit", "branch"]);
+        let pr = &a.links[0];
+        assert_eq!(pr.label, "PR #51");
+        assert_eq!(a.links[1].url, "https://github.com/o/r/commit/75f65e2aaaa");
+        assert_eq!(
+            a.links[2].url,
+            "https://github.com/o/r/tree/feat/clean-pack"
+        );
+    }
+
+    #[test]
+    fn build_without_repo_url_keeps_flat_but_no_commit_branch_links() {
+        // No repo URL → commit/branch can't be made clickable, but the PR URL
+        // is self-sufficient so it still yields a link.
+        let a = build(Raw {
+            branch: Some("main".into()),
+            commit_short: Some("abc1234".into()),
+            commit_full: Some("abc1234ffff".into()),
+            pr_url: Some("https://github.com/o/r/pull/9".into()),
+            repo_url: None,
+        });
+        let kinds: Vec<_> = a.links.iter().map(|l| l.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["pr"], "only the self-linking PR survives");
+        assert_eq!(a.commit_hashes, vec!["abc1234"]);
     }
 
     #[test]
     fn build_drops_detached_head_empty_and_non_http() {
-        let a = build(
-            Some("HEAD".into()),
-            Some("  ".into()),
-            Some("no pull request".into()),
-        );
+        let a = build(Raw {
+            branch: Some("HEAD".into()),
+            commit_short: Some("  ".into()),
+            commit_full: None,
+            pr_url: Some("no pull request".into()),
+            repo_url: Some("not-a-url".into()),
+        });
         assert!(
             a.is_empty(),
-            "detached HEAD + empty commit + non-url PR all dropped"
+            "detached HEAD + empty commit + non-url PR/repo all dropped"
         );
     }
 
     #[test]
     fn build_tolerates_all_absent() {
-        assert!(build(None, None, None).is_empty());
+        assert!(build(Raw::default()).is_empty());
     }
 }

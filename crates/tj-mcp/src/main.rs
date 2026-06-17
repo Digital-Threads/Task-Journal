@@ -236,6 +236,22 @@ pub struct EventAddResult {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArtifactAddParams {
+    pub task_id: String,
+    /// Short tag: `doc`, `deploy`, `dashboard`, `design`, `pr`, …
+    pub kind: String,
+    /// The link target (URL or path).
+    pub url: String,
+    /// Human label shown on the card.
+    pub label: String,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ArtifactAddResult {
+    pub event_id: String,
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskCloseParams {
     pub task_id: String,
     pub reason: String,
@@ -604,6 +620,47 @@ impl TaskJournalServer {
                     event_id: event.event_id,
                     task_id: p.task_id.clone(),
                     event_type: p.event_type.clone(),
+                })
+            })
+            .await
+            .map(Json)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "artifact_add",
+        description = "Attach a clickable, typed link to a task — a doc, deploy, dashboard, design, spec, etc. Renders on the task card / resume pack under Artifacts as [label](url). Use it when the work produces a reference a human would want to click later. Writes a `finding` event carrying the link; PR/commit/branch are harvested automatically at close, so use this for the things git can't give you."
+    )]
+    async fn artifact_add(
+        &self,
+        Parameters(p): Parameters<ArtifactAddParams>,
+    ) -> Result<Json<ArtifactAddResult>, McpError> {
+        traced_tool("artifact_add", async move {
+            run_blocking(move || {
+                let (_, events_path, _) = project_paths()?;
+                std::fs::create_dir_all(events_path.parent().unwrap())?;
+
+                let mut event = tj_core::event::Event::new(
+                    &p.task_id,
+                    tj_core::event::EventType::Finding,
+                    tj_core::event::Author::Agent,
+                    tj_core::event::Source::Chat,
+                    format!("📎 {}: {} — {}", p.kind, p.label, p.url),
+                );
+                event.meta = tj_core::artifacts::link_event_meta(&p.kind, &p.url, &p.label);
+                tj_core::session_id::stamp_session_id(
+                    &mut event.meta,
+                    tj_core::session_id::session_id_from_env().as_deref(),
+                );
+
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+
+                Ok(ArtifactAddResult {
+                    event_id: event.event_id,
+                    task_id: p.task_id.clone(),
                 })
             })
             .await
