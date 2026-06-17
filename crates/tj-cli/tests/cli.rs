@@ -5728,3 +5728,63 @@ fn complete_retitles_and_closes_via_fake_backend() {
         .stdout(contains("status: closed"))
         .stdout(contains("Refunded the missing half"));
 }
+
+#[test]
+fn close_harvests_git_commit_and_branch_into_pack() {
+    use std::process::Command as PCommand;
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = dir.path().join("repo");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    // Minimal git repo on a named branch with one commit.
+    let git = |args: &[&str]| {
+        PCommand::new("git")
+            .current_dir(&proj)
+            .args(args)
+            .output()
+            .unwrap();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t.io"]);
+    git(&["config", "user.name", "T"]);
+    git(&["checkout", "-q", "-b", "feat/harvest-me"]);
+    std::fs::write(proj.join("f.txt"), "hi").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    // Create + close a task from inside the repo.
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&proj)
+            .args(["create", "Harvest test"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&proj)
+        .args(["close", &task_id, "--reason", "done"])
+        .assert()
+        .success();
+
+    // The pack's Artifacts carries the branch (deterministic git harvest).
+    // gh may be absent/unauthed in CI, so we don't assert the PR url.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&proj)
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("feat/harvest-me"));
+}

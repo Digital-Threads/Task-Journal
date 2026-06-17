@@ -861,7 +861,19 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     // IDs, file paths, branch names) out of the event text. Storing
     // per-event so reclassify can recompute without touching foreign
     // events; pack aggregates and dedupes across events at render time.
-    let artifacts = crate::artifacts::extract(&event.text);
+    let mut artifacts = crate::artifacts::extract(&event.text);
+    // v0.26.5: structured artifacts harvested deterministically at close
+    // (git/gh: PR url, commit, branch) ride in `event.meta["artifacts"]`.
+    // Merge them so reliable refs land without depending on the lossy text
+    // regex — this is what turns a closed task into a clickable Loom card.
+    if let Some(meta_arts) = event
+        .meta
+        .get("artifacts")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<crate::artifacts::Artifacts>(v).ok())
+    {
+        artifacts.merge(meta_arts);
+    }
     let artifacts_json = if artifacts.is_empty() {
         None
     } else {
@@ -1469,6 +1481,37 @@ mod tests {
             crate::event::Source::Cli,
             text.into(),
         )
+    }
+
+    #[test]
+    fn index_event_merges_structured_meta_artifacts() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        // Close-time harvest writes deterministic refs into meta.artifacts;
+        // the event text itself has no scrapeable tokens.
+        let mut ev = make_text_event("closed: shipped the Loom spine");
+        ev.meta = serde_json::json!({
+            "artifacts": {
+                "pr_urls": ["https://github.com/o/r/pull/51"],
+                "commit_hashes": ["75f65e2"],
+                "branch_names": ["feat/clean-pack"],
+            }
+        });
+        index_event(&conn, &ev).unwrap();
+
+        let arts = task_artifacts(&conn, "tj-x").unwrap();
+        assert!(
+            arts.pr_urls.iter().any(|p| p.contains("/pull/51")),
+            "pr merged"
+        );
+        assert!(
+            arts.commit_hashes.iter().any(|c| c == "75f65e2"),
+            "commit merged"
+        );
+        assert!(
+            arts.branch_names.iter().any(|b| b == "feat/clean-pack"),
+            "branch merged"
+        );
     }
 
     #[test]

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.5] - 2026-06-17
+
+### Added
+- **Closed tasks become a clickable ledger.** When a task is closed,
+  `task_close` / `close` now harvests the real refs of what shipped — the
+  current commit, branch, and (when `gh` is available) the PR URL — straight
+  from `git`/`gh` and stamps them onto the close event as structured
+  artifacts. The resume pack renders them under **Artifacts** (`commits:`,
+  `branches:`, `PRs:`), so a month later the task shows *where it landed*
+  without relying on the agent having typed the refs into prose. Deterministic
+  and best-effort: no repo, no `gh`, or a detached HEAD just yields fewer
+  artifacts and never fails the close. Structured artifacts ride in
+  `event.meta["artifacts"]` and are merged with the existing text-scrape in
+  `db::index_event`.
+
 ## [0.26.4] - 2026-06-17
 
 ### Fixed
@@ -17,8 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed every classification, silently piling chunks into the pending queue.
   The classifier now feeds the prompt on **stdin** (like the `complete`/enrich
   and dream backends already did), so chunks classify instead of dead-lettering.
-  Run `task-journal pending retry` once to drain a backlog accumulated by the
-  old behavior.
+  The backlog drains on its own as the capture hook re-spawns the classify
+  worker — no operator action needed.
 
 ## [0.26.3] - 2026-06-16
 
