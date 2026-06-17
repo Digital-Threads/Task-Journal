@@ -86,6 +86,18 @@ pub fn extract(text: &str) -> Artifacts {
         text,
     );
 
+    // Short PR references: "PR #51", "PR#51", "pull request #51". Anchored to
+    // the PR / "pull request" keyword so a bare "#3" in prose (step #3, issue
+    // #3) is NOT captured. Normalised to "PR #<n>" so it dedupes cleanly and
+    // renders next to full URLs under the same `PRs:` group.
+    if let Ok(re) = Regex::new(r"(?i)\b(?:PR|pull request)\s*#(\d+)\b") {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                a.pr_urls.push(format!("PR #{}", m.as_str()));
+            }
+        }
+    }
+
     // Ticket IDs: ABC-123. At least 2 letters to avoid matching version
     // strings like v1-2 and minimum 1 digit.
     static_re(
@@ -238,6 +250,15 @@ mod tests {
     fn empty_text_yields_empty_artifacts() {
         let a = extract("");
         assert!(a.is_empty());
+    }
+
+    #[test]
+    fn captures_short_pr_reference_but_not_bare_hash() {
+        let a = extract("merged PR #51 and PR#52, see pull request #53");
+        assert_eq!(a.pr_urls, vec!["PR #51", "PR #52", "PR #53"]);
+        // bare hashes in prose must NOT be captured as PRs
+        let b = extract("step #3 of 5, issue #7, line #42");
+        assert!(b.pr_urls.is_empty(), "got: {:?}", b.pr_urls);
     }
 
     #[test]
