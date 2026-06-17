@@ -38,6 +38,16 @@ pub trait CommandRunner: Send + Sync {
     /// Run the classification for `prompt` against `model`, returning the raw
     /// stdout (the `--output-format json` wrapper) on success.
     fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String>;
+
+    /// True when the runner feeds the prompt on **stdin** rather than as a
+    /// positional argv arg. The classifier MUST use a stdin runner: the base
+    /// command ends with `--disallowed-tools <tools>`, which the current
+    /// `claude` CLI parses greedily — a positional prompt right after it is
+    /// swallowed as bogus deny-rules (`Permission deny rule "You" matches no
+    /// known tool`), failing every classification. Defaults to false.
+    fn feeds_prompt_on_stdin(&self) -> bool {
+        false
+    }
 }
 
 /// Build the base `claude` invocation shared by both runners: print mode, the
@@ -188,6 +198,10 @@ impl CommandRunner for ClaudeBinaryRunner {
 pub struct ClaudeBinaryStdinRunner;
 
 impl CommandRunner for ClaudeBinaryStdinRunner {
+    fn feeds_prompt_on_stdin(&self) -> bool {
+        true
+    }
+
     fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
         use std::io::Write;
         use std::process::Stdio;
@@ -222,6 +236,14 @@ pub struct ClaudeCliClassifier {
     runner: Box<dyn CommandRunner>,
 }
 
+/// The runner the production classifier uses. MUST feed the prompt on stdin —
+/// see [`CommandRunner::feeds_prompt_on_stdin`] for why a positional prompt is
+/// silently eaten by `--disallowed-tools`. Extracted so a unit test can lock
+/// this choice without spawning `claude`.
+fn default_runner() -> Box<dyn CommandRunner> {
+    Box::new(ClaudeBinaryStdinRunner)
+}
+
 impl ClaudeCliClassifier {
     /// Build from environment. Returns `None` unless a `claude` binary is on
     /// PATH (probed with `claude --version`) — the caller then falls through to
@@ -233,7 +255,7 @@ impl ClaudeCliClassifier {
         let model = std::env::var("TJ_AGENT_SDK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
         Some(Self {
             model,
-            runner: Box::new(ClaudeBinaryRunner),
+            runner: default_runner(),
         })
     }
 
@@ -487,5 +509,20 @@ mod tests {
         let c = ClaudeCliClassifier::with_runner(DEFAULT_MODEL, Box::new(FakeRunner::new(canned)));
         let err = c.classify(&input()).unwrap_err();
         assert!(format!("{err}").contains("error"), "got: {err}");
+    }
+
+    /// Regression: the production classifier MUST feed the prompt on stdin. With
+    /// the argv runner the prompt lands right after `--disallowed-tools` and the
+    /// current `claude` CLI swallows it as bogus deny-rules, failing every
+    /// classification (the "139 pending" backlog). Lock the choice here.
+    #[test]
+    fn production_runner_feeds_prompt_on_stdin() {
+        assert!(
+            default_runner().feeds_prompt_on_stdin(),
+            "classifier prompt must go on stdin, not as an argv positional"
+        );
+        // the argv runner is the one that collides — keep the contrast explicit
+        assert!(!ClaudeBinaryRunner.feeds_prompt_on_stdin());
+        assert!(ClaudeBinaryStdinRunner.feeds_prompt_on_stdin());
     }
 }
