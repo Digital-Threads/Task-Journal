@@ -399,6 +399,16 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         if !arts.branch_names.is_empty() {
             text.push_str(&format!("- branches: {}\n", arts.branch_names.join(", ")));
         }
+        if !arts.links.is_empty() {
+            // Clickable, typed links for the task card: "[label](url) (kind)".
+            let rendered = arts
+                .links
+                .iter()
+                .map(|l| format!("[{}]({}) ({})", l.label, l.url, l.kind))
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&format!("- links: {rendered}\n"));
+        }
     }
     text.push('\n');
 

@@ -727,6 +727,22 @@ enum Commands {
         #[arg(long)]
         outcome_tag: Option<String>,
     },
+    /// Attach a clickable, typed link to a task (doc, deploy, dashboard,
+    /// design, …). Renders under the pack's Artifacts as `[label](url)` so a
+    /// host like the Loom board shows it on the task card. Writes a `finding`
+    /// event carrying the link in `meta.artifacts`.
+    ArtifactAdd {
+        task_id: String,
+        /// Short tag: `doc`, `deploy`, `dashboard`, `design`, `pr`, …
+        #[arg(long)]
+        kind: String,
+        /// The link target (URL or path).
+        #[arg(long)]
+        url: String,
+        /// Human label shown on the card.
+        #[arg(long)]
+        label: String,
+    },
     /// Reopen a previously closed task (writes a `reopen` event and
     /// flips status back to `open`). Use when the same scope comes
     /// back, e.g. a regression on a shipped fix or a follow-up bug
@@ -1448,6 +1464,33 @@ fn real_main() -> Result<()> {
             );
             event.corrects = corrects;
             event.supersedes = supersedes;
+
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+            println!("{}", event.event_id);
+        }
+        Commands::ArtifactAdd {
+            task_id,
+            kind,
+            url,
+            label,
+        } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            std::fs::create_dir_all(events_path.parent().unwrap())?;
+
+            // A `finding` event carries the link in meta.artifacts; index_event
+            // merges it so it renders under the pack's Artifacts.
+            let mut event = tj_core::event::Event::new(
+                &task_id,
+                tj_core::event::EventType::Finding,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                format!("📎 {kind}: {label} — {url}"),
+            );
+            event.meta = tj_core::artifacts::link_event_meta(&kind, &url, &label);
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;

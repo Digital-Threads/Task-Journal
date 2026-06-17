@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-06-17
+
+### Added
+- **Clickable, typed artifact links on the task card.** `Artifacts` gains a
+  `links: [{kind, url, label}]` field rendered in the pack as
+  `[label](url) (kind)`. Two sources feed it:
+  - **Auto at close** — the harvest now resolves the repo's web URL (`gh repo
+    view`) and emits ready-to-click links for the PR (labelled `PR #N`), the
+    commit (`…/commit/<sha>`), and the branch (`…/tree/<branch>`), so a bare
+    commit hash becomes a real link.
+  - **`artifact_add`** — a new MCP tool (and `task-journal artifact-add` CLI
+    command) lets the agent attach arbitrary references — a design doc, a
+    deploy/preview URL, a dashboard — as `artifact_add(task_id, kind, url,
+    label)`. Stored as a `finding` event whose `meta.artifacts` is merged by
+    `index_event`, so it surfaces on the card without new storage.
+
+  The flat token vectors (commit_hashes, pr_urls, …) are unchanged and still
+  power artifact search / task relatedness.
+
 ## [0.26.6] - 2026-06-17
 
 ### Added

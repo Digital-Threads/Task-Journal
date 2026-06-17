@@ -5788,3 +5788,46 @@ fn close_harvests_git_commit_and_branch_into_pack() {
         .success()
         .stdout(contains("feat/harvest-me"));
 }
+
+#[test]
+fn artifact_add_renders_clickable_link_in_pack() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Card test"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "artifact-add",
+            &task_id,
+            "--kind",
+            "doc",
+            "--url",
+            "https://example.com/spec.md",
+            "--label",
+            "Design spec",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("[Design spec](https://example.com/spec.md) (doc)"));
+}
