@@ -32,8 +32,21 @@ pub fn project_root(start: &Path) -> PathBuf {
 }
 
 pub fn from_path(p: impl AsRef<Path>) -> anyhow::Result<String> {
-    let canonical = dunce::canonicalize(p.as_ref())
-        .with_context(|| format!("canonicalize {:?}", p.as_ref()))?;
+    let p = p.as_ref();
+    // `canonicalize` requires the path to EXIST — it returns ENOENT ("No such
+    // file or directory") otherwise. A Loom task session can resolve its
+    // project dir before the worktree is checked out, which made `task_create`
+    // hard-fail on its very first path resolution. When the path is merely
+    // absent (not a permission/other error), fall back to a lexical
+    // absolutisation that touches no filesystem, so journal resolution still
+    // works instead of erroring.
+    let canonical = match dunce::canonicalize(p) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+        }
+        Err(e) => return Err(e).with_context(|| format!("canonicalize {p:?}")),
+    };
     let root = project_root(&canonical);
     let bytes = root.as_os_str().as_encoded_bytes();
     let mut h = Sha256::new();
@@ -56,6 +69,19 @@ mod tests {
         let b = from_path(d.path()).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.len(), 16, "16 hex chars expected, got: {a}");
+    }
+
+    #[test]
+    fn nonexistent_path_falls_back_instead_of_erroring() {
+        // Regression: `from_path` used to ENOENT on a path that doesn't exist
+        // yet (canonicalize requires existence), which made task_create
+        // hard-fail in a Loom session whose worktree wasn't checked out.
+        let base = TempDir::new().unwrap();
+        let missing = base.path().join("not/created/yet");
+        let h = from_path(&missing).expect("must not fail on a missing path");
+        assert_eq!(h.len(), 16);
+        // Deterministic for the same absent path.
+        assert_eq!(h, from_path(&missing).unwrap());
     }
 
     #[test]
