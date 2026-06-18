@@ -255,13 +255,17 @@ pub fn artifact_gaps_for_cwd(arts: &Artifacts) -> Vec<Gap> {
     artifact_gaps_in(arts, &cwd)
 }
 
-/// Best-effort artifact drift rooted at an explicit `dir` (e.g. the MCP
-/// project-dir override). Returns no gaps unless `dir` is a git repo.
+/// Best-effort artifact drift for the project containing `dir`. Resolution is
+/// anchored to the project root (git/`.task-journal` boundary), not `dir`
+/// itself, so relative file paths and commits resolve from the repo root —
+/// correct even when invoked from a nested subdir of a monorepo. Returns no
+/// gaps unless the resolved root is a git repo.
 pub fn artifact_gaps_in(arts: &Artifacts, dir: &Path) -> Vec<Gap> {
-    if !is_git_repo(dir) {
+    let root = crate::project_hash::project_root(dir);
+    if !is_git_repo(&root) {
         return Vec::new();
     }
-    assess_artifacts(arts, dir)
+    assess_artifacts(arts, &root)
 }
 
 /// True when `dir` is inside a git working tree.

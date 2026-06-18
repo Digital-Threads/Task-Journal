@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Falls back to `start` if no marker is found, preserving prior
 /// behaviour for non-git scratch directories.
-fn project_root(start: &Path) -> PathBuf {
+pub fn project_root(start: &Path) -> PathBuf {
     let mut cur = start;
     loop {
         if cur.join(".task-journal").is_dir() || cur.join(".git").exists() {
