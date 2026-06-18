@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-06-18
+
+### Fixed
+- **`task_create` ENOENT on first use in a Loom session.** Project-path
+  resolution (`project_hash::from_path`) canonicalized the project directory,
+  and `canonicalize` returns "No such file or directory" when the path does
+  not exist yet — so a task session whose worktree wasn't checked out failed
+  before writing anything, even though the data directory existed. When the
+  path is merely absent, resolution now falls back to a lexical absolutisation
+  that touches no filesystem; other canonicalize errors still propagate.
+
 ## [0.28.1] - 2026-06-18
 
 ### Fixed
