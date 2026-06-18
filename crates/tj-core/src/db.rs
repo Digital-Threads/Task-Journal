@@ -329,8 +329,14 @@ pub fn rebuild_state(
     jsonl_path: impl AsRef<Path>,
     project_hash: &str,
 ) -> anyhow::Result<usize> {
-    let f = std::fs::File::open(&jsonl_path)
-        .with_context(|| format!("open {:?}", jsonl_path.as_ref()))?;
+    let f = match std::fs::File::open(&jsonl_path) {
+        Ok(f) => f,
+        // A fresh project has no events log on disk yet — there is simply nothing
+        // to read, which is not an error (this is what crashed task_create the
+        // first time the journal was touched in a new worktree).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref()))),
+    };
     let reader = std::io::BufReader::new(f);
 
     let tx = conn.unchecked_transaction()?;
@@ -791,8 +797,14 @@ pub fn ingest_new_events(
         None => return rebuild_state(conn, jsonl_path, project_hash),
     };
 
-    let f = std::fs::File::open(&jsonl_path)
-        .with_context(|| format!("open {:?}", jsonl_path.as_ref()))?;
+    let f = match std::fs::File::open(&jsonl_path) {
+        Ok(f) => f,
+        // A fresh project has no events log on disk yet — there is simply nothing
+        // to read, which is not an error (this is what crashed task_create the
+        // first time the journal was touched in a new worktree).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref()))),
+    };
     let reader = std::io::BufReader::new(f);
 
     // First pass: confirm the marker still exists in the file. If it does
@@ -2061,6 +2073,18 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM events_index", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rebuild_state_treats_a_missing_jsonl_as_empty() {
+        // A brand-new project has no events log on disk yet — rebuild/ingest must
+        // report zero events, not error. This is the crash that made task_create
+        // fail the first time the journal was touched in a fresh worktree.
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let missing = d.path().join("does-not-exist.jsonl");
+        assert_eq!(rebuild_state(&conn, &missing, "deadbeefdeadbeef").unwrap(), 0);
+        assert_eq!(ingest_new_events(&conn, &missing, "deadbeefdeadbeef").unwrap(), 0);
     }
 
     #[test]
