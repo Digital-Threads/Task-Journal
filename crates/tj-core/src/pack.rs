@@ -426,7 +426,13 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
-    let report = crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
+    let mut report =
+        crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
+    // Honesty drift: flag artifacts (files/commits/local links) that no longer
+    // exist. Best-effort — silent unless cwd is the project's git repo.
+    report
+        .gaps
+        .extend(crate::completeness::artifact_gaps_for_cwd(&arts));
     if let Some(section) = crate::completeness::render_section(&report) {
         text.push_str(&section);
     }

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-06-18
+
+### Added
+- **Pack honesty score + artifact drift detection** (inspired by
+  [mex](https://github.com/theDakshJaitly/mex)). Deterministic, zero-LLM
+  checks that a task's recorded artifacts still match reality:
+  - New `GapKind`s in `completeness`: `MissingFile` (a referenced file is gone
+    from disk), `DeadCommit` (a referenced commit hash is unknown to git),
+    `BrokenLink` (a local-file link is missing). A pure
+    `check_artifacts(arts, file_exists, commit_alive)` core plus a git/FS
+    wrapper `assess_artifacts`; wired into the pack via `artifact_gaps_for_cwd`
+    (silent outside the project's git repo, so no false drift).
+  - **Honesty score 0–100** — `CompletenessReport::score()` deducts each gap's
+    weight (error −10, warn −3, info −1). Rendered in the pack's Completeness
+    section as `honesty score: N/100`.
+- **`task-journal check <id> [--json]`** — print a task's honesty score and
+  gaps (like `mex check`).
+- **`task-journal gaps <id> [--fill]`** — list gaps, or with `--fill` emit a
+  targeted, deterministic gap-fill prompt embedding the current pack (like
+  `mex sync --dry-run`) for the in-session agent to close — no LLM call in the
+  binary.
+- **`task_check` MCP tool** — returns `{score, gaps:[{kind, severity, detail}]}`
+  so an in-session agent can self-assess a task before closing.
+
 ## [0.27.0] - 2026-06-17
 
 ### Added
