@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-06-18
+
+### Fixed
+- **Artifact drift false positives.** Two issues surfaced dogfooding 0.28.0:
+  - The file-path extractor captured semver version directories (e.g.
+    `…/superpowers/5.1.0`, `…/template-bridge/1.0.0`) as files because the
+    trailing `.0` looked like an extension. A numeric-only "extension" is now
+    rejected — real file extensions contain at least one letter.
+  - Artifact drift resolved file paths and commits against the current working
+    directory. It now anchors to the **project root** (git / `.task-journal`
+    boundary), so relative paths and commits resolve correctly even when
+    `check` is invoked from a nested subdirectory of a monorepo
+    (`project_hash::project_root` is now public).
+
 ## [0.28.0] - 2026-06-18
 
 ### Added

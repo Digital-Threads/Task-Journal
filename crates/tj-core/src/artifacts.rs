@@ -150,7 +150,17 @@ pub fn extract(text: &str) -> Artifacts {
     // crates/tj-core/src/db.rs).
     static_re(
         r"(?:\./|\.?[A-Za-z0-9_\-]+/)+[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,8}\b",
-        |m| a.files.push(m.to_string()),
+        |m| {
+            // Reject version-dir lookalikes: a numeric-only "extension"
+            // (foo/1.0.0, …/superpowers/5.1.0) is a version number, not a
+            // file. Real file extensions contain at least one letter.
+            if let Some(ext) = m.rsplit('.').next() {
+                if ext.chars().all(|c| c.is_ascii_digit()) {
+                    return;
+                }
+            }
+            a.files.push(m.to_string());
+        },
         text,
     );
 
@@ -229,6 +239,20 @@ mod tests {
         let a = extract("edited crates/tj-core/src/db.rs and ./README.md");
         assert!(a.files.contains(&"crates/tj-core/src/db.rs".to_string()));
         assert!(a.files.contains(&"./README.md".to_string()));
+    }
+
+    #[test]
+    fn rejects_version_dirs_with_numeric_extension() {
+        // Semver dirs from plugin-cache paths must NOT be captured as files:
+        // the trailing ".0" is a version number, not a file extension.
+        let a = extract(
+            "cache/claude-plugins-official/superpowers/5.1.0 and \
+             cache/template-bridge-marketplace/template-bridge/1.0.0",
+        );
+        assert!(a.files.is_empty(), "captured: {:?}", a.files);
+        // A real file two dirs deep still parses.
+        let b = extract("touched cache/foo/main.rs");
+        assert!(b.files.contains(&"cache/foo/main.rs".to_string()));
     }
 
     #[test]
