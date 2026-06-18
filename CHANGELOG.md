@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.3] - 2026-06-18
+
+### Fixed
+- **`task_create` ENOENT on a missing events log.** `rebuild_state` /
+  `ingest_new_events` opened the project's events JSONL with no guard, so the
+  first journal touch in a brand-new project (e.g. a fresh git worktree)
+  crashed with "No such file or directory". A missing log now reads as zero
+  events (`Ok(0)` on `NotFound`). This completes the fresh-worktree fix started
+  in 0.28.2 (`project_hash::from_path`).
+
 ## [0.28.2] - 2026-06-18
 
 ### Fixed

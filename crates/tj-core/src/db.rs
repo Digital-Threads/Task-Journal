@@ -335,7 +335,9 @@ pub fn rebuild_state(
         // to read, which is not an error (this is what crashed task_create the
         // first time the journal was touched in a new worktree).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref()))),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref())))
+        }
     };
     let reader = std::io::BufReader::new(f);
 
@@ -803,7 +805,9 @@ pub fn ingest_new_events(
         // to read, which is not an error (this is what crashed task_create the
         // first time the journal was touched in a new worktree).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref()))),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref())))
+        }
     };
     let reader = std::io::BufReader::new(f);
 
@@ -2083,8 +2087,14 @@ mod tests {
         let d = TempDir::new().unwrap();
         let conn = open(d.path().join("s.sqlite")).unwrap();
         let missing = d.path().join("does-not-exist.jsonl");
-        assert_eq!(rebuild_state(&conn, &missing, "deadbeefdeadbeef").unwrap(), 0);
-        assert_eq!(ingest_new_events(&conn, &missing, "deadbeefdeadbeef").unwrap(), 0);
+        assert_eq!(
+            rebuild_state(&conn, &missing, "deadbeefdeadbeef").unwrap(),
+            0
+        );
+        assert_eq!(
+            ingest_new_events(&conn, &missing, "deadbeefdeadbeef").unwrap(),
+            0
+        );
     }
 
     #[test]
