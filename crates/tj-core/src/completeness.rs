@@ -1,7 +1,11 @@
 //! Capture completeness: deterministic, read-only detection of structural
 //! gaps in a task's captured history. Measure + flag only — no mutation.
 
+use std::path::Path;
+
 use rusqlite::Connection;
+
+use crate::artifacts::Artifacts;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GapKind {
@@ -10,6 +14,30 @@ pub enum GapKind {
     SuggestedUnconfirmed,
     NoGoal,
     PendingLeak,
+    /// A file referenced by the task's artifacts no longer exists on disk.
+    MissingFile,
+    /// A commit hash referenced by the task is unknown to git.
+    DeadCommit,
+    /// A local-file link (e.g. a doc) referenced by the task is missing.
+    BrokenLink,
+}
+
+impl GapKind {
+    /// Honesty-score weight, mirroring mex: error −10, warn −3, info −1.
+    /// A structurally broken task (no goal, closed without outcome) is an
+    /// error; a stale reference or unverified decision is a warning; soft
+    /// hygiene signals are info.
+    pub fn weight(&self) -> u32 {
+        match self {
+            GapKind::NoGoal | GapKind::ClosedNoOutcome => 10,
+            GapKind::DecisionNoEvidence
+            | GapKind::PendingLeak
+            | GapKind::MissingFile
+            | GapKind::DeadCommit
+            | GapKind::BrokenLink => 3,
+            GapKind::SuggestedUnconfirmed => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +54,13 @@ pub struct CompletenessReport {
 impl CompletenessReport {
     pub fn is_complete(&self) -> bool {
         self.gaps.is_empty()
+    }
+
+    /// Honesty score 0–100: start at 100 and deduct each gap's weight,
+    /// clamped at 0. A complete report scores 100.
+    pub fn score(&self) -> u8 {
+        let deduction: u32 = self.gaps.iter().map(|g| g.kind.weight()).sum();
+        100u32.saturating_sub(deduction).min(100) as u8
     }
 }
 
@@ -145,15 +180,186 @@ pub fn pending_count() -> usize {
     inner().unwrap_or(0)
 }
 
+/// True when `url` is a local filesystem path rather than an http(s) link.
+fn is_local_path(url: &str) -> bool {
+    !url.starts_with("http://") && !url.starts_with("https://")
+}
+
+/// Pure artifact-honesty checker: given a task's aggregated artifacts and two
+/// predicates — does a path exist? is a commit known to git? — return the
+/// drift gaps. Filesystem- and git-free so it stays deterministic and
+/// unit-testable; `assess_artifacts` supplies the real predicates.
+pub fn check_artifacts(
+    arts: &Artifacts,
+    file_exists: impl Fn(&str) -> bool,
+    commit_alive: impl Fn(&str) -> bool,
+) -> Vec<Gap> {
+    let mut gaps = Vec::new();
+    for f in &arts.files {
+        if !file_exists(f) {
+            gaps.push(Gap {
+                kind: GapKind::MissingFile,
+                detail: format!("referenced file no longer exists: {f}"),
+            });
+        }
+    }
+    for c in &arts.commit_hashes {
+        if !commit_alive(c) {
+            gaps.push(Gap {
+                kind: GapKind::DeadCommit,
+                detail: format!("commit not found in git: {c}"),
+            });
+        }
+    }
+    // Only links that point at a local file can break locally; http(s) links
+    // (commit/PR/branch web URLs) are remote and not checked here.
+    for l in &arts.links {
+        if is_local_path(&l.url) && !file_exists(&l.url) {
+            gaps.push(Gap {
+                kind: GapKind::BrokenLink,
+                detail: format!("broken {} link: {} ({})", l.kind, l.label, l.url),
+            });
+        }
+    }
+    gaps
+}
+
+/// Filesystem+git artifact-honesty assessment for a task's aggregated
+/// artifacts, rooted at `project_root`. A path is resolved relative to the
+/// root; a commit is "alive" iff `git cat-file -e <sha>^{commit}` succeeds.
+/// When `project_root` is not a git repo, commit checks are skipped (treated
+/// as alive) so we never raise false DeadCommit drift outside a repo.
+pub fn assess_artifacts(arts: &Artifacts, project_root: &Path) -> Vec<Gap> {
+    let in_git = is_git_repo(project_root);
+    let file_exists = |p: &str| -> bool {
+        let path = Path::new(p);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        };
+        abs.exists()
+    };
+    let commit_alive = |sha: &str| -> bool { !in_git || git_has_commit(project_root, sha) };
+    check_artifacts(arts, file_exists, commit_alive)
+}
+
+/// Best-effort artifact drift for the current working directory's project.
+/// Returns no gaps unless cwd is a git repo — this avoids false
+/// MissingFile/DeadCommit when a pack is assembled outside its project (e.g.
+/// on the Loom host or in tests where paths resolve against an unrelated cwd).
+pub fn artifact_gaps_for_cwd(arts: &Artifacts) -> Vec<Gap> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    artifact_gaps_in(arts, &cwd)
+}
+
+/// Best-effort artifact drift rooted at an explicit `dir` (e.g. the MCP
+/// project-dir override). Returns no gaps unless `dir` is a git repo.
+pub fn artifact_gaps_in(arts: &Artifacts, dir: &Path) -> Vec<Gap> {
+    if !is_git_repo(dir) {
+        return Vec::new();
+    }
+    assess_artifacts(arts, dir)
+}
+
+/// True when `dir` is inside a git working tree.
+fn is_git_repo(dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// True when `sha` resolves to a commit object in the repo at `dir`.
+fn git_has_commit(dir: &Path, sha: &str) -> bool {
+    std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Render the Completeness section, or None when there are no gaps.
 pub fn render_section(report: &CompletenessReport) -> Option<String> {
     if report.gaps.is_empty() {
         return None;
     }
     let mut s = format!("\n## Completeness ({})\n", report.gaps.len());
+    s.push_str(&format!("- honesty score: {}/100\n", report.score()));
     for g in &report.gaps {
         s.push_str(&format!("- ⚠ {}\n", g.detail));
     }
+    Some(s)
+}
+
+/// Severity label for a gap, derived from its score weight.
+fn severity_label(k: &GapKind) -> &'static str {
+    match k.weight() {
+        10 => "error",
+        3 => "warn",
+        _ => "info",
+    }
+}
+
+/// Concrete, deterministic fix instruction for each gap kind.
+fn fix_instruction(k: &GapKind) -> &'static str {
+    match k {
+        GapKind::NoGoal => "Record the task's one-sentence goal.",
+        GapKind::ClosedNoOutcome => {
+            "Add the outcome: re-close with an outcome/reason, or add a finding summarising the result."
+        }
+        GapKind::DecisionNoEvidence => "Add an evidence event proving the key decision(s).",
+        GapKind::SuggestedUnconfirmed => "Review the suggested event(s) and confirm or correct each.",
+        GapKind::PendingLeak => "Classify the pending entries (run the classifier / drain the queue).",
+        GapKind::MissingFile => {
+            "Referenced file is gone — add a correction event with the current path, or confirm intentional removal."
+        }
+        GapKind::DeadCommit => {
+            "Referenced commit is not in git — correct the hash via a correction event."
+        }
+        GapKind::BrokenLink => {
+            "Local link is broken — fix or drop it (artifact_add / correction event)."
+        }
+    }
+}
+
+/// Build a targeted, deterministic gap-fill prompt for an in-session agent to
+/// close the gaps in `report` for `task_id`. Mirrors mex's sync brief: each
+/// issue gets a concrete fix instruction, and the current pack is embedded as
+/// read-only context. Emits NO LLM call — the caller prints it; the agent runs
+/// it cheaply on the session subscription. Returns None when there are no gaps.
+pub fn build_gap_fill_prompt(
+    task_id: &str,
+    report: &CompletenessReport,
+    pack_text: &str,
+) -> Option<String> {
+    if report.gaps.is_empty() {
+        return None;
+    }
+    let mut s = format!(
+        "Task {task_id} has {} completeness gap(s) (honesty {}/100). \
+Close ONLY these — do not invent work:\n\n",
+        report.gaps.len(),
+        report.score()
+    );
+    for g in &report.gaps {
+        s.push_str(&format!(
+            "- [{}] {}\n  → {}\n",
+            severity_label(&g.kind),
+            g.detail,
+            fix_instruction(&g.kind)
+        ));
+    }
+    s.push_str(
+        "\nCurrent task pack (context — fix against this, change nothing already correct):\n\n```markdown\n",
+    );
+    s.push_str(pack_text);
+    s.push_str("\n```\n");
     Some(s)
 }
 
@@ -289,5 +495,126 @@ mod tests {
         let s = render_section(&r).unwrap();
         assert!(s.contains("Completeness (1)"));
         assert!(s.contains("no goal recorded"));
+    }
+
+    #[test]
+    fn score_is_100_when_complete() {
+        let r = CompletenessReport::default();
+        assert_eq!(r.score(), 100);
+    }
+
+    #[test]
+    fn score_deducts_by_weight_and_clamps() {
+        // NoGoal (10) + MissingFile (3) + SuggestedUnconfirmed (1) = 14 → 86.
+        let r = CompletenessReport {
+            gaps: vec![
+                Gap {
+                    kind: GapKind::NoGoal,
+                    detail: "x".into(),
+                },
+                Gap {
+                    kind: GapKind::MissingFile,
+                    detail: "x".into(),
+                },
+                Gap {
+                    kind: GapKind::SuggestedUnconfirmed,
+                    detail: "x".into(),
+                },
+            ],
+        };
+        assert_eq!(r.score(), 86);
+
+        // 11 errors × 10 = 110 deduction → clamps to 0, never underflows.
+        let many = CompletenessReport {
+            gaps: (0..11)
+                .map(|_| Gap {
+                    kind: GapKind::NoGoal,
+                    detail: "x".into(),
+                })
+                .collect(),
+        };
+        assert_eq!(many.score(), 0);
+    }
+
+    #[test]
+    fn render_section_shows_honesty_score() {
+        let r = CompletenessReport {
+            gaps: vec![Gap {
+                kind: GapKind::MissingFile,
+                detail: "gone.rs".into(),
+            }],
+        };
+        let s = render_section(&r).unwrap();
+        assert!(s.contains("honesty score: 97/100"));
+    }
+
+    #[test]
+    fn check_artifacts_flags_missing_file_dead_commit_broken_link() {
+        let arts = Artifacts {
+            files: vec!["src/live.rs".into(), "src/gone.rs".into()],
+            commit_hashes: vec!["dead00".into(), "alive1".into()],
+            links: vec![
+                crate::artifacts::ArtifactLink {
+                    kind: "doc".into(),
+                    url: "docs/missing.md".into(),
+                    label: "spec".into(),
+                },
+                crate::artifacts::ArtifactLink {
+                    kind: "commit".into(),
+                    url: "https://github.com/x/y/commit/abc".into(),
+                    label: "abc".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        // live file present, gone file absent; alive1 alive, dead00 dead.
+        let gaps = check_artifacts(&arts, |p| p == "src/live.rs", |c| c == "alive1");
+        assert!(gaps
+            .iter()
+            .any(|g| g.kind == GapKind::MissingFile && g.detail.contains("src/gone.rs")));
+        assert!(gaps
+            .iter()
+            .any(|g| g.kind == GapKind::DeadCommit && g.detail.contains("dead00")));
+        assert!(gaps
+            .iter()
+            .any(|g| g.kind == GapKind::BrokenLink && g.detail.contains("docs/missing.md")));
+        // The live file, alive commit, and remote http link raise nothing.
+        assert_eq!(gaps.len(), 3);
+    }
+
+    #[test]
+    fn build_gap_fill_prompt_none_when_complete_else_lists_gaps() {
+        let complete = CompletenessReport::default();
+        assert!(build_gap_fill_prompt("t1", &complete, "pack").is_none());
+
+        let r = CompletenessReport {
+            gaps: vec![
+                Gap {
+                    kind: GapKind::ClosedNoOutcome,
+                    detail: "closed without a recorded outcome".into(),
+                },
+                Gap {
+                    kind: GapKind::MissingFile,
+                    detail: "referenced file no longer exists: src/gone.rs".into(),
+                },
+            ],
+        };
+        let p = build_gap_fill_prompt("tj-abc", &r, "# PACK BODY").unwrap();
+        assert!(p.contains("tj-abc"));
+        assert!(p.contains("honesty 87/100")); // 100 - 10 - 3
+        assert!(p.contains("[error] closed without a recorded outcome"));
+        assert!(p.contains("[warn] referenced file no longer exists: src/gone.rs"));
+        assert!(p.contains("# PACK BODY"));
+    }
+
+    #[test]
+    fn check_artifacts_clean_when_all_present() {
+        let arts = Artifacts {
+            files: vec!["a.rs".into()],
+            commit_hashes: vec!["c1".into()],
+            ..Default::default()
+        };
+        let gaps = check_artifacts(&arts, |_| true, |_| true);
+        assert!(gaps.is_empty());
     }
 }

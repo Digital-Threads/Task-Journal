@@ -326,6 +326,25 @@ fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::Pat
     resolve_project_paths(&dir)
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaskCheckParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskCheckGap {
+    pub kind: String,
+    pub severity: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskCheckResult {
+    pub task_id: String,
+    pub score: u8,
+    pub gaps: Vec<TaskCheckGap>,
+}
+
 #[tool_router]
 impl TaskJournalServer {
     #[tool(
@@ -363,6 +382,63 @@ impl TaskJournalServer {
                         source_event_count: Some(pack.metadata.source_event_count),
                         cache_hit: Some(pack.metadata.cache_hit),
                     },
+                })
+            })
+            .await
+            .map(Json)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "task_check",
+        description = "Deterministic honesty check for a task: 0–100 score plus completeness and artifact-drift gaps. Zero-LLM. Use to self-assess a task's pack (e.g. before closing)."
+    )]
+    async fn task_check(
+        &self,
+        Parameters(p): Parameters<TaskCheckParams>,
+    ) -> Result<Json<TaskCheckResult>, McpError> {
+        traced_tool("task_check", async move {
+            run_blocking(move || {
+                let (project_hash, events_path, state_path) = project_paths()?;
+                let conn_arc = cached_open(&state_path)?;
+                let conn = conn_arc
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+                if events_path.exists() {
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                }
+                let mut report = tj_core::completeness::assess(
+                    &conn,
+                    &p.task_id,
+                    tj_core::completeness::pending_count(),
+                )?;
+                let dir = match PROJECT_DIR_OVERRIDE.get() {
+                    Some(d) => d.clone(),
+                    None => std::env::current_dir()?,
+                };
+                let arts = tj_core::db::task_artifacts(&conn, &p.task_id)?;
+                report
+                    .gaps
+                    .extend(tj_core::completeness::artifact_gaps_in(&arts, &dir));
+                let gaps = report
+                    .gaps
+                    .iter()
+                    .map(|g| TaskCheckGap {
+                        kind: format!("{:?}", g.kind),
+                        severity: match g.kind.weight() {
+                            10 => "error",
+                            3 => "warn",
+                            _ => "info",
+                        }
+                        .to_string(),
+                        detail: g.detail.clone(),
+                    })
+                    .collect();
+                Ok(TaskCheckResult {
+                    task_id: p.task_id.clone(),
+                    score: report.score(),
+                    gaps,
                 })
             })
             .await
@@ -1309,6 +1385,54 @@ mod tests {
                 .any(|g| g.contains("closed without a recorded outcome")),
             "gaps: {:?}",
             res.completeness_gaps
+        );
+    }
+
+    #[tokio::test]
+    async fn task_check_returns_score_and_gaps() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Check me".into(),
+                initial_context: None,
+                goal: Some("ship it".into()),
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        // A decision with no evidence → DecisionNoEvidence (warn, −3) → 97.
+        server
+            .event_add(Parameters(EventAddParams {
+                task_id: task.clone(),
+                event_type: "decision".into(),
+                text: "Adopt X".into(),
+                corrects: None,
+                supersedes: None,
+                alternatives: None,
+            }))
+            .await
+            .unwrap();
+
+        let res = server
+            .task_check(Parameters(TaskCheckParams {
+                task_id: task.clone(),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(res.score, 97);
+        assert!(
+            res.gaps
+                .iter()
+                .any(|g| g.severity == "warn" && g.detail.contains("decisions unverified")),
+            "gaps: {:?}",
+            res.gaps
         );
     }
 

@@ -144,6 +144,87 @@ fn close_warns_on_completeness_gap() {
 }
 
 #[test]
+fn check_reports_honesty_score_and_gaps() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Check me", "--goal", "ship it"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // A decision with no evidence → DecisionNoEvidence (warn, −3) → 97/100.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["event", &task_id, "--type", "decision", "--text", "Adopt X"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["check", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("honesty score: 97/100"))
+        .stdout(contains("decisions unverified"));
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["check", &task_id, "--json"])
+        .assert()
+        .success()
+        .stdout(contains("\"score\": 97"))
+        .stdout(contains("\"severity\": \"warn\""));
+}
+
+#[test]
+fn gaps_fill_emits_targeted_prompt() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Fill me", "--goal", "ship it"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["event", &task_id, "--type", "decision", "--text", "Adopt X"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["gaps", &task_id, "--fill"])
+        .assert()
+        .success()
+        .stdout(contains("Close ONLY these"))
+        .stdout(contains("Add an evidence event"))
+        .stdout(contains("```markdown"));
+}
+
+#[test]
 fn doctor_exits_zero_on_fresh_install() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")

@@ -1053,6 +1053,21 @@ enum Commands {
     /// Why-this-approach, Verification, Affected). Reuses event log +
     /// artifacts; introduces no new tables.
     ExportPr { task_id: String },
+    /// Print a task's honesty score (0–100) and completeness gaps —
+    /// deterministic, zero-LLM (like `mex check`). `--json` for machines.
+    Check {
+        task_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a targeted gap-fill prompt for a task (deterministic, zero-LLM,
+    /// like `mex sync --dry-run`); the in-session agent runs it to close gaps.
+    Gaps {
+        task_id: String,
+        /// Emit the full fix prompt (default: just list gaps + score).
+        #[arg(long)]
+        fill: bool,
+    },
     /// Export task knowledge as Claude-memory frontmatter files (feeds native dream).
     ExportMemory {
         /// Export a single task by id.
@@ -3351,6 +3366,12 @@ runs in the background and won't block you; it only fills gaps and never closes 
         Commands::ExportPr { task_id } => {
             run_export_pr(&task_id)?;
         }
+        Commands::Check { task_id, json } => {
+            run_check(&task_id, json)?;
+        }
+        Commands::Gaps { task_id, fill } => {
+            run_gaps(&task_id, fill)?;
+        }
         Commands::ExportMemory {
             task,
             all_closed,
@@ -3763,6 +3784,109 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     }
 
     print!("{}", out);
+    Ok(())
+}
+
+/// Severity label for a gap weight (10/3/1 → error/warn/info).
+fn severity_for(weight: u32) -> &'static str {
+    match weight {
+        10 => "error",
+        3 => "warn",
+        _ => "info",
+    }
+}
+
+/// Open the project DB, ingest new events, and build the full completeness
+/// report — structural gaps plus artifact honesty drift — for `task_id`.
+/// Exits(1) when the task is unknown.
+fn assess_task(
+    task_id: &str,
+) -> Result<(
+    rusqlite::Connection,
+    tj_core::completeness::CompletenessReport,
+)> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+    }
+
+    // Typed not-found exit, mirroring run_export_pr.
+    if let Err(rusqlite::Error::QueryReturnedNoRows) = conn.query_row(
+        "SELECT 1 FROM tasks WHERE task_id = ?1",
+        rusqlite::params![task_id],
+        |r| r.get::<_, i64>(0),
+    ) {
+        eprintln!("Error: task not found: {task_id}");
+        std::process::exit(1);
+    }
+
+    let mut report =
+        tj_core::completeness::assess(&conn, task_id, tj_core::completeness::pending_count())?;
+    let arts = tj_core::db::task_artifacts(&conn, task_id)?;
+    report
+        .gaps
+        .extend(tj_core::completeness::artifact_gaps_for_cwd(&arts));
+    Ok((conn, report))
+}
+
+/// `task-journal check <id> [--json]` — print honesty score + gaps.
+fn run_check(task_id: &str, json: bool) -> Result<()> {
+    let (_conn, report) = assess_task(task_id)?;
+    if json {
+        let gaps: Vec<_> = report
+            .gaps
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "kind": format!("{:?}", g.kind),
+                    "severity": severity_for(g.kind.weight()),
+                    "detail": g.detail,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "task_id": task_id,
+            "score": report.score(),
+            "gaps": gaps,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "honesty score: {}/100 ({} gap(s))",
+            report.score(),
+            report.gaps.len()
+        );
+        for g in &report.gaps {
+            println!("- [{}] {}", severity_for(g.kind.weight()), g.detail);
+        }
+    }
+    Ok(())
+}
+
+/// `task-journal gaps <id> [--fill]` — list gaps, or with `--fill` print the
+/// deterministic gap-fill prompt (embedding the current pack) for the agent.
+fn run_gaps(task_id: &str, fill: bool) -> Result<()> {
+    let (conn, report) = assess_task(task_id)?;
+    if !fill {
+        println!(
+            "honesty score: {}/100 ({} gap(s))",
+            report.score(),
+            report.gaps.len()
+        );
+        for g in &report.gaps {
+            println!("- [{}] {}", severity_for(g.kind.weight()), g.detail);
+        }
+        return Ok(());
+    }
+    let pack = tj_core::pack::assemble(&conn, task_id, tj_core::pack::PackMode::Full)?;
+    match tj_core::completeness::build_gap_fill_prompt(task_id, &report, &pack.text) {
+        Some(prompt) => print!("{prompt}"),
+        None => println!("honesty score: 100/100 — no gaps to fill"),
+    }
     Ok(())
 }
 
