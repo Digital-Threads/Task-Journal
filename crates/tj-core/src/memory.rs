@@ -48,6 +48,7 @@ pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Connection> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
@@ -371,5 +372,19 @@ mod tests {
         let q = emb.embed_one("outbox").unwrap();
         assert_eq!(search(&global, &q, "other-model", 5).unwrap().len(), 0);
         assert_eq!(search(&global, &q, emb.model_id(), 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_sets_wal_and_busy_timeout() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = open(d.path().join("memory.sqlite")).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(timeout > 0, "busy_timeout must be > 0, got {timeout}");
     }
 }
