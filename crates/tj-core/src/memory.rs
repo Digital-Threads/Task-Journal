@@ -48,7 +48,11 @@ pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Connection> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+    // busy_timeout FIRST: the one-time WAL conversion takes a brief exclusive lock
+    // on the first open of a fresh/rollback-mode DB; with the timeout already in
+    // effect, two processes first-opening at once wait instead of hitting
+    // SQLITE_BUSY on the conversion itself.
+    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
