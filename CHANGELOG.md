@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.4] - 2026-06-29
+
+### Fixed
+- **`SQLITE_BUSY` on concurrent first open of the global memory DB.** The
+  cross-project memory database (`memory.sqlite`) is opened concurrently by
+  sessions from different projects. The one-time WAL conversion on the first
+  open of a fresh/rollback-mode DB takes a brief exclusive lock; with no
+  `busy_timeout` in effect, a second process opening at the same instant hit
+  `SQLITE_BUSY` on the conversion itself. `memory::open` now sets
+  `PRAGMA busy_timeout=5000` *before* `PRAGMA journal_mode=WAL`, so concurrent
+  first-opens wait instead of erroring.
+
 ## [0.28.3] - 2026-06-18
 
 ### Fixed
