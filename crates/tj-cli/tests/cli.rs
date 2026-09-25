@@ -966,9 +966,85 @@ fn install_hooks_auto_capture_wires_all_events() {
         "Stop",
         "PreCompact",
         "SessionEnd",
+        "PostModelSwitch",
     ] {
         assert!(content.contains(ev), "--auto-capture must wire {ev}");
     }
+}
+
+/// Which model did the work is a fact about the task that nothing else keeps
+/// once the session is gone. PostModelSwitch (Claude Code 2.1.251+) lands as a
+/// `constraint` on the active task.
+#[test]
+fn post_model_switch_records_a_constraint_on_the_active_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Ship the widget"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostModelSwitch",
+        "session_id": "s-switch",
+        "cwd": proj.path().to_string_lossy(),
+        "from_model": "claude-opus-5",
+        "to_model": "claude-haiku-4-5",
+        "source": "auto",
+    })
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("Model switched (auto): claude-opus-5 → claude-haiku-4-5"));
+}
+
+/// No open task → a model switch is not a reason to start one.
+#[test]
+fn post_model_switch_without_active_task_is_a_noop() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "PostModelSwitch",
+        "cwd": proj.path().to_string_lossy(),
+        "from_model": "claude-opus-5",
+        "to_model": "claude-haiku-4-5",
+        "source": "user",
+    })
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(proj.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["ingest-hook", "--backend", "hybrid"])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .stdout("");
 }
 
 /// Claude Code 2.1.268: SessionEnd hooks share a 1.5-second budget unless a

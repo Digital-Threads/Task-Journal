@@ -1944,7 +1944,7 @@ fn real_main() -> Result<()> {
                             { "type": "command", "command": cmd, "async": true },
                         ]}]),
                     );
-                    for ev in ["PostToolUse", "Stop", "PreCompact"] {
+                    for ev in ["PostToolUse", "Stop", "PreCompact", "PostModelSwitch"] {
                         obj.insert(
                             ev.to_string(),
                             serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command", "command": cmd, "async": true }] }]),
@@ -2455,6 +2455,59 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::event::Author::Classifier,
                     tj_core::event::Source::Hook,
                     evidence_text,
+                );
+                event.confidence = Some(0.9);
+                event.status = tj_core::event::EventStatus::Confirmed;
+                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
+                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+                writer.append(&event)?;
+                writer.flush_durable()?;
+                println!("{}", event.event_id);
+                return Ok(());
+            }
+
+            // PostModelSwitch (Claude Code 2.1.251+). Payload: { from_model,
+            // to_model, source: "user"|"auto"|"resume", requested_model }.
+            // Which model did the work is a fact about the task that neither
+            // the diff nor the transcript keeps once the session is gone —
+            // "why did this stretch come out shallow" is usually answered by
+            // "it ran on a fallback model". Recorded as a `constraint`: it's an
+            // external condition the work happened under, not a decision.
+            // No active task → drop silently, same rule as FileChanged.
+            if kind == "PostModelSwitch" {
+                if !events_path.exists() {
+                    return Ok(());
+                }
+                let state_path =
+                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                let recent = recent_task_contexts(&conn, 1)?;
+                let Some(tc) = recent.into_iter().next() else {
+                    return Ok(());
+                };
+                let to_model = payload
+                    .get("to_model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if to_model.is_empty() {
+                    return Ok(());
+                }
+                let from_model = payload
+                    .get("from_model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)");
+                let switch_source = payload
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user");
+                let text = format!("Model switched ({switch_source}): {from_model} → {to_model}");
+                let mut event = tj_core::event::Event::new(
+                    &tc.task_id,
+                    tj_core::event::EventType::Constraint,
+                    tj_core::event::Author::Classifier,
+                    tj_core::event::Source::Hook,
+                    text,
                 );
                 event.confidence = Some(0.9);
                 event.status = tj_core::event::EventStatus::Confirmed;
