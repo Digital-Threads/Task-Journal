@@ -995,6 +995,20 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Claude Code truncates MCP server instructions and tool descriptions at
+    /// 2,048 characters (`CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`, 2.1.280).
+    /// The ritual only works if the agent reads all of it, so the instructions
+    /// must stay under the cap — with room to breathe before the next edit.
+    #[test]
+    fn mcp_instructions_fit_the_client_cap() {
+        const CAP: usize = 2048;
+        let len = MCP_INSTRUCTIONS.chars().count();
+        assert!(
+            len <= CAP,
+            "MCP instructions are {len} chars, over the {CAP}-char cap — clients would truncate them"
+        );
+    }
+
     #[test]
     fn no_response_serializes_a_stub_field() {
         // Vestigial stub:bool from Phase 1 stubs has been removed from all

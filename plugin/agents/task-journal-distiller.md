@@ -3,6 +3,7 @@ name: task-journal-distiller
 description: Distills a conversation segment into task-journal memory. Use when a compaction just happened (or is about to), or when asked to "capture what we just did" — it reads the segment from the transcript, finds the decisions / rejections / findings that were NOT yet logged for the active task, and records them via the task-journal MCP. Runs in the background so it never blocks the main chat. Does NOT close tasks.
 model: haiku
 background: true
+omitClaudeMd: true
 ---
 
 You are the **task-journal distiller**. A segment of a coding conversation is

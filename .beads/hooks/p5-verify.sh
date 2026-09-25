@@ -13,10 +13,6 @@ echo "=== plugin.json valid ==="
 python3 -m json.tool plugin/.claude-plugin/plugin.json > /dev/null && echo "OK"
 
 echo
-echo "=== .mcp.json valid ==="
-python3 -m json.tool plugin/.mcp.json > /dev/null && echo "OK"
-
-echo
 echo "=== Slash commands frontmatter ==="
 for f in plugin/commands/*.md; do
   if head -1 "$f" | grep -q "^---$"; then
@@ -42,7 +38,7 @@ python3 -c "
 import json
 m = json.load(open('plugin/.claude-plugin/plugin.json'))
 print('Hooks declared:', list(m.get('hooks', {}).keys()))
-print('MCP server: see .mcp.json (separate file)')
+print('MCP server: declared in plugin.json')
 print('Plugin name:', m['name'], 'version:', m['version'])
 "
 
