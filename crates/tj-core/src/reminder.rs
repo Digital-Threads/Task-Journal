@@ -129,7 +129,9 @@ mod tests {
     #[test]
     fn reminder_none_when_no_open_task() {
         let (_d, conn) = seed(&[]);
-        assert!(active_task_reminder(&conn, "Active task").unwrap().is_none());
+        assert!(active_task_reminder(&conn, "Active task")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -144,6 +146,8 @@ mod tests {
         close.timestamp = "2026-06-05T00:00:00Z".into();
         let events = vec![open_event("tj-1", "Build the widget"), close];
         let (_d, conn) = seed(&events);
-        assert!(active_task_reminder(&conn, "Active task").unwrap().is_none());
+        assert!(active_task_reminder(&conn, "Active task")
+            .unwrap()
+            .is_none());
     }
 }

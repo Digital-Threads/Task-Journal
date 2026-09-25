@@ -1106,7 +1106,9 @@ fn post_model_switch_records_a_constraint_on_the_active_task() {
         .args(["pack", &task_id])
         .assert()
         .success()
-        .stdout(contains("Model switched (auto): claude-opus-5 → claude-haiku-4-5"));
+        .stdout(contains(
+            "Model switched (auto): claude-opus-5 → claude-haiku-4-5",
+        ));
 }
 
 /// No open task → a model switch is not a reason to start one.

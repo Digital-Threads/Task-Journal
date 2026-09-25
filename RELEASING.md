@@ -27,8 +27,16 @@ cargo fmt --all --check
 # `/plugin update` будет показывать старую версию (см. историю: 0.10.3 vs 0.12.0).
 # Обнови до той же версии:
 #   - plugin/.claude-plugin/plugin.json        → "version"
+#   - plugin/package.json                      → "version"
 #   - .claude-plugin/marketplace.json          → metadata.version И plugins[0].version
-git add Cargo.toml plugin/.claude-plugin/plugin.json .claude-plugin/marketplace.json
+#
+# Проверка (падает, если хоть один манифест отстал):
+cargo test -p task-journal-cli --test plugin_metadata
+
+# Плагин целиком — манифест, MCP-объявления, frontmatter скиллов и команд:
+claude plugin validate plugin --json
+
+git add Cargo.toml plugin/.claude-plugin/plugin.json plugin/package.json .claude-plugin/marketplace.json
 git commit -m "chore: bump version to v0.1.1"
 git push
 ```

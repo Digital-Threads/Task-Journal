@@ -65,7 +65,21 @@ The installer:
 - Wraps the hook command with `|| true` so a classifier failure (network down, rate limit, missing key) **never** breaks Claude Code.
 - Failures land in `<data-dir>/pending/<id>.json` and are replayed on next successful ingest.
 
-> **Note**: Claude Code passes hook variables `$CLAUDE_HOOK_NAME` and `$CLAUDE_HOOK_TEXT`. Verify these are correct for your version — if Claude Code renamed them, edit the `command` field in `settings.json` accordingly.
+- Gives each hook the timing it needs: the capture hooks run `async` so the chat never waits on them, and `SessionEnd` carries an explicit `timeout` — without one Claude Code cancels it after 1.5 seconds and the tail of the session is lost.
+
+> **Note**: the hook payload arrives as JSON on stdin (`hook_event_name`, `source`, `cwd`, `transcript_path`, …). There are no `$CLAUDE_HOOK_*` environment variables — an older template used them and always fed the classifier empty text.
+
+## Codex
+
+Codex speaks the same hook protocol, so the same journal works there:
+
+```bash
+codex mcp add task-journal -- task-journal-mcp
+task-journal install-hooks --scope user --client codex
+# → /home/<you>/.codex/hooks.json
+```
+
+`--client codex` writes to Codex's own hooks file and trims the wiring to what Codex supports: its `SessionEnd` budget caps at 3 seconds, and it has no `PostModelSwitch` event. Everything else — the resume pack on `SessionStart`, the nudge, the background capture — behaves the same.
 
 ## Verify install
 
@@ -82,6 +96,7 @@ You should see Markdown output with the title and the `[decision]` event.
 
 ```bash
 task-journal install-hooks --scope user --uninstall
+# add --client codex to remove them from ~/.codex/hooks.json
 ```
 
 This removes only the `hooks` block from `settings.json` (keeps theme, other servers, everything else).

@@ -73,6 +73,25 @@ That's it. Restart Claude Code, start working, and the journal fills itself.
 
 **Alternative installs:** [pre-built binaries](https://github.com/Digital-Threads/Task-Journal/releases), `cargo install` only (manual MCP wiring), or build from source — see [Manual Setup](#manual-setup).
 
+**Codex.** The same journal works in Codex — it speaks the same hook protocol:
+
+```bash
+codex mcp add task-journal -- task-journal-mcp
+task-journal install-hooks --scope user --client codex
+```
+
+## Why not just use the agent's own memory?
+
+Claude Code has auto-memory (`MEMORY.md`, `/memory`) and Codex has its own memory
+store. They remember **facts**: "the deploy script lives in `ops/`", "the user
+prefers short answers". Useful, and Task Journal doesn't replace them.
+
+What neither keeps is the **reasoning chain**: which approaches you ruled out and
+why, what a failing test proved, which constraint was in force when the decision was
+made. That's what you actually need two weeks later, and it is what this journal
+records — typed, append-only, per task, with the artifacts (commits, files, issues)
+that tie it back to the code.
+
 ## How it works
 
 - **Self-tagging is the primary path (recommended).** You — the agent in the live session — record reasoning directly via the five MCP tools: open a task with a `goal`, append a typed `decision` / `finding` / `rejection` / `evidence` event at the moment of commitment, and `task_close` with a written `outcome`. This is free (it rides the interactive session), language-agnostic, and higher-fidelity than any after-the-fact classifier. The bundled `task-journal` skill drives this automatically. See [MCP tools](#mcp-tools).
@@ -196,6 +215,10 @@ or `ingest-hook`:
   not the interactive pool. Classification is Haiku-class and tiny (a few hundred
   tokens per chunk), so the credit lasts a long time — but it is not strictly free.
 - **`api`** — call the Anthropic API directly. Requires `ANTHROPIC_API_KEY`.
+- **`codex`** — classify via the local, already-logged-in `codex` binary
+  (`codex exec`), on your Codex subscription and with no API key. Pick the model
+  with `TJ_CODEX_MODEL`, bound the call with `TJ_CODEX_TIMEOUT_SECS` (default 90s).
+  Up to 0.28.x this name meant "the OpenAI API"; that backend is now `openai`.
 
 `--backend=hybrid` (the default) runs the heuristic first, then falls through the LLM
 chain `agent-sdk → api`, using whichever backends are available. Reorder the chain

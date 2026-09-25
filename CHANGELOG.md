@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-09-25
+
+Three months of Claude Code releases (2.1.196 → 2.1.281) changed how hooks are
+timed and what they receive; Codex grew a hook system of its own. This release
+catches up with both.
+
+### Added
+- **Codex support.** `install-hooks --client codex` wires the journal into
+  `~/.codex/hooks.json` (or `.codex/hooks.json` for `--scope project`). Codex
+  sends the same stdin payload and reads back the same
+  `hookSpecificOutput.additionalContext`, so the resume pack, the nudge and the
+  background capture all work unchanged. The wiring is trimmed to what Codex
+  supports: `SessionEnd` gets the 3-second timeout that is its documented
+  maximum, and `PostModelSwitch` is left out (Codex has no such event). With
+  `codex mcp add task-journal -- task-journal-mcp` the MCP tools are available
+  there too.
+- **`codex` LLM backend.** `--backend codex` / `TJ_BACKEND=codex` now runs the
+  local `codex exec` on your Codex subscription — no API key, like `claude-p`.
+  `TJ_CODEX_MODEL` picks the model, `TJ_CODEX_TIMEOUT_SECS` bounds the call.
+- **Model switches are recorded.** With `--auto-capture`, a `PostModelSwitch`
+  hook (Claude Code 2.1.251+) lands a `constraint` on the active task: "Model
+  switched (auto): claude-opus-5 → claude-haiku-4-5". Which model did the work
+  is a fact about the task that neither the diff nor the transcript keeps.
+- **Stale resumes re-inject the active task.** Claude Code 2.1.251+ reports
+  `seconds_since_last_response` on `resume` and `fork`. A conversation picked up
+  after eight hours or more now gets the active-task reminder it used to get
+  only after a compaction, labelled with the gap ("Active task, idle for 14h").
+  A fresh resume still gets nothing — its context is intact.
+
+### Fixed
+- **The SessionEnd catch-up no longer gets cancelled.** Claude Code 2.1.268
+  gives `SessionEnd` hooks a shared 1.5-second budget unless a per-hook
+  `timeout` raises it. `install-hooks` wrote no timeout, so the last-chance
+  ingest — the one that closes the gap at the end of a session — was killed
+  mid-run. It now declares 30 seconds (3 on Codex, its documented cap).
+- **The capture hooks no longer make the chat wait.** `PostToolUse`, `Stop`,
+  `PreCompact` and `PostModelSwitch` are installed with `"async": true`, so the
+  classifier runs in the background with no timeout against it.
+- **One MCP declaration, not two.** `plugin/.mcp.json` duplicated the
+  `mcpServers` entry in `plugin.json`, which could connect the same stdio server
+  twice. Removed, with a test that keeps it removed.
+- **The manifests agree on the version.** `marketplace.json` (0.14.2),
+  `plugin.json` (0.28.4) and `plugin/package.json` (0.10.3) had drifted apart —
+  the marketplace advertised a three-month-old release. All three now track the
+  crate version, enforced by a test.
+- **INSTALL.md no longer points at `$CLAUDE_HOOK_NAME` / `$CLAUDE_HOOK_TEXT`.**
+  Claude Code never set those variables; the hook reads its payload from stdin.
+
+### Changed
+- **`codex` is no longer an alias for the OpenAI API backend.** It used to mean
+  "OpenAI-compatible API with `OPENAI_API_KEY`"; that is now `openai` (and
+  `codex` means the Codex CLI). Set `TJ_BACKEND=openai` if you relied on the old
+  name.
+- The distiller subagent runs with `omitClaudeMd: true` (Claude Code 2.1.271),
+  so a background gap-fill no longer loads every CLAUDE.md into its context.
+- A guard test keeps the MCP server instructions under the 2,048-character cap
+  clients truncate at (`CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`, 2.1.280).
+
 ## [0.28.4] - 2026-06-29
 
 ### Fixed
