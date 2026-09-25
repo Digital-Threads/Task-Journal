@@ -7,7 +7,7 @@ pub const MAX_CONSTRAINTS: usize = 3;
 
 /// Most-recent OPEN task → "title + goal + up to MAX_CONSTRAINTS newest
 /// constraint texts". `None` when there is no open task. Read-only.
-pub fn active_task_reminder(conn: &Connection) -> anyhow::Result<Option<String>> {
+pub fn active_task_reminder(conn: &Connection, label: &str) -> anyhow::Result<Option<String>> {
     let row: Option<(String, String)> = conn
         .query_row(
             "SELECT task_id, title FROM tasks \
@@ -40,7 +40,7 @@ pub fn active_task_reminder(conn: &Connection) -> anyhow::Result<Option<String>>
         .filter(|t| !t.trim().is_empty())
         .collect();
 
-    let mut out = format!("[Active task after compaction] {task_id} — {title}");
+    let mut out = format!("[{label}] {task_id} — {title}");
     if let Some(g) = goal {
         out.push_str(&format!("\nGoal: {g}"));
     }
@@ -114,7 +114,9 @@ mod tests {
         let (_d, conn) = seed(&events);
         db::set_task_goal(&conn, "tj-1", "Ship the dashboard widget").unwrap();
 
-        let r = active_task_reminder(&conn).unwrap().unwrap();
+        let r = active_task_reminder(&conn, "Active task after compaction")
+            .unwrap()
+            .unwrap();
         assert!(r.starts_with("[Active task after compaction]"), "got: {r}");
         assert!(r.contains("Build the widget"), "got: {r}");
         assert!(r.contains("Goal: Ship the dashboard widget"), "got: {r}");
@@ -127,7 +129,7 @@ mod tests {
     #[test]
     fn reminder_none_when_no_open_task() {
         let (_d, conn) = seed(&[]);
-        assert!(active_task_reminder(&conn).unwrap().is_none());
+        assert!(active_task_reminder(&conn, "Active task").unwrap().is_none());
     }
 
     #[test]
@@ -142,6 +144,6 @@ mod tests {
         close.timestamp = "2026-06-05T00:00:00Z".into();
         let events = vec![open_event("tj-1", "Build the widget"), close];
         let (_d, conn) = seed(&events);
-        assert!(active_task_reminder(&conn).unwrap().is_none());
+        assert!(active_task_reminder(&conn, "Active task").unwrap().is_none());
     }
 }

@@ -4627,6 +4627,13 @@ fn push_recall_mcp_does_not_drop_capture() {
 // Seed a task with a goal + one constraint, run SessionStart with the
 // given `source`, and return the parsed `additionalContext` string.
 fn session_start_additional_context(source: &str) -> String {
+    session_start_additional_context_with(serde_json::json!({ "source": source }))
+}
+
+/// Same as [`session_start_additional_context`], but lets a test add the
+/// SessionStart fields Claude Code 2.1.251+ sends on `resume` / `fork`
+/// (`seconds_since_last_response` and friends).
+fn session_start_additional_context_with(extra: serde_json::Value) -> String {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
         Command::cargo_bin("task-journal")
@@ -4662,11 +4669,11 @@ fn session_start_additional_context(source: &str) -> String {
         .assert()
         .success();
 
-    let stdin_payload = serde_json::json!({
-        "hook_event_name": "SessionStart",
-        "source": source,
-    })
-    .to_string();
+    let mut payload = serde_json::json!({ "hook_event_name": "SessionStart" });
+    for (k, v) in extra.as_object().expect("extra payload is an object") {
+        payload[k] = v.clone();
+    }
+    let stdin_payload = payload.to_string();
 
     let out = Command::cargo_bin("task-journal")
         .unwrap()
@@ -4710,6 +4717,46 @@ fn session_start_compact_prepends_active_task_reminder() {
     assert!(
         ctx.contains("task-journal-distiller"),
         "compact SessionStart must advise delegating to the distiller subagent: {ctx}"
+    );
+}
+
+/// A conversation picked up the next day keeps its transcript, but what it was
+/// doing is no longer fresh — re-inject the active task. Claude Code 2.1.251+
+/// reports the gap in `seconds_since_last_response` on `resume` and `fork`.
+#[test]
+fn session_start_reinjects_active_task_after_a_long_idle_gap() {
+    for source in ["resume", "fork"] {
+        let ctx = session_start_additional_context_with(serde_json::json!({
+            "source": source,
+            "seconds_since_last_response": 32_400, // 9h
+            "prompt_cache_likely_expired": true,
+        }));
+        assert!(
+            ctx.starts_with("[Active task, idle for 9h]"),
+            "{source} after a long gap must lead with the reminder: {ctx}"
+        );
+        assert!(
+            ctx.contains("Must ship before Friday"),
+            "reminder must carry the in-force constraint: {ctx}"
+        );
+        assert!(
+            !ctx.contains("task-journal-distiller"),
+            "no compaction happened, so no distiller advice: {ctx}"
+        );
+    }
+}
+
+/// A session resumed minutes later still has everything in context — the
+/// reminder would just be noise.
+#[test]
+fn session_start_resume_after_short_gap_has_no_reminder() {
+    let ctx = session_start_additional_context_with(serde_json::json!({
+        "source": "resume",
+        "seconds_since_last_response": 120,
+    }));
+    assert!(
+        !ctx.contains("[Active task"),
+        "a fresh resume must NOT inject the reminder: {ctx}"
     );
 }
 

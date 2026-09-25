@@ -2293,11 +2293,33 @@ fn real_main() -> Result<()> {
                     bundle.push_str(&prefs_block);
                     bundle.push_str("\n\n");
                 }
-                if source == "compact" {
-                    if let Ok(Some(reminder)) = tj_core::reminder::active_task_reminder(&conn) {
+                // A resumed or forked session keeps its transcript, so the
+                // reminder would be noise — except when the conversation sat
+                // idle long enough that what it was doing is no longer fresh
+                // for the user either. Claude Code 2.1.251+ reports the gap in
+                // `seconds_since_last_response` on `resume` and `fork`.
+                let idle_secs = payload
+                    .get("seconds_since_last_response")
+                    .and_then(|v| v.as_u64());
+                let stale_resume = matches!(source, "resume" | "fork")
+                    && idle_secs.is_some_and(|s| s >= STALE_RESUME_SECS);
+                if source == "compact" || stale_resume {
+                    let label = if source == "compact" {
+                        "Active task after compaction".to_string()
+                    } else {
+                        format!(
+                            "Active task, idle for {}",
+                            human_gap(idle_secs.unwrap_or_default())
+                        )
+                    };
+                    if let Ok(Some(reminder)) =
+                        tj_core::reminder::active_task_reminder(&conn, &label)
+                    {
                         bundle.push_str(&reminder);
                         bundle.push_str("\n\n");
                     }
+                }
+                if source == "compact" {
                     // Advisory (the hook can't force it): suggest the main agent
                     // delegate the just-compacted segment to the in-session
                     // distiller subagent, which backfills missed reasoning from
@@ -4354,6 +4376,21 @@ fn session_preferences_block() -> String {
         s.push_str(&line);
     }
     s.trim_end().to_string()
+}
+
+/// How long a resumed or forked conversation must have sat idle before the
+/// active-task reminder earns its place in `additionalContext`. Eight hours —
+/// roughly "picked it up the next day".
+const STALE_RESUME_SECS: u64 = 8 * 60 * 60;
+
+/// Coarse, human-readable gap ("14h", "3d") for the reminder label.
+fn human_gap(secs: u64) -> String {
+    let hours = secs / 3600;
+    if hours >= 48 {
+        format!("{}d", hours / 24)
+    } else {
+        format!("{hours}h")
+    }
 }
 
 /// Emit a SessionStart `additionalContext` envelope and nothing else.
