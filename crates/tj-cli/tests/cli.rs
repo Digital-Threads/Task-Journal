@@ -972,6 +972,92 @@ fn install_hooks_auto_capture_wires_all_events() {
     }
 }
 
+/// Codex speaks the same hook protocol as Claude Code but keeps its hooks in
+/// `~/.codex/hooks.json`, caps SessionEnd at 3 seconds, and has no
+/// PostModelSwitch event.
+#[test]
+fn install_hooks_wires_codex_into_its_own_hooks_file() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--client",
+            "codex",
+            "--auto-capture",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        !dir.path().join(".claude").exists(),
+        "--client codex must not touch the Claude Code settings directory"
+    );
+    let hooks: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".codex").join("hooks.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("task-journal ingest-hook"),
+        "codex SessionStart must run the ingest hook: {hooks}"
+    );
+    assert_eq!(
+        hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"],
+        serde_json::json!(3),
+        "codex caps the SessionEnd timeout at 3 seconds"
+    );
+    assert!(
+        hooks["hooks"]["PostModelSwitch"].is_null(),
+        "codex has no PostModelSwitch event: {hooks}"
+    );
+}
+
+#[test]
+fn install_hooks_uninstall_works_for_codex() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let args = ["install-hooks", "--scope", "user", "--client", "codex"];
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(args)
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(args)
+        .arg("--uninstall")
+        .assert()
+        .success();
+
+    let hooks: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".codex").join("hooks.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        hooks.get("hooks").is_none(),
+        "uninstall must leave no task-journal hooks behind: {hooks}"
+    );
+}
+
+#[test]
+fn install_hooks_rejects_an_unknown_client() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--client", "cursor"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown --client"));
+}
+
 /// Which model did the work is a fact about the task that nothing else keeps
 /// once the session is gone. PostModelSwitch (Claude Code 2.1.251+) lands as a
 /// `constraint` on the active task.

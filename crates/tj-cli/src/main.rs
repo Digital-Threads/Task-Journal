@@ -815,11 +815,17 @@ enum Commands {
         #[arg(long)]
         text: String,
     },
-    /// Install Claude Code hooks that ingest events into the task journal.
+    /// Install agent hooks that ingest events into the task journal.
     InstallHooks {
-        /// Scope: user (~/.claude/settings.json) or project (./.claude/settings.json).
+        /// Scope: user (home directory) or project (current directory).
         #[arg(long, default_value = "user")]
         scope: String,
+        /// Which agent to wire: "claude" (~/.claude/settings.json) or
+        /// "codex" (~/.codex/hooks.json). Both speak the same hook protocol —
+        /// one JSON payload on stdin, `hookSpecificOutput.additionalContext`
+        /// back on stdout — so the same ingest command serves both.
+        #[arg(long, default_value = "claude")]
+        client: String,
         /// Remove our hook entries instead of installing.
         #[arg(long)]
         uninstall: bool,
@@ -1788,23 +1794,31 @@ fn real_main() -> Result<()> {
         }
         Commands::InstallHooks {
             scope,
+            client,
             uninstall,
             backfill,
             backend,
             auto_capture,
             proactive_recall,
         } => {
+            // Codex keeps hooks in their own file rather than in a settings
+            // file, and gives SessionEnd a 1-second budget capped at 3 (Claude
+            // Code allows up to 60). Everything else about the wiring is the
+            // same, so the two clients differ only in these two values.
+            let (config_dir, config_file, session_end_timeout) = match client.as_str() {
+                "claude" => (".claude", "settings.json", 30),
+                "codex" => (".codex", "hooks.json", 3),
+                other => anyhow::bail!("unknown --client: {other} (expected `claude` or `codex`)"),
+            };
             let settings_path = match scope.as_str() {
                 "user" => {
                     let home =
                         std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
                     std::path::PathBuf::from(home)
-                        .join(".claude")
-                        .join("settings.json")
+                        .join(config_dir)
+                        .join(config_file)
                 }
-                "project" => std::env::current_dir()?
-                    .join(".claude")
-                    .join("settings.json"),
+                "project" => std::env::current_dir()?.join(config_dir).join(config_file),
                 other => anyhow::bail!("unknown scope: {other}"),
             };
             if let Some(p) = settings_path.parent() {
@@ -1929,7 +1943,6 @@ fn real_main() -> Result<()> {
                 //   shares a 1.5-second budget unless a per-hook `timeout`
                 //   raises it, up to 60s (Claude Code 2.1.268). Without this
                 //   the last-chance catch-up was cancelled mid-write.
-                let session_end_timeout = 30;
                 let mut entries = serde_json::json!({
                     "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd, "timeout": 20 }] }],
                     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": nudge_cmd, "timeout": 10 }] }],
@@ -1944,7 +1957,14 @@ fn real_main() -> Result<()> {
                             { "type": "command", "command": cmd, "async": true },
                         ]}]),
                     );
-                    for ev in ["PostToolUse", "Stop", "PreCompact", "PostModelSwitch"] {
+                    // PostModelSwitch is Claude Code only — Codex has no such
+                    // event, and an unknown key there is dead config.
+                    let async_events: &[&str] = if client == "codex" {
+                        &["PostToolUse", "Stop", "PreCompact"]
+                    } else {
+                        &["PostToolUse", "Stop", "PreCompact", "PostModelSwitch"]
+                    };
+                    for ev in async_events {
                         obj.insert(
                             ev.to_string(),
                             serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command", "command": cmd, "async": true }] }]),
