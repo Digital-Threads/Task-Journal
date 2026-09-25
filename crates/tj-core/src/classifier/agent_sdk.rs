@@ -130,7 +130,7 @@ fn claude_timeout() -> std::time::Duration {
 /// Wait for `child` up to `timeout`, draining stdout/stderr concurrently so a
 /// full pipe can't deadlock the wait. On timeout the child is killed and an
 /// error returned; otherwise the captured output is handed back.
-fn wait_with_timeout(
+pub(crate) fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: std::time::Duration,
 ) -> anyhow::Result<std::process::Output> {

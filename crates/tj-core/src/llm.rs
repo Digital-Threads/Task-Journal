@@ -7,9 +7,11 @@
 //! global) or a per-command `--backend`:
 //!
 //! - `claude-p` (default) — local `claude -p`, Haiku, subscription auth.
+//! - `codex` — local `codex exec`, subscription auth, no API key
+//!   (`TJ_CODEX_MODEL`, `TJ_CODEX_TIMEOUT_SECS`).
 //! - `anthropic` — direct Anthropic API (`ANTHROPIC_API_KEY`).
 //! - `openai` — any OpenAI-compatible chat API (`OPENAI_API_KEY`,
-//!   `TJ_OPENAI_BASE_URL`, `TJ_OPENAI_MODEL`). Covers OpenAI, Codex, and other
+//!   `TJ_OPENAI_BASE_URL`, `TJ_OPENAI_MODEL`). Covers OpenAI and other
 //!   compatible providers by pointing the base URL.
 //! - `ollama` — a local Ollama model (its OpenAI-compatible endpoint), **free**:
 //!   no key, no network beyond localhost. `TJ_OLLAMA_URL`, `TJ_OLLAMA_MODEL`.
@@ -87,13 +89,23 @@ pub fn backend_from_env(explicit: Option<&str>) -> anyhow::Result<Option<Box<dyn
             Ok(key) if !key.is_empty() => Ok(Some(Box::new(AnthropicBackend::new(key)))),
             _ => Ok(None),
         },
-        "openai" | "codex" => match std::env::var("OPENAI_API_KEY") {
+        // Up to 0.28.x "codex" was an alias for the OpenAI API backend, which
+        // needed an API key and never touched the Codex CLI. It now means what
+        // it says: the local `codex exec`, on the user's subscription.
+        "codex" | "codex-cli" => {
+            if codex_on_path() {
+                Ok(Some(Box::new(CodexCliBackend::from_env())))
+            } else {
+                Ok(None)
+            }
+        }
+        "openai" => match std::env::var("OPENAI_API_KEY") {
             Ok(key) if !key.is_empty() => Ok(Some(Box::new(OpenAiBackend::openai(key)))),
             _ => Ok(None),
         },
         "ollama" => Ok(Some(Box::new(OpenAiBackend::ollama()))),
         other => Err(anyhow!(
-            "unknown backend '{other}' (expected: claude-p, anthropic, openai, ollama)"
+            "unknown backend '{other}' (expected: claude-p, codex, anthropic, openai, ollama)"
         )),
     }
 }
@@ -127,6 +139,124 @@ impl LlmBackend for ClaudeCliBackend {
             &self.model,
             prompt,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codex exec — local Codex CLI, subscription auth, no API key.
+// ---------------------------------------------------------------------------
+
+/// Probe whether `codex` resolves on PATH and runs. Same contract as
+/// [`crate::classifier::agent_sdk::claude_on_path`]: any failure means "not
+/// available", never an error.
+pub fn codex_on_path() -> bool {
+    std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub struct CodexCliBackend {
+    /// `None` leaves the model to Codex's own configuration.
+    model: Option<String>,
+}
+
+impl CodexCliBackend {
+    pub fn from_env() -> Self {
+        Self {
+            model: std::env::var("TJ_CODEX_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        }
+    }
+}
+
+/// Per-call ceiling for `codex exec`, mirroring `TJ_CLAUDE_TIMEOUT_SECS`.
+fn codex_timeout() -> std::time::Duration {
+    let secs = std::env::var("TJ_CODEX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(90);
+    std::time::Duration::from_secs(secs)
+}
+
+impl LlmBackend for CodexCliBackend {
+    fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
+        self.complete_usage(prompt, max_tokens).map(|(t, _)| t)
+    }
+
+    fn name(&self) -> &'static str {
+        "codex-exec"
+    }
+
+    fn complete_usage(&self, prompt: &str, _max_tokens: u32) -> anyhow::Result<(String, LlmUsage)> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // `codex exec` streams its progress to stdout, so the answer is taken
+        // from `--output-last-message` instead of the pipe. A plain temp path
+        // (no tempfile dependency in this crate) is enough: we write it once
+        // and delete it right after reading.
+        let out_path = std::env::temp_dir().join(format!(
+            "task-journal-codex-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+
+        let mut cmd = Command::new("codex");
+        cmd.arg("exec")
+            // Classification is a pure question: no session files, no git
+            // requirement, no writes, no colour codes in the answer.
+            .arg("--ephemeral")
+            .arg("--skip-git-repo-check")
+            .args(["--sandbox", "read-only"])
+            .args(["--color", "never"])
+            .arg("-o")
+            .arg(&out_path);
+        if let Some(model) = &self.model {
+            cmd.args(["-m", model]);
+        }
+        // `-` makes Codex read the prompt from stdin, which keeps a
+        // transcript-sized prompt away from the argv size limit.
+        cmd.arg("-");
+
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn `codex` (is the Codex CLI installed and on PATH?)")?;
+        child
+            .stdin
+            .take()
+            .context("codex stdin was not captured")?
+            .write_all(prompt.as_bytes())
+            .context("failed to write prompt to codex stdin")?;
+
+        let output = crate::classifier::agent_sdk::wait_with_timeout(child, codex_timeout())?;
+        let answer = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "`codex exec` failed ({}): {}",
+                output.status,
+                stderr.trim().chars().take(400).collect::<String>()
+            );
+        }
+        let answer = answer.trim().to_string();
+        if answer.is_empty() {
+            anyhow::bail!("`codex exec` produced no final message");
+        }
+        // Codex reports no token accounting on this path; a subscription run
+        // costs nothing per call anyway, so an empty usage is honest.
+        Ok((answer, LlmUsage::default()))
     }
 }
 
@@ -363,6 +493,22 @@ mod tests {
 
     // Serialise env-touching tests (process-global env).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `codex` used to resolve to the OpenAI API backend, so an OPENAI_API_KEY
+    /// in the environment must no longer pull the wrong backend in. Whether the
+    /// Codex CLI is installed decides between `Some(codex-exec)` and `None`.
+    #[test]
+    fn codex_backend_is_the_codex_cli_not_the_openai_api() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _key = EnvGuard::set("OPENAI_API_KEY", "sk-should-not-be-used");
+        match backend_from_env(Some("codex")).unwrap() {
+            Some(b) => assert_eq!(b.name(), "codex-exec"),
+            None => assert!(
+                !codex_on_path(),
+                "codex is on PATH, so the backend must resolve"
+            ),
+        }
+    }
 
     #[test]
     fn unknown_backend_errors() {
