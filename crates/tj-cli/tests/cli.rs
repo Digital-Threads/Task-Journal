@@ -971,6 +971,63 @@ fn install_hooks_auto_capture_wires_all_events() {
     }
 }
 
+/// Claude Code 2.1.268: SessionEnd hooks share a 1.5-second budget unless a
+/// per-hook `timeout` raises it (up to 60s). Without one, the last-chance
+/// catch-up ingest is cancelled and the tail of the session is lost.
+#[test]
+fn install_hooks_gives_session_end_a_timeout() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--auto-capture"])
+        .assert()
+        .success();
+
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    let timeout = settings["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"]
+        .as_u64()
+        .expect("SessionEnd hook must declare a timeout");
+    assert!(
+        (10..=60).contains(&timeout),
+        "SessionEnd timeout must raise the 1.5s budget without exceeding the 60s cap: {timeout}"
+    );
+}
+
+/// The heavy capture hooks spawn a classifier. `async: true` (Claude Code
+/// 2.1.x) runs them in the background, so the chat never waits on them and no
+/// timeout applies. SessionStart stays synchronous — its stdout is the resume
+/// pack Claude must see on the first turn.
+#[test]
+fn install_hooks_runs_heavy_capture_hooks_async() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["install-hooks", "--scope", "user", "--auto-capture"])
+        .assert()
+        .success();
+
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    for ev in ["PostToolUse", "Stop", "PreCompact"] {
+        assert_eq!(
+            settings["hooks"][ev][0]["hooks"][0]["async"],
+            serde_json::json!(true),
+            "{ev} ingest must run in the background"
+        );
+    }
+    assert!(
+        settings["hooks"]["SessionStart"][0]["hooks"][0]["async"].is_null(),
+        "SessionStart must stay synchronous so its resume pack reaches the first turn"
+    );
+}
+
 #[test]
 fn session_end_hook_is_clean_noop_without_journal() {
     // SessionEnd(clear) with no journal yet must exit cleanly (it's the

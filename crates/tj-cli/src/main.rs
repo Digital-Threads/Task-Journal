@@ -1919,9 +1919,20 @@ fn real_main() -> Result<()> {
                 // `--auto-capture`, which appends `ingest-hook` to the message
                 // events. Primary capture is the agent self-tagging via the MCP
                 // tools.
+                // Timing fields matter as much as the commands:
+                // - SessionStart and the nudge stay synchronous — their stdout
+                //   is context Claude must see on the first turn — so they only
+                //   carry a `timeout` well under the event budget.
+                // - The classifier hooks run `async` (Claude Code 2.1.x): the
+                //   chat never waits on them and no timeout is enforced.
+                // - SessionEnd can't be async (the session is going away) and
+                //   shares a 1.5-second budget unless a per-hook `timeout`
+                //   raises it, up to 60s (Claude Code 2.1.268). Without this
+                //   the last-chance catch-up was cancelled mid-write.
+                let session_end_timeout = 30;
                 let mut entries = serde_json::json!({
-                    "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }],
-                    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": nudge_cmd }] }],
+                    "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": cmd, "timeout": 20 }] }],
+                    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": nudge_cmd, "timeout": 10 }] }],
                 });
                 if auto_capture {
                     let obj = entries.as_object_mut().expect("entries is an object");
@@ -1929,16 +1940,22 @@ fn real_main() -> Result<()> {
                     obj.insert(
                         "UserPromptSubmit".into(),
                         serde_json::json!([{ "matcher": "", "hooks": [
-                            { "type": "command", "command": nudge_cmd },
-                            { "type": "command", "command": cmd },
+                            { "type": "command", "command": nudge_cmd, "timeout": 10 },
+                            { "type": "command", "command": cmd, "async": true },
                         ]}]),
                     );
-                    for ev in ["PostToolUse", "Stop", "PreCompact", "SessionEnd"] {
+                    for ev in ["PostToolUse", "Stop", "PreCompact"] {
                         obj.insert(
                             ev.to_string(),
-                            serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command", "command": cmd }] }]),
+                            serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command", "command": cmd, "async": true }] }]),
                         );
                     }
+                    obj.insert(
+                        "SessionEnd".into(),
+                        serde_json::json!([{ "matcher": "", "hooks": [
+                            { "type": "command", "command": cmd, "timeout": session_end_timeout },
+                        ]}]),
+                    );
                 }
                 if proactive_recall {
                     // Append the recall injector to the UserPromptSubmit hooks,
@@ -1957,6 +1974,7 @@ fn real_main() -> Result<()> {
                         hooks.push(serde_json::json!({
                             "type": "command",
                             "command": "task-journal recall-hook || true",
+                            "timeout": 10,
                         }));
                     }
                 }
