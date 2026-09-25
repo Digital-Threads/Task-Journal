@@ -15,7 +15,7 @@ pub const SCHEMA_VERSION: &str = "1.0";
 pub fn new_task_id() -> String {
     format!(
         "tj-{}",
-        &ulid::Ulid::new().to_string()[10..20].to_lowercase()
+        ulid::Ulid::new().to_string()[10..20].to_lowercase()
     )
 }
 
