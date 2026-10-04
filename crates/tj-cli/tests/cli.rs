@@ -1,6 +1,50 @@
-use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
+
+/// Every `Command::cargo_bin` in this file goes through this wrapper, not
+/// `assert_cmd`'s, so a test can't reach a real model or the developer's live
+/// session by accident: PATH loses every directory holding a `claude` or
+/// `codex` binary, API keys and backend overrides are cleared, and the Claude
+/// Code session / mod markers of the shell running `cargo test` are dropped.
+/// A test that needs a model installs its own fake and sets PATH itself.
+struct Command;
+
+impl Command {
+    fn cargo_bin(name: &str) -> Result<assert_cmd::Command, assert_cmd::cargo::CargoError> {
+        let mut cmd = assert_cmd::Command::cargo_bin(name)?;
+        cmd.env("PATH", path_without_llm_clis());
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "TJ_BACKEND",
+            "TJ_HYBRID_LLM_ORDER",
+            "TASK_JOURNAL_DATA_DIR",
+            "CLAUDE_CODE_SESSION_ID",
+            "TJ_IN_CLASSIFIER",
+            "TJ_MOD_ACTIVE",
+        ] {
+            cmd.env_remove(var);
+        }
+        Ok(cmd)
+    }
+}
+
+/// The test process's PATH minus any directory that holds `claude` or `codex`.
+/// Computed once: on WSL the PATH carries dozens of slow `/mnt/c` directories.
+fn path_without_llm_clis() -> &'static std::ffi::OsStr {
+    static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let keep = std::env::split_paths(&path).filter(|dir| {
+            ["claude", "codex"].iter().all(|bin| {
+                ["", ".exe", ".cmd"]
+                    .iter()
+                    .all(|ext| !dir.join(format!("{bin}{ext}")).exists())
+            })
+        });
+        std::env::join_paths(keep).unwrap()
+    })
+}
 
 #[test]
 fn pack_command_prints_markdown_for_existing_task() {
@@ -288,6 +332,23 @@ fn doctor_reports_missing_codex_and_claude_as_information_only() {
 
     let human = doctor_with_path(xdg.path(), empty_bin.path(), false);
     assert!(human.contains("codex binary"), "{human}");
+}
+
+/// The suite must never reach a real model: a test command sees no `claude`
+/// or `codex` unless the test installs its own fake on PATH.
+#[test]
+fn test_commands_see_no_real_claude_or_codex() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["claude_in_path"], false, "{v}");
+    assert_eq!(v["codex_in_path"], false, "{v}");
 }
 
 #[cfg(unix)]
