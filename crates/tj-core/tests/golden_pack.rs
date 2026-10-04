@@ -25,6 +25,19 @@ fn fixture_a_compact_pack_for_simple_task() {
     insta_assert_contains(&pack.text, "Adopt PKCE flow");
     insta_assert_contains(&pack.text, "Recent events");
     assert_eq!(pack.metadata.source_event_count, 5);
+
+    assert!(
+        pack.text
+            .starts_with("# Add OAuth login  [status: open]\n\n**Goal**: (not set)\n"),
+        "header:\n{}",
+        pack.text
+    );
+    assert_eq!(
+        section_order(&pack.text),
+        ["Active decisions", "Recent events", "Completeness"],
+        "{}",
+        pack.text
+    );
 }
 
 fn build_fixture_a() -> Vec<Event> {
@@ -107,6 +120,35 @@ fn fixture_b_full_pack_with_supersede_and_correction() {
     );
 
     assert_eq!(pack.metadata.source_event_count, 12);
+
+    assert!(
+        pack.text.starts_with(
+            "# Stack choice for journal  [status: closed]\n\n**Goal**: (not set)\n**Outcome**: (not recorded)\n"
+        ),
+        "header:\n{}",
+        pack.text
+    );
+    assert_eq!(
+        section_order(&pack.text),
+        [
+            "Lifecycle",
+            "Active decisions",
+            "Rejected",
+            "Evidence",
+            "Recent events",
+            "Completeness"
+        ],
+        "{}",
+        pack.text
+    );
+}
+
+/// The pack's `## ` section headings in order, without a `(count)` suffix.
+fn section_order(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("## "))
+        .map(|h| h.split(" (").next().unwrap_or(h))
+        .collect()
 }
 
 fn build_fixture_b() -> Vec<Event> {
