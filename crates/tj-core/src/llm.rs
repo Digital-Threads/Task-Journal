@@ -581,7 +581,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codex_timeout_error_names_codex() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let dir = fake_codex_dir();
         let _path = path_with(dir.path());
         let _timeout = EnvGuard::set("TJ_CODEX_TIMEOUT_SECS", "1");
