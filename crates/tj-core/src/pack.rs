@@ -154,6 +154,7 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
         "SELECT d.text, d.alternatives, ei.status FROM decisions d
          JOIN events_index ei ON ei.event_id = d.decision_id
          WHERE d.task_id=?1 AND d.status='active' AND ei.corrected_by IS NULL
+           AND ei.bookkeeping = 0
          ORDER BY d.decision_id DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
@@ -1355,5 +1356,24 @@ mod tests {
             "{rejected}"
         );
         assert!(rejected.contains("- Postgres: too heavy\n"), "{rejected}");
+    }
+
+    #[test]
+    fn compaction_marker_kind_stays_out_of_active_decisions() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-bk", "Bookkeeping");
+        // Identified by meta.kind, whatever the marker text says.
+        let mut marker = ev("tj-bk", EventType::Decision, "Context boundary here");
+        marker.meta = serde_json::json!({ "kind": "compaction_marker" });
+        put(&conn, &marker);
+        put(&conn, &ev("tj-bk", EventType::Decision, "Use SQLite"));
+
+        let pack = assemble(&conn, "tj-bk", PackMode::Full).unwrap();
+        let active = section(&pack.text, "Active decisions");
+        assert!(!active.contains("Context boundary"), "{active}");
+        assert!(active.contains("Use SQLite"), "{active}");
     }
 }

@@ -2774,6 +2774,9 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(1.0);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                // Bookkeeping, not a decision: kept out of active decisions,
+                // export-pr, recall and global memory — see db::is_bookkeeping.
+                event.meta = serde_json::json!({ "kind": "compaction_marker" });
                 tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
@@ -3959,7 +3962,7 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT ei.type, sf.text FROM events_index ei
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.task_id = ?1 AND ei.corrected_by IS NULL
+         WHERE ei.task_id = ?1 AND ei.corrected_by IS NULL AND ei.bookkeeping = 0
          ORDER BY ei.timestamp ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {

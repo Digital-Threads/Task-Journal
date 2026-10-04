@@ -109,7 +109,10 @@ pub fn assess(
     let mut evidence = 0usize;
     let mut suggested = 0usize;
     {
-        let mut stmt = conn.prepare("SELECT type, status FROM events_index WHERE task_id = ?1")?;
+        // Bookkeeping (compaction markers) is not a decision to verify.
+        let mut stmt = conn.prepare(
+            "SELECT type, status FROM events_index WHERE task_id = ?1 AND bookkeeping = 0",
+        )?;
         let rows = stmt.query_map(rusqlite::params![task_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -437,6 +440,25 @@ mod tests {
             .gaps
             .iter()
             .any(|g| g.kind == GapKind::DecisionNoEvidence));
+    }
+
+    #[test]
+    fn compaction_marker_alone_is_not_an_unverified_decision() {
+        let (_d, c) = conn();
+        open_task(&c, "t3m");
+        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t3m'", [])
+            .unwrap();
+        let marker = Event::new(
+            "t3m",
+            EventType::Decision,
+            Author::Classifier,
+            Source::Hook,
+            "Conversation compacted at 2026-01-01T00:00:00Z; preceding events…".into(),
+        );
+        crate::db::index_event(&c, &marker).unwrap();
+
+        let r = assess(&c, "t3m", 0).unwrap();
+        assert!(r.is_complete(), "{:?}", r.gaps);
     }
 
     #[test]

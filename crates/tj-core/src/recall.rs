@@ -87,6 +87,7 @@ pub fn relevant_recall(
          JOIN search_fts sf ON sf.event_id = ei.event_id
          WHERE ei.status = 'confirmed'
            AND ei.type IN ('rejection','decision')
+           AND ei.bookkeeping = 0
            AND search_fts MATCH ?1"
     } else {
         "SELECT ei.event_id, ei.task_id, ei.type, sf.text
@@ -94,6 +95,7 @@ pub fn relevant_recall(
          JOIN search_fts sf ON sf.event_id = ei.event_id
          WHERE ei.status = 'confirmed'
            AND ei.type IN ('rejection','decision')
+           AND ei.bookkeeping = 0
            AND sf.text LIKE ?1"
     };
     let bind = if let Some(or_query) = fts_or {
@@ -137,6 +139,7 @@ pub fn relevant_recall(
              JOIN search_fts sf ON sf.event_id = ei.event_id
              WHERE ei.status = 'confirmed'
                AND ei.type IN ('rejection','decision')
+               AND ei.bookkeeping = 0
                AND ei.artifacts LIKE ?1",
         ) {
             let rows = stmt.query_map(rusqlite::params![pattern], |r| {
@@ -329,5 +332,27 @@ mod tests {
         assert!(relevant_recall(&conn, "   ", DEFAULT_MAX_HITS)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn compaction_markers_are_never_recalled() {
+        // An old marker (recognised by its text) and a new one (by meta.kind).
+        let old = ev(
+            "tj-1",
+            EventType::Decision,
+            "Conversation compacted at 2026-01-01T00:00:00Z; preceding events should be treated as a single reasoning unit.",
+            EventStatus::Confirmed,
+        );
+        let mut new = ev(
+            "tj-1",
+            EventType::Decision,
+            "Compaction boundary: reasoning unit closed.",
+            EventStatus::Confirmed,
+        );
+        new.meta = serde_json::json!({ "kind": "compaction_marker" });
+        let (_d, conn) = seeded(&[old, new]);
+
+        let hits = relevant_recall(&conn, "reasoning unit", DEFAULT_MAX_HITS).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
     }
 }

@@ -4368,6 +4368,7 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
                         .unwrap_or("")
                         .contains("Conversation compacted at")
                 {
+                    assert_eq!(v["meta"]["kind"], "compaction_marker", "{v}");
                     marker_lines += 1;
                 }
             }
@@ -4391,6 +4392,10 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
                 .not()
                 .and(contains("single reasoning unit").not()),
         );
+
+    // It is bookkeeping, not a change the PR made.
+    let pr = tj_stdout(dir.path(), &workdir, &["export-pr", &task_id]);
+    assert!(!pr.contains("Conversation compacted at"), "{pr}");
 }
 
 #[test]
