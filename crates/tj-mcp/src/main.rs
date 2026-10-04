@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use rmcp::{
-    handler::server::tool::Parameters, handler::server::wrapper::Json, tool, tool_handler,
-    tool_router, transport::io::stdio, ErrorData as McpError, ServerHandler, ServiceExt,
+    handler::server::tool::Parameters, handler::server::wrapper::Json, tool, tool_router,
+    transport::io::stdio, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -955,7 +955,8 @@ impl TaskJournalServer {
     }
 }
 
-#[tool_handler(router = Self::tool_router())]
+// Written out instead of `#[tool_handler]`, which generates the same two
+// methods, so `call_tool` can read the request's `_meta` first.
 impl ServerHandler for TaskJournalServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo {
@@ -969,6 +970,49 @@ impl ServerHandler for TaskJournalServer {
             instructions: Some(MCP_INSTRUCTIONS.into()),
             ..Default::default()
         }
+    }
+
+    async fn call_tool(
+        &self,
+        mut request: rmcp::model::CallToolRequestParam,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        stamp_client_session(&mut request, &context.meta);
+
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParam>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        Ok(rmcp::model::ListToolsResult::with_all_items(
+            Self::tool_router().list_all(),
+        ))
+    }
+}
+
+/// Codex names the session in each call's `_meta`, never in the MCP
+/// server's environment. Carry it into the `session_id` argument of the
+/// tools that stamp one, unless the caller passed its own.
+fn stamp_client_session(request: &mut rmcp::model::CallToolRequestParam, meta: &rmcp::model::Meta) {
+    const STAMPING: [&str; 4] = ["task_create", "event_add", "artifact_add", "task_close"];
+    if !STAMPING.contains(&request.name.as_ref()) {
+        return;
+    }
+    let Some(session) = tj_core::session_id::session_id_from_mcp_meta(&meta.0) else {
+        return;
+    };
+
+    let args = request.arguments.get_or_insert_with(Default::default);
+    let has_own = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if !has_own {
+        args.insert("session_id".into(), serde_json::Value::String(session));
     }
 }
 
@@ -1041,6 +1085,44 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
+
+    fn call(name: &'static str, args: serde_json::Value) -> rmcp::model::CallToolRequestParam {
+        rmcp::model::CallToolRequestParam {
+            name: name.into(),
+            arguments: args.as_object().cloned(),
+        }
+    }
+
+    fn codex_meta(session: &str) -> rmcp::model::Meta {
+        let meta = serde_json::json!({ "x-codex-turn-metadata": { "session_id": session } });
+        rmcp::model::Meta(meta.as_object().unwrap().clone())
+    }
+
+    #[test]
+    fn codex_session_from_meta_reaches_the_stamping_tools() {
+        let mut add = call("event_add", serde_json::json!({ "task_id": "tj-1" }));
+        stamp_client_session(&mut add, &codex_meta("c-1"));
+        assert_eq!(add.arguments.unwrap()["session_id"], "c-1");
+
+        let mut create = call("task_create", serde_json::json!(null));
+        stamp_client_session(&mut create, &codex_meta("c-1"));
+        assert_eq!(create.arguments.unwrap()["session_id"], "c-1");
+    }
+
+    #[test]
+    fn an_explicit_session_id_and_other_tools_are_left_alone() {
+        let mut own = call("event_add", serde_json::json!({ "session_id": "mine" }));
+        stamp_client_session(&mut own, &codex_meta("c-1"));
+        assert_eq!(own.arguments.unwrap()["session_id"], "mine");
+
+        let mut search = call("task_search", serde_json::json!({ "query": "x" }));
+        stamp_client_session(&mut search, &codex_meta("c-1"));
+        assert!(search.arguments.unwrap().get("session_id").is_none());
+
+        let mut claude = call("event_add", serde_json::json!({ "task_id": "tj-1" }));
+        stamp_client_session(&mut claude, &rmcp::model::Meta::default());
+        assert!(claude.arguments.unwrap().get("session_id").is_none());
+    }
 
     /// Handler tests touch process-global state (PROJECT_DIR_OVERRIDE OnceLock
     /// and the XDG_DATA_HOME env var), so they must run one at a time and share

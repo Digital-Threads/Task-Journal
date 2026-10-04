@@ -25,6 +25,20 @@ pub fn session_id_from_payload(payload: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Pull the session id out of an MCP request's `_meta`. Codex sends it on
+/// every `tools/call` as `x-codex-turn-metadata.session_id` (and the same
+/// value as `thread_id`); its MCP servers get no session env var, so this is
+/// the only way a Codex event learns its session. Empty counts as absent.
+pub fn session_id_from_mcp_meta(meta: &serde_json::Map<String, Value>) -> Option<String> {
+    let turn = meta.get("x-codex-turn-metadata")?;
+
+    ["session_id", "thread_id"]
+        .iter()
+        .filter_map(|key| turn.get(*key).and_then(|v| v.as_str()))
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Read the live session id from the environment: `CLAUDE_CODE_SESSION_ID`,
 /// then Codex's `CODEX_THREAD_ID`, then `CODEX_SESSION_ID`. Empty counts as
 /// absent.
@@ -66,6 +80,31 @@ mod tests {
     fn payload_session_id_extracted() {
         let p = json!({"session_id": "abc-123", "hook_event_name": "PostToolUse"});
         assert_eq!(session_id_from_payload(&p).as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn mcp_meta_reads_codex_turn_metadata() {
+        let meta = json!({
+            "callId": "exec-1",
+            "x-codex-turn-metadata": { "session_id": "c-1", "thread_id": "c-1", "model": "x" }
+        });
+        let meta = meta.as_object().unwrap();
+        assert_eq!(session_id_from_mcp_meta(meta).as_deref(), Some("c-1"));
+
+        let thread_only =
+            json!({ "x-codex-turn-metadata": { "session_id": "", "thread_id": "t-2" } });
+        assert_eq!(
+            session_id_from_mcp_meta(thread_only.as_object().unwrap()).as_deref(),
+            Some("t-2")
+        );
+    }
+
+    #[test]
+    fn mcp_meta_without_codex_metadata_is_none() {
+        // Claude Code sends only its tool-use id.
+        let claude = json!({ "claudecode/toolUseId": "toolu_1", "progressToken": 2 });
+        assert_eq!(session_id_from_mcp_meta(claude.as_object().unwrap()), None);
+        assert_eq!(session_id_from_mcp_meta(&serde_json::Map::new()), None);
     }
 
     #[test]
