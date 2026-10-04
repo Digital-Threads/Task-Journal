@@ -104,27 +104,37 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// A classifier's guess (`status = suggested`) must not read like a choice
+/// the agent made: such decisions and rejections stay listed but marked.
+fn unconfirmed_marker(status: &str) -> &'static str {
+    if status == "suggested" {
+        " _(unconfirmed)_"
+    } else {
+        ""
+    }
+}
+
 fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Rejected\n");
     // v0.10.3: newest-first so end-of-pack truncation drops the
     // OLDEST rejections, not the latest decision the agent recorded.
     let mut id_stmt = conn.prepare(
-        "SELECT event_id FROM events_index
+        "SELECT event_id, status FROM events_index
          WHERE task_id=?1 AND type='rejection' AND corrected_by IS NULL
          ORDER BY timestamp DESC",
     )?;
     let mut text_stmt = conn.prepare("SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1")?;
-    let event_ids: Vec<String> = id_stmt
-        .query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?
+    let event_ids: Vec<(String, String)> = id_stmt
+        .query_map(rusqlite::params![task_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     let mut count = 0;
     let mut seen: HashSet<String> = HashSet::new();
-    for eid in event_ids {
+    for (eid, status) in event_ids {
         let text: String = text_stmt.query_row(rusqlite::params![eid], |r| r.get(0))?;
         if is_noise(&text) || !seen.insert(text.trim().to_string()) {
             continue;
         }
-        out.push_str(&format!("- {text}\n"));
+        out.push_str(&format!("- {text}{}\n", unconfirmed_marker(&status)));
         count += 1;
     }
     if count == 0 {
@@ -141,24 +151,28 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
     // event the agent records just before close is now the FIRST line
     // of this section, surviving end-of-pack truncation.
     let mut stmt = conn.prepare(
-        "SELECT d.text, d.alternatives FROM decisions d
+        "SELECT d.text, d.alternatives, ei.status FROM decisions d
          JOIN events_index ei ON ei.event_id = d.decision_id
          WHERE d.task_id=?1 AND d.status='active' AND ei.corrected_by IS NULL
          ORDER BY d.decision_id DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+        ))
     })?;
     let mut count = 0;
     let mut seen: HashSet<String> = HashSet::new();
     for row in rows {
-        let (text, alternatives) = row?;
+        let (text, alternatives, status) = row?;
         // Skip machine noise (compaction markers) and exact duplicates so the
         // section reads as crisp decisions, not repeated essays.
         if is_noise(&text) || !seen.insert(text.trim().to_string()) {
             continue;
         }
-        out.push_str(&format!("- {text}\n"));
+        out.push_str(&format!("- {text}{}\n", unconfirmed_marker(&status)));
         // v0.12.0: structured alternatives render under the decision so the
         // pack shows "considered A/B/C, chose X" without reconstructing it
         // from the hypothesis+rejection chain.
@@ -1296,5 +1310,50 @@ mod tests {
 
         let pack = assemble(&conn, "tj-a", PackMode::Full).unwrap();
         assert!(!pack.text.contains("Wrong decision in A"), "{}", pack.text);
+    }
+
+    /// The body of the `## {heading}` section, up to the next `## ` heading.
+    fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let start = text
+            .find(&format!("## {heading}"))
+            .unwrap_or_else(|| panic!("no {heading} section in:\n{text}"));
+        let end = text[start + 3..]
+            .find("\n## ")
+            .map_or(text.len(), |i| start + 3 + i);
+        &text[start..end]
+    }
+
+    #[test]
+    fn suggested_decisions_and_rejections_are_marked_unconfirmed() {
+        use crate::event::{EventStatus, EventType};
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-un", "Unconfirmed");
+        let mut guess = ev("tj-un", EventType::Decision, "Maybe adopt Rust");
+        guess.status = EventStatus::Suggested;
+        put(&conn, &guess);
+        let mut guess_rej = ev("tj-un", EventType::Rejection, "Maybe drop TypeScript");
+        guess_rej.status = EventStatus::Suggested;
+        put(&conn, &guess_rej);
+        put(&conn, &ev("tj-un", EventType::Decision, "Use SQLite"));
+        put(
+            &conn,
+            &ev("tj-un", EventType::Rejection, "Postgres: too heavy"),
+        );
+
+        let pack = assemble(&conn, "tj-un", PackMode::Full).unwrap();
+        let active = section(&pack.text, "Active decisions");
+        assert!(
+            active.contains("- Maybe adopt Rust _(unconfirmed)_\n"),
+            "{active}"
+        );
+        assert!(active.contains("- Use SQLite\n"), "{active}");
+        let rejected = section(&pack.text, "Rejected");
+        assert!(
+            rejected.contains("- Maybe drop TypeScript _(unconfirmed)_\n"),
+            "{rejected}"
+        );
+        assert!(rejected.contains("- Postgres: too heavy\n"), "{rejected}");
     }
 }
