@@ -31,6 +31,25 @@ pub fn in_scope(
     out
 }
 
+/// Where an unscoped run may move the watermark, given every in-scope
+/// session as `(mtime, mined_cleanly)`: the newest clean mtime older than
+/// every failed or skipped session, so the next run (which keeps only
+/// mtimes strictly after the watermark) still sees those. `None` = leave
+/// the watermark where it is.
+pub fn next_watermark(sessions: &[(SystemTime, bool)]) -> Option<SystemTime> {
+    let first_bad = sessions
+        .iter()
+        .filter(|(_, clean)| !clean)
+        .map(|(t, _)| *t)
+        .min();
+
+    sessions
+        .iter()
+        .filter(|(t, clean)| *clean && first_bad.is_none_or(|bad| *t < bad))
+        .map(|(t, _)| *t)
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +81,27 @@ mod tests {
             r,
             vec![std::path::PathBuf::from("c"), std::path::PathBuf::from("b")]
         );
+    }
+
+    #[test]
+    fn watermark_advances_to_newest_when_all_clean() {
+        let s = [(at(300), true), (at(100), true), (at(200), true)];
+        assert_eq!(next_watermark(&s), Some(at(300)));
+    }
+
+    #[test]
+    fn watermark_never_jumps_over_a_failed_session() {
+        // 200 failed → stop at 100, so 200 and 300 are mined again.
+        let s = [(at(100), true), (at(200), false), (at(300), true)];
+        assert_eq!(next_watermark(&s), Some(at(100)));
+        // Oldest failed → nothing to advance to.
+        let s = [(at(100), false), (at(200), true)];
+        assert_eq!(next_watermark(&s), None);
+        // A clean session sharing the failed one's mtime can't be the
+        // watermark either (`in_scope` keeps only mtime > watermark).
+        let s = [(at(100), true), (at(200), true), (at(200), false)];
+        assert_eq!(next_watermark(&s), Some(at(100)));
+        assert_eq!(next_watermark(&[]), None);
     }
 
     #[test]

@@ -4524,11 +4524,13 @@ fn run_dream_op(
             Some(tj_core::dream::scope::SessionFile { path: p, mtime })
         })
         .collect();
+    let mtimes: std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> =
+        scoped.iter().map(|s| (s.path.clone(), s.mtime)).collect();
     let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
 
     // 2. Assemble (session_id, BackfillInput) per session.
     let run_id = ulid::Ulid::new().to_string();
-    let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
+    let (sessions, unreadable) = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
 
     let opts = tj_core::dream::DreamOptions {
         project_hash: project_hash.clone(),
@@ -4561,12 +4563,25 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
         &run_id,
     )?;
 
-    // 4. Advance watermark to now (only reached on success).
-    tj_core::dream::state::set_last_dream_at(
-        &conn,
-        &project_hash,
-        &chrono::Utc::now().to_rfc3339(),
-    )?;
+    // 4. Advance the watermark — only on an unscoped run (--task / --limit /
+    // --since skip sessions they never looked at), and only to the newest
+    // session such that it and every older in-scope one were mined cleanly.
+    if since.is_none() && task.is_none() && limit.is_none() {
+        let mined: Vec<(std::time::SystemTime, bool)> = in_scope
+            .iter()
+            .map(|p| {
+                let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let clean = !unreadable.iter().any(|u| u == id)
+                    && !report.failed_sessions.iter().any(|f| f == id);
+                (mtimes[p], clean)
+            })
+            .collect();
+        if let Some(t) = tj_core::dream::scope::next_watermark(&mined) {
+            let at = chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339();
+            tj_core::dream::state::set_last_dream_at(&conn, &project_hash, &at)?;
+        }
+    }
+
     let mut summary = format!(
         "dream: {} session(s) processed, {} event(s) backfilled",
         report.sessions_processed, report.events_backfilled
@@ -4575,6 +4590,12 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
         summary.push_str(&format!(
             ", {} dropped (unknown task id)",
             report.events_dropped_unknown_task
+        ));
+    }
+    if !report.failed_sessions.is_empty() {
+        summary.push_str(&format!(
+            ", {} only partly mined (retried next run)",
+            report.failed_sessions.len()
         ));
     }
     println!("{summary}");
@@ -4709,7 +4730,7 @@ fn task_sessions(
         })
         .collect();
     let in_scope = tj_core::dream::scope::in_scope(scoped, None, None);
-    build_dream_inputs(events_path, &in_scope, Some(task_id))
+    Ok(build_dream_inputs(events_path, &in_scope, Some(task_id))?.0)
 }
 
 /// Enrich a single task from every session that touched it. Unlike `dream`,
@@ -6135,18 +6156,23 @@ fn candidate_tasks_for_session(
     out
 }
 
+/// Per-session `(session_id, BackfillInput)` pairs fed to `run_dream`.
+type DreamInputs = Vec<(String, tj_core::dream::backend::BackfillInput)>;
+
 /// Assemble per-session `(session_id, BackfillInput)` from the in-scope
-/// session transcripts and the project's existing events.
+/// session transcripts and the project's existing events. Also returns the
+/// ids of sessions skipped as unreadable.
 fn build_dream_inputs(
     events_path: &std::path::Path,
     sessions: &[std::path::PathBuf],
     task_filter: Option<&str>,
-) -> anyhow::Result<Vec<(String, tj_core::dream::backend::BackfillInput)>> {
+) -> anyhow::Result<(DreamInputs, Vec<String>)> {
     use tj_core::dream::backend::BackfillInput;
     use tj_core::session::parser::parse_session;
 
     let by_task = events_by_task(events_path)?;
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     for path in sessions {
         let session_id = path
             .file_stem()
@@ -6161,6 +6187,7 @@ fn build_dream_inputs(
                     "dream: skipping unreadable session {}: {e:#}",
                     path.display()
                 );
+                unreadable.push(session_id);
                 continue;
             }
         };
@@ -6182,7 +6209,7 @@ fn build_dream_inputs(
         let transcript = flatten_transcript(&parsed);
         out.push((session_id, BackfillInput { tasks, transcript }));
     }
-    Ok(out)
+    Ok((out, unreadable))
 }
 
 #[cfg(test)]
@@ -6382,10 +6409,11 @@ mod inline_tests {
         std::fs::write(&good,
             "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
 
-        let inputs = build_dream_inputs(&events_path, &[bad, good], None).unwrap();
+        let (inputs, unreadable) = build_dream_inputs(&events_path, &[bad, good], None).unwrap();
 
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].0, "good");
+        assert_eq!(unreadable, vec!["bad".to_string()]);
     }
 
     #[test]

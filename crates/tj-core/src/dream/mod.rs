@@ -26,6 +26,9 @@ pub struct DreamReport {
     /// Proposals dropped because their `task_id` was not one of the
     /// session's candidate tasks (the model invented or misspelled it).
     pub events_dropped_unknown_task: usize,
+    /// Sessions with at least one failed transcript chunk — only partly
+    /// mined, so the watermark must not move past them.
+    pub failed_sessions: Vec<String>,
 }
 
 /// Run one dream Pass A over the given sessions, using the supplied
@@ -48,7 +51,11 @@ pub fn run_dream(
         if opts.dry_run {
             continue;
         }
-        let mut proposed = backend.backfill(&input)?;
+        let out = backend.backfill(&input)?;
+        if out.failed_chunks > 0 {
+            report.failed_sessions.push(session_id.clone());
+        }
+        let mut proposed = out.events;
 
         // Only the session's candidate tasks may receive events; anything
         // else would be an orphan event for a nonexistent task.
@@ -130,6 +137,7 @@ mod tests {
                     timestamp: "2026-06-08T10:01:00Z".into(),
                 },
             ],
+            failed_chunks: 0,
         };
         let opts = DreamOptions {
             project_hash: "ph".into(),
@@ -173,6 +181,7 @@ mod tests {
                     timestamp: "2026-06-08T10:01:00Z".into(),
                 },
             ],
+            failed_chunks: 0,
         };
         let opts = DreamOptions {
             project_hash: "ph".into(),
@@ -209,6 +218,7 @@ mod tests {
                 text: "Chose SQLite over Postgres.".into(),
                 timestamp: "2026-06-08T10:00:00Z".into(),
             }],
+            failed_chunks: 0,
         };
         let opts = DreamOptions {
             project_hash: "ph".into(),
@@ -232,11 +242,41 @@ mod tests {
     }
 
     #[test]
+    fn run_dream_reports_sessions_with_failed_chunks() {
+        let d = TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        let events_path = d.path().join("events.jsonl");
+        let backend = MockDreamBackend {
+            events: vec![],
+            failed_chunks: 1,
+        };
+        let opts = DreamOptions {
+            project_hash: "ph".into(),
+            dry_run: false,
+        };
+
+        let report = run_dream(
+            &conn,
+            &events_path,
+            &opts,
+            &backend,
+            vec![task_input()],
+            "run-1",
+        )
+        .unwrap();
+
+        assert_eq!(report.failed_sessions, vec!["sess-1".to_string()]);
+    }
+
+    #[test]
     fn dry_run_writes_nothing_and_skips_backend() {
         let d = TempDir::new().unwrap();
         let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
         let events_path = d.path().join("events.jsonl");
-        let backend = MockDreamBackend { events: vec![] };
+        let backend = MockDreamBackend {
+            events: vec![],
+            failed_chunks: 0,
+        };
         let opts = DreamOptions {
             project_hash: "ph".into(),
             dry_run: true,
