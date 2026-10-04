@@ -1339,23 +1339,16 @@ fn real_main() -> Result<()> {
             if let Some(ref parent_id) = parent {
                 meta["parent_id"] = serde_json::Value::String(parent_id.clone());
             }
+            // The goal rides in the open event, so ingest (and a rebuild
+            // from the JSONL) restores it.
+            if let Some(g) = goal {
+                meta["goal"] = serde_json::Value::String(g);
+            }
             event.meta = meta;
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
-
-            // If --goal was provided, ingest the open event into SQLite
-            // (so the row exists) and write the goal column. Skipping
-            // this when --goal is absent keeps the SQLite hot path
-            // exclusive to ingest-hook / pack callers.
-            if let Some(g) = goal {
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                tj_core::db::set_task_goal(&conn, &task_id, &g)?;
-            }
 
             println!("{}", task_id);
         }
@@ -1888,7 +1881,22 @@ fn real_main() -> Result<()> {
             if !tj_core::db::task_exists(&conn, &task_id)? {
                 anyhow::bail!("task not found: {task_id}");
             }
-            tj_core::db::set_task_goal(&conn, &task_id, &text)?;
+
+            // An amend event carries the change, so a rebuild from the
+            // JSONL restores it; ingest applies it to the task row.
+            let mut event = tj_core::event::Event::new(
+                &task_id,
+                tj_core::event::EventType::Amend,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                format!("goal: {text}"),
+            );
+            event.meta = serde_json::json!({ "goal": text });
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             println!("ok");
         }
         Commands::External { task_id, add } => {
@@ -1904,7 +1912,20 @@ fn real_main() -> Result<()> {
             if !tj_core::db::task_exists(&conn, &task_id)? {
                 anyhow::bail!("task not found: {task_id}");
             }
-            tj_core::db::add_task_external(&conn, &task_id, &add)?;
+
+            let mut event = tj_core::event::Event::new(
+                &task_id,
+                tj_core::event::EventType::Amend,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                format!("external: +{add}"),
+            );
+            event.meta = serde_json::json!({ "external_add": [add] });
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             println!("ok");
         }
         Commands::Reclassify { task_id } => {
@@ -5399,42 +5420,20 @@ fn auto_open_task_from_prompt(
     };
     let goal: String = tj_core::title::humanize_goal(prompt, 200).unwrap_or_else(|| title.clone());
 
-    let task_id = tj_core::new_task_id();
-    let mut event = tj_core::event::Event::new(
-        task_id.clone(),
-        tj_core::event::EventType::Open,
-        tj_core::event::Author::User,
-        tj_core::event::Source::Cli,
-        title.clone(),
-    );
-    event.meta = serde_json::json!({ "title": title, "auto_opened": true });
-    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
-
-    let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
-    writer.append(&event)?;
-    writer.flush_durable()?;
-
-    tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
-    if !goal.is_empty() {
-        tj_core::db::set_task_goal(conn, &task_id, &goal)?;
-    }
-
     // v0.5.0 Phase C / v0.6.0: score-based linking. Pull artifacts
     // from the prompt — ticket ids, commit hashes, file paths — then
     // ask the journal which prior tasks share enough signal to be a
     // probable continuation. Anything with score > 0 gets linked via
     // External; the strongest closed match also triggers a stderr
     // hint so the user can reopen instead of accumulating duplicates.
+    // Resolved before the open event is written so the links ride in it.
+    let mut linked: Vec<String> = Vec::new();
     let prompt_arts = tj_core::artifacts::extract(prompt);
     if !prompt_arts.is_empty() {
         let related = tj_core::db::find_related_tasks(conn, &prompt_arts)?;
         let mut warned = false;
         for r in related.iter().take(5) {
-            if r.task_id == task_id {
-                continue;
-            }
-            let _ =
-                tj_core::db::add_task_external(conn, &task_id, &format!("linked:{}", r.task_id));
+            linked.push(format!("linked:{}", r.task_id));
             if !warned && r.status == "closed" {
                 eprintln!(
                     "task-journal: this prompt looks like a continuation of closed task {} \
@@ -5445,6 +5444,30 @@ fn auto_open_task_from_prompt(
             }
         }
     }
+
+    let task_id = tj_core::new_task_id();
+    let mut event = tj_core::event::Event::new(
+        task_id.clone(),
+        tj_core::event::EventType::Open,
+        tj_core::event::Author::User,
+        tj_core::event::Source::Cli,
+        title.clone(),
+    );
+    // Goal and links ride in the open event, so a rebuild restores them.
+    event.meta = serde_json::json!({ "title": title, "auto_opened": true });
+    if !goal.is_empty() {
+        event.meta["goal"] = serde_json::Value::String(goal);
+    }
+    if !linked.is_empty() {
+        event.meta["external"] = serde_json::json!(linked);
+    }
+    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
+
+    let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+    writer.append(&event)?;
+    writer.flush_durable()?;
+
+    tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
 
     Ok(Some(tj_core::classifier::TaskContext {
         task_id,

@@ -292,6 +292,27 @@ pub fn upsert_task_from_event(
                  ON CONFLICT(task_id) DO UPDATE SET last_event_at = ?4",
                 rusqlite::params![event.task_id, title, project_hash, event.timestamp, parent_id],
             )?;
+
+            // Goal and external refs given at creation ride in the open
+            // event's meta so a rebuild from the JSONL restores them. A replay
+            // over an existing row keeps a goal changed since.
+            if let Some(goal) = event.meta.get("goal").and_then(|v| v.as_str()) {
+                conn.execute(
+                    "UPDATE tasks SET goal = COALESCE(goal, ?2) WHERE task_id = ?1",
+                    rusqlite::params![event.task_id, goal],
+                )?;
+            }
+            for reference in meta_strings(&event.meta, "external") {
+                add_task_external(conn, &event.task_id, reference)?;
+            }
+        }
+        EventType::Amend => {
+            if let Some(goal) = event.meta.get("goal").and_then(|v| v.as_str()) {
+                set_task_goal(conn, &event.task_id, goal)?;
+            }
+            for reference in meta_strings(&event.meta, "external_add") {
+                add_task_external(conn, &event.task_id, reference)?;
+            }
         }
         EventType::Close => {
             conn.execute(
@@ -336,6 +357,15 @@ pub fn upsert_task_from_event(
         }
     }
     Ok(())
+}
+
+/// The string items of the JSON array at `meta[key]`; empty when absent.
+fn meta_strings<'a>(meta: &'a serde_json::Value, key: &str) -> impl Iterator<Item = &'a str> {
+    meta.get(key)
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
 }
 
 use std::io::BufRead;
@@ -471,17 +501,30 @@ pub fn set_task_outcome(
 }
 
 /// Append an external reference to `tasks.external`. The column is
-/// stored as a comma-separated list — small, append-mostly, no
-/// uniqueness constraint. Acceptable shapes (loose, not enforced):
-/// `beads:claude-memory-rsw`, `github:#42`, `jira:PROJ-1234`.
+/// stored as a comma-separated list — small, append-mostly. A reference
+/// already in the list is not added again, so replaying the events that
+/// carry it is idempotent; an unknown task is a no-op. Acceptable shapes
+/// (loose, not enforced): `beads:claude-memory-rsw`, `github:#42`,
+/// `jira:PROJ-1234`.
 pub fn add_task_external(conn: &Connection, task_id: &str, reference: &str) -> anyhow::Result<()> {
-    let current: Option<String> = conn
+    let current: Option<Option<String>> = conn
         .query_row(
             "SELECT external FROM tasks WHERE task_id = ?1",
             rusqlite::params![task_id],
             |r| r.get::<_, Option<String>>(0),
         )
+        .optional()
         .with_context(|| format!("read external for {task_id}"))?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if current
+        .as_deref()
+        .is_some_and(|s| s.split(',').any(|r| r == reference))
+    {
+        return Ok(());
+    }
+
     let next = match current {
         Some(s) if !s.is_empty() => format!("{s},{reference}"),
         _ => reference.to_string(),
@@ -920,6 +963,13 @@ pub fn ingest_new_events(
 }
 
 pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
+    // An amend only changes task metadata, which upsert_task_from_event
+    // applies. It is not reasoning: keeping it out of events_index and
+    // search_fts keeps it out of packs, search, recall and memory sync.
+    if event.event_type == EventType::Amend {
+        return invalidate_pack_cascade(conn, &event.task_id);
+    }
+
     let type_str = serde_json::to_value(event.event_type)?
         .as_str()
         .unwrap()
@@ -2468,6 +2518,95 @@ mod tests {
         let meta = task_metadata(&conn, "tj-up").unwrap().unwrap();
         assert_eq!(meta.goal.as_deref(), Some("legacy goal"));
         assert_eq!(meta.external.as_deref(), Some("loom:t-legacy"));
+    }
+
+    #[test]
+    fn open_meta_goal_and_external_are_restored_by_a_rebuild() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+
+        let mut open_ev = make_open_event("tj-g", "Goal task");
+        open_ev.meta = serde_json::json!({
+            "title": "Goal task",
+            "goal": "Ship PKCE",
+            "external": ["loom:t-42", "github:#7"],
+        });
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &open_ev);
+        drop(f);
+
+        let conn = open(d.path().join("fresh.sqlite")).unwrap();
+        rebuild_state(&conn, &jsonl, ph).unwrap();
+
+        let meta = task_metadata(&conn, "tj-g").unwrap().unwrap();
+        assert_eq!(meta.goal.as_deref(), Some("Ship PKCE"));
+        assert_eq!(meta.external.as_deref(), Some("loom:t-42,github:#7"));
+        assert_eq!(
+            task_id_by_external(&conn, "loom:t-42").unwrap().as_deref(),
+            Some("tj-g")
+        );
+    }
+
+    fn amend_event(task_id: &str, meta: serde_json::Value) -> crate::event::Event {
+        let mut e = crate::event::Event::new(
+            task_id,
+            crate::event::EventType::Amend,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "amend".into(),
+        );
+        e.meta = meta;
+        e
+    }
+
+    #[test]
+    fn amend_events_are_replayed_idempotently_and_stay_out_of_the_index() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+
+        let mut open_ev = make_open_event("tj-am", "Amended");
+        open_ev.meta = serde_json::json!({"title": "Amended", "goal": "first goal"});
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &open_ev);
+        write_event_line(
+            &mut f,
+            &amend_event("tj-am", serde_json::json!({"goal": "second goal"})),
+        );
+        for _ in 0..2 {
+            write_event_line(
+                &mut f,
+                &amend_event("tj-am", serde_json::json!({"external_add": ["beads:x"]})),
+            );
+        }
+        // An amend for a task that does not exist must not break ingest.
+        write_event_line(
+            &mut f,
+            &amend_event("tj-ghost", serde_json::json!({"external_add": ["beads:y"]})),
+        );
+        drop(f);
+
+        let conn = open(d.path().join("fresh.sqlite")).unwrap();
+        rebuild_state(&conn, &jsonl, ph).unwrap();
+        // Replaying over an existing DB (e.g. after a migration) changes nothing.
+        rebuild_state(&conn, &jsonl, ph).unwrap();
+
+        let meta = task_metadata(&conn, "tj-am").unwrap().unwrap();
+        assert_eq!(meta.goal.as_deref(), Some("second goal"));
+        assert_eq!(meta.external.as_deref(), Some("beads:x"));
+
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_index WHERE type = 'amend'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 0, "amend is metadata, not a pack/search event");
+        let pack = crate::pack::assemble(&conn, "tj-am", crate::pack::PackMode::Full).unwrap();
+        assert!(pack.text.contains("**Goal**: second goal"), "{}", pack.text);
+        assert!(!pack.text.contains("[amend]"), "{}", pack.text);
     }
 
     #[test]

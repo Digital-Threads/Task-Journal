@@ -669,6 +669,15 @@ impl TaskJournalServer {
                 if let Some(ref parent_id) = p.parent {
                     event.meta["parent_id"] = serde_json::Value::String(parent_id.clone());
                 }
+                // Goal and the Loom tag ride in the open event, so ingest (and
+                // a rebuild from the JSONL) restores them; later resolves and
+                // the board → journal link find the journal by `loom:<id>`.
+                if let Some(ref goal) = p.goal {
+                    event.meta["goal"] = serde_json::Value::String(goal.clone());
+                }
+                if let Some(ref r) = loom_ref {
+                    event.meta["external"] = serde_json::json!([r]);
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     tj_core::session_id::session_id_from_env().as_deref(),
@@ -677,30 +686,6 @@ impl TaskJournalServer {
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
-
-                // v0.6.0: persist goal column when caller passed --goal /
-                // params.goal. We must ingest into SQLite first so the
-                // task row exists; without ingestion set_task_goal hits
-                // an empty tasks table and silently no-ops.
-                if let Some(goal) = p.goal.as_deref() {
-                    let conn_arc = cached_open(&state_path)?;
-                    let conn = conn_arc
-                        .lock()
-                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                    tj_core::db::set_task_goal(&conn, &task_id, goal)?;
-                }
-
-                // Tag the new journal with its Loom task id so later resolves
-                // (and the board → journal link) find it.
-                if let Some(ref r) = loom_ref {
-                    let conn_arc = cached_open(&state_path)?;
-                    let conn = conn_arc
-                        .lock()
-                        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                    tj_core::db::add_task_external(&conn, &task_id, r)?;
-                }
 
                 Ok(TaskCreateResult {
                     task_id,
@@ -1818,6 +1803,63 @@ mod tests {
 
         let after = std::fs::read_to_string(&events_path).unwrap();
         assert_eq!(after, before, "no orphan event may reach the journal");
+    }
+
+    #[tokio::test]
+    async fn task_create_goal_and_loom_ref_survive_a_state_rebuild() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let loom_id = format!("t-rebuild-{}", ulid::Ulid::new());
+        std::env::set_var("LOOM_TASK_ID", &loom_id);
+        let created = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Loom task".into(),
+                initial_context: None,
+                goal: Some("Wire the board".into()),
+                parent: None,
+            }))
+            .await;
+        std::env::remove_var("LOOM_TASK_ID");
+        let task = created.unwrap().0.task_id;
+
+        // A fresh SQLite rebuilt from the journal alone.
+        let (project_hash, events_path, _) = project_paths().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = tj_core::db::open(dir.path().join("fresh.sqlite")).unwrap();
+        tj_core::db::rebuild_state(&conn, &events_path, &project_hash).unwrap();
+
+        let meta = tj_core::db::task_metadata(&conn, &task).unwrap().unwrap();
+        assert_eq!(meta.goal.as_deref(), Some("Wire the board"));
+        let by_loom = tj_core::db::task_id_by_external(&conn, &format!("loom:{loom_id}")).unwrap();
+        assert_eq!(by_loom.as_deref(), Some(task.as_str()));
+    }
+
+    #[tokio::test]
+    async fn event_add_rejects_the_internal_amend_type() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let task = create_task(&server, "No amend").await;
+        let res = server
+            .event_add(Parameters(EventAddParams {
+                task_id: task,
+                event_type: "amend".into(),
+                text: "goal: sneaky".into(),
+                corrects: None,
+                supersedes: None,
+                alternatives: None,
+            }))
+            .await;
+        let err = match res {
+            Ok(_) => panic!("amend is internal and must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("unknown event type"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

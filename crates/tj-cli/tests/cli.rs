@@ -2385,6 +2385,56 @@ fn external_add_appends_references() {
 }
 
 #[test]
+fn goal_and_external_survive_deleting_the_state_db() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let wipe_state = || {
+        let _ = std::fs::remove_dir_all(dir.path().join("task-journal").join("state"));
+    };
+    let out = tj()
+        .args(["create", "Rebuildable", "--goal", "first goal"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+
+    wipe_state();
+    tj().args(["pack", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: first goal"));
+
+    tj().args(["goal", &task_id, "second goal"])
+        .assert()
+        .success();
+    tj().args(["external", &task_id, "--add", "beads:rb-1"])
+        .assert()
+        .success();
+    wipe_state();
+
+    tj().args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: second goal"))
+        .stdout(contains("**External**: beads:rb-1"))
+        .stdout(contains("amend").not());
+    tj().args(["pack", "--external", "beads:rb-1"])
+        .assert()
+        .success()
+        .stdout(contains("Rebuildable"));
+    tj().args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("goal: second goal"));
+}
+
+#[test]
 fn ingest_hook_short_circuits_when_in_classifier_env_set() {
     // Recursion guard: classifier sets TJ_IN_CLASSIFIER=1 before
     // spawning claude. The nested claude re-fires our hooks; without
@@ -3081,6 +3131,17 @@ fn auto_open_links_to_prior_task_referencing_same_issue() {
         // instead of mashed into External, with the prior task's
         // current status annotated next to the id.
         .stdout(contains("**Linked**:"))
+        .stdout(contains(format!("- {} [closed]", prior)));
+
+    // Goal and link ride in the journal: a state rebuilt from it keeps both.
+    std::fs::remove_dir_all(dir.path().join("task-journal").join("state")).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &new_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: (not set)").not())
         .stdout(contains(format!("- {} [closed]", prior)));
 }
 
