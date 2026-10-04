@@ -5498,6 +5498,9 @@ fn spawn_classify_worker(backend: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long an empty (pid not yet written) worker lockfile counts as held.
+const LOCK_PID_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// File-lock guard for the classify-worker. Holds the lockfile until
 /// dropped; ensures cleanup on panic. One worker per project_hash.
 struct WorkerLock {
@@ -5525,16 +5528,25 @@ impl WorkerLock {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Inspect existing lockfile. If PID is alive → another
-                    // worker is running; back off. If dead/missing →
-                    // remove stale file and retry.
+                    // worker is running; back off. If dead → remove stale
+                    // file and retry.
                     let body = std::fs::read_to_string(&path).unwrap_or_default();
-                    let pid: Option<u32> = body.trim().parse().ok();
-                    if let Some(pid) = pid {
-                        if pid_is_alive(pid) {
-                            return Ok(None);
+                    match body.trim().parse::<u32>() {
+                        Ok(pid) if pid_is_alive(pid) => return Ok(None),
+                        Ok(_) => {}
+                        Err(_) => {
+                            // No PID yet: the holder may sit between
+                            // `create_new` and the pid write. Only a lock
+                            // that stayed empty past the grace is stale.
+                            let fresh = std::fs::metadata(&path)
+                                .and_then(|m| m.modified())
+                                .map(|t| t.elapsed().unwrap_or_default() < LOCK_PID_GRACE)
+                                .unwrap_or(false);
+                            if fresh {
+                                return Ok(None);
+                            }
                         }
                     }
-                    // Stale (no PID, or dead PID) — remove and retry.
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
@@ -5554,7 +5566,12 @@ impl Drop for WorkerLock {
 fn pid_is_alive(pid: u32) -> bool {
     // kill(pid, 0) probes existence without sending a signal.
     // SAFETY: libc::kill is a thin syscall wrapper, no aliasing concerns.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+
+    // EPERM: the process exists but belongs to another user.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
@@ -6336,6 +6353,14 @@ mod inline_tests {
             tj_core::session_id::session_id_from_payload(&v).as_deref(),
             Some("sess-9")
         );
+    }
+
+    /// PID 1 always exists; for a non-root user `kill(1, 0)` fails with EPERM,
+    /// which means "alive, not ours" — never "dead".
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_treats_eperm_as_alive() {
+        assert!(pid_is_alive(1));
     }
 
     #[test]

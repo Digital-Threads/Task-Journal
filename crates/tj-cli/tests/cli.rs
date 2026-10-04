@@ -2882,6 +2882,74 @@ fn classify_worker_respects_existing_lock() {
     );
 }
 
+/// The lock is created empty and the pid is written a moment later. A
+/// second worker that reads it in between must treat it as held, not as a
+/// stale lock to delete and steal. An empty lock that has sat for a while
+/// is a crashed worker's leftover and is taken over.
+#[test]
+fn classify_worker_treats_fresh_empty_lock_as_held() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let project_hash = tj_core::project_hash::from_path(&cwd).expect("compute project hash");
+
+    let pending = dir.path().join("task-journal").join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let events_path = dir
+        .path()
+        .join("task-journal")
+        .join("events")
+        .join(format!("{project_hash}.jsonl"));
+    std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+    let entry = pending.join("01emptylock.json");
+    std::fs::write(
+        &entry,
+        serde_json::json!({
+            "schema": "v2",
+            "kind": "PostToolUse",
+            "text": "empty lock marker",
+            "project_hash": project_hash,
+            "events_path": events_path.to_string_lossy(),
+            "backend": "heuristic",
+            "queued_at": "2026-05-08T00:00:00Z",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let lock_path = state.join(format!("classifier-{project_hash}.lock"));
+    std::fs::write(&lock_path, "").unwrap();
+
+    let worker = || {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["classify-worker", "--backend", "heuristic"])
+            .assert()
+            .success();
+    };
+
+    worker();
+    assert!(
+        entry.exists(),
+        "a fresh empty lock is held — entry must stay"
+    );
+    assert!(lock_path.exists(), "a fresh empty lock must not be deleted");
+
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&lock_path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    worker();
+    assert!(!entry.exists(), "a stale empty lock is taken over");
+    assert!(!lock_path.exists(), "the new holder releases the lock");
+}
+
 // =====================================================================
 // v0.7.0: statusline / PreCompact / /rewind / rejected / export-pr
 // =====================================================================
