@@ -145,6 +145,8 @@ THE RITUAL — do this on EVERY coding session, not optional:
    every decision, rejection, and key finding from this session?" If not, log
    them NOW.
 6. DONE → task_close(reason, outcome, outcome_tag).
+7. MODULES: task_create(modules=[..]), read module_page first;
+   task_close(module_notes=[..]). "📚 Chronicle: …" names a gap: fix it after.
 
 Record in the user's language, terse and specific (file:line, ids, names). One
 task = one objective — don't spawn a new task per turn; events accumulate under
@@ -198,6 +200,8 @@ pub struct TaskSearchParams {
     /// (`decision`, `evidence`, `finding`, `rejection`, ...).
     /// Accepts any value in [`tj_core::event::EventType::ALL`].
     pub event_type: Option<String>,
+    /// Only tasks linked to this module.
+    pub module: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskSearchResult {
@@ -241,11 +245,32 @@ pub struct TaskCreateParams {
     pub parent: Option<String>,
     /// Filled in by the client or the Task Journal Claude Code mod; leave it out.
     pub session_id: Option<String>,
+    /// Modules this task belongs to (ids from module_list). An unknown id is
+    /// an error; a merged module links to the one that took it over.
+    pub modules: Option<Vec<String>>,
 }
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, schemars::JsonSchema)]
 pub struct TaskCreateResult {
     pub task_id: String,
     pub title: String,
+    /// The task's modules with their current state: read module_page before changing them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<ModuleBrief>,
+    /// Modules that look like a fit when none were given: link with module_link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_modules: Vec<tj_core::modules::Suggestion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// The chronicle's most important gap, to close once the current work is done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chronicle: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ModuleBrief {
+    pub module_id: String,
+    pub name: String,
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -298,6 +323,14 @@ pub struct TaskCloseParams {
     pub outcome_tag: Option<String>,
     /// Filled in by the client or the Task Journal Claude Code mod; leave it out.
     pub session_id: Option<String>,
+    /// One line per module on what this task changed there: the module's history.
+    pub module_notes: Option<Vec<ModuleNote>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModuleNote {
+    pub module: String,
+    pub text: String,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskCloseResult {
@@ -313,6 +346,11 @@ pub struct TaskCloseResult {
     /// has no detected gaps; omitted from the wire shape in that case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completeness_gaps: Vec<String>,
+    /// What the task's modules still need from you now that it is closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_reminder: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -327,6 +365,81 @@ pub struct MemoryNoteParams {
 pub struct MemoryNoteResult {
     pub remembered: bool,
     pub text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModuleSaveParams {
+    /// Short slug: lowercase latin letters, digits, dashes (`stars`, `auth-refresh`).
+    pub module_id: String,
+    /// Human name. Required for a new module.
+    pub name: Option<String>,
+    /// One to three sentences: what this part of the system is.
+    pub description: Option<String>,
+    /// Code path prefixes and terms that mark the module; they drive suggestions.
+    pub hints: Option<tj_core::modules::Hints>,
+    /// How the module works now: a short living text you rewrite when it changes.
+    pub state: Option<String>,
+    /// `active`, `retired` or `merged` (with `merged_into`).
+    pub status: Option<String>,
+    pub merged_into: Option<String>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ModuleSaveResult {
+    pub module_id: String,
+    pub created: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModuleLink {
+    pub task_id: String,
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModuleLinkParams {
+    pub links: Vec<ModuleLink>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ModuleLinkResult {
+    /// Tasks whose links changed.
+    pub linked: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ModuleListResult {
+    pub modules: Vec<tj_core::modules::Module>,
+    /// What the chronicle is missing, most important first.
+    pub gaps: Vec<tj_core::archive::Gap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chronicle: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModulePageParams {
+    pub module_id: String,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ModulePageResult {
+    pub module_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BackfillParams {
+    /// Tasks per page, newest first (default 20, at most 100).
+    pub limit: Option<usize>,
+    /// Tasks to skip: the ones you left unlinked on earlier pages. Linked
+    /// tasks drop out of the list, so do not count them.
+    pub offset: Option<usize>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct BackfillResult {
+    pub total_unlinked: i64,
+    pub candidates: Vec<tj_core::modules::Candidate>,
 }
 
 fn parse_event_type(s: &str) -> anyhow::Result<tj_core::event::EventType> {
@@ -398,6 +511,139 @@ fn require_task(
     }
 
     Ok(())
+}
+
+/// Run `f` on this project's state with the journal tail ingested first.
+fn with_state<T>(f: impl FnOnce(&Connection, &str) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let (project_hash, events_path, state_path) = project_paths()?;
+    let conn_arc = cached_open(&state_path)?;
+    let conn = conn_arc
+        .lock()
+        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+
+    f(&conn, &project_hash)
+}
+
+/// Append `events` to this project's journal, durably.
+fn append_events(events: &[tj_core::event::Event]) -> anyhow::Result<()> {
+    let (_, events_path, _) = project_paths()?;
+    let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+    for event in events {
+        writer.append(event)?;
+    }
+    writer.flush_durable()?;
+
+    Ok(())
+}
+
+/// Append `events` to the journal at `path`, durably.
+fn append_to(path: &Path, events: &[tj_core::event::Event]) -> anyhow::Result<()> {
+    let mut writer = tj_core::storage::JsonlWriter::open(path)?;
+    for event in events {
+        writer.append(event)?;
+    }
+    writer.flush_durable()?;
+
+    Ok(())
+}
+
+/// The project's chronicle: the module map of its repository (a worktree
+/// shares the main checkout's) and every journal that links tasks to it.
+fn chronicle() -> anyhow::Result<tj_core::chronicle::Chronicle> {
+    tj_core::chronicle::Chronicle::open(&project_dir()?)
+}
+
+/// Run `f` on the chronicle and on this project's own state.
+fn with_chronicle<T>(
+    f: impl FnOnce(&tj_core::chronicle::Chronicle, &Connection, &str) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let chr = chronicle()?;
+
+    with_state(|conn, project_hash| f(&chr, conn, project_hash))
+}
+
+/// Whether this project, or the main checkout whose module map it shares, has
+/// a journal yet; read-only tools create nothing without one.
+fn has_journal() -> anyhow::Result<bool> {
+    if project_paths()?.1.exists() {
+        return Ok(true);
+    }
+
+    Ok(
+        match tj_core::project_hash::chronicle_home(&project_dir()?) {
+            Some(home) => resolve_project_paths(&home)?.1.exists(),
+            None => false,
+        },
+    )
+}
+
+/// What a new task's reply says about the chronicle: its modules with their
+/// state, or modules that look like a fit, and the archive's top gap.
+fn new_task_chronicle(
+    task_id: &str,
+    text: &str,
+    linked: &[String],
+) -> anyhow::Result<(
+    Vec<ModuleBrief>,
+    Vec<tj_core::modules::Suggestion>,
+    Option<String>,
+)> {
+    with_chronicle(|chr, conn, project_hash| {
+        let mut modules = Vec::new();
+        for id in linked {
+            if let Some(m) = tj_core::modules::get(&chr.home, &chr.home_hash, id)? {
+                modules.push(ModuleBrief {
+                    module_id: m.module_id,
+                    name: m.name,
+                    state: m.state,
+                });
+            }
+        }
+        let suggested = if linked.is_empty() {
+            tj_core::modules::suggest(&chr.home, &chr.home_hash, text, &[])?
+        } else {
+            Vec::new()
+        };
+        let gaps = tj_core::archive::gaps(chr, conn, project_hash, Some(task_id))?;
+
+        Ok((modules, suggested, tj_core::archive::headline(&gaps)))
+    })
+}
+
+/// What a closed task's modules still need: a link, or a fresh state.
+fn module_reminder(
+    chr: &tj_core::chronicle::Chronicle,
+    conn: &Connection,
+    task_id: &str,
+    has_notes: bool,
+) -> anyhow::Result<Option<String>> {
+    // No map yet: the session start and module_list already say so.
+    if tj_core::modules::list(&chr.home, &chr.home_hash)?.is_empty() {
+        return Ok(None);
+    }
+
+    let linked = tj_core::modules::modules_of_task(conn, task_id)?;
+    let ids = linked
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Ok(Some(match (linked.is_empty(), has_notes) {
+        (true, _) => "This task belongs to no module — link it with module_link so its history \
+                      is kept (module_list shows the map)."
+            .to_string(),
+        (false, false) => format!(
+            "Closed without module_notes, so the history of {ids} has no line on it — check \
+             each module's state and, if this task changed how it works, rewrite it with \
+             module_save(state=...)."
+        ),
+        (false, true) => format!(
+            "Check the state of {ids}: if this task changed how it works, rewrite it with \
+             module_save(state=...)."
+        ),
+    }))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -522,7 +768,7 @@ impl TaskJournalServer {
 
     #[tool(
         name = "task_search",
-        description = "Search tasks. `query` is full-text over event text; empty or absent lists the project's tasks, newest first. `status`: open | closed | any (default). `project`: absolute dir of another project. `tasks` gives id, title, status, last_event_at, goal per hit."
+        description = "Search tasks. `query` is full-text over event text; empty or absent lists the project's tasks, newest first. `status`: open | closed | any (default). `module`: only tasks of that module. `project`: absolute dir of another project. `tasks` gives id, title, status, last_event_at, goal per hit."
     )]
     async fn task_search(
         &self,
@@ -532,6 +778,7 @@ impl TaskJournalServer {
             let query = p.query.clone();
             let raw_query = p.query.clone();
             let event_type = p.event_type.clone();
+            let module = p.module.clone();
             let tasks = run_blocking(move || {
                 let status = match p.status.as_deref() {
                     None | Some("any") => None,
@@ -567,10 +814,15 @@ impl TaskJournalServer {
                          WHERE (?1 IS NULL OR status = ?1) \
                            AND (?2 IS NULL OR task_id IN \
                                 (SELECT task_id FROM events_index WHERE type = ?2)) \
+                           AND (?3 IS NULL OR task_id IN \
+                                (SELECT task_id FROM task_modules WHERE module_id = ?3)) \
                          ORDER BY last_event_at DESC, rowid DESC LIMIT 50",
                     )?;
                     let hits = stmt
-                        .query_map(rusqlite::params![status, event_type], task_search_hit)?
+                        .query_map(
+                            rusqlite::params![status, event_type, module],
+                            task_search_hit,
+                        )?
                         .collect::<Result<_, _>>()?;
 
                     return Ok(hits);
@@ -587,11 +839,13 @@ impl TaskJournalServer {
                      FROM search_fts JOIN tasks t ON t.task_id = search_fts.task_id \
                      WHERE search_fts MATCH ?1 \
                        AND (?2 IS NULL OR search_fts.type = ?2) \
-                       AND (?3 IS NULL OR t.status = ?3) LIMIT 50",
+                       AND (?3 IS NULL OR t.status = ?3) \
+                       AND (?4 IS NULL OR t.task_id IN \
+                            (SELECT task_id FROM task_modules WHERE module_id = ?4)) LIMIT 50",
                 )?;
                 let mut hits: Vec<TaskSearchHit> = stmt
                     .query_map(
-                        rusqlite::params![fts_query, event_type, status],
+                        rusqlite::params![fts_query, event_type, status, module],
                         task_search_hit,
                     )?
                     .collect::<Result<_, _>>()?;
@@ -608,10 +862,15 @@ impl TaskJournalServer {
                          FROM search_fts JOIN tasks t ON t.task_id = search_fts.task_id \
                          WHERE search_fts.text LIKE ?1 \
                            AND (?2 IS NULL OR search_fts.type = ?2) \
-                           AND (?3 IS NULL OR t.status = ?3) LIMIT 50",
+                           AND (?3 IS NULL OR t.status = ?3) \
+                           AND (?4 IS NULL OR t.task_id IN \
+                                (SELECT task_id FROM task_modules WHERE module_id = ?4)) LIMIT 50",
                     )?;
                     hits = stmt_like
-                        .query_map(rusqlite::params![like, event_type, status], task_search_hit)?
+                        .query_map(
+                            rusqlite::params![like, event_type, status, module],
+                            task_search_hit,
+                        )?
                         .collect::<Result<_, _>>()?;
                 }
 
@@ -631,7 +890,7 @@ impl TaskJournalServer {
 
     #[tool(
         name = "task_create",
-        description = "Open a new task. Always pass `goal` (one sentence: what the user is trying to accomplish) — it is the first line of every resume pack and the anchor for \"why was this done?\" weeks later. `title` is a short label; `initial_context` is optional."
+        description = "Open a new task. Always pass `goal` (one sentence: what the user is trying to accomplish) — it is the first line of every resume pack and the anchor for \"why was this done?\" weeks later. `title` is a short label; `initial_context` is optional. `modules`: the modules it belongs to (module_list); without them the reply suggests some."
     )]
     async fn task_create(
         &self,
@@ -663,6 +922,7 @@ impl TaskJournalServer {
                         return Ok(TaskCreateResult {
                             task_id: existing,
                             title: p.title.clone(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -684,6 +944,17 @@ impl TaskJournalServer {
                     }
                 }
 
+                // Modules are checked before the open event is written: an
+                // unknown id fails the call and leaves no task behind.
+                let resolved = match p.modules.as_deref() {
+                    Some(ids) if !ids.is_empty() => {
+                        let chr = chronicle()?;
+                        let r = tj_core::modules::resolve(&chr.home, &chr.home_hash, ids)?;
+                        Some((r, chr))
+                    }
+                    _ => None,
+                };
+
                 let mut event = tj_core::event::Event::new(
                     task_id.clone(),
                     tj_core::event::EventType::Open,
@@ -704,6 +975,10 @@ impl TaskJournalServer {
                 if let Some(ref r) = loom_ref {
                     event.meta["external"] = serde_json::json!([r]);
                 }
+                if let Some((r, chr)) = &resolved {
+                    event.meta["modules"] = serde_json::json!(r.ids);
+                    chr.stamp(&mut event.meta);
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     session_id_or_env(p.session_id.as_deref()).as_deref(),
@@ -713,9 +988,27 @@ impl TaskJournalServer {
                 writer.append(&event)?;
                 writer.flush_durable()?;
 
+                // The task is written; what follows only advises, so it never fails the call.
+                let linked = resolved
+                    .as_ref()
+                    .map(|(r, _)| r.ids.clone())
+                    .unwrap_or_default();
+                let text = format!(
+                    "{} {} {}",
+                    p.title,
+                    p.goal.as_deref().unwrap_or(""),
+                    p.initial_context.as_deref().unwrap_or("")
+                );
+                let (modules, suggested_modules, chronicle) =
+                    new_task_chronicle(&task_id, &text, &linked).unwrap_or_default();
+
                 Ok(TaskCreateResult {
                     task_id,
                     title: p.title.clone(),
+                    modules,
+                    suggested_modules,
+                    warnings: resolved.map(|(r, _)| r.warnings).unwrap_or_default(),
+                    chronicle,
                 })
             })
             .await
@@ -828,7 +1121,7 @@ impl TaskJournalServer {
 
     #[tool(
         name = "task_close",
-        description = "Close a task with reason and outcome."
+        description = "Close a task with reason and outcome. `module_notes`: one line per module on what this task changed there — it becomes the module's history."
     )]
     async fn task_close(
         &self,
@@ -836,11 +1129,18 @@ impl TaskJournalServer {
     ) -> Result<Json<TaskCloseResult>, McpError> {
         traced_tool("task_close", async move {
             let task_id = p.task_id.clone();
-            let (open_kids, gaps) = run_blocking(move || {
+            let (open_kids, gaps, module_reminder, warnings) = run_blocking(move || {
                 let (project_hash, events_path, state_path) = project_paths()?;
 
                 let conn_arc = cached_open(&state_path)?;
                 let open_kids;
+                let mut notes = Vec::new();
+                let mut warnings = Vec::new();
+                // Notes go to modules of the repository's shared map.
+                let chr = match &p.module_notes {
+                    Some(n) if !n.is_empty() => Some(chronicle()?),
+                    _ => None,
+                };
                 {
                     let conn = conn_arc
                         .lock()
@@ -865,6 +1165,18 @@ impl TaskJournalServer {
                         }
                     }
                     open_kids = tj_core::db::count_open_children(&conn, &p.task_id)?;
+
+                    // A note to an unknown module fails the close before it is written.
+                    for note in p.module_notes.iter().flatten() {
+                        let chr = chr.as_ref().expect("opened when notes are given");
+                        let r = tj_core::modules::resolve(
+                            &chr.home,
+                            &chr.home_hash,
+                            std::slice::from_ref(&note.module),
+                        )?;
+                        warnings.extend(r.warnings);
+                        notes.push((r.ids[0].clone(), note.text.clone()));
+                    }
                 } // release the connection lock before doing the JSONL append
 
                 let mut event = tj_core::event::Event::new(
@@ -882,6 +1194,12 @@ impl TaskJournalServer {
                 if let Some(t) = &p.outcome_tag {
                     meta.insert("outcome_tag".into(), serde_json::Value::String(t.clone()));
                 }
+                if !notes.is_empty() {
+                    meta.insert(
+                        "module_notes".into(),
+                        tj_core::modules::notes_meta(&notes),
+                    );
+                }
                 // Layer-2 close harvest: stamp deterministic git/gh refs
                 // (commit, branch, PR) into the close event so the resume pack
                 // reads as a clickable ledger of what shipped. Best-effort and
@@ -895,6 +1213,9 @@ impl TaskJournalServer {
                     }
                 }
                 event.meta = serde_json::Value::Object(meta);
+                if let Some(chr) = &chr {
+                    chr.stamp(&mut event.meta);
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     session_id_or_env(p.session_id.as_deref()).as_deref(),
@@ -909,6 +1230,7 @@ impl TaskJournalServer {
                 // assess. Any error here must NOT fail the close — handle
                 // locally, never `?`-propagate.
                 let mut gaps: Vec<String> = Vec::new();
+                let mut module_reminder = None;
                 if let Ok(conn) = tj_core::db::open(&state_path) {
                     let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
                     if let Ok(report) = tj_core::completeness::assess(
@@ -918,8 +1240,14 @@ impl TaskJournalServer {
                     ) {
                         gaps = report.gaps.into_iter().map(|g| g.detail).collect();
                     }
+                    module_reminder = chronicle()
+                        .and_then(|chr| {
+                            crate::module_reminder(&chr, &conn, &p.task_id, !notes.is_empty())
+                        })
+                        .ok()
+                        .flatten();
                 }
-                Ok((open_kids, gaps))
+                Ok((open_kids, gaps, module_reminder, warnings))
             })
             .await?;
             let note = if open_kids > 0 {
@@ -932,7 +1260,203 @@ impl TaskJournalServer {
                 closed: true,
                 note,
                 completeness_gaps: gaps,
+                module_reminder,
+                warnings,
             }))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "module_list",
+        description = "The project's module map — parts of the system by meaning, each with its task count and last activity — and what the chronicle is missing (`gaps`, most important first)."
+    )]
+    async fn module_list(&self) -> Result<Json<ModuleListResult>, McpError> {
+        traced_tool("module_list", async move {
+            run_blocking(move || {
+                if !has_journal()? {
+                    return Ok(Json(ModuleListResult {
+                        modules: Vec::new(),
+                        gaps: Vec::new(),
+                        chronicle: None,
+                    }));
+                }
+
+                with_chronicle(|chr, conn, project_hash| {
+                    let gaps = tj_core::archive::gaps(chr, conn, project_hash, None)?;
+
+                    Ok(Json(ModuleListResult {
+                        modules: tj_core::modules::map(chr)?,
+                        chronicle: tj_core::archive::headline(&gaps),
+                        gaps,
+                    }))
+                })
+            })
+            .await
+        })
+        .await
+    }
+
+    #[tool(
+        name = "module_page",
+        description = "A module's page: what it is, how it works now, the active decisions, rejections and constraints of all its tasks, and its history. Read it before you change the module."
+    )]
+    async fn module_page(
+        &self,
+        Parameters(p): Parameters<ModulePageParams>,
+    ) -> Result<Json<ModulePageResult>, McpError> {
+        traced_tool("module_page", async move {
+            run_blocking(move || {
+                if !has_journal()? {
+                    anyhow::bail!(
+                        "module {:?} does not exist — module_list shows the map",
+                        p.module_id
+                    );
+                }
+
+                let text = tj_core::modules::page(&chronicle()?, &p.module_id)?;
+
+                Ok(Json(ModulePageResult {
+                    module_id: p.module_id,
+                    text,
+                }))
+            })
+            .await
+        })
+        .await
+    }
+
+    #[tool(
+        name = "module_save",
+        description = "Create or update a module: a part of the system by meaning (not a folder, not a ticket). Pass only the fields that change; a new module needs `name`. `state` is the short living text of how the module works now — rewrite it when a task changes the module. `hints` (paths, terms) drive module suggestions."
+    )]
+    async fn module_save(
+        &self,
+        Parameters(p): Parameters<ModuleSaveParams>,
+    ) -> Result<Json<ModuleSaveResult>, McpError> {
+        traced_tool("module_save", async move {
+            run_blocking(move || {
+                let fields = tj_core::modules::ModuleFields {
+                    name: p.name,
+                    description: p.description,
+                    hints: p.hints,
+                    state: p.state,
+                    status: p.status,
+                    merged_into: p.merged_into,
+                };
+                let event = tj_core::modules::module_event(&p.module_id, &fields)?;
+
+                // Modules live in the repository's home journal, also when
+                // saved from a worktree.
+                let chr = chronicle()?;
+                let (conn, project_hash) = (&chr.home, chr.home_hash.as_str());
+                let created = {
+                    let exists = tj_core::modules::get(conn, project_hash, &p.module_id)?.is_some();
+                    if !exists && fields.name.is_none() {
+                        anyhow::bail!("module {} is new: pass `name` too", p.module_id);
+                    }
+                    if let Some(into) = &fields.merged_into {
+                        if into == &p.module_id {
+                            anyhow::bail!("a module cannot be merged into itself");
+                        }
+                        if tj_core::modules::get(conn, project_hash, into)?.is_none() {
+                            anyhow::bail!("merged_into: module {into:?} does not exist");
+                        }
+                    }
+
+                    !exists
+                };
+                append_to(&chr.home_events(), &[event])?;
+
+                Ok(Json(ModuleSaveResult {
+                    module_id: p.module_id,
+                    created,
+                }))
+            })
+            .await
+        })
+        .await
+    }
+
+    #[tool(
+        name = "module_link",
+        description = "Link tasks to modules or unlink them, many at once: `links` = [{task_id, add: [module ids], remove: [module ids]}]. Unknown tasks or modules fail the whole call before anything is written; a merged module links to the one that took it over."
+    )]
+    async fn module_link(
+        &self,
+        Parameters(p): Parameters<ModuleLinkParams>,
+    ) -> Result<Json<ModuleLinkResult>, McpError> {
+        traced_tool("module_link", async move {
+            run_blocking(move || {
+                let mut warnings = Vec::new();
+                let events = with_chronicle(|chr, conn, _| {
+                    let mut events = Vec::new();
+                    for link in &p.links {
+                        if !tj_core::db::task_exists(conn, &link.task_id)? {
+                            anyhow::bail!("task not found: {}", link.task_id);
+                        }
+                        for id in &link.remove {
+                            tj_core::modules::validate_id(id)?;
+                        }
+                        let add = tj_core::modules::resolve(&chr.home, &chr.home_hash, &link.add)?;
+                        warnings.extend(add.warnings);
+                        if add.ids.is_empty() && link.remove.is_empty() {
+                            continue;
+                        }
+                        let mut event =
+                            tj_core::modules::link_event(&link.task_id, &add.ids, &link.remove);
+                        chr.stamp(&mut event.meta);
+                        events.push(event);
+                    }
+
+                    Ok(events)
+                })?;
+                append_events(&events)?;
+
+                Ok(Json(ModuleLinkResult {
+                    linked: events.len(),
+                    warnings,
+                }))
+            })
+            .await
+        })
+        .await
+    }
+
+    #[tool(
+        name = "module_backfill_candidates",
+        description = "Tasks that belong to no module, newest first: id, title, status, goal, outcome, files, and the modules the journal suggests for each. Sort them, confirm with the user, then module_link. `total_unlinked` counts them all; page with `limit`, and `offset` = the tasks you left unlinked so far."
+    )]
+    async fn module_backfill_candidates(
+        &self,
+        Parameters(p): Parameters<BackfillParams>,
+    ) -> Result<Json<BackfillResult>, McpError> {
+        traced_tool("module_backfill_candidates", async move {
+            run_blocking(move || {
+                if !has_journal()? {
+                    return Ok(Json(BackfillResult {
+                        total_unlinked: 0,
+                        candidates: Vec::new(),
+                    }));
+                }
+
+                let limit = p.limit.unwrap_or(20).min(100);
+                let (total_unlinked, candidates) = with_chronicle(|chr, conn, project_hash| {
+                    tj_core::modules::backfill_candidates(
+                        chr,
+                        conn,
+                        project_hash,
+                        limit,
+                        p.offset.unwrap_or(0),
+                    )
+                })?;
+
+                Ok(Json(BackfillResult {
+                    total_unlinked,
+                    candidates,
+                }))
+            })
+            .await
         })
         .await
     }
@@ -1200,8 +1724,13 @@ mod tests {
         let create = TaskCreateResult {
             task_id: "tj-x".into(),
             title: "t".into(),
+            ..Default::default()
         };
-        assert!(!keys_of(&serde_json::to_value(&create).unwrap()).contains(&"stub".to_string()));
+        // Empty chronicle fields stay off the wire: the reply keeps its old shape.
+        assert_eq!(
+            keys_of(&serde_json::to_value(&create).unwrap()),
+            vec!["task_id".to_string(), "title".to_string()]
+        );
 
         let event = EventAddResult {
             event_id: "e".into(),
@@ -1215,8 +1744,13 @@ mod tests {
             closed: true,
             note: None,
             completeness_gaps: Vec::new(),
+            module_reminder: None,
+            warnings: Vec::new(),
         };
-        assert!(!keys_of(&serde_json::to_value(&close).unwrap()).contains(&"stub".to_string()));
+        assert_eq!(
+            keys_of(&serde_json::to_value(&close).unwrap()),
+            vec!["closed".to_string(), "task_id".to_string()]
+        );
     }
 
     #[test]
@@ -1369,6 +1903,7 @@ mod tests {
                 goal: None,
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1415,6 +1950,7 @@ mod tests {
                 goal: None,
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1459,6 +1995,7 @@ mod tests {
                 goal: None,
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1472,6 +2009,7 @@ mod tests {
                 goal: None,
                 parent: Some(parent.clone()),
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1503,6 +2041,7 @@ mod tests {
                 goal: None,
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1517,6 +2056,7 @@ mod tests {
                 goal: None,
                 parent: Some(parent.clone()),
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap();
@@ -1528,6 +2068,7 @@ mod tests {
                 outcome: None,
                 outcome_tag: None,
                 session_id: None,
+                module_notes: None,
             }))
             .await
             .unwrap()
@@ -1546,6 +2087,7 @@ mod tests {
                 goal: Some("g".into()),
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1584,6 +2126,7 @@ mod tests {
                 goal: Some("ship it".into()),
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1598,6 +2141,7 @@ mod tests {
                 outcome: None,
                 outcome_tag: None,
                 session_id: None,
+                module_notes: None,
             }))
             .await
             .unwrap()
@@ -1625,6 +2169,7 @@ mod tests {
                 goal: Some("ship it".into()),
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1671,6 +2216,7 @@ mod tests {
                 goal: Some(format!("goal of {title}")),
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await
             .unwrap()
@@ -1691,6 +2237,7 @@ mod tests {
                 status: status.map(Into::into),
                 project: project.map(Into::into),
                 event_type: event_type.map(Into::into),
+                module: None,
             }))
             .await
             .map(|j| j.0)
@@ -1717,6 +2264,7 @@ mod tests {
                 outcome: None,
                 outcome_tag: None,
                 session_id: None,
+                module_notes: None,
             }))
             .await
             .unwrap();
@@ -1767,6 +2315,7 @@ mod tests {
                 outcome: None,
                 outcome_tag: None,
                 session_id: None,
+                module_notes: None,
             }))
             .await
             .unwrap();
@@ -1857,6 +2406,7 @@ mod tests {
                 outcome: None,
                 outcome_tag: None,
                 session_id: None,
+                module_notes: None,
             }))
             .await
             .unwrap();
@@ -1887,6 +2437,7 @@ mod tests {
             outcome: Some(outcome.into()),
             outcome_tag: Some("done".into()),
             session_id: None,
+            module_notes: None,
         };
 
         // Make the close append fail: the journal is read-only.
@@ -1985,6 +2536,7 @@ mod tests {
                 goal: None,
                 parent: None,
                 session_id: Some("s-create".into()),
+                modules: None,
             }))
             .await
             .unwrap()
@@ -2017,6 +2569,7 @@ mod tests {
                 outcome: None,
                 outcome_tag: None,
                 session_id: Some("s-close".into()),
+                module_notes: None,
             }))
             .await;
         match prev {
@@ -2057,6 +2610,309 @@ mod tests {
         assert_eq!(p.session_id, None);
     }
 
+    fn create_params(title: &str, modules: Option<&[&str]>) -> TaskCreateParams {
+        TaskCreateParams {
+            title: title.into(),
+            initial_context: None,
+            goal: None,
+            parent: None,
+            session_id: None,
+            modules: modules.map(|m| m.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    fn close_params(task_id: &str, notes: Option<Vec<(&str, &str)>>) -> TaskCloseParams {
+        TaskCloseParams {
+            task_id: task_id.into(),
+            reason: "done".into(),
+            outcome: Some("shipped".into()),
+            outcome_tag: None,
+            session_id: None,
+            module_notes: notes.map(|n| {
+                n.into_iter()
+                    .map(|(module, text)| ModuleNote {
+                        module: module.into(),
+                        text: text.into(),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    fn save_params(id: &str, name: Option<&str>, terms: &[&str]) -> ModuleSaveParams {
+        ModuleSaveParams {
+            module_id: id.into(),
+            name: name.map(str::to_string),
+            description: None,
+            hints: Some(tj_core::modules::Hints {
+                paths: vec![],
+                terms: terms.iter().map(|t| t.to_string()).collect(),
+            }),
+            state: None,
+            status: None,
+            merged_into: None,
+        }
+    }
+
+    fn journal_lines() -> usize {
+        let (_, events_path, _) = project_paths().unwrap();
+        std::fs::read_to_string(events_path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn chronicle_params_are_optional() {
+        let p: TaskCreateParams =
+            serde_json::from_value(serde_json::json!({"title": "t"})).unwrap();
+        assert!(p.modules.is_none());
+        let c: TaskCloseParams =
+            serde_json::from_value(serde_json::json!({"task_id": "tj-a", "reason": "r"})).unwrap();
+        assert!(c.module_notes.is_none());
+        let s: TaskSearchParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(s.module.is_none());
+
+        let l: ModuleLinkParams = serde_json::from_value(
+            serde_json::json!({"links": [{"task_id": "tj-a", "add": ["stars"]}]}),
+        )
+        .unwrap();
+        assert_eq!(l.links[0].add, vec!["stars".to_string()]);
+        assert!(l.links[0].remove.is_empty());
+    }
+
+    #[test]
+    fn instructions_teach_the_chronicle() {
+        for needle in ["modules=", "module_page", "module_notes", "📚 Chronicle"] {
+            assert!(MCP_INSTRUCTIONS.contains(needle), "{needle}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_lives_in_its_module_from_create_to_close() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let saved = server
+            .module_save(Parameters(save_params("mcp-flow", Some("Flow"), &[])))
+            .await
+            .unwrap()
+            .0;
+        assert!(saved.created);
+
+        let created = server
+            .task_create(Parameters(create_params("Flow work", Some(&["mcp-flow"]))))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(created.modules[0].module_id, "mcp-flow");
+
+        let closed = server
+            .task_close(Parameters(close_params(
+                &created.task_id,
+                Some(vec![("mcp-flow", "Flow now retries")]),
+            )))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            closed.module_reminder.as_deref(),
+            Some(
+                "Check the state of mcp-flow: if this task changed how it works, rewrite it with \
+                 module_save(state=...)."
+            ),
+        );
+
+        let page = server
+            .module_page(Parameters(ModulePageParams {
+                module_id: "mcp-flow".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(page.text.contains("Flow now retries"), "{}", page.text);
+        assert!(page.text.contains(&created.task_id), "{}", page.text);
+
+        let hits = server
+            .task_search(Parameters(TaskSearchParams {
+                query: String::new(),
+                status: None,
+                project: None,
+                event_type: None,
+                module: Some("mcp-flow".into()),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(hits.results, vec![created.task_id.clone()]);
+
+        let map = server.module_list().await.unwrap().0;
+        assert!(map.modules.iter().any(|m| m.module_id == "mcp-flow"));
+    }
+
+    #[tokio::test]
+    async fn unknown_modules_and_new_modules_without_a_name_write_nothing() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+        let before = journal_lines();
+
+        let err = server
+            .task_create(Parameters(create_params("Orphan", Some(&["mcp-nope"]))))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.message.contains("module_save"), "{}", err.message);
+
+        let err = server
+            .module_save(Parameters(save_params("mcp-unnamed", None, &[])))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.message.contains("name"), "{}", err.message);
+
+        let err = server
+            .module_save(Parameters(save_params("Bad Slug", Some("x"), &[])))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.message.contains("auth-refresh"), "{}", err.message);
+
+        assert_eq!(journal_lines(), before);
+    }
+
+    #[tokio::test]
+    async fn a_new_task_gets_module_suggestions_and_links_later() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+        server
+            .module_save(Parameters(save_params(
+                "mcp-billing",
+                Some("Billing"),
+                &["invoice ledger"],
+            )))
+            .await
+            .unwrap();
+
+        let created = server
+            .task_create(Parameters(create_params(
+                "Fix the invoice ledger rounding",
+                None,
+            )))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            created
+                .suggested_modules
+                .iter()
+                .any(|s| s.module_id == "mcp-billing"),
+            "{:?}",
+            created.suggested_modules
+        );
+        assert!(created.chronicle.is_some());
+
+        let candidates = server
+            .module_backfill_candidates(Parameters(BackfillParams {
+                limit: Some(100),
+                offset: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(candidates
+            .candidates
+            .iter()
+            .any(|c| c.task_id == created.task_id));
+
+        let linked = server
+            .module_link(Parameters(ModuleLinkParams {
+                links: vec![ModuleLink {
+                    task_id: created.task_id.clone(),
+                    add: vec!["mcp-billing".into()],
+                    remove: vec![],
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(linked.linked, 1);
+
+        let closed = server
+            .task_close(Parameters(close_params(&created.task_id, None)))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            closed
+                .module_reminder
+                .as_deref()
+                .unwrap_or("")
+                .contains("mcp-billing"),
+            "{:?}",
+            closed.module_reminder
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_redirects_a_merged_module_and_refuses_an_unknown_task() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+        server
+            .module_save(Parameters(save_params("mcp-new", Some("New"), &[])))
+            .await
+            .unwrap();
+        server
+            .module_save(Parameters(save_params("mcp-old", Some("Old"), &[])))
+            .await
+            .unwrap();
+        let mut merge = save_params("mcp-old", None, &[]);
+        merge.hints = None;
+        merge.status = Some("merged".into());
+        merge.merged_into = Some("mcp-new".into());
+        server.module_save(Parameters(merge)).await.unwrap();
+
+        let task = server
+            .task_create(Parameters(create_params("Old area work", None)))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+        let linked = server
+            .module_link(Parameters(ModuleLinkParams {
+                links: vec![ModuleLink {
+                    task_id: task.clone(),
+                    add: vec!["mcp-old".into()],
+                    remove: vec![],
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            linked.warnings[0].contains("merged into mcp-new"),
+            "{:?}",
+            linked.warnings
+        );
+
+        let err = server
+            .module_link(Parameters(ModuleLinkParams {
+                links: vec![ModuleLink {
+                    task_id: "tj-missing".into(),
+                    add: vec!["mcp-new".into()],
+                    remove: vec![],
+                }],
+            }))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.message.contains("tj-missing"), "{}", err.message);
+
+        let mut into_self = save_params("mcp-new", None, &[]);
+        into_self.hints = None;
+        into_self.status = Some("merged".into());
+        into_self.merged_into = Some("mcp-new".into());
+        assert!(server.module_save(Parameters(into_self)).await.is_err());
+    }
+
     #[tokio::test]
     async fn task_search_of_a_project_without_a_journal_creates_no_state_db() {
         let _env = handler_env();
@@ -2090,6 +2946,7 @@ mod tests {
                 goal: Some("Wire the board".into()),
                 parent: None,
                 session_id: None,
+                modules: None,
             }))
             .await;
         std::env::remove_var("LOOM_TASK_ID");

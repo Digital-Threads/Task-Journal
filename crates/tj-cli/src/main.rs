@@ -122,6 +122,180 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     r
 }
 
+/// Run `f` on the project's chronicle (the module map of its repository, a
+/// worktree sharing the main checkout's) and on the current project's state.
+fn with_chronicle<T>(
+    f: impl FnOnce(&tj_core::chronicle::Chronicle, &rusqlite::Connection, &str) -> Result<T>,
+) -> Result<T> {
+    let cwd = std::env::current_dir()?;
+    let chr = tj_core::chronicle::Chronicle::open(&cwd)?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+
+    f(&chr, &conn, &project_hash)
+}
+
+/// Append `events` to the current project's journal, durably.
+fn append_to_journal(events: &[tj_core::event::Event]) -> Result<()> {
+    let project_hash = tj_core::project_hash::from_path(&std::env::current_dir()?)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    append_to(&events_path, events)
+}
+
+/// Append `events` to the journal at `path`, durably.
+fn append_to(path: &std::path::Path, events: &[tj_core::event::Event]) -> Result<()> {
+    let mut writer = tj_core::storage::JsonlWriter::open(path)?;
+    for event in events {
+        writer.append(event)?;
+    }
+    writer.flush_durable()?;
+
+    Ok(())
+}
+
+/// The CLI writes as the user, from the command line.
+fn by_user(mut event: tj_core::event::Event) -> tj_core::event::Event {
+    event.author = tj_core::event::Author::User;
+    event.source = tj_core::event::Source::Cli;
+
+    event
+}
+
+fn run_module(action: ModuleCmd) -> Result<()> {
+    match action {
+        ModuleCmd::List { json } => {
+            let (modules, gaps) = with_chronicle(|chr, conn, hash| {
+                Ok((
+                    tj_core::modules::map(chr)?,
+                    tj_core::archive::gaps(chr, conn, hash, None)?,
+                ))
+            })?;
+            if json {
+                let out = serde_json::json!({ "modules": modules, "gaps": gaps });
+                println!("{}", serde_json::to_string(&out)?);
+                return Ok(());
+            }
+
+            if modules.is_empty() {
+                println!("(no modules yet)");
+            }
+            for m in &modules {
+                let last = m.last_activity.as_deref().map(|t| t.get(..10).unwrap_or(t));
+                let status = if m.status == "active" {
+                    String::new()
+                } else {
+                    format!(" [{}]", m.status)
+                };
+                println!(
+                    "{:<20} {}{status} — {} task(s){}{}",
+                    m.module_id,
+                    m.name,
+                    m.task_count,
+                    last.map(|d| format!(", last {d}")).unwrap_or_default(),
+                    m.description
+                        .as_deref()
+                        .map(|d| format!(" — {d}"))
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some(line) = tj_core::archive::headline(&gaps) {
+                println!("\n{line}");
+            }
+        }
+        ModuleCmd::Show { module_id } => {
+            let page = with_chronicle(|chr, _, _| tj_core::modules::page(chr, &module_id))?;
+            println!("{page}");
+        }
+        ModuleCmd::Save {
+            module_id,
+            name,
+            description,
+            paths,
+            terms,
+            state,
+            status,
+            merged_into,
+        } => {
+            let hints = (!paths.is_empty() || !terms.is_empty())
+                .then_some(tj_core::modules::Hints { paths, terms });
+            let fields = tj_core::modules::ModuleFields {
+                name,
+                description,
+                hints,
+                state,
+                status,
+                merged_into,
+            };
+            let event = tj_core::modules::module_event(&module_id, &fields)?;
+
+            // Modules live in the repository's home journal, also when saved
+            // from a worktree.
+            let (created, home_events) = with_chronicle(|chr, _, _| {
+                let (conn, hash) = (&chr.home, chr.home_hash.as_str());
+                let exists = tj_core::modules::get(conn, hash, &module_id)?.is_some();
+                if !exists && fields.name.is_none() {
+                    anyhow::bail!("module {module_id} is new: pass --name too");
+                }
+                if let Some(into) = &fields.merged_into {
+                    if into == &module_id {
+                        anyhow::bail!("a module cannot be merged into itself");
+                    }
+                    if tj_core::modules::get(conn, hash, into)?.is_none() {
+                        anyhow::bail!("--merged-into: module {into:?} does not exist");
+                    }
+                }
+
+                Ok((!exists, chr.home_events()))
+            })?;
+            append_to(&home_events, &[by_user(event)])?;
+            println!(
+                "{} {module_id}",
+                if created { "created" } else { "updated" }
+            );
+        }
+        ModuleCmd::Link {
+            task_id,
+            add,
+            remove,
+        } => {
+            let event = with_chronicle(|chr, conn, _| {
+                if !tj_core::db::task_exists(conn, &task_id)? {
+                    anyhow::bail!("task not found: {task_id}");
+                }
+                for id in &remove {
+                    tj_core::modules::validate_id(id)?;
+                }
+
+                let resolved = tj_core::modules::resolve(&chr.home, &chr.home_hash, &add)?;
+                for w in &resolved.warnings {
+                    eprintln!("warning: {w}");
+                }
+                if resolved.ids.is_empty() && remove.is_empty() {
+                    anyhow::bail!("nothing to do: pass --add or --remove");
+                }
+                let mut event = tj_core::modules::link_event(&task_id, &resolved.ids, &remove);
+                chr.stamp(&mut event.meta);
+
+                Ok(event)
+            })?;
+            append_to_journal(&[by_user(event)])?;
+            println!("linked {task_id}");
+        }
+        ModuleCmd::Candidates { limit, offset } => {
+            let (total, candidates) = with_chronicle(|chr, conn, hash| {
+                tj_core::modules::backfill_candidates(chr, conn, hash, limit, offset)
+            })?;
+            let out = serde_json::json!({ "total_unlinked": total, "candidates": candidates });
+            println!("{}", serde_json::to_string(&out)?);
+        }
+    }
+
+    Ok(())
+}
+
 /// Read a project's JSONL event log. Malformed lines are skipped with a
 /// warning on stderr, the same policy as `rebuild_state`, so one bad line
 /// cannot abort a read-only command.
@@ -292,13 +466,50 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             "tasks",
             "index_state",
             "projection_state",
+            "projection_state_014",
             "embeddings",
             "dream_state",
+            "modules",
+            "task_modules",
+            "module_notes",
         ] {
             conn.execute(
                 &format!("UPDATE {table} SET project_hash = ?1 WHERE project_hash = ?2"),
                 rusqlite::params![to_hash, from_hash],
             )?;
+        }
+    }
+
+    // The chronicle registry: a moved home keeps the worktree journals its
+    // module history comes from, and a moved member stays listed under its home.
+    let chronicle_dir = tj_core::paths::data_dir()?.join("chronicle");
+    if chronicle_dir.is_dir() {
+        let from_registry = chronicle_dir.join(format!("{from_hash}.members"));
+        if from_registry.exists() {
+            let to_registry = chronicle_dir.join(format!("{to_hash}.members"));
+            let mut members = std::fs::read_to_string(&to_registry).unwrap_or_default();
+            members.push_str(&std::fs::read_to_string(&from_registry)?);
+            std::fs::write(&to_registry, members)?;
+            std::fs::remove_file(&from_registry)?;
+            moved.push(to_registry.display().to_string());
+        }
+        for entry in std::fs::read_dir(&chronicle_dir)? {
+            let path = entry?.path();
+            let text = std::fs::read_to_string(&path)?;
+            if text.lines().any(|l| l.trim() == from_hash) {
+                let renamed: String = text
+                    .lines()
+                    .map(|l| {
+                        if l.trim() == from_hash {
+                            to_hash.as_str()
+                        } else {
+                            l
+                        }
+                    })
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                std::fs::write(&path, renamed)?;
+            }
         }
     }
 
@@ -821,6 +1032,9 @@ enum Commands {
         /// Parent task id — makes this a subtask of the given id.
         #[arg(long)]
         parent: Option<String>,
+        /// Modules the task belongs to, comma-separated (see `module list`).
+        #[arg(long, value_delimiter = ',')]
+        modules: Vec<String>,
     },
     /// List tasks for the current project.
     List {
@@ -972,6 +1186,10 @@ enum Commands {
         /// primary field; the tag is for filtering / aggregation.
         #[arg(long)]
         outcome_tag: Option<String>,
+        /// A line of a module's history: `module=what this task changed there`.
+        /// Repeat for several modules.
+        #[arg(long = "module-note")]
+        module_notes: Vec<String>,
     },
     /// Attach a clickable, typed link to a task (doc, deploy, dashboard,
     /// design, …). Renders under the pack's Artifacts as `[label](url)` so a
@@ -1035,6 +1253,12 @@ enum Commands {
         /// several references over time.
         #[arg(long = "add")]
         add: String,
+    },
+    /// The project chronicle: modules (parts of the system by meaning) and
+    /// their history.
+    Module {
+        #[command(subcommand)]
+        action: ModuleCmd,
     },
     /// Re-run artifact extraction over every event of a task and
     /// refresh the pack cache. Use after upgrading from v0.4.x — older
@@ -1348,6 +1572,54 @@ enum EventsCmd {
 }
 
 #[derive(Subcommand)]
+enum ModuleCmd {
+    /// The module map and what the chronicle is missing.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// A module's page: state, decisions, rejections, constraints, history.
+    Show { module_id: String },
+    /// Create or update a module; only the fields given change.
+    Save {
+        module_id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        /// A code path prefix that marks the module (repeatable).
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// A term of the module (repeatable).
+        #[arg(long = "term")]
+        terms: Vec<String>,
+        /// How the module works now.
+        #[arg(long)]
+        state: Option<String>,
+        /// `active`, `retired` or `merged` (with `--merged-into`).
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        merged_into: Option<String>,
+    },
+    /// Link a task to modules, or unlink it.
+    Link {
+        task_id: String,
+        #[arg(long = "add")]
+        add: Vec<String>,
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
+    /// Tasks that belong to no module, with suggestions (JSON).
+    Candidates {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+}
+
+#[derive(Subcommand)]
 enum PendingCmd {
     /// List queued classifier failures.
     List,
@@ -1400,6 +1672,7 @@ fn real_main() -> Result<()> {
             context,
             goal,
             parent,
+            modules,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -1440,6 +1713,15 @@ fn real_main() -> Result<()> {
             // from the JSONL) restores it.
             if let Some(g) = goal {
                 meta["goal"] = serde_json::Value::String(g);
+            }
+            if !modules.is_empty() {
+                let chr = tj_core::chronicle::Chronicle::open(&cwd)?;
+                let resolved = tj_core::modules::resolve(&chr.home, &chr.home_hash, &modules)?;
+                for w in &resolved.warnings {
+                    eprintln!("warning: {w}");
+                }
+                meta["modules"] = serde_json::json!(resolved.ids);
+                chr.stamp(&mut meta);
             }
             event.meta = meta;
 
@@ -1482,6 +1764,7 @@ fn real_main() -> Result<()> {
                     return Ok(());
                 }
                 let mut events = read_events_lenient(&events_path, "events list")?;
+                events.retain(|e| !e.is_module());
                 events.reverse();
                 for e in events.into_iter().take(limit) {
                     let title = e
@@ -1777,6 +2060,7 @@ fn real_main() -> Result<()> {
                     &project_hash,
                     session.as_deref(),
                     prefer.as_deref(),
+                    tj_core::chronicle::Chronicle::open(&cwd).ok().as_ref(),
                 )?
             } else {
                 tj_core::session_state::SessionState {
@@ -1784,6 +2068,7 @@ fn real_main() -> Result<()> {
                     session_id: session,
                     open_tasks: 0,
                     active: None,
+                    archive: Vec::new(),
                 }
             };
 
@@ -1821,6 +2106,7 @@ fn real_main() -> Result<()> {
             reason,
             outcome,
             outcome_tag,
+            module_notes,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -1838,6 +2124,13 @@ fn real_main() -> Result<()> {
                     ),
                 }
             }
+            let mut notes = Vec::new();
+            for note in &module_notes {
+                let Some((module, text)) = note.split_once('=') else {
+                    anyhow::bail!("--module-note expects module=text, got {note:?}");
+                };
+                notes.push((module.trim().to_string(), text.trim().to_string()));
+            }
 
             // Catch up the index then assert the task is real before we
             // append a close event for an id that never existed.
@@ -1849,6 +2142,24 @@ fn real_main() -> Result<()> {
                 anyhow::bail!("task not found: {task_id}");
             }
             let open_kids = tj_core::db::count_open_children(&conn, &task_id)?;
+            // A note to an unknown module fails the close before it is written.
+            let chr = if notes.is_empty() {
+                None
+            } else {
+                Some(tj_core::chronicle::Chronicle::open(&cwd)?)
+            };
+            for (module, _) in notes.iter_mut() {
+                let chr = chr.as_ref().expect("opened when notes are given");
+                let resolved = tj_core::modules::resolve(
+                    &chr.home,
+                    &chr.home_hash,
+                    std::slice::from_ref(module),
+                )?;
+                for w in &resolved.warnings {
+                    eprintln!("warning: {w}");
+                }
+                *module = resolved.ids[0].clone();
+            }
             drop(conn);
 
             let mut event = tj_core::event::Event::new(
@@ -1870,6 +2181,17 @@ fn real_main() -> Result<()> {
             }
             if let Some(t) = outcome_tag {
                 meta.insert("outcome_tag".into(), serde_json::Value::String(t));
+            }
+            if !notes.is_empty() {
+                meta.insert("module_notes".into(), tj_core::modules::notes_meta(&notes));
+                if let Some(chr) = &chr {
+                    if chr.member_hash.is_some() {
+                        meta.insert(
+                            tj_core::chronicle::HOME_KEY.into(),
+                            chr.home_hash.clone().into(),
+                        );
+                    }
+                }
             }
             // Layer-2 close harvest: stamp deterministic git/gh refs (commit,
             // branch, PR) so the closed pack reads as a clickable ledger of
@@ -2050,6 +2372,7 @@ fn real_main() -> Result<()> {
             tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             println!("ok");
         }
+        Commands::Module { action } => run_module(action)?,
         Commands::External { task_id, add } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -2715,6 +3038,17 @@ runs in the background and won't block you; it only fills gaps and never closes 
                         ));
                     }
                 }
+                // The chronicle's most important gap, for every client that
+                // reads this hook (Claude Code with or without the mod, Codex).
+                // Advice only: it never fails the session start.
+                if let Some(line) = tj_core::chronicle::Chronicle::open(&cwd)
+                    .and_then(|chr| tj_core::archive::gaps(&chr, &conn, &project_hash, None))
+                    .ok()
+                    .and_then(|gaps| tj_core::archive::headline(&gaps))
+                {
+                    bundle.push_str(&line);
+                    bundle.push_str("\n\n");
+                }
                 for tc in &recent {
                     let pack = tj_core::pack::assemble(
                         &conn,
@@ -3340,7 +3674,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 anyhow::bail!("no events file at {events_path:?}");
             }
 
-            let all_events = read_events_lenient(&events_path, "export")?;
+            let mut all_events = read_events_lenient(&events_path, "export")?;
+            // Module lines are the project's map, not a task: hosts group an
+            // export by task id, so they stay out of every format.
+            all_events.retain(|e| !e.is_module());
 
             // Filter to specific task if requested.
             let events: Vec<&tj_core::event::Event> = if let Some(ref tid) = task {
@@ -6544,6 +6881,9 @@ fn events_by_task(
             continue;
         }
         if let Ok(e) = serde_json::from_str::<Event>(line) {
+            if e.is_module() {
+                continue;
+            }
             by_task.entry(e.task_id.clone()).or_default().push(e);
         }
     }
@@ -6818,6 +7158,38 @@ mod inline_tests {
         assert_eq!(hit[0].task_id, "tj-1");
         assert_eq!(hit[0].title, "Task one");
         assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn events_by_task_skips_module_lines() {
+        // A module line has no session id: by the legacy time window it would
+        // pass for a task of every session it falls into.
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("e.jsonl");
+        let mut writer = tj_core::storage::JsonlWriter::open(&log).unwrap();
+        for e in [
+            Event::new(
+                "tj-1",
+                EventType::Open,
+                Author::User,
+                Source::Cli,
+                "T".into(),
+            ),
+            Event::new(
+                "mod:stars",
+                EventType::Module,
+                Author::Agent,
+                Source::Chat,
+                "Stars".into(),
+            ),
+        ] {
+            writer.append(&e).unwrap();
+        }
+
+        let by_task = events_by_task(&log).unwrap();
+
+        assert_eq!(by_task.keys().collect::<Vec<_>>(), vec!["tj-1"]);
     }
 
     #[test]

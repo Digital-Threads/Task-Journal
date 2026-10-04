@@ -34,6 +34,46 @@ pub fn project_root(start: &Path) -> PathBuf {
     }
 }
 
+/// The main checkout of the repository a linked git worktree belongs to,
+/// where the project chronicle (the module map) lives. `None` when `dir` is
+/// not in a linked worktree: the project is its own home. A worktree's root
+/// holds a `.git` file naming its gitdir, whose `commondir` leads to the
+/// main repository's `.git`, which lists the worktree in turn; a submodule's
+/// gitdir has no `commondir`.
+pub fn chronicle_home(dir: &Path) -> Option<PathBuf> {
+    let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let root = project_root(&dir);
+    // A plain file only: a symlinked `.git` could borrow another worktree.
+    let dot_git = root.join(".git");
+    if !std::fs::symlink_metadata(&dot_git)
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir =
+        dunce::canonicalize(root.join(pointer.trim().strip_prefix("gitdir:")?.trim())).ok()?;
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = dunce::canonicalize(gitdir.join(common.trim())).ok()?;
+
+    // Git's own check, both ways: the gitdir sits in the repository's
+    // `worktrees/` and names this worktree back. Without it, any folder
+    // with a forged `.git` file could join another repository's chronicle.
+    let back = std::fs::read_to_string(gitdir.join("gitdir")).ok()?;
+    let points_back = dunce::canonicalize(gitdir.join(back.trim())).ok()? == dot_git;
+    let is_listed = gitdir.parent() == Some(common.join("worktrees").as_path());
+    if !points_back || !is_listed || !common.join("HEAD").exists() {
+        return None;
+    }
+
+    match common.file_name() {
+        Some(name) if name == ".git" => common.parent().map(Path::to_path_buf),
+        _ => None,
+    }
+}
+
 pub fn from_path(p: impl AsRef<Path>) -> anyhow::Result<String> {
     let p = p.as_ref();
     // `canonicalize` requires the path to EXIST — it returns ENOENT ("No such
@@ -135,6 +175,123 @@ mod tests {
             root_hash, sub_hash,
             "subdir with .task-journal/ marker must NOT inherit parent's project hash"
         );
+    }
+
+    #[test]
+    fn a_worktree_finds_the_main_checkout_as_its_chronicle_home() {
+        let d = tempfile::TempDir::new().unwrap();
+        let main = d.path().join("repo");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        let wt = d.path().join("wt");
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+        std::fs::create_dir_all(wt.join("deep/dir")).unwrap();
+
+        let main_root = dunce::canonicalize(&main).unwrap();
+        assert_eq!(chronicle_home(&wt.join("deep/dir")), Some(main_root));
+        assert_eq!(chronicle_home(&main.join("src")), None);
+    }
+
+    #[test]
+    fn a_forged_git_file_cannot_join_another_repository() {
+        // A downloaded folder whose `.git` file points, through a gitdir it
+        // ships itself, at someone else's repository: git would refuse it,
+        // because that repository lists no such worktree. So do we.
+        let d = tempfile::TempDir::new().unwrap();
+        let victim = d.path().join("victim");
+        std::fs::create_dir_all(victim.join(".git")).unwrap();
+        std::fs::write(victim.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let forged = d.path().join("forged");
+        let fake = forged.join("fake-gitdir");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(
+            fake.join("commondir"),
+            victim.join(".git").display().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            fake.join("gitdir"),
+            forged.join(".git").display().to_string(),
+        )
+        .unwrap();
+        std::fs::write(forged.join(".git"), format!("gitdir: {}\n", fake.display())).unwrap();
+
+        assert_eq!(chronicle_home(&forged), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_git_file_cannot_borrow_a_real_worktree() {
+        // A folder whose `.git` is a symlink to a real worktree's `.git`
+        // file would pass the two-way check by borrowing that worktree.
+        let d = tempfile::TempDir::new().unwrap();
+        let main = d.path().join("repo");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        let wt = d.path().join("wt");
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let forged = d.path().join("forged");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::os::unix::fs::symlink(wt.join(".git"), forged.join(".git")).unwrap();
+
+        assert!(chronicle_home(&wt).is_some());
+        assert_eq!(chronicle_home(&forged), None);
+    }
+
+    #[test]
+    fn a_git_file_without_a_common_dir_is_its_own_home() {
+        // A submodule's `.git` file points into the parent's modules dir,
+        // which has no `commondir`: it is a project of its own.
+        let d = tempfile::TempDir::new().unwrap();
+        let gitdir = d.path().join("parent/.git/modules/sub");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        let sub = d.path().join("parent/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+
+        assert_eq!(chronicle_home(&sub), None);
     }
 
     #[test]

@@ -31,6 +31,16 @@ const STOPWORDS: &[&str] = &[
     "tool", "bash", "name", "response",
 ];
 
+/// The meaningful words of `text`: alphanumeric runs of 3+ chars, lowercased,
+/// stopwords dropped. Shared by recall's FTS query and module suggestions.
+pub(crate) fn keywords(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+        .map(|t| t.to_lowercase())
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
 /// Build an FTS5 OR-of-tokens query from a free-text context string. A raw
 /// multi-word context like "let's switch to axum" parses as an implicit AND
 /// under FTS5, so it would never match a short rejection that only shares one
@@ -40,12 +50,7 @@ const STOPWORDS: &[&str] = &[
 /// for prose input. Returns `None` when no usable token survives (caller
 /// then falls back to a raw LIKE on the query).
 fn fts_or_query(query_text: &str) -> Option<String> {
-    let tokens: Vec<String> = query_text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.chars().count() >= 3)
-        .map(|t| t.to_lowercase())
-        .filter(|t| !STOPWORDS.contains(&t.as_str()))
-        .collect();
+    let tokens = keywords(query_text);
     if tokens.is_empty() {
         return None;
     }

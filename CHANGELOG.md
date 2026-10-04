@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-04
+
+The journal becomes a map of the system. A project splits into modules — parts
+of the system by meaning, not folders or tickets — every task belongs to one or
+more, and each module keeps its history. The agent keeps this chronicle up by
+itself: the journal says what is missing and what to do about it.
+
+### Added
+- **Modules.** `module_save` creates or updates a module: name, description,
+  `hints` (code path prefixes and terms), `state` — a short living text of how
+  it works now — and status (`active`, `retired`, `merged`). Modules live in
+  the journal as a new `module` event, so a rebuild restores them.
+- **Links.** `task_create(modules=[...])`, `module_link` for many tasks at once,
+  and `task_close(module_notes=[...])`: one line per module on what the task
+  changed there. Links ride in the `open` / `amend` / `close` events 0.30
+  already reads. An unknown module fails the call before anything is written;
+  a merged module links to the one that took it over.
+- **Module page.** `module_page` (CLI `module show`): the module's state, the
+  active decisions, rejections and constraints of all its tasks, open tasks,
+  and history. A task's pack names its modules.
+- **Suggestions without a model.** A new task without modules gets
+  `suggested_modules` from its words (English and Russian forms) and, for old
+  tasks, its files.
+- **The chronicle keeps itself up.** The journal names what is missing — no
+  module map, tasks without a module, a module whose state lags behind its
+  tasks, an active task without a module — at session start (every client,
+  Codex included), in `task_create` / `task_close` / `module_list` replies, in
+  `task-journal state` (`archive`), and in the Claude Code mod when a gap opens
+  mid-session. The mod's status line shows the task's modules.
+- **Mapping and sorting old work.** `/task-journal:map` and the skill's steps:
+  propose modules, confirm with the user, save them, sort past tasks with
+  `module_backfill_candidates` (paged with `limit` / `offset`), confirm, link —
+  leftovers to a catch-all module — and write each module's first state.
+- **One map per repository, worktrees included.** A git worktree reads and
+  writes the module map of its main checkout, while its tasks stay in its own
+  journal. A module's page, task counts and staleness gather the tasks of the
+  main checkout and of every worktree, removed ones too. Worktrees register
+  next to the journals, and their module links carry the main checkout's id,
+  so the registry can be rebuilt from the journals.
+- CLI: `module list|show|save|link|candidates`, `create --modules`,
+  `close --module-note module=text`; `task_search` / MCP gain a `module` filter.
+
+### Changed
+- `migrate-project` re-keys the module tables too.
+- Task views (`events list`, every `export` format, backfill) skip `module`
+  lines, so hosts that group an export by task id see no phantom tasks. The
+  JSONL log itself remains the full record.
+
+### Upgrading
+- Restart open Claude Code and Codex sessions after `cargo install --force`.
+  The first command re-indexes the project once.
+- A 0.30 binary next to 0.31 skips `module` lines with a warning and keeps all
+  tasks; 0.31 re-indexes once afterwards, so no module is lost.
+- Existing tools, commands and packs work as before. What is new before you
+  create a module: the session start shows a `📚 Chronicle:` line inviting you
+  to map the project, `task_create` replies may carry
+  `chronicle` and `suggested_modules`, and `task-journal state` gains
+  `archive` and `active.modules`.
+
 ## [0.30.0] - 2026-10-04
 
 Claude Code 2.1.287 added mods: plugins that run inside Claude Code and can

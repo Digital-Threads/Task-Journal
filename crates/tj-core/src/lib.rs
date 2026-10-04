@@ -57,7 +57,9 @@ mod task_id_tests {
     }
 }
 
+pub mod archive;
 pub mod artifacts;
+pub mod chronicle;
 pub mod classifier;
 pub mod completeness;
 pub mod consolidate;
@@ -71,6 +73,7 @@ pub mod fts;
 pub mod harvest;
 pub mod llm;
 pub mod memory;
+pub mod modules;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;

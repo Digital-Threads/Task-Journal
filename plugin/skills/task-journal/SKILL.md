@@ -7,11 +7,12 @@ description: |
   tools yourself at the decisive moments below.
   Open a task with an explicit goal at the start, append a typed event the moment you
   decide / reject / discover / prove something, and close with a written outcome so the
-  resume pack comes out clean: Goal -> Decisions -> Outcome.
+  resume pack comes out clean: Goal -> Decisions -> Outcome. Keep the project
+  chronicle too: every task belongs to modules (parts of the system), each with a history.
   Triggers: start of any task/bug/investigation; a choice is committed; an approach is
   ruled out; a fact is verified from code or logs; a test/benchmark proves something; an
   earlier belief turns out wrong; task finished; "what was I working on?", "remind me
-  about X", "почему мы сделали так?".
+  about X", "почему мы сделали так?"; "map the project", "what do we know about <module>?".
 ---
 
 # Task Journal — Reasoning Chain Memory (self-tagging first)
@@ -27,7 +28,8 @@ treat it as if it does nothing and record explicitly.
    there an open task for this? Each entry in `tasks` shows its title and goal. If yes,
    `task_pack(task_id)` and continue it. **Do not** open a duplicate.
 2. If nothing fits, `task_create(title=<short>, goal=<one sentence: what the user is trying to accomplish>)`. **Always pass `goal`** — it is the first line of every pack and
-   the anchor for "why was this done?".
+   the anchor for "why was this done?". Pass `modules=[...]` when you know the part of the
+   system it touches (see Chronicle below).
 3. Hold the returned `task_id` for the whole task. One task = one logical objective.
    Events accumulate under it; do not spawn a new task per turn.
 
@@ -107,15 +109,60 @@ An empty or absent `query` lists the tasks, newest activity first. The result ha
 `results` (task ids) and `tasks` — the same ids in the same order, each with `title`,
 `status`, `last_event_at` and `goal`.
 
+## Chronicle — modules and their history
+
+The project is a map of **modules**: parts of the system by meaning — not folders, not
+tickets. Every task belongs to one or more modules, and each module keeps a page: how it
+works now (`state`), what is decided, rejected and constrained there across all its tasks,
+and every task in order. Six months later, `module_page` is how you learn a part of the
+system before touching it. A repository has one map: in a git worktree the same modules
+apply, and its tasks join their history.
+
+- **Start:** `task_create(..., modules=["stars"])`. Not sure which? The reply carries
+  `suggested_modules` — link with `module_link`, or create a module with `module_save`.
+  Read `module_page(module_id)` before you change a module.
+- **Done:** `task_close(..., module_notes=[{"module": "stars", "text": "ranking by Wilson score"}])`
+  — one line per module on what changed. If the module works differently now, rewrite its
+  `state` with `module_save(module_id, state=...)`.
+- **Gaps:** a line starting with `📚 Chronicle:` (session start, `task_create`, `module_list`)
+  names what the chronicle is missing — no map, tasks without a module, a module whose
+  state lags behind its tasks. Close it once the current work is done.
+
+### Mapping a project (no map yet, or `/task-journal:map`)
+
+1. `module_list` — extend an existing map rather than starting over.
+2. Study the project: layout, README and docs, the key code paths.
+3. Propose 5–15 modules: id (`stars`, `auth-refresh`), name, one to three sentences,
+   `hints.paths` (code path prefixes) and `hints.terms` (the words people use for it).
+4. Show the list to the user and **confirm** it; adjust from the answer.
+5. `module_save` each confirmed module.
+6. `module_backfill_candidates(limit=50)`, page by page (`offset` steps past a page): assign
+   each old task to modules by its title, goal, outcome, files and the suggestions; list the
+   doubtful ones separately.
+7. Show the assignment to the user, **confirm**, then one `module_link` call per page. Tasks
+   that fit no module go to a catch-all module (`other`, "Other") once the user agrees, so
+   the chronicle has no loose ends.
+8. For each module with tasks, read its `module_page` and write its first `state`.
+
+Chronicle tools:
+
+- `module_list()` → `modules` (id, name, description, task_count, last_activity) + `gaps`.
+- `module_page(module_id)` → `text`: the module's page in Markdown.
+- `module_save(module_id, name?, description?, hints?{paths, terms}, state?, status?, merged_into?)`
+  — partial update; a new module needs `name`. `status`: active | retired | merged.
+- `module_link(links=[{task_id, add?: [...], remove?: [...]}])` — many tasks at once.
+- `module_backfill_candidates(limit?, offset?)` → `total_unlinked`, `candidates` (id, title,
+  goal, outcome, files, suggestions).
+
 ## The 5 MCP tools (exact params)
 
-- `task_create(title, goal?, initial_context?, parent?)` → `task_id` like `tj-x9rz1f`. **Pass `goal`.**
+- `task_create(title, goal?, initial_context?, parent?, modules?)` → `task_id` like `tj-x9rz1f`. **Pass `goal`.**
 - `event_add(task_id, event_type, text, corrects?, supersedes?, alternatives?)` → `event_id`.
   `event_type` ∈ hypothesis | finding | evidence | decision | rejection | constraint |
   correction | reopen | supersede | redirect. `alternatives` is decision-only.
-- `task_close(task_id, reason, outcome?, outcome_tag?)` — **always pass `outcome` + `outcome_tag`.**
+- `task_close(task_id, reason, outcome?, outcome_tag?, module_notes?)` — **always pass `outcome` + `outcome_tag`.**
 - `task_pack(task_id, mode?)` — `compact` | `full`.
-- `task_search(query?, status?, project?, event_type?)` — full-text search over the project's
+- `task_search(query?, status?, project?, event_type?, module?)` — full-text search over the project's
   events; no `query` lists its tasks. Returns `results` (ids) and `tasks` (id, title, status, goal).
 
 ## Invariants

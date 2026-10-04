@@ -7,6 +7,8 @@
 //   its own active task;
 // - shows the task in the status line and a toast on every entry;
 // - reminds the agent to log only after N turns without an entry;
+// - brings up a project-chronicle gap that opened during the session (the
+//   session start already showed the one it began with);
 // - before a compaction, asks the model (from its own prompt cache) what
 //   was not logged and records it as suggested events.
 //
@@ -17,12 +19,15 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 import {
+  chronicleKeys,
+  chronicleNudge,
   compactInstruction,
   distillPrompt,
   journalTool,
   nudgeText,
   parseDistill,
   parseState,
+  REFRESH_TOOLS,
   sectionText,
   statusText,
   transcriptExcerpt,
@@ -62,6 +67,9 @@ const mod = {
   pinned: null as string | null,
   turnsSinceEntry: 0,
   workSinceEntry: 0,
+  // Chronicle gaps this session has been told about. Seeded at its start
+  // with every gap the SessionStart hook showed, so none is repeated.
+  chronicleSeen: new Set<string>(),
 }
 
 type CliResult =
@@ -122,7 +130,10 @@ async function refresh($: EngineInterface): Promise<void> {
     return
   }
 
-  if (mod.session !== session) mod.pinned = null
+  if (mod.session !== session) {
+    mod.pinned = null
+    mod.chronicleSeen = new Set(chronicleKeys(state))
+  }
   mod.session = session
   mod.state = state
   mod.pinned = state.active?.task_id ?? null
@@ -219,6 +230,7 @@ export const register: Register = (on, options) => {
     mod.retryAt = 0
     mod.turnsSinceEntry = 0
     mod.workSinceEntry = 0
+    mod.chronicleSeen = new Set()
 
     return next(e)
   })
@@ -244,14 +256,25 @@ export const register: Register = (on, options) => {
     const state = await current($)
     if (state === null) return next(e)
 
+    // Both reminders ride in the prompt's context, never in the system
+    // prompt: a change there would re-send the conversation uncached.
+    const added: string[] = []
+    const chronicle = chronicleNudge(state, mod.chronicleSeen)
+    if (chronicle !== null) {
+      mod.chronicleSeen.add(chronicle.key)
+      added.push(chronicle.text)
+    }
+
     mod.turnsSinceEntry += 1
     const isDue =
       nudgeAfter > 0 && mod.turnsSinceEntry > nudgeAfter && (state.active !== null || mod.workSinceEntry > 0)
-    if (!isDue) return next(e)
+    if (isDue) {
+      mod.turnsSinceEntry = 0
+      added.push(nudgeText(state, nudgeAfter))
+    }
+    if (added.length === 0) return next(e)
 
-    mod.turnsSinceEntry = 0
-
-    return next({ ...e, context: [...(e.context ?? []), nudgeText(state, nudgeAfter)] })
+    return next({ ...e, context: [...(e.context ?? []), ...added] })
   })
 
   on('tool.call', async ($, e, next) => {
@@ -267,7 +290,12 @@ export const register: Register = (on, options) => {
     const session = await $.session.id()
     const call = WRITE_TOOLS.has(name) && args.session_id === undefined ? { ...e, session_id: session } : e
     const ran = await next(call)
-    if (ran.deny !== undefined || ran.isError === true || !WRITE_TOOLS.has(name)) return ran
+    if (ran.deny !== undefined || ran.isError === true || !REFRESH_TOOLS.has(name)) return ran
+    if (!WRITE_TOOLS.has(name)) {
+      await refresh($)
+
+      return ran
+    }
 
     // A new task, or closing the named one, moves the pin; logging to
     // another task does not.

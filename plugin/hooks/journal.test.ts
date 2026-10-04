@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
+  chronicleKeys,
+  chronicleNudge,
   journalTool,
   nudgeText,
   parseDistill,
@@ -8,6 +10,8 @@ import {
   sectionText,
   statusText,
   transcriptExcerpt,
+  REFRESH_TOOLS,
+  WRITE_TOOLS,
   type JournalState,
 } from './journal'
 
@@ -33,7 +37,7 @@ describe('parseState', () => {
 
   test('no active task is a state, not a failure', () => {
     const s = parseState(JSON.stringify({ schema: 'tj-state/1', open_tasks: 0, active: null }))
-    expect(s).toEqual({ active: null, open_tasks: 0 })
+    expect(s).toEqual({ active: null, open_tasks: 0, archive: [] })
   })
 
   test('rejects garbage and other schemas', () => {
@@ -50,12 +54,12 @@ describe('parseState', () => {
 
 describe('texts', () => {
   const s = parseState(ACTIVE) as JournalState
-  const none: JournalState = { active: null, open_tasks: 3 }
+  const none: JournalState = { active: null, open_tasks: 3, archive: [] }
 
   test('status line names the task and its counts', () => {
     expect(statusText(s)).toBe('📓 tj-abc · 3 decisions · 1 rejected · 0 evidence')
     expect(statusText(none)).toBe('📓 no task in this session · 3 open')
-    expect(statusText({ active: null, open_tasks: 0 })).toBe('📓 no task')
+    expect(statusText({ active: null, open_tasks: 0, archive: [] })).toBe('📓 no task')
   })
 
   test('the prompt section holds nothing that changes per entry', () => {
@@ -69,6 +73,91 @@ describe('texts', () => {
   test('nudge names the task, or asks to open one', () => {
     expect(nudgeText(s, 6)).toContain('6 turns since the last journal entry on tj-abc')
     expect(nudgeText(none, 6)).toContain('task_create')
+  })
+})
+
+describe('chronicle', () => {
+  const withGaps = (archive: unknown[], modules: string[] = []) =>
+    parseState(
+      JSON.stringify({
+        schema: 'tj-state/1',
+        open_tasks: 1,
+        archive,
+        active: { task_id: 'tj-a', title: 'T', goal: null, counts: {}, recent: [], modules },
+      }),
+    ) as JournalState
+
+  test('status line names the task modules', () => {
+    expect(statusText(withGaps([], ['Stars', 'Auth']))).toBe(
+      '📓 tj-a [Stars, Auth] · 0 decisions · 0 rejected · 0 evidence',
+    )
+  })
+
+  test('an older CLI without archive or modules parses as none', () => {
+    const s = parseState(ACTIVE) as JournalState
+    expect(s.archive).toEqual([])
+    expect(s.active?.modules).toEqual([])
+  })
+
+  test('the active task without a module comes first', () => {
+    const s = withGaps([
+      { kind: 'unlinked_tasks', count: 4 },
+      { kind: 'task_without_module', task_id: 'tj-a' },
+    ])
+    const n = chronicleNudge(s)
+    expect(n?.key).toBe('task_without_module:tj-a')
+    expect(n?.text).toContain('📚 Chronicle: the active task tj-a belongs to no module')
+  })
+
+  test('otherwise the first gap, keyed so a changed count is not new', () => {
+    const a = chronicleNudge(withGaps([{ kind: 'unlinked_tasks', count: 4 }]))
+    const b = chronicleNudge(withGaps([{ kind: 'unlinked_tasks', count: 5 }]))
+    expect(a?.key).toBe(b?.key)
+    expect(a?.text).toContain('module_backfill_candidates')
+    expect(chronicleNudge(withGaps([{ kind: 'no_map', tasks: 3 }]))?.text).toContain('/task-journal:map')
+    expect(chronicleNudge(withGaps([{ kind: 'stale_module', module_id: 'stars', closed_since: 2 }]))?.key).toBe(
+      'stale_module:stars',
+    )
+  })
+
+  test('a gap seen once in a session is not brought up again', () => {
+    // The session starts with unlinked tasks; the new task has no module;
+    // once it is linked, the start gap must not come back.
+    const start = withGaps([{ kind: 'unlinked_tasks', count: 4 }])
+    const seen = new Set(chronicleKeys(start))
+    expect(chronicleNudge(start, seen)).toBe(null)
+
+    const created = withGaps([
+      { kind: 'task_without_module', task_id: 'tj-a' },
+      { kind: 'unlinked_tasks', count: 5 },
+    ])
+    const n = chronicleNudge(created, seen)
+    expect(n?.key).toBe('task_without_module:tj-a')
+    seen.add(n!.key)
+
+    const linked = withGaps([{ kind: 'unlinked_tasks', count: 4 }])
+    expect(chronicleNudge(linked, seen)).toBe(null)
+  })
+
+  test('the first unseen gap is brought up even behind a seen one', () => {
+    const s = withGaps([
+      { kind: 'stale_module', module_id: 'stars', closed_since: 1 },
+      { kind: 'stale_module', module_id: 'auth', closed_since: 1 },
+    ])
+    expect(chronicleNudge(s, new Set(['stale_module:stars']))?.key).toBe('stale_module:auth')
+  })
+
+  test('no gaps, or only unknown ones, is no nudge', () => {
+    expect(chronicleNudge(withGaps([]))).toBe(null)
+    expect(chronicleNudge(withGaps([{ kind: 'from_the_future' }]))).toBe(null)
+  })
+})
+
+describe('REFRESH_TOOLS', () => {
+  test('linking or saving a module refreshes the status line; only journal writes get a session id', () => {
+    for (const t of ['module_link', 'module_save', 'task_create', 'task_close']) expect(REFRESH_TOOLS.has(t)).toBe(true)
+    expect(WRITE_TOOLS.has('module_link')).toBe(false)
+    expect(REFRESH_TOOLS.has('module_page')).toBe(false)
   })
 })
 

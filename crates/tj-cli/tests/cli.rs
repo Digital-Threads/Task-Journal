@@ -990,12 +990,27 @@ fn migrate_project_rekeys_embeddings_and_dream_state() {
             [&from_hash],
         )
         .unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO modules(project_hash, module_id, name, created_at, updated_at)
+               VALUES ('{from_hash}', 'stars', 'Stars', 't', 't');
+             INSERT INTO task_modules(project_hash, task_id, module_id)
+               VALUES ('{from_hash}', 'tj-1', 'stars');
+             INSERT INTO module_notes(project_hash, event_id, module_id, task_id, text, at)
+               VALUES ('{from_hash}', 'e1', 'stars', 'tj-1', 'x', 't');"
+        ))
+        .unwrap();
     }
 
     migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
 
     let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
-    for table in ["dream_state", "embeddings"] {
+    for table in [
+        "dream_state",
+        "embeddings",
+        "modules",
+        "task_modules",
+        "module_notes",
+    ] {
         let rekeyed: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE project_hash = ?1"),
@@ -1008,6 +1023,45 @@ fn migrate_project_rekeys_embeddings_and_dream_state() {
             "{table} row not re-keyed to the new project_hash"
         );
     }
+}
+
+#[test]
+fn migrate_project_carries_the_chronicle_registry() {
+    // The registry lists the worktree journals a home's module history comes
+    // from; a moved home must keep it, and a moved member must stay listed.
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let chronicle = xdg.path().join("task-journal").join("chronicle");
+    std::fs::create_dir_all(&chronicle).unwrap();
+    std::fs::write(
+        chronicle.join(format!("{from_hash}.members")),
+        "aaaaaaaaaaaaaaaa\n",
+    )
+    .unwrap();
+    std::fs::write(
+        chronicle.join("bbbbbbbbbbbbbbbb.members"),
+        format!("{from_hash}\n"),
+    )
+    .unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Move me"])
+        .assert()
+        .success();
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    assert!(!chronicle.join(format!("{from_hash}.members")).exists());
+    assert_eq!(
+        std::fs::read_to_string(chronicle.join(format!("{to_hash}.members"))).unwrap(),
+        "aaaaaaaaaaaaaaaa\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(chronicle.join("bbbbbbbbbbbbbbbb.members")).unwrap(),
+        format!("{to_hash}\n")
+    );
 }
 
 #[test]
@@ -8488,4 +8542,334 @@ fn event_on_an_unknown_task_fails_and_writes_nothing() {
         .stderr(contains("task not found: tj-typo"));
 
     assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+}
+
+/// A `module` line (the project chronicle) describes the project's map, not a
+/// task: task views and every export format skip it.
+#[test]
+fn module_lines_stay_out_of_task_views_and_exports() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut c = Command::cargo_bin("task-journal").unwrap();
+        c.env("XDG_DATA_HOME", xdg.path()).current_dir(proj.path());
+        c
+    };
+    tj().args(["create", "T"]).assert().success();
+
+    let log = std::fs::read_dir(xdg.path().join("task-journal/events"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .unwrap();
+    let mut e = tj_core::event::Event::new(
+        "mod:stars",
+        tj_core::event::EventType::Module,
+        tj_core::event::Author::Agent,
+        tj_core::event::Source::Chat,
+        "Stars".into(),
+    );
+    e.meta = serde_json::json!({"module_id": "stars", "name": "Stars"});
+    tj_core::storage::JsonlWriter::open(&log)
+        .unwrap()
+        .append(&e)
+        .unwrap();
+
+    tj().args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("[module]").not());
+    for format in ["md", "html"] {
+        tj().args(["export", "--format", format])
+            .assert()
+            .success()
+            .stdout(contains("mod:stars").not());
+    }
+    // JSON export too: hosts such as the Loom board group it by task id, and
+    // a module line would turn into a phantom task. The JSONL is the full copy.
+    tj().args(["export", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(contains("mod:stars").not());
+}
+
+/// A `task-journal` command run in its own data home and project dir.
+fn chronicle_cli<'a>(
+    xdg: &'a assert_fs::TempDir,
+    proj: &'a assert_fs::TempDir,
+) -> impl Fn() -> assert_cmd::Command + 'a {
+    move || {
+        let mut c = Command::cargo_bin("task-journal").unwrap();
+        c.env("XDG_DATA_HOME", xdg.path()).current_dir(proj.path());
+        c
+    }
+}
+
+fn stdout_of(mut cmd: assert_cmd::Command) -> String {
+    String::from_utf8(cmd.assert().success().get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn module_lifecycle_through_the_cli() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+
+    tj().args([
+        "module",
+        "save",
+        "stars",
+        "--name",
+        "Stars",
+        "--path",
+        "src/stars/",
+        "--term",
+        "star feed",
+    ])
+    .assert()
+    .success();
+    let mut create = tj();
+    create.args(["create", "Rank stars", "--modules", "stars"]);
+    let id = stdout_of(create);
+    tj().args([
+        "close",
+        &id,
+        "--outcome",
+        "Ranked",
+        "--module-note",
+        "stars=Ranking by Wilson score",
+    ])
+    .assert()
+    .success();
+
+    tj().args(["module", "show", "stars"])
+        .assert()
+        .success()
+        .stdout(
+            contains("# Stars (stars)")
+                .and(contains("Ranking by Wilson score"))
+                .and(contains(id.as_str())),
+        );
+    tj().args(["pack", &id])
+        .assert()
+        .success()
+        .stdout(contains("**Modules**: Stars (stars)"));
+    tj().args(["module", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(contains(r#""module_id":"stars""#));
+    tj().args(["module", "list"])
+        .assert()
+        .success()
+        .stdout(contains("stars").and(contains("Stars")));
+}
+
+#[test]
+fn module_link_and_candidates_through_the_cli() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+    tj().args([
+        "module",
+        "save",
+        "auth",
+        "--name",
+        "Auth",
+        "--term",
+        "token refresh",
+    ])
+    .assert()
+    .success();
+    let mut create = tj();
+    create.args(["create", "Fix token refresh race"]);
+    let id = stdout_of(create);
+
+    let mut candidates = tj();
+    candidates.args(["module", "candidates"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(candidates)).unwrap();
+    assert_eq!(json["total_unlinked"], 1);
+    assert_eq!(json["candidates"][0]["suggestions"][0]["module_id"], "auth");
+
+    tj().args(["module", "link", &id, "--add", "auth"])
+        .assert()
+        .success();
+    tj().args(["pack", &id])
+        .assert()
+        .success()
+        .stdout(contains("**Modules**: Auth (auth)"));
+    tj().args(["module", "link", "tj-missing", "--add", "auth"])
+        .assert()
+        .failure()
+        .stderr(contains("tj-missing"));
+}
+
+#[test]
+fn unknown_module_and_bad_slug_fail_before_writing() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+
+    tj().args(["create", "Orphan", "--modules", "nope"])
+        .assert()
+        .failure()
+        .stderr(contains("module_save"));
+    tj().args(["module", "save", "Bad Slug", "--name", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("auth-refresh"));
+    tj().args(["module", "save", "unnamed"])
+        .assert()
+        .failure()
+        .stderr(contains("--name"));
+    tj().args(["close", "tj-x", "--module-note", "no-equals-sign"])
+        .assert()
+        .failure()
+        .stderr(contains("module=text"));
+
+    assert!(
+        !xdg.path().join("task-journal/events").exists()
+            || std::fs::read_dir(xdg.path().join("task-journal/events"))
+                .unwrap()
+                .all(|e| std::fs::metadata(e.unwrap().path()).unwrap().len() == 0),
+        "a failed command wrote to the journal"
+    );
+}
+
+#[test]
+fn session_start_names_the_top_chronicle_gap() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+    tj().args(["create", "Some work"]).assert().success();
+
+    let mut hook = tj();
+    hook.args(["ingest-hook", "--kind", "SessionStart", "--text", ""]);
+    let out: serde_json::Value = serde_json::from_str(&stdout_of(hook)).unwrap();
+    let ctx = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+
+    assert!(ctx.contains("📚 Chronicle: no module map yet"), "{ctx}");
+}
+
+#[test]
+fn state_carries_archive_gaps() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+    tj().args(["create", "Some work"]).assert().success();
+
+    tj().args(["state"])
+        .assert()
+        .success()
+        .stdout(contains(r#""kind":"no_map""#));
+}
+
+/// A git repository with one linked worktree: their own journals, one map.
+fn repo_with_worktree(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let main = root.join("repo");
+    std::fs::create_dir_all(&main).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&main)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    ]);
+    let worktree = root.join("wt");
+    git(&["worktree", "add", "-q", worktree.to_str().unwrap()]);
+
+    (main, worktree)
+}
+
+#[test]
+fn a_worktree_shares_the_main_checkouts_module_map() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let root = assert_fs::TempDir::new().unwrap();
+    let (main, worktree) = repo_with_worktree(root.path());
+    let tj = |dir: &std::path::Path| {
+        let mut c = Command::cargo_bin("task-journal").unwrap();
+        c.env("XDG_DATA_HOME", xdg.path()).current_dir(dir);
+        c
+    };
+
+    tj(&main)
+        .args(["module", "save", "stars", "--name", "Stars"])
+        .assert()
+        .success();
+
+    // In the worktree: the same map, a task of its own linked to it.
+    tj(&worktree)
+        .args(["module", "list"])
+        .assert()
+        .success()
+        .stdout(contains("stars"));
+    let mut create = tj(&worktree);
+    create.args(["create", "Rank in the worktree", "--modules", "stars"]);
+    let id = stdout_of(create);
+    tj(&worktree)
+        .args([
+            "close",
+            &id,
+            "--outcome",
+            "Ranked",
+            "--module-note",
+            "stars=Ranked from the worktree",
+        ])
+        .assert()
+        .success();
+    tj(&worktree)
+        .args(["module", "save", "auth", "--name", "Auth"])
+        .assert()
+        .success();
+    tj(&worktree)
+        .args(["state"])
+        .assert()
+        .success()
+        .stdout(contains("no_map").not());
+
+    // In the main checkout: the worktree's task is in the module's history,
+    // and the module saved from the worktree is on the map.
+    tj(&main)
+        .args(["module", "show", "stars"])
+        .assert()
+        .success()
+        .stdout(contains(id.as_str()).and(contains("Ranked from the worktree")));
+    tj(&main)
+        .args(["module", "list"])
+        .assert()
+        .success()
+        .stdout(contains("auth").and(contains("1 task(s)")));
+    // The task itself stays in the worktree's journal.
+    tj(&main)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(contains(id.as_str()).not());
 }

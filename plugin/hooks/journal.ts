@@ -9,11 +9,18 @@ export type ActiveTask = {
   goal: string | null
   counts: Record<string, number>
   recent: JournalEvent[]
+  /** Names of the modules the task belongs to. */
+  modules: string[]
 }
+
+/** What the project chronicle is missing: `kind` plus its own fields. */
+export type ArchiveGap = { kind: string; [field: string]: unknown }
 
 export type JournalState = {
   active: ActiveTask | null
   open_tasks: number
+  /** Most important first. Empty from a CLI older than 0.31. */
+  archive: ArchiveGap[]
 }
 
 export const STATE_SCHEMA = 'tj-state/1'
@@ -29,6 +36,10 @@ const MAX_EVENT_CHARS = 500
 const JOURNAL_TOOL = /^mcp__(?:plugin_task-journal_)?task-journal__([a-z_]+)$/
 
 export const WRITE_TOOLS = new Set(['task_create', 'event_add', 'artifact_add', 'task_close'])
+
+// After these the status line is re-read: the journal writes, and the module
+// tools that change which modules a task shows.
+export const REFRESH_TOOLS = new Set([...WRITE_TOOLS, 'module_link', 'module_save'])
 
 export function journalTool(tool: string): string | undefined {
   return JOURNAL_TOOL.exec(tool)?.[1]
@@ -48,9 +59,14 @@ export function parseState(stdout: string): JournalState | null {
   if (v.schema !== STATE_SCHEMA) return null
 
   const open = typeof v.open_tasks === 'number' ? v.open_tasks : 0
+  const archive = Array.isArray(v.archive)
+    ? v.archive.filter(
+        (g): g is ArchiveGap => typeof g === 'object' && g !== null && typeof (g as ArchiveGap).kind === 'string',
+      )
+    : []
   const a = v.active as Record<string, unknown> | null | undefined
   if (a === null || a === undefined || typeof a.task_id !== 'string') {
-    return { active: null, open_tasks: open }
+    return { active: null, open_tasks: open, archive }
   }
 
   const recent = Array.isArray(a.recent)
@@ -67,8 +83,10 @@ export function parseState(stdout: string): JournalState | null {
       goal: typeof a.goal === 'string' && a.goal.trim() !== '' ? a.goal : null,
       counts: (a.counts as Record<string, number>) ?? {},
       recent,
+      modules: Array.isArray(a.modules) ? a.modules.filter((m): m is string => typeof m === 'string') : [],
     },
     open_tasks: open,
+    archive,
   }
 }
 
@@ -79,8 +97,51 @@ export function statusText(state: JournalState): string {
   }
 
   const n = (k: string) => a.counts[k] ?? 0
+  const where = a.modules.length > 0 ? ` [${a.modules.join(', ')}]` : ''
 
-  return `📓 ${a.task_id} · ${n('decision')} decisions · ${n('rejection')} rejected · ${n('evidence')} evidence`
+  return `📓 ${a.task_id}${where} · ${n('decision')} decisions · ${n('rejection')} rejected · ${n('evidence')} evidence`
+}
+
+const GAP_TEXT: Record<string, (g: ArchiveGap) => string> = {
+  no_map: g =>
+    `no module map yet (${g.tasks} tasks) — map the project with /task-journal:map and confirm the modules with the user`,
+  unlinked_tasks: g =>
+    `${g.count} task(s) belong to no module — sort them with module_backfill_candidates, confirm with the user, then module_link (leftovers go to a catch-all module)`,
+  stale_module: g =>
+    `module ${g.module_id}: ${g.closed_since} closed task(s) not reflected in its state — read module_page and rewrite it with module_save(state=...)`,
+  task_without_module: g => `the active task ${g.task_id} belongs to no module — link it with module_link (module_list shows the map)`,
+}
+
+// The field that tells one gap of a kind from another; counts are left out,
+// so a gap whose count moved is not new.
+const GAP_SUBJECT: Record<string, string> = { stale_module: 'module_id', task_without_module: 'task_id' }
+
+function gapKey(gap: ArchiveGap): string {
+  const subject = GAP_SUBJECT[gap.kind]
+
+  return subject === undefined ? gap.kind : `${gap.kind}:${String(gap[subject])}`
+}
+
+/** Keys of the gaps a state names: what the session start already showed. */
+export function chronicleKeys(state: JournalState): string[] {
+  return state.archive.filter(g => GAP_TEXT[g.kind] !== undefined).map(gapKey)
+}
+
+/**
+ * The chronicle gap to bring up, if one is new to this session (`seen`
+ * holds the keys already shown). The session's own task without a module
+ * comes first: it is the one gap the agent can close right now.
+ */
+export function chronicleNudge(
+  state: JournalState,
+  seen: ReadonlySet<string> = new Set(),
+): { key: string; text: string } | null {
+  const fresh = state.archive.filter(g => GAP_TEXT[g.kind] !== undefined && !seen.has(gapKey(g)))
+  const gap = fresh.find(g => g.kind === 'task_without_module') ?? fresh[0]
+  const describe = gap === undefined ? undefined : GAP_TEXT[gap.kind]
+  if (gap === undefined || describe === undefined) return null
+
+  return { key: gapKey(gap), text: `📚 Chronicle: ${describe(gap)}. Close this gap once the current work is done.` }
 }
 
 /**
