@@ -567,7 +567,7 @@ impl TaskJournalServer {
                          WHERE (?1 IS NULL OR status = ?1) \
                            AND (?2 IS NULL OR task_id IN \
                                 (SELECT task_id FROM events_index WHERE type = ?2)) \
-                         ORDER BY last_event_at DESC LIMIT 50",
+                         ORDER BY last_event_at DESC, rowid DESC LIMIT 50",
                     )?;
                     let hits = stmt
                         .query_map(rusqlite::params![status, event_type], task_search_hit)?

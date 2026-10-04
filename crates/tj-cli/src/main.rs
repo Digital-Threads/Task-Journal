@@ -3868,7 +3868,7 @@ fn run_search(
         let mut stmt = conn.prepare(
             "SELECT task_id FROM tasks \
              WHERE ?1 IS NULL OR task_id IN (SELECT task_id FROM events_index WHERE type = ?1) \
-             ORDER BY last_event_at DESC LIMIT ?2",
+             ORDER BY last_event_at DESC, rowid DESC LIMIT ?2",
         )?;
         let ids = stmt
             .query_map(rusqlite::params![event_type, limit as i64], |r| {
