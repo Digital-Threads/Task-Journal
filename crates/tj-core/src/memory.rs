@@ -86,7 +86,7 @@ pub fn sync_from_project(
     let sql = format!(
         "SELECT e.event_id, e.task_id, f.type, e.tier, f.text, e.model, e.dim, e.vec, e.created_at,
                 CASE WHEN d.superseded_by IS NOT NULL THEN 1 ELSE 0 END,
-                COALESCE(ei.bookkeeping, 0) OR ei.corrected_by IS NOT NULL
+                COALESCE(ei.bookkeeping, 0) OR ei.corrected_by IS NOT NULL OR ei.status = 'suggested'
            FROM embeddings e
            JOIN search_fts f ON f.event_id = e.event_id
            LEFT JOIN decisions d ON d.decision_id = e.event_id
@@ -433,6 +433,22 @@ mod tests {
         assert!(keyword_search(&global, "kafka audit pipeline", 5)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn sync_leaves_out_suggested_events() {
+        let d = tempfile::TempDir::new().unwrap();
+        let proj = crate::db::open(d.path().join("p.sqlite")).unwrap();
+        let global = open(d.path().join("memory.sqlite")).unwrap();
+        let emb = crate::embed::HashEmbedder::new(64);
+
+        let mut guess = finding("the classifier guessed a redis cache");
+        guess.status = crate::event::EventStatus::Suggested;
+        crate::db::index_event(&proj, &guess).unwrap();
+        crate::db::embed_pending(&proj, "ph", &emb, "t", 100).unwrap();
+
+        assert_eq!(sync_from_project(&global, &proj, "ph").unwrap(), 0);
+        assert_eq!(count(&global).unwrap(), 0);
     }
 
     #[test]
