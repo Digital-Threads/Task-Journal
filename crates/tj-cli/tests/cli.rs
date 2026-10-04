@@ -2249,7 +2249,8 @@ fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
 }
 
 /// The Claude Code mod captures in-process and sets TJ_MOD_ACTIVE for the
-/// hooks it starts; the classic capture must then stand down.
+/// hooks it starts; the classic capture must then stand down. (Nothing here
+/// echoes a prior entry, so push-recall stays quiet too.)
 #[test]
 fn mod_active_silences_the_classic_capture_hooks() {
     for kind in [
@@ -2271,6 +2272,77 @@ fn mod_active_keeps_session_start_and_model_switch() {
     for kind in ["SessionStart", "PostModelSwitch"] {
         assert!(hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
     }
+}
+
+/// The mod takes over capture, not push-recall: a tool call that echoes a
+/// prior rejection still gets the recall on both paths, and nothing is queued.
+#[test]
+fn mod_active_keeps_push_recall() {
+    let (dir, _task_id) = seed_axum_rejection();
+
+    for tool in ["Bash", "mcp__x__do"] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": "let's switch the server to axum" },
+            "tool_response": { "output": "" }
+        });
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+            .env("TJ_MOD_ACTIVE", "1")
+            .args(["ingest-hook", "--backend", "heuristic"])
+            .write_stdin(payload.to_string())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("previously rejected"), "{tool}: {out}");
+    }
+
+    let pending = std::fs::read_dir(dir.path().join("task-journal").join("pending"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(pending, 0, "the mod queues tool calls itself");
+}
+
+/// `/rewind` is the user rolling back a path — the mod doesn't record that,
+/// so the correction event still lands.
+#[test]
+fn mod_active_keeps_the_rewind_correction() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Rewind host"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .env("TJ_MOD_ACTIVE", "1")
+        .current_dir(proj.path())
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "/rewind go back to plan A",
+            })
+            .to_string(),
+        )
+        .assert()
+        .success();
+
+    let journal = project_events(xdg.path(), &hash);
+    assert_eq!(session_ids_of(&journal, "correction").len(), 1, "{journal}");
 }
 
 #[test]

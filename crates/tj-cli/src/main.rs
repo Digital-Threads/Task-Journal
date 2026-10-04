@@ -2438,14 +2438,13 @@ fn real_main() -> Result<()> {
             };
 
             // The Claude Code mod captures in-process and marks the hooks it
-            // starts; the classic capture stands down instead of doing the
-            // same work twice. Resume packs and model switches stay ours.
-            if mod_active()
-                && matches!(
-                    kind.as_str(),
-                    "UserPromptSubmit" | "PostToolUse" | "Stop" | "PreCompact" | "SessionEnd"
-                )
-            {
+            // starts; the classic capture stands down where the mod does the
+            // same work: the Stop / PreCompact / SessionEnd transcript
+            // catch-up (and the compaction marker) here, per-message queueing
+            // and auto-open further down. Push-recall, the `/rewind`
+            // correction, resume packs and model switches stay ours.
+            let mod_on = mod_active();
+            if mod_on && matches!(kind.as_str(), "Stop" | "PreCompact" | "SessionEnd") {
                 return Ok(());
             }
 
@@ -3001,6 +3000,11 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 writer.append(&event)?;
                 writer.flush_durable()?;
                 println!("{}", event.event_id);
+                return Ok(());
+            }
+
+            // The mod classifies prompts and tool calls itself (see above).
+            if mod_on && matches!(kind.as_str(), "UserPromptSubmit" | "PostToolUse") {
                 return Ok(());
             }
 
