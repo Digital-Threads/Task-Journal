@@ -361,13 +361,22 @@ fn pending_retry_marks_dead_after_max_attempts() {
     let proj = assert_fs::TempDir::new().unwrap();
     // Already at attempts=2; one more failure should rename to *.dead.json.
     write_pending(xdg.path(), "tj-dying", "any text", 2);
+    // An open task, so the chunk reaches the classifier at all.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Dying host"])
+        .assert()
+        .success();
 
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", xdg.path())
         .current_dir(proj.path())
-        // No --mock-* flags → retry fails → attempts becomes 3 → dead.
-        .args(["pending", "retry"])
+        // The heuristic can't place "any text" → a real classifier failure
+        // → attempts becomes 3 → dead.
+        .args(["pending", "retry", "--backend", "heuristic"])
         .assert()
         .success()
         .stdout(contains("1 marked dead"));
@@ -377,6 +386,81 @@ fn pending_retry_marks_dead_after_max_attempts() {
     let dead = pending_dir.join("tj-dying.dead.json");
     assert!(!live.exists(), "live file must be gone after dead-rename");
     assert!(dead.exists(), "dead file must exist: {dead:?}");
+}
+
+#[test]
+fn pending_retry_without_a_backend_leaves_entries_untouched() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "tj-waiting", "any text", 2);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        // Hybrid with no LLM fallback can only repeat the heuristic that
+        // already failed — that is "no backend", not a failed attempt.
+        .env("TJ_HYBRID_LLM_ORDER", "none")
+        .env_remove("ANTHROPIC_API_KEY")
+        .current_dir(proj.path())
+        .args(["pending", "retry"])
+        .assert()
+        .success()
+        .stdout(contains("no classifier backend"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    let live = pending_dir.join("tj-waiting.json");
+    assert!(live.exists(), "entry must stay queued");
+    assert!(!pending_dir.join("tj-waiting.dead.json").exists());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&live).unwrap()).unwrap();
+    assert_eq!(v["attempts"], 2, "no attempt is burned without a backend");
+}
+
+#[test]
+fn pending_retry_classifies_through_the_real_backend() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Retry host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    write_pending(
+        xdg.path(),
+        "tj-retry-real",
+        "After review we decided to use postgres for the journal store",
+        1,
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pending", "retry", "--backend", "heuristic"])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    assert!(!pending_dir.join("tj-retry-real.json").exists());
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("[decision]").and(contains("postgres")));
 }
 
 #[test]
@@ -1109,6 +1193,17 @@ fn post_model_switch_records_a_constraint_on_the_active_task() {
         .stdout(contains(
             "Model switched (auto): claude-opus-5 → claude-haiku-4-5",
         ));
+
+    // Marked so readers of the journal can tell it from a real constraint.
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    let journal = project_events(dir.path(), &hash);
+    let switch: serde_json::Value = journal
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["type"] == "constraint")
+        .expect("model switch recorded");
+    assert_eq!(switch["meta"]["kind"], "model_switch", "{switch}");
+    assert_eq!(switch["meta"]["session_id"], "s-switch", "{switch}");
 }
 
 /// No open task → a model switch is not a reason to start one.
@@ -1645,8 +1740,8 @@ fn ingest_hook_session_start_emits_resume_pack_json() {
 
 #[test]
 fn session_start_emits_neither_session_title_nor_initial_message() {
-    // 0.14.3: the SessionStart envelope carries ONLY additionalContext
-    // (+ optional watchPaths). It must never set sessionTitle (which
+    // 0.14.3: the SessionStart envelope carries ONLY additionalContext.
+    // It must never set sessionTitle (which
     // overrode Claude Code's own session name with our task id) nor
     // initialUserMessage (which seeded garbage "[Task Journal resumed: …]"
     // task titles).
@@ -1964,6 +2059,22 @@ fn ingest_hook_short_circuits_when_in_classifier_env_set() {
         !body.contains("should not be ingested"),
         "TJ_IN_CLASSIFIER must short-circuit before any write: {body}"
     );
+}
+
+#[test]
+fn nudge_is_silent_inside_a_classifier_child() {
+    // A `claude -p` / `codex exec` spawned by the classifier re-runs the
+    // user's UserPromptSubmit hooks; the nudge must not inject into it.
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_IN_CLASSIFIER", "1")
+        .args(["nudge"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("");
 }
 
 #[test]
@@ -2866,6 +2977,403 @@ fn classify_worker_respects_existing_lock() {
     );
 }
 
+/// The lock is created empty and the pid is written a moment later. A
+/// second worker that reads it in between must treat it as held, not as a
+/// stale lock to delete and steal. An empty lock that has sat for a while
+/// is a crashed worker's leftover and is taken over.
+#[test]
+fn classify_worker_treats_fresh_empty_lock_as_held() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let project_hash = tj_core::project_hash::from_path(&cwd).expect("compute project hash");
+
+    let pending = dir.path().join("task-journal").join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let events_path = dir
+        .path()
+        .join("task-journal")
+        .join("events")
+        .join(format!("{project_hash}.jsonl"));
+    std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+    let entry = pending.join("01emptylock.json");
+    std::fs::write(
+        &entry,
+        serde_json::json!({
+            "schema": "v2",
+            "kind": "PostToolUse",
+            "text": "empty lock marker",
+            "project_hash": project_hash,
+            "events_path": events_path.to_string_lossy(),
+            "backend": "heuristic",
+            "queued_at": "2026-05-08T00:00:00Z",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let lock_path = state.join(format!("classifier-{project_hash}.lock"));
+    std::fs::write(&lock_path, "").unwrap();
+
+    let worker = || {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["classify-worker", "--backend", "heuristic"])
+            .assert()
+            .success();
+    };
+
+    worker();
+    assert!(
+        entry.exists(),
+        "a fresh empty lock is held — entry must stay"
+    );
+    assert!(lock_path.exists(), "a fresh empty lock must not be deleted");
+
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&lock_path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    worker();
+    assert!(!entry.exists(), "a stale empty lock is taken over");
+    assert!(!lock_path.exists(), "the new holder releases the lock");
+}
+
+// ---------------- pending/ is global: every consumer is project-scoped ----------------
+
+/// Write a pending entry. `project_hash: None` leaves the field out (an
+/// entry from before the queue knew about projects).
+fn write_pending_entry(
+    pending: &std::path::Path,
+    file_name: &str,
+    project_hash: Option<&str>,
+    schema_v2: bool,
+    kind: &str,
+    text: &str,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(pending).unwrap();
+    let mut body = serde_json::json!({
+        "kind": kind,
+        "text": text,
+        "backend": "heuristic",
+        "queued_at": "2026-05-08T00:00:00Z",
+    });
+    if schema_v2 {
+        body["schema"] = serde_json::json!("v2");
+    }
+    if let Some(h) = project_hash {
+        body["project_hash"] = serde_json::json!(h);
+        body["events_path"] = serde_json::json!(format!("/nowhere/{h}.jsonl"));
+    }
+    let path = pending.join(file_name);
+    std::fs::write(&path, body.to_string()).unwrap();
+    path
+}
+
+fn project_events(xdg: &std::path::Path, project_hash: &str) -> String {
+    std::fs::read_to_string(
+        xdg.join("task-journal")
+            .join("events")
+            .join(format!("{project_hash}.jsonl")),
+    )
+    .unwrap_or_default()
+}
+
+const OTHER_PROJECT: &str = "0123456789abcdef";
+
+#[test]
+fn classify_worker_only_processes_its_own_projects_entries() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+    let pending = dir.path().join("task-journal").join("pending");
+
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        true,
+        "UserPromptSubmit",
+        "We decided to use sqlite for the project A store",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        true,
+        "UserPromptSubmit",
+        "We decided to use postgres for the project B store",
+    );
+    let legacy_foreign = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000002.json",
+        Some(OTHER_PROJECT),
+        true,
+        "UserPromptSubmit",
+        "We decided to use mongodb for the project B cache",
+    );
+    let legacy_no_project = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000003.json",
+        None,
+        true,
+        "UserPromptSubmit",
+        "We decided to use redis for the unknown project cache",
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    assert!(!own.exists(), "the project's own entry is processed");
+    assert!(
+        foreign.exists(),
+        "another project's entry must be left alone"
+    );
+    assert!(
+        legacy_foreign.exists(),
+        "a legacy entry of another project too"
+    );
+    assert!(
+        legacy_no_project.exists(),
+        "a legacy entry without project_hash is left for `pending retry`"
+    );
+    let journal = project_events(dir.path(), &hash_a);
+    assert!(journal.contains("sqlite"), "own entry recorded: {journal}");
+    for other in ["postgres", "mongodb", "redis"] {
+        assert!(
+            !journal.contains(other),
+            "{other} belongs to another project: {journal}"
+        );
+    }
+}
+
+#[test]
+fn statusline_counts_only_this_projects_pending_entries() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Statusline scope"])
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    for i in 0..2 {
+        write_pending_entry(
+            &pending,
+            &format!("{hash_a}.01JA000000000000000000000{i}.json"),
+            Some(&hash_a),
+            true,
+            "PostToolUse",
+            "own",
+        );
+    }
+    for i in 0..3 {
+        write_pending_entry(
+            &pending,
+            &format!("{OTHER_PROJECT}.01JA000000000000000000000{i}.json"),
+            Some(OTHER_PROJECT),
+            true,
+            "PostToolUse",
+            "foreign",
+        );
+    }
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["statusline"])
+        .assert()
+        .success()
+        .stdout(contains("pending: 2"));
+}
+
+#[test]
+fn pending_list_retry_and_hook_drain_skip_other_projects() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Project A"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        false,
+        "Stop",
+        "own legacy-v1 chunk alpha",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        false,
+        "Stop",
+        "foreign chunk bravo",
+    );
+    let legacy_foreign = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000002.json",
+        Some(OTHER_PROJECT),
+        false,
+        "Stop",
+        "foreign legacy chunk charlie",
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["pending", "list"])
+        .assert()
+        .success()
+        .stdout(contains("alpha"))
+        .stdout(contains("bravo").not())
+        .stdout(contains("charlie").not());
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "pending",
+            "retry",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+    assert!(!own.exists(), "own entry drained");
+
+    // The hook's mock drain is project-scoped too.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "ingest-hook",
+            "--kind",
+            "Stop",
+            "--text",
+            "Live chunk",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        foreign.exists(),
+        "another project's entry must be left alone"
+    );
+    assert!(
+        legacy_foreign.exists(),
+        "a legacy entry of another project too"
+    );
+    let journal = project_events(dir.path(), &hash_a);
+    assert!(journal.contains("alpha"), "own entry recorded: {journal}");
+    assert!(
+        !journal.contains("bravo") && !journal.contains("charlie"),
+        "foreign chunks leaked into project A: {journal}"
+    );
+}
+
+#[test]
+fn pending_gc_is_project_scoped_unless_all() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+    let pending = dir.path().join("task-journal").join("pending");
+
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        true,
+        "PostToolUse",
+        "own",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        true,
+        "PostToolUse",
+        "foreign",
+    );
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    for p in [&own, &foreign] {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    let gc = |extra: &[&str]| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["pending-gc", "--days", "1"])
+            .args(extra)
+            .assert()
+            .success();
+    };
+
+    gc(&[]);
+    assert!(!own.exists(), "own stale entry collected");
+    assert!(
+        foreign.exists(),
+        "another project's entry is not ours to collect"
+    );
+
+    gc(&["--all"]);
+    assert!(!foreign.exists(), "--all collects every project");
+}
+
 // =====================================================================
 // v0.7.0: statusline / PreCompact / /rewind / rejected / export-pr
 // =====================================================================
@@ -3308,6 +3816,92 @@ fn rewind_prompt_appends_correction_event() {
         .stdout(contains("[correction]").and(contains("/rewind")));
 }
 
+/// `meta.session_id` of the journal's events of `etype`.
+fn session_ids_of(journal: &str, etype: &str) -> Vec<Option<String>> {
+    journal
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["type"] == etype)
+        .map(|e| e["meta"]["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn hook_written_events_carry_the_session_id() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    let hook = |prompt: &str| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_INGEST_SYNC", "1")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .current_dir(&workdir)
+            .args(["ingest-hook", "--backend", "heuristic"])
+            .write_stdin(
+                serde_json::json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "sess-hook",
+                    "prompt": prompt,
+                })
+                .to_string(),
+            )
+            .assert()
+            .success();
+    };
+
+    // No open task: the prompt auto-opens one and is classified inline.
+    hook("We decided to use postgres for the journal store going forward");
+    hook("/rewind go back to plan A");
+
+    let journal = project_events(dir.path(), &hash);
+    let want = vec![Some("sess-hook".to_string())];
+    assert_eq!(session_ids_of(&journal, "open"), want, "auto-open event");
+    assert_eq!(
+        session_ids_of(&journal, "decision"),
+        want,
+        "sync-classified"
+    );
+    assert_eq!(session_ids_of(&journal, "correction"), want, "/rewind");
+}
+
+#[test]
+fn worker_auto_open_carries_the_chunk_session_id() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let entry = write_pending_entry(
+        &pending,
+        &format!("{hash}.01JA0000000000000000000000.json"),
+        Some(&hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use postgres for the journal store going forward",
+    );
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&entry).unwrap()).unwrap();
+    v["session_id"] = serde_json::json!("sess-chunk");
+    std::fs::write(&entry, v.to_string()).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    let journal = project_events(dir.path(), &hash);
+    let want = vec![Some("sess-chunk".to_string())];
+    assert_eq!(session_ids_of(&journal, "open"), want, "auto-open event");
+    assert_eq!(session_ids_of(&journal, "decision"), want, "classified");
+}
+
 #[test]
 fn install_hooks_wires_precompact_event() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -3555,12 +4149,9 @@ fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
         .stderr(contains("task not found: tj-zzzz"));
 }
 
-// v0.10.0: asyncRewake backlog signal. PostToolUse hook configured with
-// asyncRewake:true in hooks.json sets TJ_ASYNC_REWAKE=1; when pending/
-// has more than PENDING_OVERFLOW_THRESHOLD (25) entries already queued,
-// ingest-hook exits 2 with a wake-message on stdout. Sync hooks (or
-// CLI invocations without the env var) must NEVER exit 2 — that would
-// block the operation in Claude Code's hook contract.
+// The PostToolUse hook used to exit 2 on a large pending backlog to wake the
+// model (TJ_ASYNC_REWAKE). Nothing installs that env var, so the signal was
+// dead code; a backlog must never turn the hook into a non-zero exit.
 fn seed_pending_chunks(pending_dir: &std::path::Path, count: usize) {
     std::fs::create_dir_all(pending_dir).unwrap();
     for i in 0..count {
@@ -3592,82 +4183,19 @@ fn posttooluse_payload() -> String {
 }
 
 #[test]
-fn session_start_emits_watch_paths_for_existing_marker_files() {
-    // v0.10.2 X4: SessionStart envelope must include `watchPaths` with
-    // existing marker files (CLAUDE.md, README.md, .docs/plans). Files
-    // that don't exist are skipped — Claude Code's watcher logs an
-    // error and gives up on missing paths, so we don't emit them.
+fn session_start_does_not_emit_watch_paths() {
+    // install-hooks never registers FileChanged, so asking Claude Code to
+    // watch marker files only made it watch them for nothing.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(workdir.join(".docs").join("plans")).unwrap();
-    std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
-    // README.md intentionally absent — must NOT appear in watchPaths.
-
-    let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .current_dir(&workdir)
-            .args(["create", "Watch paths test"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-    let _ = task_id;
-
-    let body = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .current_dir(&workdir)
-            .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap();
-    let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
-    let watches = v["hookSpecificOutput"]["watchPaths"]
-        .as_array()
-        .expect("watchPaths must be present when at least one marker exists");
-    let joined: String = watches
-        .iter()
-        .filter_map(|x| x.as_str())
-        .collect::<Vec<_>>()
-        .join("|");
-    assert!(
-        joined.contains("CLAUDE.md"),
-        "CLAUDE.md must be watched: {joined}"
-    );
-    assert!(
-        joined.contains("plans"),
-        ".docs/plans must be watched: {joined}"
-    );
-    assert!(
-        !joined.contains("README.md"),
-        "README.md does not exist, must NOT be watched: {joined}"
-    );
-}
-
-#[test]
-fn session_start_omits_watch_paths_when_disabled_via_env() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    let workdir = dir.path().join("proj");
-    std::fs::create_dir_all(&workdir).unwrap();
     std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
 
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Watch paths env-disabled"])
+        .args(["create", "Watch paths test"])
         .assert()
         .success();
 
@@ -3675,7 +4203,6 @@ fn session_start_omits_watch_paths_when_disabled_via_env() {
         Command::cargo_bin("task-journal")
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
-            .env("TJ_WATCH_PATHS", "0")
             .current_dir(&workdir)
             .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
             .assert()
@@ -3688,19 +4215,18 @@ fn session_start_omits_watch_paths_when_disabled_via_env() {
     let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
     assert!(
         v["hookSpecificOutput"]["watchPaths"].is_null(),
-        "TJ_WATCH_PATHS=0 must suppress watchPaths emission"
+        "SessionStart must not emit watchPaths: {body}"
     );
     assert!(
         v["hookSpecificOutput"]["additionalContext"].is_string(),
-        "additionalContext still emitted independently of watchPaths"
+        "resume context is still emitted: {body}"
     );
 }
 
 #[test]
-fn file_changed_hook_appends_evidence_to_active_task() {
-    // v0.10.2 X4: FileChanged hook handler should append an evidence
-    // event to the most-recent open task with the changed path
-    // (trimmed project-relative) and the change kind.
+fn file_changed_payload_is_ignored() {
+    // No FileChanged handler any more: the payload carries no text, so the
+    // hook writes nothing even with an open task.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3710,7 +4236,7 @@ fn file_changed_hook_appends_evidence_to_active_task() {
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .current_dir(&workdir)
-            .args(["create", "FileChanged evidence test"])
+            .args(["create", "Watched file ignored"])
             .assert()
             .success()
             .get_output()
@@ -3723,7 +4249,6 @@ fn file_changed_hook_appends_evidence_to_active_task() {
 
     let touched = workdir.join("CLAUDE.md");
     std::fs::write(&touched, "# rules v2").unwrap();
-
     let stdin_payload = serde_json::json!({
         "hook_event_name": "FileChanged",
         "file_path": touched.to_str().unwrap(),
@@ -3734,8 +4259,9 @@ fn file_changed_hook_appends_evidence_to_active_task() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
+        .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(stdin_payload)
         .assert()
         .success();
@@ -3747,8 +4273,7 @@ fn file_changed_hook_appends_evidence_to_active_task() {
         .args(["pack", &task_id, "--mode", "full"])
         .assert()
         .success()
-        .stdout(contains("FileChanged (change)"))
-        .stdout(contains("CLAUDE.md"));
+        .stdout(contains("FileChanged").not());
 }
 
 #[test]
@@ -3788,7 +4313,7 @@ fn file_changed_hook_with_no_open_task_is_no_op() {
 }
 
 #[test]
-fn asyncrewake_below_threshold_exits_zero() {
+fn post_tool_use_backlog_never_exits_two() {
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3797,41 +4322,11 @@ fn asyncrewake_below_threshold_exits_zero() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Async wake test below threshold"])
+        .args(["create", "Backlog test"])
         .assert()
         .success();
 
-    // Seed 5 entries — well under the 25 threshold.
-    let pending = dir.path().join("task-journal").join("pending");
-    seed_pending_chunks(&pending, 5);
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .env("TJ_ASYNC_REWAKE", "1")
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
-        .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
-        .write_stdin(posttooluse_payload())
-        .assert()
-        .success(); // exit 0, no wake
-}
-
-#[test]
-fn asyncrewake_overflow_exits_two_with_drain_hint() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    let workdir = dir.path().join("proj");
-    std::fs::create_dir_all(&workdir).unwrap();
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .current_dir(&workdir)
-        .args(["create", "Async wake overflow test"])
-        .assert()
-        .success();
-
-    // Seed 30 entries — over the 25 threshold.
+    // Seed 30 entries — over the old 25-entry wake threshold.
     let pending = dir.path().join("task-journal").join("pending");
     seed_pending_chunks(&pending, 30);
 
@@ -3841,21 +4336,56 @@ fn asyncrewake_overflow_exits_two_with_drain_hint() {
         .env("TJ_ASYNC_REWAKE", "1")
         .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
+        .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(posttooluse_payload())
         .assert()
-        .failure()
-        .code(2)
-        .stdout(contains("Task Journal pending queue"))
-        .stdout(contains("pending-gc"));
+        .success()
+        .stdout(contains("pending queue").not());
 }
 
 #[test]
-fn asyncrewake_overflow_without_env_does_not_exit_two() {
-    // Sync hook safety: without TJ_ASYNC_REWAKE=1 we must NEVER exit 2
-    // even on overflow, because exit 2 from a sync hook blocks the
-    // operation in Claude Code. CLI invocations and the PreCompact/Stop
-    // hooks (which stay sync) rely on this guarantee.
+fn post_tool_use_queues_truncated_text() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "big.rs"},
+        "tool_response": {"content": "ж".repeat(10_000)},
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let entries: Vec<_> = std::fs::read_dir(&pending).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let body = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let chars = v["text"].as_str().unwrap().chars().count();
+    assert!(
+        chars <= 2000,
+        "PostToolUse text must be capped, got {chars}"
+    );
+    assert!(
+        chars > 100,
+        "the start of the tool call is kept, got {chars}"
+    );
+}
+
+#[test]
+fn post_tool_use_output_wording_is_not_a_constraint() {
+    // "must be" / "requires" inside tool output used to become constraint
+    // events whose text was raw tool JSON.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3864,23 +4394,33 @@ fn asyncrewake_overflow_without_env_does_not_exit_two() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Sync hook safety test"])
+        .args(["create", "Tool output noise"])
         .assert()
         .success();
 
-    let pending = dir.path().join("task-journal").join("pending");
-    seed_pending_chunks(&pending, 30);
-
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "schema.json"},
+        "tool_response": {"content": "the id field must be unique and requires an index"},
+    })
+    .to_string();
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
-        .env_remove("TJ_ASYNC_REWAKE")
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .env("TJ_INGEST_SYNC", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
-        .write_stdin(posttooluse_payload())
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload)
         .assert()
-        .success(); // exit 0, no wake — must not block sync hooks
+        .success();
+
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    let journal = project_events(dir.path(), &hash);
+    assert!(
+        !journal.contains("\"constraint\""),
+        "tool output must not become a constraint: {journal}"
+    );
 }
 
 // ---------------------------------------------------------------------------

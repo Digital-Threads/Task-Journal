@@ -34,6 +34,7 @@ mod tests {
                 text: "ignored".into(),
                 author_hint: "user".into(),
                 recent_tasks: vec![],
+                tool_output: false,
             })
             .unwrap();
         assert_eq!(out.event_type, EventType::Decision);

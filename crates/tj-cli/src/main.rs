@@ -343,23 +343,63 @@ fn pending_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// The current project's entries in the global `pending/` dir. New entries
+/// are named `<project_hash>.<ulid>.json` (`….dead.json` once retries are
+/// exhausted); a legacy bare `<ulid>.json` counts as ours unless its JSON
+/// names another project. Callers filter schema / dead state on top.
+fn project_pending_entries(
+    dir: &std::path::Path,
+    project_hash: &str,
+) -> Result<Vec<std::path::PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let stem = stem.strip_suffix(".dead").unwrap_or(stem);
+        let (ulid, ours) = match stem.split_once('.') {
+            Some((prefix, ulid)) => (ulid, prefix == project_hash),
+            None => (stem, !legacy_pending_is_foreign(&path, project_hash)),
+        };
+        if ours {
+            out.push((ulid.to_string(), path));
+        }
+    }
+
+    // ULIDs sort by creation time: oldest first, so a user prompt is
+    // classified before the assistant turn that answered it.
+    out.sort();
+    Ok(out.into_iter().map(|(_, path)| path).collect())
+}
+
+/// A legacy (un-prefixed) entry belongs to another project only when its
+/// JSON says so; one without `project_hash` stays visible here.
+fn legacy_pending_is_foreign(path: &std::path::Path, project_hash: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("project_hash")?.as_str().map(|h| h != project_hash))
+        .unwrap_or(false)
+}
+
 fn run_pending_list() -> Result<()> {
     let dir = pending_dir()?;
-    if !dir.exists() {
-        println!("(no pending entries)");
-        return Ok(());
-    }
+    let project_hash = tj_core::project_hash::from_path(std::env::current_dir()?)?;
     let mut entries: Vec<(String, String, String, u32)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
+    for path in project_pending_entries(&dir, &project_hash)? {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+        let id = stem
+            .strip_prefix(&format!("{project_hash}."))
+            .unwrap_or(stem)
             .to_string();
         let body = std::fs::read_to_string(&path)?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
@@ -376,9 +416,7 @@ fn run_pending_list() -> Result<()> {
             .take(72)
             .collect();
         let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-        let dead_marker = if id.ends_with(".dead") { " [DEAD]" } else { "" };
         entries.push((id, queued_at, text_preview, attempts));
-        let _ = dead_marker;
     }
     if entries.is_empty() {
         println!("(no pending entries)");
@@ -392,6 +430,7 @@ fn run_pending_list() -> Result<()> {
 }
 
 fn run_pending_retry(
+    backend: &str,
     mock_etype: Option<&str>,
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
@@ -405,15 +444,27 @@ fn run_pending_retry(
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
 
+    // The CI-safe mock branch needs no classifier. Without a usable backend
+    // a retry can't do better than the attempt that queued the entry, so
+    // leave everything as it is rather than burn attempts toward `.dead`.
+    let classifier = match (mock_etype, mock_tid) {
+        (Some(_), Some(_)) => None,
+        _ => match retry_classifier(backend)? {
+            Some(c) => Some(c),
+            None => {
+                println!(
+                    "pending retry: no classifier backend available for `{backend}` \
+                     (no `claude` on PATH, no ANTHROPIC_API_KEY) — entries left untouched"
+                );
+                return Ok(());
+            }
+        },
+    };
+
     let mut succeeded = 0usize;
     let mut died = 0usize;
     let mut still_pending = 0usize;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    for path in project_pending_entries(&dir, &project_hash)? {
         if path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -436,11 +487,14 @@ fn run_pending_retry(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
+        let kind = v
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .unwrap_or("Stop")
+            .to_string();
 
-        // The real retry path would call the classifier. The CI-safe
-        // mock branch lets tests drive a deterministic outcome.
-        let outcome: anyhow::Result<()> = match (mock_etype, mock_tid) {
-            (Some(etype), Some(tid)) => {
+        let outcome: anyhow::Result<()> = match (mock_etype, mock_tid, &classifier) {
+            (Some(etype), Some(tid), _) => {
                 let mut event = tj_core::event::Event::new(
                     tid,
                     parse_event_type(etype)?,
@@ -455,9 +509,18 @@ fn run_pending_retry(
                 writer.flush_durable()?;
                 Ok(())
             }
-            _ => Err(anyhow::anyhow!(
-                "no real classifier wired in retry path yet — pass --mock-* for tests, or run install-hooks and let the hook drain the queue"
-            )),
+            (_, _, Some(classifier)) => match classify_chunk(
+                classifier.as_ref(),
+                &events_path,
+                &project_hash,
+                &kind,
+                &text,
+                None,
+            )? {
+                ChunkOutcome::Unplaced(err) => Err(anyhow::anyhow!(err)),
+                ChunkOutcome::Recorded | ChunkOutcome::Dropped => Ok(()),
+            },
+            _ => unreachable!("a missing classifier returns before the loop"),
         };
 
         match outcome {
@@ -491,6 +554,24 @@ fn run_pending_retry(
         "pending retry: {succeeded} drained, {still_pending} still pending, {died} marked dead"
     );
     Ok(())
+}
+
+/// The classifier `pending retry` runs, or `None` when the backend has
+/// nothing beyond what already failed: hybrid without an LLM fallback, or
+/// agent-sdk / api without `claude` / a key.
+fn retry_classifier(
+    backend: &str,
+) -> anyhow::Result<Option<Box<dyn tj_core::classifier::Classifier>>> {
+    Ok(match backend {
+        "hybrid" | "" => {
+            let hybrid = tj_core::classifier::hybrid::HybridClassifier::from_env();
+            hybrid
+                .has_llm_fallback()
+                .then(|| Box::new(hybrid) as Box<dyn tj_core::classifier::Classifier>)
+        }
+        "agent-sdk" | "api" => build_classifier(backend).ok(),
+        other => Some(build_classifier(other)?),
+    })
 }
 
 fn run_doctor() -> Result<DoctorReport> {
@@ -761,14 +842,17 @@ enum Commands {
         #[arg(long, default_value_t = 7)]
         days: i64,
     },
-    /// Garbage-collect the pending classifier queue. Removes entries
-    /// older than N days OR marked dead by retry exhaustion. Run after
-    /// classifier auth was broken for a while and the queue grew
-    /// stale.
+    /// Garbage-collect the current project's pending classifier queue.
+    /// Removes entries older than N days OR marked dead by retry
+    /// exhaustion. Run after classifier auth was broken for a while and
+    /// the queue grew stale.
     PendingGc {
         /// Age threshold in days. Default 7.
         #[arg(long, default_value_t = 7)]
         days: i64,
+        /// Collect every project's entries, not just the current one's.
+        #[arg(long)]
+        all: bool,
     },
     /// Set or update the goal of an existing task.
     Goal {
@@ -1104,7 +1188,12 @@ enum PendingCmd {
     List,
     /// Re-feed every pending entry through the classifier. Marks an
     /// entry as `<id>.dead.json` after PENDING_MAX_ATTEMPTS failures.
+    /// With no usable backend, entries are left untouched.
     Retry {
+        /// Classifier backend: "hybrid", "agent-sdk", "api", or "heuristic".
+        /// Defaults to hybrid.
+        #[arg(long, default_value = "hybrid")]
+        backend: String,
         /// Test/dev override: bypass classifier and force this event
         /// type. Hidden from --help.
         #[arg(long, hide = true)]
@@ -1642,7 +1731,7 @@ fn real_main() -> Result<()> {
                 );
             }
         }
-        Commands::PendingGc { days } => {
+        Commands::PendingGc { days, all } => {
             let pending_dir = tj_core::paths::events_dir()?
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("events_dir has no parent"))?
@@ -1651,20 +1740,23 @@ fn real_main() -> Result<()> {
                 println!("(no pending dir — nothing to gc)");
                 return Ok(());
             }
+            let entries: Vec<std::path::PathBuf> = if all {
+                std::fs::read_dir(&pending_dir)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                    .collect()
+            } else {
+                let project_hash = tj_core::project_hash::from_path(std::env::current_dir()?)?;
+                project_pending_entries(&pending_dir, &project_hash)?
+            };
             let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
             let mut removed = 0usize;
-            for entry in std::fs::read_dir(&pending_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
+            for path in entries {
                 // Prefer the file's mtime over JSON parsing — pending
                 // payloads include their own queued_at but are not
                 // guaranteed parseable when the classifier corrupted
                 // input mid-stream.
-                let mtime = entry
-                    .metadata()
+                let mtime = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| {
@@ -2134,11 +2226,13 @@ fn real_main() -> Result<()> {
                 run_pending_list()?;
             }
             PendingCmd::Retry {
+                backend,
                 mock_event_type,
                 mock_task_id,
                 mock_confidence,
             } => {
                 run_pending_retry(
+                    &backend,
                     mock_event_type.as_deref(),
                     mock_task_id.as_deref(),
                     mock_confidence,
@@ -2370,33 +2464,6 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     bundle.push_str("\n\n");
                 }
 
-                // v0.10.2 X4: emit `watchPaths` so Claude Code starts
-                // monitoring our marker files (CLAUDE.md, README.md,
-                // .docs/plans). When any of them changes, Claude Code
-                // fires a FileChanged hook event — our ingest-hook
-                // handler below treats those as `evidence` entries on
-                // the active task so the journal captures
-                // "instructions were updated mid-session" without the
-                // user manually logging it. Only paths that exist at
-                // SessionStart time are emitted (no point watching a
-                // non-existent file — Claude Code logs `watcher error`
-                // and gives up on it). Gated by TJ_WATCH_PATHS=0.
-                let allow_watch_paths = std::env::var("TJ_WATCH_PATHS").as_deref() != Ok("0");
-                let watch_candidates = [
-                    cwd.join("CLAUDE.md"),
-                    cwd.join("README.md"),
-                    cwd.join(".docs").join("plans"),
-                ];
-                let watch_paths: Vec<String> = if allow_watch_paths {
-                    watch_candidates
-                        .iter()
-                        .filter(|p| p.exists())
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
                 // We deliberately DO NOT emit `sessionTitle` or
                 // `initialUserMessage` here. The v0.10.1 X2 experiment set
                 // `sessionTitle` to "TJ — <task_id> (<n> open)", which
@@ -2408,81 +2475,14 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // title. The resume context the model actually needs already
                 // rides in `additionalContext`; the tab label belongs to
                 // Claude Code, not to us. (0.14.3)
-                let mut hook_specific = serde_json::json!({
+                let hook_specific = serde_json::json!({
                     "hookEventName": "SessionStart",
                     "additionalContext": bundle.trim_end(),
                 });
-                if !watch_paths.is_empty() {
-                    hook_specific["watchPaths"] = serde_json::Value::Array(
-                        watch_paths
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    );
-                }
                 let envelope = serde_json::json!({
                     "hookSpecificOutput": hook_specific,
                 });
                 println!("{}", serde_json::to_string(&envelope)?);
-                return Ok(());
-            }
-
-            // v0.10.2 X4: FileChanged. Claude Code 2.1.x fires this
-            // event whenever a path in `watchPaths` (emitted on
-            // SessionStart) changes. Payload: { file_path, event:
-            // "change"|"add"|"unlink" }. We translate it into an
-            // `evidence` event on the active task — captures
-            // "the user/agent edited CLAUDE.md mid-session" without
-            // anyone typing anything. Schema verified in 2.1.160:
-            // `literal("FileChanged"), file_path: y.string(), event:
-            // y.enum(["change","add","unlink"])`.
-            //
-            // No active task → drop silently (we're not opening a
-            // task just because a watched file moved). No events_path
-            // → ditto, fresh project.
-            if kind == "FileChanged" {
-                if !events_path.exists() {
-                    return Ok(());
-                }
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
-                let Some(tc) = recent.into_iter().next() else {
-                    return Ok(());
-                };
-                let file_path = payload
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown)");
-                let change = payload
-                    .get("event")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("change");
-                // Trim noisy absolute paths to project-relative when
-                // possible — the journal is per-project so the prefix
-                // is redundant and just steals tokens from the pack.
-                let display_path = cwd
-                    .to_str()
-                    .and_then(|c| file_path.strip_prefix(c))
-                    .map(|s| s.trim_start_matches('/').to_string())
-                    .unwrap_or_else(|| file_path.to_string());
-                let evidence_text = format!("FileChanged ({change}): {display_path}");
-                let mut event = tj_core::event::Event::new(
-                    &tc.task_id,
-                    tj_core::event::EventType::Evidence,
-                    tj_core::event::Author::Classifier,
-                    tj_core::event::Source::Hook,
-                    evidence_text,
-                );
-                event.confidence = Some(0.9);
-                event.status = tj_core::event::EventStatus::Confirmed;
-                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
-                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
-                writer.append(&event)?;
-                writer.flush_durable()?;
-                println!("{}", event.event_id);
                 return Ok(());
             }
 
@@ -2493,7 +2493,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             // "why did this stretch come out shallow" is usually answered by
             // "it ran on a fallback model". Recorded as a `constraint`: it's an
             // external condition the work happened under, not a decision.
-            // No active task → drop silently, same rule as FileChanged.
+            // No active task → drop silently.
             if kind == "PostModelSwitch" {
                 if !events_path.exists() {
                     return Ok(());
@@ -2521,7 +2521,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     .get("source")
                     .and_then(|v| v.as_str())
                     .unwrap_or("user");
-                let text = format!("Model switched ({switch_source}): {from_model} → {to_model}");
+                let text = format!(
+                    "{}{switch_source}): {from_model} → {to_model}",
+                    tj_core::reminder::MODEL_SWITCH_TEXT_PREFIX
+                );
                 let mut event = tj_core::event::Event::new(
                     &tc.task_id,
                     tj_core::event::EventType::Constraint,
@@ -2531,6 +2534,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(0.9);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                // Kept in the journal, but left out of the constraint lists
+                // (resume reminder, classifier context) — see
+                // MODEL_SWITCH_TEXT_PREFIX.
+                event.meta = serde_json::json!({ "kind": "model_switch" });
                 tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
@@ -2748,6 +2755,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             // Drain any pending entries first (Task 10 fills the real-classifier branch).
             drain_pending(
                 &events_path,
+                &project_hash,
                 mock_event_type.as_deref(),
                 mock_task_id.as_deref(),
                 mock_confidence,
@@ -2792,12 +2800,21 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(1.0);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
                 println!("{}", event.event_id);
                 return Ok(());
             }
+
+            // A tool call arrives as its full input + response JSON; cap it
+            // so one big file read or command output can't flood the queue.
+            let text: String = if kind == "PostToolUse" {
+                text.chars().take(POST_TOOL_USE_TEXT_MAX).collect()
+            } else {
+                text
+            };
 
             // v0.6.2 fork-bomb fix. The real-classifier path used to run
             // `claude -p` synchronously inside the hook, blocking each
@@ -2828,25 +2845,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // Fire-and-forget worker. Errors here are best-effort —
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
-                let _ = spawn_classify_worker(&backend);
-
-                // v0.10.0 asyncRewake backlog signal. Only the PostToolUse
-                // hook runs as asyncRewake (hooks.json sets TJ_ASYNC_REWAKE=1
-                // there), so other kinds — and direct CLI invocations —
-                // never exit 2 even on overflow. Exit code 2 from a sync
-                // hook would BLOCK the operation; only asyncRewake hooks
-                // treat code 2 as "wake the model with rewakeMessage". stdout
-                // is appended to the wake message, so the user sees the
-                // drain command without us reaching into stderr.
-                let allow_wake = std::env::var("TJ_ASYNC_REWAKE").as_deref() == Ok("1");
-                if allow_wake && kind == "PostToolUse" {
-                    let pending_count = count_pending_entries(&events_path).unwrap_or(0);
-                    if pending_count > PENDING_OVERFLOW_THRESHOLD {
-                        println!(
-                            "Task Journal pending queue: {pending_count} entries. Classifier behind — run `task-journal pending-gc --days 0` to drain.",
-                        );
-                        std::process::exit(2);
-                    }
+                if std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
+                    let _ = spawn_classify_worker(&backend);
                 }
                 return Ok(());
             }
@@ -2896,8 +2896,13 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     if auto_open_disabled || !kind.contains("UserPrompt") {
                         return Ok(());
                     }
-                    let Some(new_task) =
-                        auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?
+                    let Some(new_task) = auto_open_task_from_prompt(
+                        &events_path,
+                        &project_hash,
+                        &conn,
+                        &text,
+                        live_session_id.as_deref(),
+                    )?
                     else {
                         // Prompt was only machine noise — nothing worth a task.
                         return Ok(());
@@ -2953,11 +2958,12 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     text: text.clone(),
                     author_hint: author_hint.into(),
                     recent_tasks: recent,
+                    tool_output: kind == "PostToolUse",
                 };
                 let out = match classifier.classify(&input) {
                     Ok(o) => o,
                     Err(e) => {
-                        persist_pending(&events_path, &text, &e.to_string())?;
+                        persist_pending(&events_path, &project_hash, &kind, &text, &e.to_string())?;
                         return Ok(());
                     }
                 };
@@ -2987,6 +2993,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     None => {
                         persist_pending(
                             &events_path,
+                            &project_hash,
+                            &kind,
                             &text,
                             &format!("task_id_guess `{tid}` not found"),
                         )?;
@@ -2995,6 +3003,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     Some(s) if s == "closed" => {
                         persist_pending(
                             &events_path,
+                            &project_hash,
+                            &kind,
                             &text,
                             &format!("task_id_guess `{tid}` is closed"),
                         )?;
@@ -3026,6 +3036,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             event.confidence = Some(confidence);
             event.status = tj_core::classifier::decide_status(confidence);
             event.evidence_strength = evidence_strength;
+            tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
@@ -3556,20 +3567,19 @@ fn run_statusline() -> anyhow::Result<String> {
         })
         .count();
 
-    // Pending dir is global — one entry per queued classifier failure.
-    // No project filter (matches the brief; per-project counting would
-    // need extra metadata in each pending file).
+    // Pending dir is global; this project's entries carry its hash as a
+    // filename prefix, so counting stays a cheap readdir with no JSON
+    // parsing. Legacy un-prefixed entries are not counted.
+    let prefix = format!("{project_hash}.");
     let pending_count = pending_dir()
         .ok()
         .and_then(|d| std::fs::read_dir(&d).ok())
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .map(|x| x == "json")
-                        .unwrap_or(false)
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(&prefix) && name.ends_with(".json")
                 })
                 .count()
         })
@@ -4153,17 +4163,22 @@ fn recent_task_contexts(
             "SELECT sf.text FROM events_index ei
              LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
              WHERE ei.task_id = ?1 AND ei.type = 'constraint'
+             AND COALESCE(sf.text, '') NOT LIKE ?3
              ORDER BY ei.timestamp DESC LIMIT ?2",
         )?;
+        let model_switch = format!("{}%", tj_core::reminder::MODEL_SWITCH_TEXT_PREFIX);
         let constraints: Vec<String> = c_stmt
-            .query_map(rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT], |r| {
-                let txt: Option<String> = r.get(0)?;
-                Ok(txt
-                    .unwrap_or_default()
-                    .chars()
-                    .take(120)
-                    .collect::<String>())
-            })?
+            .query_map(
+                rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT, model_switch],
+                |r| {
+                    let txt: Option<String> = r.get(0)?;
+                    Ok(txt
+                        .unwrap_or_default()
+                        .chars()
+                        .take(120)
+                        .collect::<String>())
+                },
+            )?
             .collect::<Result<Vec<String>, _>>()?
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -4246,6 +4261,12 @@ fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usiz
 /// substantial work but logged little — escalate. All signals are cheap (a file
 /// size + a tail scan); no model, never blocks the prompt.
 fn run_nudge() -> anyhow::Result<()> {
+    // Recursion guard, same as recall-hook: never inject into our own
+    // classifier child (`claude -p` / `codex exec` re-run the user's hooks).
+    if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
+        return Ok(());
+    }
+
     let mut ctx = NUDGE_BASE.to_string();
     let escalation = (|| -> Option<String> {
         use std::io::{IsTerminal, Read};
@@ -5254,6 +5275,7 @@ fn auto_open_task_from_prompt(
     project_hash: &str,
     conn: &rusqlite::Connection,
     prompt: &str,
+    session_id: Option<&str>,
 ) -> anyhow::Result<Option<tj_core::classifier::TaskContext>> {
     // Title/goal must read like a human wrote them on purpose. When the
     // prompt is only machine noise — session-start scrollback
@@ -5275,6 +5297,7 @@ fn auto_open_task_from_prompt(
         title.clone(),
     );
     event.meta = serde_json::json!({ "title": title, "auto_opened": true });
+    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
 
     let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
     writer.append(&event)?;
@@ -5320,7 +5343,13 @@ fn auto_open_task_from_prompt(
     }))
 }
 
-fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyhow::Result<()> {
+fn persist_pending(
+    events_path: &std::path::Path,
+    project_hash: &str,
+    kind: &str,
+    text: &str,
+    err: &str,
+) -> anyhow::Result<()> {
     let pending_dir = events_path
         .parent()
         .unwrap()
@@ -5329,9 +5358,10 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
         .join("pending");
     std::fs::create_dir_all(&pending_dir)?;
     let id = ulid::Ulid::new().to_string();
-    let payload = serde_json::json!({"text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
+    // `kind` lets `pending retry` classify the chunk the way the hook would.
+    let payload = serde_json::json!({"kind": kind, "text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
     std::fs::write(
-        pending_dir.join(format!("{id}.json")),
+        pending_dir.join(format!("{project_hash}.{id}.json")),
         serde_json::to_string_pretty(&payload)?,
     )?;
     Ok(())
@@ -5340,41 +5370,6 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
 /// v0.6.2: queue an ingest event for the detached classify-worker. The
 /// hook returns immediately after writing this entry so it does not
 /// block Claude Code's hook timeout (was 5-30s, now <100ms). Schema "v2"
-/// Threshold for the v0.10.0 asyncRewake backlog signal. When the
-/// PostToolUse hook (configured with `asyncRewake: true` in
-/// `hooks.json`) finds more than this many entries already queued
-/// in `pending/`, it exits with code 2 to wake the model with a
-/// system reminder pointing at `task-journal pending-gc`. Tuned so
-/// that normal load (<5 in-flight at any moment) never trips, but
-/// a stuck classifier surfaces visibly before the queue grows into
-/// the hundreds (the v0.6.2 fork-bomb era saw 515 entries before a
-/// user noticed).
-const PENDING_OVERFLOW_THRESHOLD: usize = 25;
-
-/// Count `.json` (and `.json.dead`) entries currently sitting in
-/// `pending/` next to `events_path`. Best-effort: any IO error
-/// returns 0 so a borked filesystem never wakes the model with
-/// noise. Used by the asyncRewake backlog signal.
-fn count_pending_entries(events_path: &std::path::Path) -> anyhow::Result<usize> {
-    let dir = events_path
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("events_path has no grandparent"))?
-        .join("pending");
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut count = 0usize;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some("json") = path.extension().and_then(|e| e.to_str()) {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// distinguishes async-ingest entries from legacy v1 (text+error) ones
 /// the `pending retry` path knows how to handle.
 fn persist_pending_v2(
@@ -5405,7 +5400,9 @@ fn persist_pending_v2(
     if let Some(sid) = session_id {
         payload["session_id"] = serde_json::Value::String(sid.to_string());
     }
-    let path = pending_dir.join(format!("{id}.json"));
+    // `pending/` is shared by every project: the hash prefix tells each
+    // project's worker which entries are its own.
+    let path = pending_dir.join(format!("{project_hash}.{id}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
     Ok(path)
 }
@@ -5492,6 +5489,12 @@ fn spawn_classify_worker(backend: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Characters of a PostToolUse chunk (tool input + response) that get queued.
+const POST_TOOL_USE_TEXT_MAX: usize = 2000;
+
+/// How long an empty (pid not yet written) worker lockfile counts as held.
+const LOCK_PID_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// File-lock guard for the classify-worker. Holds the lockfile until
 /// dropped; ensures cleanup on panic. One worker per project_hash.
 struct WorkerLock {
@@ -5519,16 +5522,25 @@ impl WorkerLock {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Inspect existing lockfile. If PID is alive → another
-                    // worker is running; back off. If dead/missing →
-                    // remove stale file and retry.
+                    // worker is running; back off. If dead → remove stale
+                    // file and retry.
                     let body = std::fs::read_to_string(&path).unwrap_or_default();
-                    let pid: Option<u32> = body.trim().parse().ok();
-                    if let Some(pid) = pid {
-                        if pid_is_alive(pid) {
-                            return Ok(None);
+                    match body.trim().parse::<u32>() {
+                        Ok(pid) if pid_is_alive(pid) => return Ok(None),
+                        Ok(_) => {}
+                        Err(_) => {
+                            // No PID yet: the holder may sit between
+                            // `create_new` and the pid write. Only a lock
+                            // that stayed empty past the grace is stale.
+                            let fresh = std::fs::metadata(&path)
+                                .and_then(|m| m.modified())
+                                .map(|t| t.elapsed().unwrap_or_default() < LOCK_PID_GRACE)
+                                .unwrap_or(false);
+                            if fresh {
+                                return Ok(None);
+                            }
                         }
                     }
-                    // Stale (no PID, or dead PID) — remove and retry.
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
@@ -5548,7 +5560,12 @@ impl Drop for WorkerLock {
 fn pid_is_alive(pid: u32) -> bool {
     // kill(pid, 0) probes existence without sending a signal.
     // SAFETY: libc::kill is a thin syscall wrapper, no aliasing concerns.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+
+    // EPERM: the process exists but belongs to another user.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
@@ -5583,14 +5600,9 @@ fn run_classify_worker(backend: &str) -> Result<()> {
     }
 
     // Snapshot entries up front so concurrent re-queues don't loop us.
-    let mut entries: Vec<std::path::PathBuf> = Vec::new();
-    for e in std::fs::read_dir(&pending)? {
-        let e = e?;
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("json") {
-            entries.push(p);
-        }
-    }
+    // Only this project's entries: the lock is per project, so a worker
+    // of another project may be draining the same directory right now.
+    let entries = project_pending_entries(&pending, &project_hash)?;
 
     for path in entries {
         if let Err(err) = process_pending_entry(&path, &events_path, &project_hash, backend) {
@@ -5620,6 +5632,11 @@ fn process_pending_entry(
     if schema != "v2" {
         return Ok(()); // legacy entry, handled by `pending retry`
     }
+    // A legacy un-prefixed entry is ours only when it names this project;
+    // one without `project_hash` is left for `pending retry`.
+    if v.get("project_hash").and_then(|x| x.as_str()) != Some(project_hash) {
+        return Ok(());
+    }
 
     let kind = v
         .get("kind")
@@ -5635,41 +5652,39 @@ fn process_pending_entry(
     // Inherit the session id queued on the v2 chunk (additive; absent → None).
     let chunk_session_id = tj_core::session_id::session_id_from_payload(&v);
 
-    // Mirror the synchronous flow that used to live in IngestHook —
-    // see commit history of v0.6.1 for the original. Auto-open, run
-    // classifier, apply integrity safeguards, persist event, telemetry.
-    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-    let conn = tj_core::db::open(&state_path)?;
-    if events_path.exists() {
-        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    let classifier = build_classifier(backend)?;
+    let outcome = classify_chunk(
+        classifier.as_ref(),
+        events_path,
+        project_hash,
+        &kind,
+        &text,
+        chunk_session_id.as_deref(),
+    )?;
+    if let ChunkOutcome::Unplaced(err) = outcome {
+        // Persist as legacy v1 pending entry so `pending retry`
+        // surfaces it; remove the v2 source.
+        persist_pending(events_path, project_hash, &kind, &text, &err)?;
     }
 
-    let mut recent = recent_task_contexts(&conn, 5)?;
-    if recent.is_empty() {
-        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
-            .ok()
-            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        if auto_open_disabled || !kind.contains("UserPrompt") {
-            // Nothing to do — drop the entry silently.
-            std::fs::remove_file(path)?;
-            return Ok(());
-        }
-        let Some(new_task) = auto_open_task_from_prompt(events_path, project_hash, &conn, &text)?
-        else {
-            // Prompt was only machine noise — drop the entry silently.
-            std::fs::remove_file(path)?;
-            return Ok(());
-        };
-        recent.push(new_task);
-    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
 
-    let author_hint = if kind.contains("UserPrompt") {
-        "user"
-    } else {
-        "assistant"
-    };
+/// What became of one classified chunk.
+enum ChunkOutcome {
+    /// An event was written to the journal.
+    Recorded,
+    /// Nothing worth recording: no task to attach to, machine noise, no
+    /// task guess, or a session-end "close".
+    Dropped,
+    /// The classifier failed or guessed a missing / closed task; the reason
+    /// goes back into `pending/` with the chunk.
+    Unplaced(String),
+}
 
+/// The classifier behind a `--backend` name.
+fn build_classifier(backend: &str) -> anyhow::Result<Box<dyn tj_core::classifier::Classifier>> {
     use tj_core::classifier::Classifier;
     let classifier: Box<dyn Classifier> = match backend {
         "hybrid" | "" => Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env()),
@@ -5701,50 +5716,83 @@ fn process_pending_entry(
             "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
         ),
     };
+    Ok(classifier)
+}
+
+/// Classify one chunk against the project's open tasks and record the
+/// event. Shared by classify-worker and `pending retry`, so both auto-open,
+/// check attribution, stamp the session and write telemetry the same way.
+fn classify_chunk(
+    classifier: &dyn tj_core::classifier::Classifier,
+    events_path: &std::path::Path,
+    project_hash: &str,
+    kind: &str,
+    text: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<ChunkOutcome> {
+    // Mirror the synchronous flow that used to live in IngestHook —
+    // see commit history of v0.6.1 for the original. Auto-open, run
+    // classifier, apply integrity safeguards, persist event, telemetry.
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    }
+
+    let mut recent = recent_task_contexts(&conn, 5)?;
+    if recent.is_empty() {
+        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+            .ok()
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if auto_open_disabled || !kind.contains("UserPrompt") {
+            // Nothing to do — drop the entry silently.
+            return Ok(ChunkOutcome::Dropped);
+        }
+        let Some(new_task) =
+            auto_open_task_from_prompt(events_path, project_hash, &conn, text, session_id)?
+        else {
+            // Prompt was only machine noise — drop the entry silently.
+            return Ok(ChunkOutcome::Dropped);
+        };
+        recent.push(new_task);
+    }
+
+    let author_hint = if kind.contains("UserPrompt") {
+        "user"
+    } else {
+        "assistant"
+    };
+
     let input = tj_core::classifier::ClassifyInput {
-        text: text.clone(),
+        text: text.to_string(),
         author_hint: author_hint.into(),
         recent_tasks: recent,
+        tool_output: kind == "PostToolUse",
     };
     let out = match classifier.classify(&input) {
         Ok(o) => o,
-        Err(e) => {
-            // Persist as legacy v1 pending entry so `pending retry`
-            // surfaces it; remove the v2 source.
-            persist_pending(events_path, &text, &e.to_string())?;
-            std::fs::remove_file(path)?;
-            return Ok(());
-        }
+        Err(e) => return Ok(ChunkOutcome::Unplaced(e.to_string())),
     };
 
     let Some(tid) = out.task_id_guess else {
-        std::fs::remove_file(path)?;
-        return Ok(());
+        return Ok(ChunkOutcome::Dropped);
     };
 
     use tj_core::event::EventType;
     if matches!(out.event_type, EventType::Close) && kind == "Stop" {
-        std::fs::remove_file(path)?;
-        return Ok(());
+        return Ok(ChunkOutcome::Dropped);
     }
     match tj_core::db::task_status(&conn, &tid)? {
         None => {
-            persist_pending(
-                events_path,
-                &text,
-                &format!("task_id_guess `{tid}` not found"),
-            )?;
-            std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(ChunkOutcome::Unplaced(format!(
+                "task_id_guess `{tid}` not found"
+            )))
         }
         Some(s) if s == "closed" => {
-            persist_pending(
-                events_path,
-                &text,
-                &format!("task_id_guess `{tid}` is closed"),
-            )?;
-            std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(ChunkOutcome::Unplaced(format!(
+                "task_id_guess `{tid}` is closed"
+            )))
         }
         _ => {}
     }
@@ -5764,7 +5812,7 @@ fn process_pending_entry(
     event.confidence = Some(confidence);
     event.status = tj_core::classifier::decide_status(confidence);
     event.evidence_strength = evidence_strength;
-    tj_core::session_id::stamp_session_id(&mut event.meta, chunk_session_id.as_deref());
+    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
 
     let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
     writer.append(&event)?;
@@ -5792,12 +5840,12 @@ fn process_pending_entry(
         },
     );
 
-    std::fs::remove_file(path)?;
-    Ok(())
+    Ok(ChunkOutcome::Recorded)
 }
 
 fn drain_pending(
     events_path: &std::path::Path,
+    project_hash: &str,
     mock_etype: Option<&str>,
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
@@ -5808,17 +5856,9 @@ fn drain_pending(
         .parent()
         .unwrap()
         .join("pending");
-    if !pending_dir.exists() {
-        return Ok(());
-    }
 
-    for entry in std::fs::read_dir(&pending_dir)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-
-        let body = std::fs::read_to_string(entry.path())?;
+    for path in project_pending_entries(&pending_dir, project_hash)? {
+        let body = std::fs::read_to_string(&path)?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
         // v0.6.2: skip v2 entries — those are owned by classify-worker.
         // Removing them here would silently drop async-queued events.
@@ -5846,7 +5886,7 @@ fn drain_pending(
                 writer.flush_durable()?;
             }
         }
-        std::fs::remove_file(entry.path())?;
+        std::fs::remove_file(&path)?;
     }
     Ok(())
 }
@@ -6332,6 +6372,14 @@ mod inline_tests {
         );
     }
 
+    /// PID 1 always exists; for a non-root user `kill(1, 0)` fails with EPERM,
+    /// which means "alive, not ours" — never "dead".
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_treats_eperm_as_alive() {
+        assert!(pid_is_alive(1));
+    }
+
     #[test]
     fn persist_pending_v2_omits_session_id_when_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -6342,6 +6390,59 @@ mod inline_tests {
         let body = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("session_id").is_none());
+    }
+
+    #[test]
+    fn pending_entries_are_named_after_their_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+
+        persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
+        persist_pending(&events_path, "h", "Stop", "txt", "err").unwrap();
+
+        let pending = dir.path().join("pending");
+        let names: Vec<String> = std::fs::read_dir(&pending)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|n| n.starts_with("h.")), "{names:?}");
+        assert_eq!(
+            project_pending_entries(&pending, "h").unwrap().len(),
+            2,
+            "both entries belong to project h"
+        );
+        assert!(project_pending_entries(&pending, "other")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_entries_come_back_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // ULID order == queue order; legacy un-prefixed names interleave by
+        // their ULID, not by the hash prefix of the new names.
+        let mut expected = Vec::new();
+        for i in 0..20u32 {
+            let ulid = format!("01JA{i:022}");
+            let name = if i % 5 == 0 {
+                format!("{ulid}.json")
+            } else {
+                format!("h.{ulid}.json")
+            };
+            expected.push(name);
+        }
+        for name in expected.iter().rev() {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+
+        let got: Vec<String> = project_pending_entries(dir.path(), "h")
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -6482,6 +6583,59 @@ mod inline_tests {
             .constraints
             .iter()
             .any(|s| s.contains("constraint number 1")));
+    }
+
+    #[test]
+    fn recent_task_contexts_skips_model_switch_constraints() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        let mut open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task one".into(),
+        );
+        open.meta = serde_json::json!({ "title": "task one" });
+        open.timestamp = "2026-01-01T00:00:00Z".into();
+        writer.append(&open).unwrap();
+        for i in 0..8 {
+            // Five real constraints, then three newer model switches.
+            let text = if i < 5 {
+                format!("constraint number {i}")
+            } else {
+                format!("Model switched (auto): opus → haiku {i}")
+            };
+            let mut cons = Event::new(
+                "tj-1",
+                EventType::Constraint,
+                Author::Agent,
+                Source::Hook,
+                text,
+            );
+            cons.timestamp = format!("2026-01-01T00:00:1{i}Z");
+            writer.append(&cons).unwrap();
+        }
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, "h").unwrap();
+
+        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
+        assert_eq!(ctx.constraints.len(), 5, "{:?}", ctx.constraints);
+        assert!(
+            ctx.constraints
+                .iter()
+                .all(|s| s.starts_with("constraint number")),
+            "{:?}",
+            ctx.constraints
+        );
     }
 
     #[test]

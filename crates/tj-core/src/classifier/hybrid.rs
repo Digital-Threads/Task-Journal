@@ -141,6 +141,7 @@ mod tests {
                 last_events: vec![],
                 constraints: vec![],
             }],
+            tool_output: false,
         }
     }
 

@@ -31,6 +31,11 @@ pub fn try_heuristic(input: &ClassifyInput) -> Option<ClassifyOutput> {
     let task_id_guess = input.recent_tasks.first().map(|t| t.task_id.clone());
 
     for (patterns, etype, confidence) in RULES {
+        // Tool output is JSON and logs full of "must be" / "requires" /
+        // "rejected": only a test result is a reliable signal there.
+        if input.tool_output && *etype != EventType::Evidence {
+            continue;
+        }
         for p in *patterns {
             if lower.contains(p) {
                 return Some(ClassifyOutput {
@@ -189,6 +194,7 @@ mod tests {
                 last_events: vec![],
                 constraints: vec![],
             }],
+            tool_output: false,
         }
     }
 
@@ -253,6 +259,31 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(out.event_type, EventType::Decision);
+    }
+
+    /// Tool output is JSON and logs full of "must be" / "requires" / "rate
+    /// limit": only a test result is a reliable signal there.
+    #[test]
+    fn tool_output_only_matches_test_results() {
+        let tool = |text: &str| ClassifyInput {
+            tool_output: true,
+            ..input(text)
+        };
+
+        assert!(try_heuristic(&tool(
+            r#"Read: {"file_path":"a.rs"} → {"content":"the id must be unique; requires auth"}"#
+        ))
+        .is_none());
+        assert!(try_heuristic(&tool(
+            r#"Bash: {"command":"x"} → {"stdout":"we'll use the cached build, rejected 2 files"}"#
+        ))
+        .is_none());
+
+        let out = try_heuristic(&tool(
+            r#"Bash: {"command":"cargo test"} → {"stdout":"all 12 tests pass"}"#,
+        ))
+        .unwrap();
+        assert_eq!(out.event_type, EventType::Evidence);
     }
 
     #[test]
