@@ -3399,23 +3399,6 @@ transcripts only (Codex sessions are not read yet)",
                 }
             };
 
-            // List available sessions.
-            let mut sessions = discovery::list_sessions(&proj_dir)?;
-            if let Some(max) = limit {
-                sessions.truncate(max);
-            }
-
-            if sessions.is_empty() {
-                eprintln!("No session JSONL files found in: {}", proj_dir.display());
-                return Ok(());
-            }
-
-            eprintln!(
-                "Found {} session(s) for {}",
-                sessions.len(),
-                project_path.display()
-            );
-
             // Check which sessions are already imported (idempotent): a session
             // counts once some event is tagged with it in `meta.session_id` —
             // not merely mentioned in some unrelated event's text.
@@ -3431,6 +3414,34 @@ transcripts only (Codex sessions are not read yet)",
                             .map(String::from)
                     })
                     .collect();
+
+            // List available sessions. --limit counts only sessions not yet
+            // imported, so a rerun reaches older ones; imported ones stay in
+            // the list and are reported as skipped below.
+            let mut sessions = discovery::list_sessions(&proj_dir)?;
+            if let Some(max) = limit {
+                let mut fresh = 0;
+                sessions.retain(|p| {
+                    let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                    if already_imported.contains(id) {
+                        return true;
+                    }
+
+                    fresh += 1;
+                    fresh <= max
+                });
+            }
+
+            if sessions.is_empty() {
+                eprintln!("No session JSONL files found in: {}", proj_dir.display());
+                return Ok(());
+            }
+
+            eprintln!(
+                "Found {} session(s) for {}",
+                sessions.len(),
+                project_path.display()
+            );
 
             let mut total_tasks = 0;
             let mut total_events = 0;

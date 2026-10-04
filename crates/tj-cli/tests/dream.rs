@@ -160,13 +160,14 @@ fn dream_session_with_a_failed_chunk_is_mined_again() {
     assert!(second.contains("1 session(s) processed"), "{second}");
 }
 
-fn backfill(fx: &Fixture) -> String {
+fn backfill(fx: &Fixture, extra: &[&str]) -> String {
     let out = Command::cargo_bin("task-journal")
         .unwrap()
         .current_dir(fx.proj.path())
         .env("XDG_DATA_HOME", fx.xdg.path())
         .env("CLAUDE_CONFIG_DIR", fx.claude.path())
         .args(["backfill"])
+        .args(extra)
         .assert()
         .success()
         .get_output()
@@ -192,13 +193,27 @@ fn backfill_imports_a_session_only_mentioned_in_unrelated_text() {
     w.append(&e).unwrap();
     w.flush_durable().unwrap();
 
-    let first = backfill(&fx);
+    let first = backfill(&fx, &[]);
     assert!(first.contains("Imported 1 task(s)"), "{first}");
 
     // Now it really was imported (its events carry meta.session_id).
-    let second = backfill(&fx);
+    let second = backfill(&fx, &[]);
     assert!(second.contains("already imported"), "{second}");
     assert!(second.contains("Imported 0 task(s)"), "{second}");
+}
+
+#[test]
+fn backfill_limit_counts_only_sessions_not_yet_imported() {
+    let fx = fixture();
+    write_session(&fx, "sess-old", "hello", 3600);
+    write_session(&fx, "sess-new", "hello", 60);
+
+    let first = backfill(&fx, &["--limit", "1"]);
+    assert!(first.contains("Imported 1 task(s)"), "{first}");
+
+    // sess-new is imported now; the next --limit 1 run must reach sess-old.
+    let second = backfill(&fx, &["--limit", "1"]);
+    assert!(second.contains("Imported 1 task(s)"), "{second}");
 }
 
 #[test]
@@ -206,7 +221,7 @@ fn backfill_indexes_imported_tasks_into_sqlite() {
     let fx = fixture();
     write_session(&fx, "sess-index", "hello", 60);
 
-    let out = backfill(&fx);
+    let out = backfill(&fx, &[]);
     assert!(out.contains("Imported 1 task(s)"), "{out}");
 
     // search / pack read SQLite, so the task must be there right away.
@@ -230,7 +245,7 @@ fn mining_without_claude_code_sessions_says_codex_is_not_read() {
         "{out}"
     );
 
-    let err = backfill(&fx);
+    let err = backfill(&fx, &[]);
     assert!(
         err.contains("Claude Code") && err.contains("Codex"),
         "{err}"
