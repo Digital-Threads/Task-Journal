@@ -3260,7 +3260,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     let path = state_dir.join(format!("{hash}.sqlite"));
                     let conn = match rusqlite::Connection::open(&path) {
                         Ok(c) => c,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn_skipped_project(&hash, e);
+                            continue;
+                        }
                     };
                     let ids = match run_search(
                         &conn,
@@ -3270,7 +3273,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                         limit,
                     ) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn_skipped_project(&hash, e);
+                            continue;
+                        }
                     };
                     for id in ids {
                         println!("{hash}\t{id}");
@@ -3701,6 +3707,12 @@ fn run_search(
     Ok(ids_like)
 }
 
+/// Cross-project reads keep going past a project they cannot read, but say
+/// so on stderr instead of dropping it silently.
+fn warn_skipped_project(hash: &str, err: impl std::fmt::Display) {
+    eprintln!("warning: skipping project {hash}: {err}");
+}
+
 fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64>) -> Result<()> {
     let cutoff: Option<String> = since.map(|d| {
         (chrono::Utc::now() - chrono::Duration::days(d))
@@ -3733,11 +3745,21 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
     // attached DBs would be faster but rusqlite's bundled build doesn't
     // ship ATTACH-friendly ergonomics; per-project loop is fine here.
     let mut hits: Vec<(String, String, String, String, String)> = Vec::new();
+    // Only the --all-projects sweep reports a skipped project: the current
+    // project of a fresh clone legitimately has no tables yet.
+    let skip = |hash: &str, e: rusqlite::Error| {
+        if all_projects {
+            warn_skipped_project(hash, e);
+        }
+    };
     for hash in hashes {
         let path = state_dir.join(format!("{hash}.sqlite"));
         let conn = match rusqlite::Connection::open(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
 
         let use_fts = topic_is_fts_safe(topic);
@@ -3763,7 +3785,10 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
 
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
         let bind_q = if use_fts {
             topic.to_string()
@@ -3780,7 +3805,10 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
             ))
         }) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
         for row in rows.flatten() {
             hits.push(row);

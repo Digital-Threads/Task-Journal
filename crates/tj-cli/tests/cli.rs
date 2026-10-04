@@ -957,6 +957,45 @@ fn search_all_projects_finds_match_in_other_project_hash() {
 }
 
 #[test]
+fn all_projects_search_and_rejected_warn_about_unreadable_projects() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let good = "aaaa1111aaaa1111";
+    let conn = tj_core::db::open(state.join(format!("{good}.sqlite"))).unwrap();
+    let mut e = tj_core::event::Event::new(
+        "tj-good1".to_string(),
+        tj_core::event::EventType::Open,
+        tj_core::event::Author::User,
+        tj_core::event::Source::Cli,
+        "Marker in a healthy project".to_string(),
+    );
+    e.meta = serde_json::json!({"title": "Healthy"});
+    tj_core::db::upsert_task_from_event(&conn, &e, good).unwrap();
+    tj_core::db::index_event(&conn, &e).unwrap();
+    drop(conn);
+    std::fs::write(state.join("cccc3333cccc3333.sqlite"), b"not a database").unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stdout(contains(good))
+        .stderr(contains("warning: skipping project cccc3333cccc3333"));
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["rejected", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stderr(contains("warning: skipping project cccc3333cccc3333"));
+}
+
+#[test]
 fn search_command_finds_task_by_event_text() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
