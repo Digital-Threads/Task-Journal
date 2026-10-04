@@ -24,6 +24,8 @@ pub struct SessionState {
     pub session_id: Option<String>,
     pub open_tasks: i64,
     pub active: Option<ActiveTask>,
+    /// What the project chronicle is missing, most important first.
+    pub archive: Vec<crate::archive::Gap>,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,6 +37,8 @@ pub struct ActiveTask {
     pub counts: BTreeMap<String, i64>,
     /// The latest entries, oldest first. No `open` / `amend` bookkeeping.
     pub recent: Vec<RecentEntry>,
+    /// Names of the modules the task belongs to.
+    pub modules: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,12 +81,18 @@ pub fn session_state(
         (None, None) => None,
     };
     let active = active_id.map(|id| active_task(conn, &id)).transpose()?;
+    let archive = crate::archive::gaps(
+        conn,
+        project_hash,
+        active.as_ref().map(|a| a.task_id.as_str()),
+    )?;
 
     Ok(SessionState {
         schema: SCHEMA,
         session_id: session_id.map(str::to_string),
         open_tasks,
         active,
+        archive,
     })
 }
 
@@ -131,6 +141,10 @@ fn active_task(conn: &Connection, task_id: &str) -> anyhow::Result<ActiveTask> {
         goal: goal.filter(|g| !g.trim().is_empty()),
         counts,
         recent,
+        modules: crate::modules::modules_of_task(conn, task_id)?
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect(),
     })
 }
 
@@ -156,6 +170,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(dir.path().join("s.sqlite")).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn state_carries_the_tasks_modules_and_the_archive_gaps() {
+        use crate::modules::tests_support::{journal, open_task};
+
+        let stars = crate::modules::module_event(
+            "stars",
+            &crate::modules::ModuleFields {
+                name: Some("Stars".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut mine = open_task("tj-a", &["stars"]);
+        crate::session_id::stamp_session_id(&mut mine.meta, Some("s1"));
+        let (_d, conn) = journal(&[stars, mine, open_task("tj-b", &[])]);
+
+        let state = session_state(&conn, "p", Some("s1"), None).unwrap();
+
+        assert_eq!(
+            state.active.as_ref().unwrap().modules,
+            vec!["Stars".to_string()]
+        );
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["archive"][0]["kind"], "unlinked_tasks");
+        assert_eq!(json["active"]["modules"][0], "Stars");
     }
 
     #[test]

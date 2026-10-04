@@ -1789,6 +1789,7 @@ fn real_main() -> Result<()> {
                     session_id: session,
                     open_tasks: 0,
                     active: None,
+                    archive: Vec::new(),
                 }
             };
 
