@@ -101,7 +101,7 @@ that tie it back to the code.
 
 ## How it works
 
-- **The mod (Claude Code 2.1.287+).** A plugin of function hooks that runs inside Claude Code and calls the `task-journal` CLI. It keeps the session's active task in the system prompt (a compaction can't drop it), gives each session its own active task, shows the task in the status line, reminds the agent to log only after several prompts without an entry, and — right before a compaction — asks the model what was never logged and records it as `suggested` events. It needs no setup; when it runs, the classic capture hooks stand down so nothing is recorded twice. Codex and older Claude Code keep using the hooks below.
+- **The mod (Claude Code 2.1.287+).** A plugin of function hooks that runs inside Claude Code and calls the `task-journal` CLI. It keeps the session's active task in the system prompt (a compaction can't drop it), gives each session its own active task, shows the task in the status line, reminds the agent to log only after several prompts without an entry, and — right before a compaction — asks the model what was never logged and records it as `suggested` events. It needs no setup. When it runs, the classic hooks skip what it replaces (the reminder, per-message classification and the transcript catch-ups) and keep the rest (resume packs, push-recall, `/rewind`). Codex and Claude Code older than 2.1.287 keep using the hooks below; there the mod simply doesn't load.
 - **Self-tagging is the primary path (recommended).** You — the agent in the live session — record reasoning directly via the five MCP tools: open a task with a `goal`, append a typed `decision` / `finding` / `rejection` / `evidence` event at the moment of commitment, and `task_close` with a written `outcome`. This is free (it rides the interactive session), language-agnostic, and higher-fidelity than any after-the-fact classifier. The bundled `task-journal` skill drives this automatically. See [MCP tools](#mcp-tools).
 - **Auto-capture is an opt-in backstop — OFF by default (v0.14.0).** A fresh `install-hooks` wires only a cheap, read-only SessionStart resume hook: no per-message classifier runs, no `claude -p` is ever spawned, nothing is charged. Self-tagging is the capture mechanism. Opt in with `install-hooks --auto-capture` and Claude Code hooks also run every prompt, tool call, and reply through a two-stage classifier that lands typed events on its own: Stage 1 is a fast in-process heuristic (obvious EN+RU phrasing, zero cost); Stage 2 falls back to an LLM only when the heuristic is uncertain (and only if you pick `--backend agent-sdk` / `api`). Even opted in it is a safety net under your explicit self-tagging, not the main mechanism, and it misses real reasoning — especially non-English prose.
 - **Artifact extraction.** Each event scans its text for commit hashes, PR URLs, file paths, issue IDs, and branch names. Aggregated artifacts are how Task Journal links related tasks: when you start a new task touching the same issue or file, the prior task is surfaced automatically.
@@ -319,11 +319,14 @@ Plugin install:
 /plugin update task-journal@task-journal
 ```
 
-Then refresh the binaries (the plugin doesn't bundle them):
+Then refresh the binaries (the plugin doesn't bundle them) and restart every
+open Claude Code and Codex session:
 
 ```bash
 cargo install task-journal-cli task-journal-mcp --force
 ```
+
+The first command after an upgrade may re-index the project once.
 
 Restart Claude Code and verify:
 

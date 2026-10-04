@@ -65,13 +65,18 @@ Two options live in `/config` (or `claude plugin configure task-journal`):
 `distill_on_compact` (default on).
 
 The mod calls the `task-journal` CLI, so the binaries must be installed and
-current (0.30+). If they aren't, it says so once and stays off.
+current (0.30+). If they aren't, it says so once and stays off. On Claude Code
+older than 2.1.287 the mod doesn't load; the MCP tools and the skill work as
+before.
 
-**Classic hooks next to the mod.** If you ran `task-journal install-hooks` with
-`--auto-capture` before, you can keep it: the mod tells those hooks it is active
-(`TJ_MOD_ACTIVE=1`) and they stand down, except the session-start resume pack and
-the model-switch record. To remove them anyway:
-`task-journal install-hooks --scope user --uninstall`.
+**Classic hooks next to the mod.** If you ran `task-journal install-hooks`
+before, you can keep it. The mod tells those hooks it is active
+(`TJ_MOD_ACTIVE=1`), and they skip what the mod replaces — the reminder,
+per-message classification (`--auto-capture`) and the transcript catch-ups at
+stop, compaction and `/clear` (the mod catches up once, right before each
+compaction). The rest keeps running: the session-start resume
+pack, the model-switch record, push-recall and `/rewind` corrections. To remove
+them anyway: `task-journal install-hooks --scope user --uninstall`.
 
 ### Older Claude Code, or without the plugin
 
@@ -140,6 +145,17 @@ built-in instructions describe the workflow, and the seven tools work the same:
 it with `--project-dir <path>` if the client launches it elsewhere. A client that
 knows its session id can pass `session_id` to the write tools so each session
 keeps its own active task.
+
+## Upgrading
+
+```bash
+cargo install task-journal-cli task-journal-mcp --force
+```
+
+Then restart every open Claude Code and Codex session, so no old MCP server
+keeps writing next to the new one. The first command after the upgrade
+re-indexes the project once (a few seconds for a large journal); later calls
+are incremental.
 
 ## Verify
 
