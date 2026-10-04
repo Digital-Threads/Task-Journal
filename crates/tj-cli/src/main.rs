@@ -241,6 +241,15 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         }
     }
 
+    // The global cross-project index keys its rows by project_hash too.
+    let memory_path = tj_core::paths::memory_db()?;
+    if memory_path.exists() {
+        tj_core::memory::open(&memory_path)?.execute(
+            "UPDATE global_memory SET project_hash = ?1 WHERE project_hash = ?2",
+            rusqlite::params![to_hash, from_hash],
+        )?;
+    }
+
     if moved.is_empty() {
         println!("no on-disk data found for project_hash {from_hash} — nothing to migrate");
     } else {

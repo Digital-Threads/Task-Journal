@@ -936,6 +936,48 @@ fn migrate_project_rekeys_embeddings_and_dream_state() {
     }
 }
 
+#[test]
+fn migrate_project_rekeys_only_its_rows_in_global_memory() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Re-key global memory"])
+        .assert()
+        .success();
+    let memory_path = xdg.path().join("task-journal").join("memory.sqlite");
+    {
+        let global = tj_core::memory::open(&memory_path).unwrap();
+        for (event_id, hash) in [("e-mine", from_hash.as_str()), ("e-other", "otherhash")] {
+            global
+                .execute(
+                    "INSERT INTO global_memory(event_id, project_hash, task_id, type, text, model, dim, vec, created_at)
+                     VALUES (?1, ?2, 'tj-1', 'decision', 't', 'hash', 1, x'00000000', 't')",
+                    [event_id, hash],
+                )
+                .unwrap();
+        }
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    let global = rusqlite::Connection::open(&memory_path).unwrap();
+    let hash_of = |event_id: &str| -> String {
+        global
+            .query_row(
+                "SELECT project_hash FROM global_memory WHERE event_id = ?1",
+                [event_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(hash_of("e-mine"), to_hash);
+    assert_eq!(hash_of("e-other"), "otherhash");
+}
+
 /// A write still sitting in `<hash>.sqlite-wal` (another process holds the
 /// DB open, so nothing checkpointed it) must reach the new project, and no
 /// sidecar may stay behind under the old hash. Unix-only: Windows refuses to
