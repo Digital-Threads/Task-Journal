@@ -327,6 +327,10 @@ pub fn upsert_task_from_event(
     event: &Event,
     project_hash: &str,
 ) -> anyhow::Result<()> {
+    if event.event_type == EventType::Module {
+        return Ok(());
+    }
+
     match event.event_type {
         EventType::Open => {
             let title = event
@@ -1108,6 +1112,10 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     if event.event_type == EventType::Amend {
         return invalidate_pack_cascade(conn, &event.task_id);
     }
+    // A module event describes the project's map, not a task.
+    if event.event_type == EventType::Module {
+        return Ok(());
+    }
 
     let type_str = serde_json::to_value(event.event_type)?
         .as_str()
@@ -1663,6 +1671,30 @@ mod tests {
     use super::*;
     use crate::embed::Embedder;
     use tempfile::TempDir;
+
+    #[test]
+    fn module_event_creates_no_task_and_no_index_row() {
+        use crate::event::{Author, Source};
+
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let e = Event::new(
+            "mod:stars",
+            EventType::Module,
+            Author::Agent,
+            Source::Chat,
+            "Stars".into(),
+        );
+
+        upsert_task_from_event(&conn, &e, "p").unwrap();
+        index_event(&conn, &e).unwrap();
+
+        assert!(!task_exists(&conn, "mod:stars").unwrap());
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events_index", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
 
     #[test]
     fn task_exists_returns_true_for_known_id_false_otherwise() {

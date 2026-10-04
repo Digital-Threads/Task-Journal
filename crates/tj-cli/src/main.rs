@@ -1482,6 +1482,7 @@ fn real_main() -> Result<()> {
                     return Ok(());
                 }
                 let mut events = read_events_lenient(&events_path, "events list")?;
+                events.retain(|e| !e.is_module());
                 events.reverse();
                 for e in events.into_iter().take(limit) {
                     let title = e
@@ -3340,7 +3341,12 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 anyhow::bail!("no events file at {events_path:?}");
             }
 
-            let all_events = read_events_lenient(&events_path, "export")?;
+            let mut all_events = read_events_lenient(&events_path, "export")?;
+            // Module lines are the project's map, not a task: only the full
+            // JSON dump carries them.
+            if format != "json" {
+                all_events.retain(|e| !e.is_module());
+            }
 
             // Filter to specific task if requested.
             let events: Vec<&tj_core::event::Event> = if let Some(ref tid) = task {
@@ -6544,6 +6550,9 @@ fn events_by_task(
             continue;
         }
         if let Ok(e) = serde_json::from_str::<Event>(line) {
+            if e.is_module() {
+                continue;
+            }
             by_task.entry(e.task_id.clone()).or_default().push(e);
         }
     }
@@ -6818,6 +6827,38 @@ mod inline_tests {
         assert_eq!(hit[0].task_id, "tj-1");
         assert_eq!(hit[0].title, "Task one");
         assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn events_by_task_skips_module_lines() {
+        // A module line has no session id: by the legacy time window it would
+        // pass for a task of every session it falls into.
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("e.jsonl");
+        let mut writer = tj_core::storage::JsonlWriter::open(&log).unwrap();
+        for e in [
+            Event::new(
+                "tj-1",
+                EventType::Open,
+                Author::User,
+                Source::Cli,
+                "T".into(),
+            ),
+            Event::new(
+                "mod:stars",
+                EventType::Module,
+                Author::Agent,
+                Source::Chat,
+                "Stars".into(),
+            ),
+        ] {
+            writer.append(&e).unwrap();
+        }
+
+        let by_task = events_by_task(&log).unwrap();
+
+        assert_eq!(by_task.keys().collect::<Vec<_>>(), vec!["tj-1"]);
     }
 
     #[test]

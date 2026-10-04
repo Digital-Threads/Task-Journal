@@ -22,6 +22,10 @@ pub enum EventType {
     /// Not reasoning — kept out of packs, search and recall. Written by the
     /// `goal` / `external` commands, never accepted as a user event type.
     Amend,
+    /// A module of the project chronicle (`task_id` = `mod:<id>`): a partial
+    /// update of the module's fields in `meta`. Not a task's reasoning — kept
+    /// out of tasks, packs, search and recall. Written by `module_save`.
+    Module,
 }
 
 impl EventType {
@@ -40,6 +44,7 @@ impl EventType {
         Self::Redirect,
         Self::Rename,
         Self::Amend,
+        Self::Module,
     ];
 }
 
@@ -114,6 +119,11 @@ pub struct Event {
 }
 
 impl Event {
+    /// A module's own event (`mod:<id>`): project metadata, not a task's reasoning.
+    pub fn is_module(&self) -> bool {
+        self.event_type == EventType::Module
+    }
+
     pub fn new(
         task_id: impl Into<String>,
         event_type: EventType,
@@ -159,6 +169,25 @@ mod tests {
             let back: EventType = serde_json::from_str(&s).unwrap();
             assert_eq!(*ty, back);
         }
+    }
+
+    #[test]
+    fn module_event_round_trips_and_is_recognised() {
+        let mut e = Event::new(
+            "mod:stars",
+            EventType::Module,
+            Author::Agent,
+            Source::Chat,
+            "Stars".into(),
+        );
+        e.meta = serde_json::json!({"module_id": "stars", "name": "Stars"});
+
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(line.contains(r#""type":"module""#), "{line}");
+
+        let back: Event = serde_json::from_str(&line).unwrap();
+        assert!(back.is_module());
+        assert!(EventType::ALL.contains(&EventType::Module));
     }
 
     #[test]

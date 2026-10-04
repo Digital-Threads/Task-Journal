@@ -8489,3 +8489,50 @@ fn event_on_an_unknown_task_fails_and_writes_nothing() {
 
     assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
 }
+
+/// A `module` line (the project chronicle) describes the project's map, not a
+/// task: task views skip it, the full JSON dump keeps it.
+#[test]
+fn module_lines_stay_out_of_task_views_but_not_json_export() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut c = Command::cargo_bin("task-journal").unwrap();
+        c.env("XDG_DATA_HOME", xdg.path()).current_dir(proj.path());
+        c
+    };
+    tj().args(["create", "T"]).assert().success();
+
+    let log = std::fs::read_dir(xdg.path().join("task-journal/events"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .unwrap();
+    let mut e = tj_core::event::Event::new(
+        "mod:stars",
+        tj_core::event::EventType::Module,
+        tj_core::event::Author::Agent,
+        tj_core::event::Source::Chat,
+        "Stars".into(),
+    );
+    e.meta = serde_json::json!({"module_id": "stars", "name": "Stars"});
+    tj_core::storage::JsonlWriter::open(&log)
+        .unwrap()
+        .append(&e)
+        .unwrap();
+
+    tj().args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("[module]").not());
+    for format in ["md", "html"] {
+        tj().args(["export", "--format", format])
+            .assert()
+            .success()
+            .stdout(contains("mod:stars").not());
+    }
+    tj().args(["export", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(contains("mod:stars"));
+}
