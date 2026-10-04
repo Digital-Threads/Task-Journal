@@ -5019,6 +5019,44 @@ fn search_does_not_crash_on_hyphenated_identifier() {
 }
 
 #[test]
+fn search_with_an_empty_query_lists_tasks_newest_first() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path()).current_dir(&workdir);
+        cmd
+    };
+    let create = |title: &str| {
+        let out = tj().args(["create", title]).assert().success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let search = |args: &[&str]| {
+        let out = tj().arg("search").args(args).assert().success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    let older = create("Older task");
+    let newer = create("Newer task");
+    assert_eq!(search(&[""]), [newer.clone(), older.clone()]);
+
+    tj().args(["event", &older, "--type", "decision", "--text", "Pick X"])
+        .assert()
+        .success();
+    assert_eq!(search(&["   "]), [older.clone(), newer.clone()]);
+    assert_eq!(search(&["", "--type", "decision"]), [older.as_str()]);
+    assert_eq!(search(&["", "--limit", "1"]), [older]);
+}
+
+#[test]
 fn search_does_not_crash_on_slash_or_colon() {
     // Same B1 family — paths and `ttl:30s`-style tokens used to crash.
     let dir = assert_fs::TempDir::new().unwrap();

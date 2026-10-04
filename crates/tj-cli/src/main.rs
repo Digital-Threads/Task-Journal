@@ -946,7 +946,7 @@ enum Commands {
     Reclassify { task_id: String },
     /// Full-text search across events (FTS5).
     Search {
-        /// Query string.
+        /// Query string. Empty lists the tasks instead, newest first.
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -3704,6 +3704,23 @@ fn run_search(
     event_type: Option<&str>,
     limit: usize,
 ) -> Result<Vec<String>> {
+    // No query: list the tasks, newest first, like MCP task_search. FTS5
+    // rejects an empty MATCH, so it must not reach it.
+    if fts_query.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT task_id FROM tasks \
+             WHERE ?1 IS NULL OR task_id IN (SELECT task_id FROM events_index WHERE type = ?1) \
+             ORDER BY last_event_at DESC LIMIT ?2",
+        )?;
+        let ids = stmt
+            .query_map(rusqlite::params![event_type, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        return Ok(ids);
+    }
+
     let (fts_sql, fts_uses_type) = match event_type {
         Some(_) => (
             "SELECT DISTINCT task_id FROM search_fts \
