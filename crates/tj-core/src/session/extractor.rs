@@ -195,17 +195,15 @@ fn derive_title(session: &ParsedSession) -> String {
                     .unwrap_or(&clean);
                 let trimmed = first_line.trim();
                 // Skip empty or very short titles (likely slash commands).
-                if trimmed.len() > 5 {
+                if trimmed.chars().count() > 5 {
                     return truncate(trimmed, 120);
                 }
             }
         }
     }
 
-    format!(
-        "Session {}",
-        &session.session_id[..8.min(session.session_id.len())]
-    )
+    let head: String = session.session_id.chars().take(8).collect();
+    format!("Session {head}")
 }
 
 /// Strip XML/HTML-like tags from text (e.g. <command-message>, <command-name>).
@@ -322,17 +320,51 @@ fn classify_text_heuristic(task_id: &str, text: &str, timestamp: &str) -> Option
     None
 }
 
-/// Check if a bash command is a test command.
+const TEST_RUNNERS: [&str; 8] = [
+    "cargo test",
+    "npm test",
+    "pytest",
+    "phpunit",
+    "jest",
+    "vitest",
+    "go test",
+    "make test",
+];
+
+/// True when a bash command actually runs a test runner: some `&&`/`;` step
+/// must be it (after `VAR=value` assignments, an `npx` / `python -m`
+/// launcher or a `vendor/bin/` path), so an `echo`/`grep` that merely
+/// mentions "cargo test" doesn't count.
 fn is_test_command(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
-    lower.contains("cargo test")
-        || lower.contains("npm test")
-        || lower.contains("pytest")
-        || lower.contains("phpunit")
-        || lower.contains("jest")
-        || lower.contains("vitest")
-        || lower.contains("go test")
-        || lower.contains("make test")
+    let is_env_assignment = |word: &&str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+
+    lower.split("&&").flat_map(|s| s.split(';')).any(|step| {
+        let words: Vec<&str> = step
+            .split_whitespace()
+            .skip_while(is_env_assignment)
+            .collect();
+        let words = match words.as_slice() {
+            ["npx", rest @ ..] => rest,
+            [python, "-m", rest @ ..] if python.starts_with("python") => rest,
+            all => all,
+        };
+        let Some((bin, args)) = words.split_first() else {
+            return false;
+        };
+        let bin = bin.rsplit('/').next().unwrap_or(bin);
+
+        TEST_RUNNERS
+            .iter()
+            .any(|runner| match runner.split_once(' ') {
+                Some((runner_bin, sub)) => bin == runner_bin && args.first() == Some(&sub),
+                None => bin == *runner,
+            })
+    })
 }
 
 /// True when a bash command actually runs `git commit` (not `--amend`): some
@@ -354,17 +386,11 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
-/// Truncate text to max_len, adding "…" if truncated.
+/// Truncate text to max_len chars, adding "…" if truncated.
 fn truncate(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        let mut end = max_len;
-        // Don't cut in the middle of a UTF-8 char.
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &text[..end])
+    match text.char_indices().nth(max_len) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
     }
 }
 
@@ -789,6 +815,35 @@ mod tests {
     }
 
     #[test]
+    fn derive_title_counts_chars_not_bytes() {
+        // 5 chars (9 bytes): as short as "/init", so it is skipped.
+        let session = ParsedSession {
+            session_id: "abcdefghij".into(),
+            file_path: "/tmp/s.jsonl".into(),
+            entries: vec![
+                make_user_entry("u1", "t", "Да да"),
+                make_user_entry("u2", "t", "Implement the feature for user profiles"),
+            ],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert!(derive_title(&session).contains("Implement the feature"));
+    }
+
+    #[test]
+    fn derive_title_fallback_cuts_session_id_on_char_boundary() {
+        // Byte 8 falls inside the fourth 'é'.
+        let session = ParsedSession {
+            session_id: "aééééé".into(),
+            file_path: "/tmp/s.jsonl".into(),
+            entries: vec![make_user_entry("u1", "t", "hi")],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        assert_eq!(derive_title(&session), "Session aééééé");
+    }
+
+    #[test]
     fn derive_title_strips_xml_from_summary() {
         let session = ParsedSession {
             session_id: "abcdefghij".into(),
@@ -850,8 +905,19 @@ mod tests {
         assert!(is_test_command("go test ./..."));
         assert!(is_test_command("make test"));
         assert!(is_test_command("phpunit tests/Unit"));
-        assert!(is_test_command("echo 'cargo test'")); // matches because it contains "cargo test"
         assert!(!is_test_command("ls -la"));
+    }
+
+    #[test]
+    fn is_test_command_requires_the_runner_to_be_the_command() {
+        assert!(is_test_command("cd crates && cargo test"));
+        assert!(is_test_command("cargo fmt; cargo test --workspace"));
+        assert!(is_test_command("RUST_LOG=debug cargo test"));
+        assert!(is_test_command("npx jest src/"));
+        assert!(is_test_command("./vendor/bin/phpunit tests/Unit"));
+        assert!(!is_test_command("echo 'cargo test'"));
+        assert!(!is_test_command("grep -rn \"pytest\" ."));
+        assert!(!is_test_command("cat jest.config.js"));
     }
 
     // --- shorten_path additional tests ---
@@ -873,12 +939,9 @@ mod tests {
 
     #[test]
     fn test_truncate_multibyte_utf8() {
-        // Russian text: each char is 2 bytes.
-        let text = "Привет мир";
-        let truncated = truncate(text, 6);
-        // 6 bytes = 3 cyrillic chars ("При")
-        assert!(truncated.ends_with('…'));
-        assert!(truncated.starts_with("При"));
+        // Russian text: each char is 2 bytes, but the limit counts chars.
+        assert_eq!(truncate("Привет мир", 6), "Привет…");
+        assert_eq!(truncate("Привет", 6), "Привет");
     }
 
     #[test]
