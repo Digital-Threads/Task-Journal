@@ -37,6 +37,9 @@ pub fn run_dream(
     run_id: &str,
 ) -> anyhow::Result<DreamReport> {
     let mut report = DreamReport::default();
+    // Texts appended earlier in this run: a later session of the same task
+    // must not re-add them (its `existing_events` predate the run).
+    let mut appended: Vec<String> = Vec::new();
     for (session_id, input) in sessions {
         report.sessions_processed += 1;
         if opts.dry_run {
@@ -48,6 +51,7 @@ pub fn run_dream(
             .tasks
             .iter()
             .flat_map(|t| t.existing_events.clone())
+            .chain(appended.iter().cloned())
             .collect();
         let kept = crate::dream::backfill::dedup_guard(proposed, &existing);
         let mut writer = crate::storage::JsonlWriter::open(events_path)?;
@@ -56,6 +60,7 @@ pub fn run_dream(
             writer.append(&e)?;
             crate::db::upsert_task_from_event(conn, &e, &opts.project_hash)?;
             crate::db::index_event(conn, &e)?;
+            appended.push(b.text.clone());
             report.events_backfilled += 1;
         }
         writer.flush_durable()?;
@@ -136,6 +141,42 @@ mod tests {
         assert!(body.contains("A brand new finding."));
         assert!(body.contains("\"source\":\"dream\""));
         assert!(!body.contains("\"text\":\"Already known fact.\",\"refs\""));
+    }
+
+    #[test]
+    fn run_dream_does_not_repeat_an_event_across_sessions() {
+        // Two sessions of one task both surface the same decision: the
+        // second must not append it again.
+        let d = TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        let events_path = d.path().join("events.jsonl");
+        let backend = MockDreamBackend {
+            events: vec![BackfillEvent {
+                event_type: EventType::Decision,
+                task_id: "tj-1".into(),
+                text: "Chose SQLite over Postgres.".into(),
+                timestamp: "2026-06-08T10:00:00Z".into(),
+            }],
+        };
+        let opts = DreamOptions {
+            project_hash: "ph".into(),
+            dry_run: false,
+        };
+        let mut second = task_input();
+        second.0 = "sess-2".into();
+
+        let report = run_dream(
+            &conn,
+            &events_path,
+            &opts,
+            &backend,
+            vec![task_input(), second],
+            "run-1",
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions_processed, 2);
+        assert_eq!(report.events_backfilled, 1);
     }
 
     #[test]
