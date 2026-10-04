@@ -88,6 +88,7 @@ pub fn relevant_recall(
          WHERE ei.status = 'confirmed'
            AND ei.type IN ('rejection','decision')
            AND ei.bookkeeping = 0
+           AND ei.corrected_by IS NULL
            AND search_fts MATCH ?1"
     } else {
         "SELECT ei.event_id, ei.task_id, ei.type, sf.text
@@ -96,6 +97,7 @@ pub fn relevant_recall(
          WHERE ei.status = 'confirmed'
            AND ei.type IN ('rejection','decision')
            AND ei.bookkeeping = 0
+           AND ei.corrected_by IS NULL
            AND sf.text LIKE ?1"
     };
     let bind = if let Some(or_query) = fts_or {
@@ -140,6 +142,7 @@ pub fn relevant_recall(
              WHERE ei.status = 'confirmed'
                AND ei.type IN ('rejection','decision')
                AND ei.bookkeeping = 0
+               AND ei.corrected_by IS NULL
                AND ei.artifacts LIKE ?1",
         ) {
             let rows = stmt.query_map(rusqlite::params![pattern], |r| {
@@ -353,6 +356,28 @@ mod tests {
         let (_d, conn) = seeded(&[old, new]);
 
         let hits = relevant_recall(&conn, "reasoning unit", DEFAULT_MAX_HITS).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+    }
+
+    #[test]
+    fn corrected_events_are_never_recalled() {
+        let rej = ev(
+            "tj-1",
+            EventType::Rejection,
+            "Rejected axum for the server in src/server.rs.",
+            EventStatus::Confirmed,
+        );
+        let mut corr = ev(
+            "tj-1",
+            EventType::Correction,
+            "That was wrong: the stdio issue was unrelated.",
+            EventStatus::Confirmed,
+        );
+        corr.corrects = Some(rej.event_id.clone());
+        let (_d, conn) = seeded(&[rej, corr]);
+
+        // Both the text and the artifact path must skip the corrected event.
+        let hits = relevant_recall(&conn, "axum src/server.rs", DEFAULT_MAX_HITS).unwrap();
         assert!(hits.is_empty(), "got: {hits:?}");
     }
 }
