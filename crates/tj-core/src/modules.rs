@@ -394,6 +394,214 @@ pub fn resolve(conn: &Connection, project_hash: &str, ids: &[String]) -> anyhow:
     Ok(out)
 }
 
+/// A suggestion needs two shared words, a term, or a file under the module.
+const MIN_SCORE: u32 = 2;
+
+const MAX_SUGGESTIONS: usize = 3;
+
+/// Titles of a module's latest tasks that join its vocabulary.
+const TITLES_PER_MODULE: i64 = 50;
+
+/// Russian glue words; recall's stopword list is English only.
+const RU_STOPWORDS: &[&str] = &[
+    "для",
+    "при",
+    "что",
+    "как",
+    "это",
+    "или",
+    "над",
+    "под",
+    "без",
+    "все",
+    "его",
+    "она",
+    "они",
+    "так",
+    "чтобы",
+];
+
+/// A module the journal thinks a task belongs to. Only a hint: the AI decides.
+#[derive(Debug, Clone, Serialize)]
+pub struct Suggestion {
+    pub module_id: String,
+    pub name: String,
+    pub score: u32,
+    /// What matched: files, terms, words.
+    pub why: String,
+}
+
+// ponytail: a 5-char prefix stands in for stemming (EN/RU inflections);
+// swap in a real stemmer if suggestions turn noisy.
+fn stems(text: &str) -> std::collections::BTreeSet<String> {
+    crate::recall::keywords(text)
+        .into_iter()
+        .filter(|w| !RU_STOPWORDS.contains(&w.as_str()))
+        .map(|w| w.chars().take(5).collect())
+        .collect()
+}
+
+fn is_under(file: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_start_matches("./");
+
+    !prefix.is_empty() && file.trim_start_matches("./").starts_with(prefix)
+}
+
+fn task_titles(
+    conn: &Connection,
+    project_hash: &str,
+    module_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.title FROM task_modules tm JOIN tasks t ON t.task_id = tm.task_id
+         WHERE tm.project_hash = ?1 AND tm.module_id = ?2
+         ORDER BY t.last_event_at DESC LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![project_hash, module_id, TITLES_PER_MODULE],
+            |r| r.get(0),
+        )?
+        .collect::<Result<_, _>>()?;
+
+    Ok(rows)
+}
+
+/// Active modules `text` and `files` point to, best first, at most three.
+/// No model: files under the module's paths, its terms, shared words.
+pub fn suggest(
+    conn: &Connection,
+    project_hash: &str,
+    text: &str,
+    files: &[String],
+) -> anyhow::Result<Vec<Suggestion>> {
+    let words = stems(text);
+    let lower = text.to_lowercase();
+    let mut out = Vec::new();
+
+    for m in list(conn, project_hash)?
+        .into_iter()
+        .filter(|m| m.status == "active")
+    {
+        let mut score = 0;
+        let mut why = Vec::new();
+
+        let hit: Vec<&str> = files
+            .iter()
+            .map(String::as_str)
+            .filter(|f| m.hints.paths.iter().any(|p| is_under(f, p)))
+            .take(3)
+            .collect();
+        if !hit.is_empty() {
+            score += 3 * hit.len() as u32;
+            why.push(format!("files: {}", hit.join(", ")));
+        }
+
+        let terms: Vec<&str> = m
+            .hints
+            .terms
+            .iter()
+            .map(String::as_str)
+            .filter(|t| t.chars().count() >= 3 && lower.contains(&t.to_lowercase()))
+            .collect();
+        if !terms.is_empty() {
+            score += 2 * terms.len() as u32;
+            why.push(format!("terms: {}", terms.join(", ")));
+        }
+
+        let vocabulary = format!(
+            "{} {} {} {}",
+            m.name,
+            m.description.as_deref().unwrap_or(""),
+            m.hints.terms.join(" "),
+            task_titles(conn, project_hash, &m.module_id)?.join(" ")
+        );
+        let shared: Vec<String> = words
+            .intersection(&stems(&vocabulary))
+            .take(5)
+            .cloned()
+            .collect();
+        if !shared.is_empty() {
+            score += shared.len() as u32;
+            why.push(format!("words: {}", shared.join(", ")));
+        }
+
+        if score >= MIN_SCORE {
+            out.push(Suggestion {
+                module_id: m.module_id,
+                name: m.name,
+                score,
+                why: why.join("; "),
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.module_id.cmp(&b.module_id))
+    });
+    out.truncate(MAX_SUGGESTIONS);
+
+    Ok(out)
+}
+
+/// A task with no module, with what the AI needs to place it.
+#[derive(Debug, Serialize)]
+pub struct Candidate {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub goal: Option<String>,
+    pub outcome: Option<String>,
+    pub files: Vec<String>,
+    pub suggestions: Vec<Suggestion>,
+}
+
+const UNLINKED: &str = "FROM tasks t WHERE t.project_hash = ?1
+     AND NOT EXISTS (SELECT 1 FROM task_modules tm WHERE tm.task_id = t.task_id)";
+
+/// The newest `limit` tasks without a module, and how many there are in all.
+pub fn backfill_candidates(
+    conn: &Connection,
+    project_hash: &str,
+    limit: usize,
+) -> anyhow::Result<(i64, Vec<Candidate>)> {
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) {UNLINKED}"),
+        [project_hash],
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.task_id, t.title, t.status {UNLINKED} ORDER BY t.last_event_at DESC LIMIT ?2"
+    ))?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map(rusqlite::params![project_hash, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    let mut out = Vec::new();
+    for (task_id, title, status) in rows {
+        let meta = crate::db::task_metadata(conn, &task_id)?.unwrap_or_default();
+        let files = crate::db::task_artifacts(conn, &task_id)?.files;
+        let text = format!("{title} {}", meta.goal.as_deref().unwrap_or(""));
+        let suggestions = suggest(conn, project_hash, &text, &files)?;
+
+        out.push(Candidate {
+            task_id,
+            title,
+            status,
+            goal: meta.goal,
+            outcome: meta.outcome,
+            files,
+            suggestions,
+        });
+    }
+
+    Ok((total, out))
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     use rusqlite::Connection;
@@ -602,6 +810,144 @@ mod tests {
         .to_string();
 
         assert!(err.contains("merged_into"), "{err}");
+    }
+
+    fn mapped() -> (TempDir, Connection) {
+        let stars = module_event(
+            "stars",
+            &ModuleFields {
+                name: Some("Stars".into()),
+                description: Some("Рейтинг звёзд и лента".into()),
+                hints: Some(Hints {
+                    paths: vec!["src/stars/".into()],
+                    terms: vec!["star feed".into()],
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let auth = module_event(
+            "auth",
+            &ModuleFields {
+                name: Some("Auth".into()),
+                description: Some("Login and token refresh".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        journal(&[stars, auth])
+    }
+
+    #[test]
+    fn files_under_a_hint_path_suggest_the_module() {
+        let (_d, conn) = mapped();
+
+        let s = suggest(&conn, "p", "fix crash", &["./src/stars/feed.rs".into()]).unwrap();
+
+        assert_eq!(s[0].module_id, "stars");
+        assert!(s[0].why.contains("src/stars/feed.rs"), "{}", s[0].why);
+    }
+
+    #[test]
+    fn russian_word_forms_match() {
+        let (_d, conn) = mapped();
+
+        let s = suggest(&conn, "p", "Пересчитать рейтинга звёзды", &[]).unwrap();
+
+        assert_eq!(s.first().map(|s| s.module_id.as_str()), Some("stars"));
+    }
+
+    #[test]
+    fn a_module_term_in_the_text_suggests_it() {
+        let (_d, conn) = mapped();
+
+        let s = suggest(&conn, "p", "The Star Feed is slow", &[]).unwrap();
+
+        assert_eq!(s.first().map(|s| s.module_id.as_str()), Some("stars"));
+        assert!(s[0].why.contains("star feed"), "{}", s[0].why);
+    }
+
+    #[test]
+    fn one_shared_word_is_noise() {
+        let (_d, conn) = mapped();
+
+        assert!(suggest(&conn, "p", "refresh the page", &[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn titles_of_a_modules_tasks_join_its_vocabulary() {
+        let mut t = open_task("tj-a", &["auth"]);
+        t.meta["title"] = serde_json::json!("Rotate signing keys");
+        let (_d, conn) = journal(&[named("auth", "Auth"), t]);
+
+        let s = suggest(&conn, "p", "signing keys expire too early", &[]).unwrap();
+
+        assert_eq!(s.first().map(|s| s.module_id.as_str()), Some("auth"));
+    }
+
+    #[test]
+    fn retired_modules_are_not_suggested() {
+        let retired = module_event(
+            "old",
+            &ModuleFields {
+                name: Some("Old feed".into()),
+                status: Some("retired".into()),
+                hints: Some(Hints {
+                    paths: vec!["src/old/".into()],
+                    terms: vec![],
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_d, conn) = journal(&[retired]);
+
+        assert!(suggest(&conn, "p", "x", &["src/old/a.rs".into()])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn backfill_lists_unlinked_tasks_with_suggestions() {
+        let stars = module_event(
+            "stars",
+            &ModuleFields {
+                name: Some("Stars".into()),
+                hints: Some(Hints {
+                    paths: vec![],
+                    terms: vec!["star feed".into()],
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut old = open_task("tj-old", &[]);
+        old.meta["goal"] = serde_json::json!("Speed up the star feed");
+
+        let (_d, conn) = journal(&[stars, old, open_task("tj-linked", &["stars"])]);
+        let (total, page) = backfill_candidates(&conn, "p", 10).unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].task_id, "tj-old");
+        assert_eq!(page[0].goal.as_deref(), Some("Speed up the star feed"));
+        assert_eq!(page[0].suggestions[0].module_id, "stars");
+    }
+
+    #[test]
+    fn backfill_pages_by_limit_but_counts_all() {
+        let (_d, conn) = journal(&[
+            open_task("tj-1", &[]),
+            open_task("tj-2", &[]),
+            open_task("tj-3", &[]),
+        ]);
+
+        let (total, page) = backfill_candidates(&conn, "p", 2).unwrap();
+
+        assert_eq!((total, page.len()), (3, 2));
     }
 
     #[test]
