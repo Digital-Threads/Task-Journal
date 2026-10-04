@@ -59,11 +59,8 @@ pub fn stamp_session_id(meta: &mut Value, sid: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env_lock;
     use serde_json::json;
-    use std::sync::Mutex;
-
-    // Serialises the env-touching tests — std env is process-global.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn payload_session_id_extracted() {
@@ -102,7 +99,7 @@ mod tests {
 
     #[test]
     fn live_payload_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = test_env_lock();
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "from-env");
         let p = json!({"session_id": "from-payload"});
         assert_eq!(live_session_id(Some(&p)).as_deref(), Some("from-payload"));
@@ -111,7 +108,7 @@ mod tests {
 
     #[test]
     fn live_falls_back_to_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = test_env_lock();
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "from-env");
         let p = json!({"hook_event_name": "Stop"});
         assert_eq!(live_session_id(Some(&p)).as_deref(), Some("from-env"));
@@ -121,7 +118,7 @@ mod tests {
 
     #[test]
     fn live_none_when_no_source() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = test_env_lock();
         for var in SESSION_ENV_VARS {
             std::env::remove_var(var);
         }
@@ -137,7 +134,7 @@ mod tests {
 
     /// Run `f` with exactly the given session env vars set (the rest unset).
     fn with_session_env(set: &[(&str, &str)], f: impl FnOnce()) {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = test_env_lock();
         for var in SESSION_ENV_VARS {
             std::env::remove_var(var);
         }

@@ -108,16 +108,6 @@ fn dirs_home() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialize every test that touches `CLAUDE_CONFIG_DIR`. Cargo runs
-    /// unit tests in parallel by default; two tests mutating the same
-    /// process env race (set in A, observed in B) and flaked Windows CI
-    /// (saw "C:\Users\runneradmin\.claude" when expecting the override).
-    /// Tests that touch the env take this lock before the first set_var.
-    /// `lock().unwrap_or_else(|p| p.into_inner())` swallows poisoning
-    /// from a panicking sibling test — env is restored regardless.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn encode_path_replaces_separators() {
@@ -205,7 +195,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_with_env_override() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -230,7 +220,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_returns_none_when_no_match() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -246,7 +236,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_returns_none_when_projects_dir_missing() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         // Don't create a "projects" subdir — it doesn't exist.
 
@@ -270,9 +260,9 @@ mod tests {
     /// than the hardcoded "/tmp/..." that doesn't exist on Windows.
     #[test]
     fn claude_config_dir_handles_env_var() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: the ENV_LOCK above serializes us against the other
-        // CLAUDE_CONFIG_DIR tests in this module; prev → restore at
+        let _g = crate::test_env_lock();
+        // SAFETY: the shared env lock serializes us against the other
+        // env-touching tests; prev → restore at
         // the end gives a clean exit regardless of panic.
         let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
 

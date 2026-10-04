@@ -91,10 +91,11 @@ mod tests {
     /// other tests in this crate.
     #[test]
     fn tj_classifier_model_env_var_overrides_http_default() {
+        let _env = crate::test_env_lock();
         let prev_model = std::env::var("TJ_CLASSIFIER_MODEL").ok();
         let prev_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
-        // SAFETY: tests in this crate do not concurrently read these env vars.
+        // SAFETY: the shared env lock serializes the crate's env tests.
         unsafe {
             std::env::remove_var("TJ_CLASSIFIER_MODEL");
             std::env::set_var("ANTHROPIC_API_KEY", "test-key-do-not-use");

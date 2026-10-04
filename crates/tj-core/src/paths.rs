@@ -54,6 +54,7 @@ mod tests {
 
     #[test]
     fn data_dir_returns_a_path_containing_task_journal() {
+        let _env = crate::test_env_lock();
         let p = data_dir().expect("data_dir");
         let s = p.to_string_lossy();
         assert!(s.contains("task-journal"), "got: {s}");
@@ -67,14 +68,15 @@ mod tests {
 
     /// Regression: on macOS/Windows the `directories` crate ignores XDG_DATA_HOME, but our
     /// tests (and power users) need a portable override. data_dir() must respect XDG_DATA_HOME
-    /// and TASK_JOURNAL_DATA_DIR on every OS. Using a thread-isolated env block since std env
-    /// is process-global; one test exercises both vars by serially restoring state.
+    /// and TASK_JOURNAL_DATA_DIR on every OS. std env is process-global, so the test holds
+    /// the shared env lock; one test exercises both vars by serially restoring state.
     #[test]
     #[cfg_attr(
         not(unix),
         ignore = "env semantics differ on Windows test runners; covered by integration tests"
     )]
     fn env_overrides_take_precedence() {
+        let _env = crate::test_env_lock();
         // Snapshot existing values (best-effort cleanup).
         let prev_tjdd = std::env::var("TASK_JOURNAL_DATA_DIR").ok();
         let prev_xdg = std::env::var("XDG_DATA_HOME").ok();

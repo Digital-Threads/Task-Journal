@@ -499,15 +499,12 @@ mod tests {
         }
     }
 
-    // Serialise env-touching tests (process-global env).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// `codex` used to resolve to the OpenAI API backend, so an OPENAI_API_KEY
     /// in the environment must no longer pull the wrong backend in. Whether the
     /// Codex CLI is installed decides between `Some(codex-exec)` and `None`.
     #[test]
     fn codex_backend_is_the_codex_cli_not_the_openai_api() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let _key = EnvGuard::set("OPENAI_API_KEY", "sk-should-not-be-used");
         match backend_from_env(Some("codex")).unwrap() {
             Some(b) => assert_eq!(b.name(), "codex-exec"),
@@ -546,7 +543,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codex_child_runs_with_the_recursion_marker() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let dir = fake_codex_dir();
         let _path = path_with(dir.path());
         let _marker = EnvGuard::unset("TJ_IN_CLASSIFIER");
@@ -562,7 +559,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codex_output_file_is_removed_when_the_call_times_out() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let dir = fake_codex_dir();
         let _path = path_with(dir.path());
         let _timeout = EnvGuard::set("TJ_CODEX_TIMEOUT_SECS", "1");
@@ -582,20 +579,20 @@ mod tests {
 
     #[test]
     fn unknown_backend_errors() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         assert!(backend_from_env(Some("nonsense")).is_err());
     }
 
     #[test]
     fn anthropic_unavailable_without_key_is_none() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let _g = EnvGuard::unset("ANTHROPIC_API_KEY");
         assert!(backend_from_env(Some("anthropic")).unwrap().is_none());
     }
 
     #[test]
     fn anthropic_with_key_resolves() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let _g = EnvGuard::set("ANTHROPIC_API_KEY", "k");
         let b = backend_from_env(Some("anthropic")).unwrap().unwrap();
         assert_eq!(b.name(), "anthropic");
@@ -603,7 +600,7 @@ mod tests {
 
     #[test]
     fn ollama_always_resolves_no_key() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let b = backend_from_env(Some("ollama")).unwrap().unwrap();
         assert_eq!(b.name(), "ollama");
     }
