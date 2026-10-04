@@ -634,12 +634,14 @@ fn module_reminder(
                       is kept (module_list shows the map)."
             .to_string(),
         (false, false) => format!(
-            "Closed without module_notes, so the history of {ids} has no line on it — make sure \
-             each module's state says what changed: module_save(state=...)."
+            "Closed without module_notes, so the history of {ids} has no line on it — check \
+             each module's state and, if this task changed how it works, rewrite it with \
+             module_save(state=...)."
         ),
-        (false, true) => {
-            format!("If {ids} work differently now, rewrite the state with module_save(state=...).")
-        }
+        (false, true) => format!(
+            "Check the state of {ids}: if this task changed how it works, rewrite it with \
+             module_save(state=...)."
+        ),
     }))
 }
 
@@ -2711,14 +2713,12 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert!(
-            closed
-                .module_reminder
-                .as_deref()
-                .unwrap_or("")
-                .contains("module_save(state"),
-            "{:?}",
-            closed.module_reminder
+        assert_eq!(
+            closed.module_reminder.as_deref(),
+            Some(
+                "Check the state of mcp-flow: if this task changed how it works, rewrite it with \
+                 module_save(state=...)."
+            ),
         );
 
         let page = server
