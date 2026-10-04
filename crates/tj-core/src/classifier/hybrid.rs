@@ -141,6 +141,7 @@ mod tests {
                 last_events: vec![],
                 constraints: vec![],
             }],
+            tool_output: false,
         }
     }
 
@@ -173,7 +174,8 @@ mod tests {
 
     #[test]
     fn from_env_constructs_without_key() {
-        // SAFETY: tests in this crate do not concurrently read these env vars.
+        // SAFETY: the shared env lock serializes the crate's env tests.
+        let _env = crate::test_env_lock();
         let prev_key = std::env::var("ANTHROPIC_API_KEY").ok();
         // Force heuristic-only by disabling both LLM backends via an order that
         // names no real one, so this stays deterministic regardless of whether

@@ -217,7 +217,10 @@ impl LlmBackend for CodexCliBackend {
             .args(["--sandbox", "read-only"])
             .args(["--color", "never"])
             .arg("-o")
-            .arg(&out_path);
+            .arg(&out_path)
+            // `codex exec` runs the user's ~/.codex hooks; the marker makes our
+            // own `ingest-hook` no-op inside this child instead of recursing.
+            .env(crate::classifier::agent_sdk::IN_CLASSIFIER_ENV, "1");
         if let Some(model) = &self.model {
             cmd.args(["-m", model]);
         }
@@ -225,22 +228,27 @@ impl LlmBackend for CodexCliBackend {
         // transcript-sized prompt away from the argv size limit.
         cmd.arg("-");
 
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to spawn `codex` (is the Codex CLI installed and on PATH?)")?;
-        child
-            .stdin
-            .take()
-            .context("codex stdin was not captured")?
-            .write_all(prompt.as_bytes())
-            .context("failed to write prompt to codex stdin")?;
-
-        let output = crate::classifier::agent_sdk::wait_with_timeout(child, codex_timeout())?;
+        // Run inside a closure so the output file is removed on every exit
+        // path — a failed stdin write and a timeout included.
+        let mut run = || -> anyhow::Result<std::process::Output> {
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("failed to spawn `codex` (is the Codex CLI installed and on PATH?)")?;
+            child
+                .stdin
+                .take()
+                .context("codex stdin was not captured")?
+                .write_all(prompt.as_bytes())
+                .context("failed to write prompt to codex stdin")?;
+            crate::classifier::agent_sdk::wait_with_timeout(child, codex_timeout(), "codex exec")
+        };
+        let output = run();
         let answer = std::fs::read_to_string(&out_path).unwrap_or_default();
         let _ = std::fs::remove_file(&out_path);
+        let output = output?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -491,15 +499,12 @@ mod tests {
         }
     }
 
-    // Serialise env-touching tests (process-global env).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// `codex` used to resolve to the OpenAI API backend, so an OPENAI_API_KEY
     /// in the environment must no longer pull the wrong backend in. Whether the
     /// Codex CLI is installed decides between `Some(codex-exec)` and `None`.
     #[test]
     fn codex_backend_is_the_codex_cli_not_the_openai_api() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let _key = EnvGuard::set("OPENAI_API_KEY", "sk-should-not-be-used");
         match backend_from_env(Some("codex")).unwrap() {
             Some(b) => assert_eq!(b.name(), "codex-exec"),
@@ -510,22 +515,102 @@ mod tests {
         }
     }
 
+    /// A stand-in `codex` that writes `TJ_IN_CLASSIFIER` into its `-o` file,
+    /// then sleeps `FAKE_CODEX_SLEEP` seconds when that is set.
+    #[cfg(unix)]
+    fn fake_codex_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift; fi\n  shift\ndone\ncat > /dev/null\nprintf 'in_classifier=%s' \"$TJ_IN_CLASSIFIER\" > \"$out\"\nif [ -n \"$FAKE_CODEX_SLEEP\" ]; then exec sleep \"$FAKE_CODEX_SLEEP\"; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn path_with(dir: &std::path::Path) -> EnvGuard {
+        let old = std::env::var("PATH").unwrap_or_default();
+        EnvGuard::set("PATH", &format!("{}:{old}", dir.display()))
+    }
+
+    /// `codex exec` runs the user's ~/.codex hooks; without the marker a
+    /// `dream`/`complete` run re-enters `ingest-hook` from inside itself.
+    #[cfg(unix)]
+    #[test]
+    fn codex_child_runs_with_the_recursion_marker() {
+        let _l = crate::test_env_lock();
+        let dir = fake_codex_dir();
+        let _path = path_with(dir.path());
+        let _marker = EnvGuard::unset("TJ_IN_CLASSIFIER");
+        let _sleep = EnvGuard::unset("FAKE_CODEX_SLEEP");
+
+        let (answer, _) = CodexCliBackend { model: None }
+            .complete_usage("classify me", 64)
+            .unwrap();
+
+        assert_eq!(answer, "in_classifier=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_output_file_is_removed_when_the_call_times_out() {
+        let _l = crate::test_env_lock();
+        let dir = fake_codex_dir();
+        let _path = path_with(dir.path());
+        let _timeout = EnvGuard::set("TJ_CODEX_TIMEOUT_SECS", "1");
+        let _sleep = EnvGuard::set("FAKE_CODEX_SLEEP", "5");
+
+        let res = CodexCliBackend { model: None }.complete_usage("classify me", 64);
+
+        assert!(res.is_err(), "a wedged codex must time out");
+        let prefix = format!("task-journal-codex-{}-", std::process::id());
+        let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert!(left.is_empty(), "codex temp file leaked: {left:?}");
+    }
+
+    /// The timeout error names the binary that hung, not always `claude -p`.
+    #[cfg(unix)]
+    #[test]
+    fn codex_timeout_error_names_codex() {
+        let _l = crate::test_env_lock();
+        let dir = fake_codex_dir();
+        let _path = path_with(dir.path());
+        let _timeout = EnvGuard::set("TJ_CODEX_TIMEOUT_SECS", "1");
+        let _sleep = EnvGuard::set("FAKE_CODEX_SLEEP", "5");
+
+        let err = CodexCliBackend { model: None }
+            .complete_usage("classify me", 64)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("`codex exec` timed out"), "{err}");
+    }
+
     #[test]
     fn unknown_backend_errors() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         assert!(backend_from_env(Some("nonsense")).is_err());
     }
 
     #[test]
     fn anthropic_unavailable_without_key_is_none() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let _g = EnvGuard::unset("ANTHROPIC_API_KEY");
         assert!(backend_from_env(Some("anthropic")).unwrap().is_none());
     }
 
     #[test]
     fn anthropic_with_key_resolves() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let _g = EnvGuard::set("ANTHROPIC_API_KEY", "k");
         let b = backend_from_env(Some("anthropic")).unwrap().unwrap();
         assert_eq!(b.name(), "anthropic");
@@ -533,7 +618,7 @@ mod tests {
 
     #[test]
     fn ollama_always_resolves_no_key() {
-        let _l = ENV_LOCK.lock().unwrap();
+        let _l = crate::test_env_lock();
         let b = backend_from_env(Some("ollama")).unwrap().unwrap();
         assert_eq!(b.name(), "ollama");
     }

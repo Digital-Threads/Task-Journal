@@ -8,6 +8,7 @@ use crate::event::EventType;
 /// One recalled high-signal event that matched the current context.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallHit {
+    pub event_id: String,
     pub task_id: String,
     pub event_type: EventType, // Rejection | Decision
     pub text: String,
@@ -86,6 +87,8 @@ pub fn relevant_recall(
          JOIN search_fts sf ON sf.event_id = ei.event_id
          WHERE ei.status = 'confirmed'
            AND ei.type IN ('rejection','decision')
+           AND ei.bookkeeping = 0
+           AND ei.corrected_by IS NULL
            AND search_fts MATCH ?1"
     } else {
         "SELECT ei.event_id, ei.task_id, ei.type, sf.text
@@ -93,6 +96,8 @@ pub fn relevant_recall(
          JOIN search_fts sf ON sf.event_id = ei.event_id
          WHERE ei.status = 'confirmed'
            AND ei.type IN ('rejection','decision')
+           AND ei.bookkeeping = 0
+           AND ei.corrected_by IS NULL
            AND sf.text LIKE ?1"
     };
     let bind = if let Some(or_query) = fts_or {
@@ -136,6 +141,8 @@ pub fn relevant_recall(
              JOIN search_fts sf ON sf.event_id = ei.event_id
              WHERE ei.status = 'confirmed'
                AND ei.type IN ('rejection','decision')
+               AND ei.bookkeeping = 0
+               AND ei.corrected_by IS NULL
                AND ei.artifacts LIKE ?1",
         ) {
             let rows = stmt.query_map(rusqlite::params![pattern], |r| {
@@ -164,6 +171,7 @@ pub fn relevant_recall(
         .filter_map(|(eid, score)| {
             meta.remove(&eid)
                 .map(|(task_id, event_type, text)| RecallHit {
+                    event_id: eid,
                     task_id,
                     event_type,
                     text,
@@ -327,5 +335,49 @@ mod tests {
         assert!(relevant_recall(&conn, "   ", DEFAULT_MAX_HITS)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn compaction_markers_are_never_recalled() {
+        // An old marker (recognised by its text) and a new one (by meta.kind).
+        let old = ev(
+            "tj-1",
+            EventType::Decision,
+            "Conversation compacted at 2026-01-01T00:00:00Z; preceding events should be treated as a single reasoning unit.",
+            EventStatus::Confirmed,
+        );
+        let mut new = ev(
+            "tj-1",
+            EventType::Decision,
+            "Compaction boundary: reasoning unit closed.",
+            EventStatus::Confirmed,
+        );
+        new.meta = serde_json::json!({ "kind": "compaction_marker" });
+        let (_d, conn) = seeded(&[old, new]);
+
+        let hits = relevant_recall(&conn, "reasoning unit", DEFAULT_MAX_HITS).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+    }
+
+    #[test]
+    fn corrected_events_are_never_recalled() {
+        let rej = ev(
+            "tj-1",
+            EventType::Rejection,
+            "Rejected axum for the server in src/server.rs.",
+            EventStatus::Confirmed,
+        );
+        let mut corr = ev(
+            "tj-1",
+            EventType::Correction,
+            "That was wrong: the stdio issue was unrelated.",
+            EventStatus::Confirmed,
+        );
+        corr.corrects = Some(rej.event_id.clone());
+        let (_d, conn) = seeded(&[rej, corr]);
+
+        // Both the text and the artifact path must skip the corrected event.
+        let hits = relevant_recall(&conn, "axum src/server.rs", DEFAULT_MAX_HITS).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
     }
 }

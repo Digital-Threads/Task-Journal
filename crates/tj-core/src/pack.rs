@@ -47,7 +47,8 @@ fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyho
     let mut stmt = conn.prepare(
         "SELECT ei.timestamp, ei.type, ei.status, sf.text FROM events_index ei
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.task_id=?1 ORDER BY ei.timestamp DESC LIMIT ?2",
+         WHERE ei.task_id=?1 AND ei.corrected_by IS NULL
+         ORDER BY ei.timestamp DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id, limit as i64], |r| {
         let ts: String = r.get(0)?;
@@ -80,7 +81,10 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     // v0.10.3: newest evidence first (ULID DESC). Matches the
     // decision-ordering fix so truncation prefers older rows.
     let mut stmt = conn.prepare(
-        "SELECT text, strength FROM evidence WHERE task_id=?1 ORDER BY evidence_id DESC",
+        "SELECT e.text, e.strength FROM evidence e
+         JOIN events_index ei ON ei.event_id = e.evidence_id
+         WHERE e.task_id=?1 AND ei.corrected_by IS NULL
+         ORDER BY e.evidence_id DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
         let t: String = r.get(0)?;
@@ -88,8 +92,13 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
         Ok((t, s))
     })?;
     let mut count = 0;
+    let mut seen: HashSet<String> = HashSet::new();
     for row in rows {
         let (t, s) = row?;
+        // Same noise / repeat filter as Active decisions and Rejected.
+        if is_noise(&t) || !seen.insert(t.trim().to_string()) {
+            continue;
+        }
         out.push_str(&format!("- {t} ({s})\n"));
         count += 1;
     }
@@ -100,30 +109,95 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
-fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
-    let mut out = String::from("## Rejected\n");
+/// A decision or rejection as the pack lists it.
+pub struct Choice {
+    pub text: String,
+    /// A decision's `meta.alternatives` JSON; always `None` for a rejection.
+    pub alternatives: Option<String>,
+    /// A classifier's guess (`status = suggested`).
+    pub unconfirmed: bool,
+}
+
+impl Choice {
+    /// A guess must not read like a choice the agent made: it stays listed
+    /// but carries this trailing marker.
+    pub fn marker(&self) -> &'static str {
+        if self.unconfirmed {
+            " _(unconfirmed)_"
+        } else {
+            ""
+        }
+    }
+}
+
+/// Keep the first of each text, minus machine noise (compaction markers), so
+/// a section reads as crisp choices, not repeated essays.
+fn dedupe(choices: impl IntoIterator<Item = Choice>) -> Vec<Choice> {
+    let mut seen: HashSet<String> = HashSet::new();
+    choices
+        .into_iter()
+        .filter(|c| !is_noise(&c.text) && seen.insert(c.text.trim().to_string()))
+        .collect()
+}
+
+/// The pack's Active decisions, newest first: neither superseded, corrected
+/// nor bookkeeping. export-pr lists the same ones.
+pub fn active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<Choice>> {
+    // v0.10.3: newest decision first. `decision_id` is a ULID so DESC
+    // gives reverse-chronological order. The summary/final-decision
+    // event the agent records just before close is now the FIRST line
+    // of this section, surviving end-of-pack truncation.
+    let mut stmt = conn.prepare(
+        "SELECT d.text, d.alternatives, ei.status FROM decisions d
+         JOIN events_index ei ON ei.event_id = d.decision_id
+         WHERE d.task_id=?1 AND d.status='active' AND ei.corrected_by IS NULL
+           AND ei.bookkeeping = 0
+         ORDER BY d.decision_id DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![task_id], |r| {
+            Ok(Choice {
+                text: r.get(0)?,
+                alternatives: r.get(1)?,
+                unconfirmed: r.get::<_, String>(2)? == "suggested",
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(dedupe(rows))
+}
+
+/// The pack's Rejected list, newest first, without corrected rejections.
+/// export-pr lists the same ones.
+pub fn rejections(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<Choice>> {
     // v0.10.3: newest-first so end-of-pack truncation drops the
     // OLDEST rejections, not the latest decision the agent recorded.
     let mut id_stmt = conn.prepare(
-        "SELECT event_id FROM events_index
-         WHERE task_id=?1 AND type='rejection'
+        "SELECT event_id, status FROM events_index
+         WHERE task_id=?1 AND type='rejection' AND corrected_by IS NULL
          ORDER BY timestamp DESC",
     )?;
     let mut text_stmt = conn.prepare("SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1")?;
-    let event_ids: Vec<String> = id_stmt
-        .query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?
+    let event_ids: Vec<(String, String)> = id_stmt
+        .query_map(rusqlite::params![task_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    let mut count = 0;
-    let mut seen: HashSet<String> = HashSet::new();
-    for eid in event_ids {
-        let text: String = text_stmt.query_row(rusqlite::params![eid], |r| r.get(0))?;
-        if is_noise(&text) || !seen.insert(text.trim().to_string()) {
-            continue;
-        }
-        out.push_str(&format!("- {text}\n"));
-        count += 1;
+    let mut rows = Vec::new();
+    for (eid, status) in event_ids {
+        rows.push(Choice {
+            text: text_stmt.query_row(rusqlite::params![eid], |r| r.get(0))?,
+            alternatives: None,
+            unconfirmed: status == "suggested",
+        });
     }
-    if count == 0 {
+    Ok(dedupe(rows))
+}
+
+fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
+    let mut out = String::from("## Rejected\n");
+    let rejected = rejections(conn, task_id)?;
+    for r in &rejected {
+        out.push_str(&format!("- {}{}\n", r.text, r.marker()));
+    }
+    if rejected.is_empty() {
         out.push_str("- (none)\n");
     }
     out.push('\n');
@@ -132,35 +206,17 @@ fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
 
 fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     let mut out = String::from("## Active decisions\n");
-    // v0.10.3: newest decision first. `decision_id` is a ULID so DESC
-    // gives reverse-chronological order. The summary/final-decision
-    // event the agent records just before close is now the FIRST line
-    // of this section, surviving end-of-pack truncation.
-    let mut stmt = conn.prepare(
-        "SELECT text, alternatives FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id DESC",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![task_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-    })?;
-    let mut count = 0;
-    let mut seen: HashSet<String> = HashSet::new();
-    for row in rows {
-        let (text, alternatives) = row?;
-        // Skip machine noise (compaction markers) and exact duplicates so the
-        // section reads as crisp decisions, not repeated essays.
-        if is_noise(&text) || !seen.insert(text.trim().to_string()) {
-            continue;
-        }
-        out.push_str(&format!("- {text}\n"));
+    let decisions = active_decisions(conn, task_id)?;
+    for d in &decisions {
+        out.push_str(&format!("- {}{}\n", d.text, d.marker()));
         // v0.12.0: structured alternatives render under the decision so the
         // pack shows "considered A/B/C, chose X" without reconstructing it
         // from the hypothesis+rejection chain.
-        if let Some(block) = render_alternatives(alternatives.as_deref()) {
+        if let Some(block) = render_alternatives(d.alternatives.as_deref()) {
             out.push_str(&block);
         }
-        count += 1;
     }
-    if count == 0 {
+    if decisions.is_empty() {
         out.push_str("- (none)\n");
     }
     out.push('\n');
@@ -176,12 +232,13 @@ fn render_alternatives(raw: Option<&str>) -> Option<String> {
     let raw = raw?;
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
     let arr = parsed.as_array()?;
-    if arr.is_empty() {
-        return None;
-    }
     let mut block = String::from("  - considered:\n");
+    let header_len = block.len();
     for entry in arr {
-        let option = entry.get("option").and_then(|v| v.as_str())?;
+        // Skip only the entry without an option, not the whole block.
+        let Some(option) = entry.get("option").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let chosen = entry
             .get("chosen")
             .and_then(|v| v.as_bool())
@@ -193,7 +250,8 @@ fn render_alternatives(raw: Option<&str>) -> Option<String> {
             None => block.push_str(&format!("    - {marker} {option}\n")),
         }
     }
-    Some(block)
+
+    (block.len() > header_len).then_some(block)
 }
 
 fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
@@ -247,6 +305,29 @@ fn render_subtasks(conn: &Connection, task_id: &str) -> anyhow::Result<Option<St
     Ok(Some(s))
 }
 
+/// Compact-mode Completeness: the heading plus ONE line with the score and
+/// every gap, capped so it always fits the 2 KB budget beside the reasoning.
+fn render_gap_line(report: &crate::completeness::CompletenessReport) -> Option<String> {
+    const GAP_LINE_MAX: usize = 400;
+
+    if report.gaps.is_empty() {
+        return None;
+    }
+    let details = report
+        .gaps
+        .iter()
+        .map(|g| g.detail.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut line = format!("- ⚠ honesty score: {}/100 — {details}", report.score());
+    truncate_to_budget(&mut line, GAP_LINE_MAX, "…");
+
+    Some(format!(
+        "\n## Completeness ({})\n{line}\n",
+        report.gaps.len()
+    ))
+}
+
 fn truncate_to_budget(text: &mut String, budget: usize, marker: &str) {
     if text.len() <= budget {
         return;
@@ -265,32 +346,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         PackMode::Compact => "compact",
         PackMode::Full => "full",
     };
-
-    // Read-through cache: if we have a stored pack with the same mode, return it.
-    let cached: Option<(String, String, i64)> = conn
-        .query_row(
-            "SELECT text, generated_at, source_event_count FROM task_pack_cache
-         WHERE task_id=?1 AND mode=?2",
-            rusqlite::params![task_id, mode_str],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
-    if let Some((cached_text, cached_at, cached_count)) = cached {
-        // Detect truncation by re-checking for the marker.
-        let was_truncated = cached_text.contains("_(truncated to fit pack budget)_");
-        return Ok(TaskPack {
-            task_id: task_id.to_string(),
-            mode,
-            schema_version: crate::SCHEMA_VERSION.into(),
-            text: cached_text,
-            metadata: PackMetadata {
-                generated_at: cached_at,
-                source_event_count: cached_count as usize,
-                cache_hit: true,
-                truncated: was_truncated,
-            },
-        });
-    }
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let (title, status, goal, outcome, outcome_tag, external): (
         String,
@@ -315,12 +371,6 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
             },
         )
         .with_context(|| format!("task not found: {task_id}"))?;
-
-    let event_count: usize = conn.query_row(
-        "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
-        rusqlite::params![task_id],
-        |r| r.get::<_, i64>(0).map(|n| n as usize),
-    )?;
 
     let mut text = format!("# {title}  [status: {status}]\n\n");
 
@@ -412,6 +462,88 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     }
     text.push('\n');
 
+    // Read-through cache of the body. It changes only with this task's own
+    // events (or a child's), and index_event clears it then. The header above
+    // (live status of linked tasks) and the gaps below (pending queue, cwd git
+    // state) change without such an event, so they are rendered every call.
+    let cached: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT text, source_event_count FROM task_pack_cache WHERE task_id=?1 AND mode=?2",
+            rusqlite::params![task_id, mode_str],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let cache_hit = cached.is_some();
+    let (body, event_count) = match cached {
+        Some((body, count)) => (body, count as usize),
+        None => {
+            let body = render_body(conn, task_id, mode)?;
+            let event_count: usize = conn.query_row(
+                "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
+                rusqlite::params![task_id],
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![task_id, mode_str, body, generated_at, event_count as i64],
+            )?;
+            (body, event_count)
+        }
+    };
+    text.push_str(&body);
+
+    let mut report =
+        crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
+    // Honesty drift: flag artifacts (files/commits/local links) that no longer
+    // exist. Best-effort — silent unless cwd is the project's git repo.
+    report
+        .gaps
+        .extend(crate::completeness::artifact_gaps_for_cwd(&arts));
+    // The gaps tell the next agent what is missing, so they go last with
+    // their room reserved: truncation cuts the reasoning above, never them.
+    let gaps = match mode {
+        PackMode::Full => crate::completeness::render_section(&report),
+        PackMode::Compact => render_gap_line(&report),
+    }
+    .unwrap_or_default();
+
+    // Token-budget truncation: cap pack size so it always fits an LLM context window.
+    // v0.10.3: full bumped 10K → 24K → 32K. Real tasks accumulate 50-100 events
+    // and the prior cap clipped final-summary decisions even after the
+    // ORDER BY DESC reshuffle. 32K still fits comfortably inside any
+    // modern LLM context budget.
+    const FULL_BUDGET: usize = 32 * 1024;
+    const COMPACT_BUDGET: usize = 2 * 1024;
+    const TRUNC_MARKER: &str = "\n\n_(truncated to fit pack budget)_\n";
+    let budget = match mode {
+        PackMode::Full => FULL_BUDGET,
+        PackMode::Compact => COMPACT_BUDGET,
+    };
+    let truncated = text.len() + gaps.len() > budget;
+    if truncated {
+        truncate_to_budget(&mut text, budget.saturating_sub(gaps.len()), TRUNC_MARKER);
+    }
+    text.push_str(&gaps);
+
+    Ok(TaskPack {
+        task_id: task_id.to_string(),
+        mode,
+        schema_version: crate::SCHEMA_VERSION.into(),
+        text,
+        metadata: PackMetadata {
+            generated_at,
+            source_event_count: event_count,
+            cache_hit,
+            truncated,
+        },
+    })
+}
+
+/// The cacheable part of a pack: every section built from this task's own
+/// events and its children's, in pack order.
+fn render_body(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Result<String> {
+    let mut text = String::new();
     if matches!(mode, PackMode::Full) {
         text.push_str(&render_lifecycle(conn, task_id)?);
     }
@@ -426,17 +558,6 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
-    let mut report =
-        crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
-    // Honesty drift: flag artifacts (files/commits/local links) that no longer
-    // exist. Best-effort — silent unless cwd is the project's git repo.
-    report
-        .gaps
-        .extend(crate::completeness::artifact_gaps_for_cwd(&arts));
-    if let Some(section) = crate::completeness::render_section(&report) {
-        text.push_str(&section);
-    }
-
     // One-level roll-up of direct children (parents only). Appended before
     // truncation so it shares the pack budget. Task 5 busts the parent cache
     // when a child changes, so the next assemble regenerates fresh.
@@ -444,44 +565,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         text.push_str(&subtasks);
     }
 
-    // Token-budget truncation: cap pack size so it always fits an LLM context window.
-    // v0.10.3: full bumped 10K → 24K → 32K. Real tasks accumulate 50-100 events
-    // and the prior cap clipped final-summary decisions even after the
-    // ORDER BY DESC reshuffle. 32K still fits comfortably inside any
-    // modern LLM context budget.
-    const FULL_BUDGET: usize = 32 * 1024;
-    const COMPACT_BUDGET: usize = 2 * 1024;
-    const TRUNC_MARKER: &str = "\n\n_(truncated to fit pack budget)_\n";
-    let budget = match mode {
-        PackMode::Full => FULL_BUDGET,
-        PackMode::Compact => COMPACT_BUDGET,
-    };
-    let truncated = text.len() > budget;
-    if truncated {
-        truncate_to_budget(&mut text, budget, TRUNC_MARKER);
-    }
-
-    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-    // Write-through cache.
-    conn.execute(
-        "INSERT OR REPLACE INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![task_id, mode_str, text, generated_at, event_count as i64],
-    )?;
-
-    Ok(TaskPack {
-        task_id: task_id.to_string(),
-        mode,
-        schema_version: crate::SCHEMA_VERSION.into(),
-        text,
-        metadata: PackMetadata {
-            generated_at,
-            source_event_count: event_count,
-            cache_hit: false,
-            truncated,
-        },
-    })
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -592,6 +676,7 @@ mod tests {
         // pending_count() resolves `<data_dir>/pending`. Point the data dir at
         // the isolated tempdir (no pending/ child) so the PendingLeak rule
         // stays silent regardless of the real dev environment.
+        let _env = crate::test_env_lock();
         std::env::set_var("TASK_JOURNAL_DATA_DIR", d.path());
 
         let pack = assemble(&conn, "g2", PackMode::Compact).unwrap();
@@ -1206,5 +1291,279 @@ mod tests {
         );
         assert_eq!(pack.metadata.source_event_count, 1);
         assert!(!pack.metadata.cache_hit);
+    }
+
+    /// Upsert + index one event, the way the tests above do inline.
+    fn put(conn: &Connection, e: &crate::event::Event) {
+        crate::db::upsert_task_from_event(conn, e, "feedface").unwrap();
+        crate::db::index_event(conn, e).unwrap();
+    }
+
+    fn ev(task: &str, ty: crate::event::EventType, text: &str) -> crate::event::Event {
+        crate::event::Event::new(
+            task,
+            ty,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            text.into(),
+        )
+    }
+
+    fn open_task(conn: &Connection, task: &str, title: &str) {
+        let mut e = ev(task, crate::event::EventType::Open, "x");
+        e.meta = serde_json::json!({ "title": title });
+        put(conn, &e);
+    }
+
+    #[test]
+    fn corrected_events_drop_out_of_every_pack_section() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-cx", "Corrected");
+
+        let wrong = [
+            ev("tj-cx", EventType::Decision, "Wrong decision: use Mongo"),
+            ev(
+                "tj-cx",
+                EventType::Rejection,
+                "Wrong rejection: SQLite too slow",
+            ),
+            ev("tj-cx", EventType::Evidence, "Wrong evidence: bench 5ms"),
+            ev("tj-cx", EventType::Finding, "Wrong finding: migration done"),
+        ];
+        for w in &wrong {
+            put(&conn, w);
+            let mut c = ev("tj-cx", EventType::Correction, "That was a mistake");
+            c.corrects = Some(w.event_id.clone());
+            put(&conn, &c);
+        }
+        put(&conn, &ev("tj-cx", EventType::Decision, "Use SQLite"));
+
+        let pack = assemble(&conn, "tj-cx", PackMode::Full).unwrap();
+        assert!(!pack.text.contains("Wrong "), "{}", pack.text);
+        assert!(pack.text.contains("Use SQLite"), "{}", pack.text);
+        assert_eq!(
+            pack.text.matches("[correction] That was a mistake").count(),
+            4,
+            "{}",
+            pack.text
+        );
+    }
+
+    #[test]
+    fn correcting_another_tasks_event_refreshes_that_tasks_cached_pack() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-a", "A");
+        open_task(&conn, "tj-b", "B");
+        let wrong = ev("tj-a", EventType::Decision, "Wrong decision in A");
+        put(&conn, &wrong);
+        assert!(assemble(&conn, "tj-a", PackMode::Full)
+            .unwrap()
+            .text
+            .contains("Wrong decision in A"));
+
+        let mut c = ev("tj-b", EventType::Correction, "A's decision was wrong");
+        c.corrects = Some(wrong.event_id.clone());
+        put(&conn, &c);
+
+        let pack = assemble(&conn, "tj-a", PackMode::Full).unwrap();
+        assert!(!pack.text.contains("Wrong decision in A"), "{}", pack.text);
+    }
+
+    /// The body of the `## {heading}` section, up to the next `## ` heading.
+    fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let start = text
+            .find(&format!("## {heading}"))
+            .unwrap_or_else(|| panic!("no {heading} section in:\n{text}"));
+        let end = text[start + 3..]
+            .find("\n## ")
+            .map_or(text.len(), |i| start + 3 + i);
+        &text[start..end]
+    }
+
+    #[test]
+    fn suggested_decisions_and_rejections_are_marked_unconfirmed() {
+        use crate::event::{EventStatus, EventType};
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-un", "Unconfirmed");
+        let mut guess = ev("tj-un", EventType::Decision, "Maybe adopt Rust");
+        guess.status = EventStatus::Suggested;
+        put(&conn, &guess);
+        let mut guess_rej = ev("tj-un", EventType::Rejection, "Maybe drop TypeScript");
+        guess_rej.status = EventStatus::Suggested;
+        put(&conn, &guess_rej);
+        put(&conn, &ev("tj-un", EventType::Decision, "Use SQLite"));
+        put(
+            &conn,
+            &ev("tj-un", EventType::Rejection, "Postgres: too heavy"),
+        );
+
+        let pack = assemble(&conn, "tj-un", PackMode::Full).unwrap();
+        let active = section(&pack.text, "Active decisions");
+        assert!(
+            active.contains("- Maybe adopt Rust _(unconfirmed)_\n"),
+            "{active}"
+        );
+        assert!(active.contains("- Use SQLite\n"), "{active}");
+        let rejected = section(&pack.text, "Rejected");
+        assert!(
+            rejected.contains("- Maybe drop TypeScript _(unconfirmed)_\n"),
+            "{rejected}"
+        );
+        assert!(rejected.contains("- Postgres: too heavy\n"), "{rejected}");
+    }
+
+    #[test]
+    fn compaction_marker_kind_stays_out_of_active_decisions() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-bk", "Bookkeeping");
+        // Identified by meta.kind, whatever the marker text says.
+        let mut marker = ev("tj-bk", EventType::Decision, "Context boundary here");
+        marker.meta = serde_json::json!({ "kind": "compaction_marker" });
+        put(&conn, &marker);
+        put(&conn, &ev("tj-bk", EventType::Decision, "Use SQLite"));
+
+        let pack = assemble(&conn, "tj-bk", PackMode::Full).unwrap();
+        let active = section(&pack.text, "Active decisions");
+        assert!(!active.contains("Context boundary"), "{active}");
+        assert!(active.contains("Use SQLite"), "{active}");
+    }
+
+    #[test]
+    fn truncated_packs_keep_the_gap_summary() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-gap", "Gaps"); // no goal → a gap
+        for i in 0..60 {
+            let long = format!("Decision #{i}: {}", "lorem ipsum ".repeat(60));
+            put(&conn, &ev("tj-gap", EventType::Decision, &long));
+        }
+
+        for mode in [PackMode::Compact, PackMode::Full] {
+            let pack = assemble(&conn, "tj-gap", mode).unwrap();
+            assert!(pack.metadata.truncated, "{mode:?}");
+            let gaps = section(&pack.text, "Completeness");
+            assert!(gaps.contains("no goal recorded"), "{mode:?}: {gaps}");
+        }
+
+        let compact = assemble(&conn, "tj-gap", PackMode::Compact).unwrap();
+        assert!(
+            compact.text.len() <= 2 * 1024 + 64,
+            "{}",
+            compact.text.len()
+        );
+        let gaps = section(&compact.text, "Completeness");
+        assert_eq!(
+            gaps.trim_end().lines().count(),
+            2,
+            "one summary line: {gaps}"
+        );
+    }
+
+    #[test]
+    fn compact_gap_line_stays_short_with_many_gaps() {
+        use crate::completeness::{CompletenessReport, Gap, GapKind};
+
+        let report = CompletenessReport {
+            gaps: (0..50)
+                .map(|i| Gap {
+                    kind: GapKind::MissingFile,
+                    detail: format!("referenced file no longer exists: src/deep/path/file_{i}.rs"),
+                })
+                .collect(),
+        };
+        let line = render_gap_line(&report).unwrap();
+        assert!(line.len() <= 512, "{} bytes: {line}", line.len());
+        assert!(line.contains("## Completeness (50)"), "{line}");
+        assert!(line.contains("honesty score: 0/100"), "{line}");
+    }
+
+    #[test]
+    fn cached_pack_shows_live_status_of_linked_tasks() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-a", "A");
+        open_task(&conn, "tj-b", "B");
+        crate::db::add_task_external(&conn, "tj-a", "linked:tj-b").unwrap();
+        assert!(assemble(&conn, "tj-a", PackMode::Compact)
+            .unwrap()
+            .text
+            .contains("- tj-b [open]"));
+
+        // Closing B touches only B's events, so A's cached body stays valid.
+        put(&conn, &ev("tj-b", EventType::Close, "done"));
+
+        let pack = assemble(&conn, "tj-a", PackMode::Compact).unwrap();
+        assert!(pack.metadata.cache_hit);
+        assert!(pack.text.contains("- tj-b [closed]"), "{}", pack.text);
+    }
+
+    #[test]
+    fn cached_pack_shows_live_gaps() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-g", "G");
+        crate::db::set_task_goal(&conn, "tj-g", "g").unwrap();
+        let _env = crate::test_env_lock();
+        std::env::set_var("TASK_JOURNAL_DATA_DIR", d.path());
+        let first = assemble(&conn, "tj-g", PackMode::Compact).unwrap();
+
+        // A pending entry appears without any new event on the task.
+        std::fs::create_dir_all(d.path().join("pending")).unwrap();
+        std::fs::write(d.path().join("pending/x.json"), "{}").unwrap();
+        let second = assemble(&conn, "tj-g", PackMode::Compact).unwrap();
+        std::env::remove_var("TASK_JOURNAL_DATA_DIR");
+
+        assert!(!first.text.contains("## Completeness"), "{}", first.text);
+        assert!(second.metadata.cache_hit);
+        assert!(second.text.contains("1 pending entry"), "{}", second.text);
+    }
+
+    #[test]
+    fn one_bad_alternative_does_not_hide_the_others() {
+        let raw = r#"[
+            {"chosen": true, "rationale": "no option field"},
+            {"option": "SQLite", "chosen": true},
+            {"option": "Postgres", "rationale": "too heavy"}
+        ]"#;
+        let block = render_alternatives(Some(raw)).expect("good entries still render");
+        assert!(block.contains("✓ chose SQLite"), "{block}");
+        assert!(block.contains("✗ Postgres — too heavy"), "{block}");
+        assert!(!block.contains("no option field"), "{block}");
+    }
+
+    #[test]
+    fn evidence_drops_noise_and_repeats() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-ev2", "Evidence");
+        for text in [
+            "Tests green: 142 passed",
+            "Tests green: 142 passed",
+            "Conversation compacted at 2026-01-01T00:00:00Z; preceding events…",
+        ] {
+            put(&conn, &ev("tj-ev2", EventType::Evidence, text));
+        }
+
+        let pack = assemble(&conn, "tj-ev2", PackMode::Full).unwrap();
+        let evidence = section(&pack.text, "Evidence");
+        assert_eq!(evidence.matches("Tests green").count(), 1, "{evidence}");
+        assert!(!evidence.contains("Conversation compacted"), "{evidence}");
     }
 }

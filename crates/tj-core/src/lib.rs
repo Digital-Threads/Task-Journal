@@ -19,6 +19,16 @@ pub fn new_task_id() -> String {
     )
 }
 
+/// One lock for every tj-core test that sets env vars or asserts on
+/// something read from them: std env is process-global, so tests running in
+/// parallel see each other's values. Poisoning is ignored so one failed test
+/// does not fail every other env test after it.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod task_id_tests {
     use super::new_task_id;
@@ -68,6 +78,7 @@ pub mod recall;
 pub mod reminder;
 pub mod session;
 pub mod session_id;
+pub mod session_state;
 pub mod storage;
 pub mod title;
 

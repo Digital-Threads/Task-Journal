@@ -118,7 +118,7 @@ impl ChatView {
                 .unwrap_or(&clean);
             truncate(line.trim(), 60)
         } else {
-            format!("Session {}", &session.session_id[..8])
+            format!("Session {}", super::short_session_id(&session.session_id))
         };
 
         ChatView {
@@ -346,6 +346,31 @@ fn format_ts(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- from_session() title fallback ---
+
+    fn session_with_id(id: &str) -> ParsedSession {
+        ParsedSession {
+            session_id: id.into(),
+            file_path: String::new(),
+            entries: vec![],
+            first_timestamp: None,
+            last_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn title_fallback_survives_short_session_id() {
+        let view = ChatView::from_session(&session_with_id("abc"));
+        assert_eq!(view.title, "Session abc");
+    }
+
+    #[test]
+    fn title_fallback_cuts_session_id_on_char_boundary() {
+        // Byte 8 falls inside the fourth 'é'.
+        let view = ChatView::from_session(&session_with_id("aééééé"));
+        assert_eq!(view.title, "Session aééééé");
+    }
 
     // --- word_wrap() tests ---
 

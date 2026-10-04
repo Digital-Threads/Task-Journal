@@ -1,6 +1,63 @@
-use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
+
+/// Every `Command::cargo_bin` in this file goes through this wrapper, not
+/// `assert_cmd`'s, so a test can't reach a real model or the developer's live
+/// session by accident: PATH loses every directory holding a `claude` or
+/// `codex` binary, API keys and backend overrides are cleared, and the Claude
+/// Code session / mod markers of the shell running `cargo test` are dropped.
+/// A test that needs a model installs its own fake and sets PATH itself.
+struct Command;
+
+impl Command {
+    fn cargo_bin(name: &str) -> Result<assert_cmd::Command, assert_cmd::cargo::CargoError> {
+        let mut cmd = assert_cmd::Command::cargo_bin(name)?;
+        cmd.env("PATH", path_without_llm_clis());
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "TJ_BACKEND",
+            "TJ_HYBRID_LLM_ORDER",
+            "TASK_JOURNAL_DATA_DIR",
+            "CLAUDE_CODE_SESSION_ID",
+            "TJ_IN_CLASSIFIER",
+            "TJ_MOD_ACTIVE",
+        ] {
+            cmd.env_remove(var);
+        }
+        Ok(cmd)
+    }
+}
+
+/// The test process's PATH minus any directory that holds `claude` or `codex`,
+/// led by a directory whose `gh` always fails, so `close`'s artifact harvest
+/// never asks GitHub about this repository. Computed once: on WSL the PATH
+/// carries dozens of slow `/mnt/c` directories.
+fn path_without_llm_clis() -> &'static std::ffi::OsStr {
+    static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let shims = std::env::temp_dir().join(format!("tj-cli-test-shims-{}", std::process::id()));
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::write(shims.join("gh.cmd"), "@exit /b 1\r\n").unwrap();
+        std::fs::write(shims.join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(shims.join("gh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let keep = std::iter::once(shims).chain(std::env::split_paths(&path).filter(|dir| {
+            ["claude", "codex"].iter().all(|bin| {
+                ["", ".exe", ".cmd"]
+                    .iter()
+                    .all(|ext| !dir.join(format!("{bin}{ext}")).exists())
+            })
+        }));
+        std::env::join_paths(keep).unwrap()
+    })
+}
 
 #[test]
 fn pack_command_prints_markdown_for_existing_task() {
@@ -255,6 +312,74 @@ fn doctor_json_output_is_parseable_and_lists_paths() {
     assert!(v.get("issues").unwrap().is_array());
 }
 
+/// `doctor` with PATH limited to `bin`, so only what the test puts there
+/// resolves.
+fn doctor_with_path(xdg: &std::path::Path, bin: &std::path::Path, json: bool) -> String {
+    let mut args = vec!["doctor"];
+    if json {
+        args.push("--json");
+    }
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .env("PATH", bin)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn doctor_reports_missing_codex_and_claude_as_information_only() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let empty_bin = assert_fs::TempDir::new().unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&doctor_with_path(xdg.path(), empty_bin.path(), true)).unwrap();
+    assert_eq!(v["codex_in_path"], false);
+    assert_eq!(v["claude_in_path"], false);
+    assert_eq!(v["issues"].as_array().unwrap().len(), 0, "{v}");
+
+    let human = doctor_with_path(xdg.path(), empty_bin.path(), false);
+    assert!(human.contains("codex binary"), "{human}");
+}
+
+/// The suite must never reach a real model: a test command sees no `claude`
+/// or `codex` unless the test installs its own fake on PATH.
+#[test]
+fn test_commands_see_no_real_claude_or_codex() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["claude_in_path"], false, "{v}");
+    assert_eq!(v["codex_in_path"], false, "{v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_detects_codex_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let bin = assert_fs::TempDir::new().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\necho codex-cli 9.9.9\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&doctor_with_path(xdg.path(), bin.path(), true)).unwrap();
+    assert_eq!(v["codex_in_path"], true);
+}
+
 fn write_pending(xdg: &std::path::Path, id: &str, text: &str, attempts: u32) {
     let dir = xdg.join("task-journal").join("pending");
     std::fs::create_dir_all(&dir).unwrap();
@@ -361,13 +486,22 @@ fn pending_retry_marks_dead_after_max_attempts() {
     let proj = assert_fs::TempDir::new().unwrap();
     // Already at attempts=2; one more failure should rename to *.dead.json.
     write_pending(xdg.path(), "tj-dying", "any text", 2);
+    // An open task, so the chunk reaches the classifier at all.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Dying host"])
+        .assert()
+        .success();
 
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", xdg.path())
         .current_dir(proj.path())
-        // No --mock-* flags → retry fails → attempts becomes 3 → dead.
-        .args(["pending", "retry"])
+        // The heuristic can't place "any text" → a real classifier failure
+        // → attempts becomes 3 → dead.
+        .args(["pending", "retry", "--backend", "heuristic"])
         .assert()
         .success()
         .stdout(contains("1 marked dead"));
@@ -377,6 +511,81 @@ fn pending_retry_marks_dead_after_max_attempts() {
     let dead = pending_dir.join("tj-dying.dead.json");
     assert!(!live.exists(), "live file must be gone after dead-rename");
     assert!(dead.exists(), "dead file must exist: {dead:?}");
+}
+
+#[test]
+fn pending_retry_without_a_backend_leaves_entries_untouched() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "tj-waiting", "any text", 2);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        // Hybrid with no LLM fallback can only repeat the heuristic that
+        // already failed — that is "no backend", not a failed attempt.
+        .env("TJ_HYBRID_LLM_ORDER", "none")
+        .env_remove("ANTHROPIC_API_KEY")
+        .current_dir(proj.path())
+        .args(["pending", "retry"])
+        .assert()
+        .success()
+        .stdout(contains("no classifier backend"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    let live = pending_dir.join("tj-waiting.json");
+    assert!(live.exists(), "entry must stay queued");
+    assert!(!pending_dir.join("tj-waiting.dead.json").exists());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&live).unwrap()).unwrap();
+    assert_eq!(v["attempts"], 2, "no attempt is burned without a backend");
+}
+
+#[test]
+fn pending_retry_classifies_through_the_real_backend() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Retry host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    write_pending(
+        xdg.path(),
+        "tj-retry-real",
+        "After review we decided to use postgres for the journal store",
+        1,
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pending", "retry", "--backend", "heuristic"])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    assert!(!pending_dir.join("tj-retry-real.json").exists());
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("[decision]").and(contains("postgres")));
 }
 
 #[test]
@@ -531,6 +740,111 @@ fn export_html_emits_self_contained_document() {
     assert!(!html.contains("https://"), "external https url leaked");
 }
 
+/// Append a raw line to the only JSONL event log under `xdg`.
+fn append_jsonl_line(xdg: &std::path::Path, line: &str) {
+    use std::io::Write;
+
+    let events = xdg.join("task-journal").join("events");
+    let log = std::fs::read_dir(&events)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .expect("events log present");
+    let mut f = std::fs::OpenOptions::new().append(true).open(log).unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+#[test]
+fn export_md_and_html_follow_close_reopen_and_rename_like_the_projection() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Original title"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Closed, then renamed: the projection says closed + new title, while the
+    // last event alone (a rename) would read as open with the old title.
+    for (etype, text) in [
+        (tj_core::event::EventType::Close, "done"),
+        (tj_core::event::EventType::Reopen, "one more fix"),
+        (tj_core::event::EventType::Close, "done again"),
+        (tj_core::event::EventType::Rename, "Renamed title"),
+    ] {
+        let e = tj_core::event::Event::new(
+            task_id.clone(),
+            etype,
+            tj_core::event::Author::User,
+            tj_core::event::Source::Cli,
+            text.to_string(),
+        );
+        append_jsonl_line(xdg.path(), &serde_json::to_string(&e).unwrap());
+    }
+
+    let export = |format: &str| {
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["export", "--format", format])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    let md = export("md");
+    assert!(
+        md.contains(&format!("## [{task_id}] Renamed title")),
+        "md title must follow the rename: {md}"
+    );
+    assert!(md.contains("**Status**: closed"), "md status: {md}");
+
+    let html = export("html");
+    assert!(
+        html.contains(&format!("{task_id}</span>Renamed title</h2>")),
+        "html title must follow the rename: {html}"
+    );
+    assert!(html.contains("status: closed"), "html status: {html}");
+}
+
+#[test]
+fn export_skips_malformed_jsonl_lines_with_a_warning() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Survives a bad line"])
+        .assert()
+        .success();
+    append_jsonl_line(xdg.path(), "{not json");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["export", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(contains("Survives a bad line"))
+        .stderr(contains("skipping malformed JSONL line 2"));
+}
+
 #[test]
 fn migrate_project_round_trips_data_to_new_path() {
     let xdg = assert_fs::TempDir::new().unwrap();
@@ -619,6 +933,372 @@ fn migrate_project_refuses_overwrite_without_force() {
         .stderr(contains("destination already exists"));
 }
 
+/// Two project dirs that each hash to themselves, plus their hashes.
+fn two_projects() -> (assert_fs::TempDir, assert_fs::TempDir, String, String) {
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+    std::fs::create_dir(proj_a.path().join(".git")).unwrap();
+    std::fs::create_dir(proj_b.path().join(".git")).unwrap();
+    let from_hash = tj_core::project_hash::from_path(proj_a.path()).unwrap();
+    let to_hash = tj_core::project_hash::from_path(proj_b.path()).unwrap();
+
+    (proj_a, proj_b, from_hash, to_hash)
+}
+
+fn migrate(xdg: &std::path::Path, from: &std::path::Path, to: &std::path::Path, force: bool) {
+    let mut args = vec![
+        "migrate-project",
+        "--from",
+        from.to_str().unwrap(),
+        "--to",
+        to.to_str().unwrap(),
+    ];
+    if force {
+        args.push("--force");
+    }
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .args(args)
+        .assert()
+        .success();
+}
+
+#[test]
+fn migrate_project_rekeys_embeddings_and_dream_state() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Re-key everything"])
+        .assert()
+        .success();
+    {
+        let conn = tj_core::db::open(state.join(format!("{from_hash}.sqlite"))).unwrap();
+        conn.execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES (?1, 't', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings(event_id, task_id, project_hash, model, dim, vec, created_at)
+             VALUES ('e1', 'tj-1', ?1, 'hash', 1, x'00000000', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
+    for table in ["dream_state", "embeddings"] {
+        let rekeyed: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE project_hash = ?1"),
+                [&to_hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rekeyed, 1,
+            "{table} row not re-keyed to the new project_hash"
+        );
+    }
+}
+
+#[test]
+fn migrate_project_rekeys_only_its_rows_in_global_memory() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Re-key global memory"])
+        .assert()
+        .success();
+    let memory_path = xdg.path().join("task-journal").join("memory.sqlite");
+    {
+        let global = tj_core::memory::open(&memory_path).unwrap();
+        for (event_id, hash) in [("e-mine", from_hash.as_str()), ("e-other", "otherhash")] {
+            global
+                .execute(
+                    "INSERT INTO global_memory(event_id, project_hash, task_id, type, text, model, dim, vec, created_at)
+                     VALUES (?1, ?2, 'tj-1', 'decision', 't', 'hash', 1, x'00000000', 't')",
+                    [event_id, hash],
+                )
+                .unwrap();
+        }
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    let global = rusqlite::Connection::open(&memory_path).unwrap();
+    let hash_of = |event_id: &str| -> String {
+        global
+            .query_row(
+                "SELECT project_hash FROM global_memory WHERE event_id = ?1",
+                [event_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(hash_of("e-mine"), to_hash);
+    assert_eq!(hash_of("e-other"), "otherhash");
+}
+
+/// A write still sitting in `<hash>.sqlite-wal` (another process holds the
+/// DB open, so nothing checkpointed it) must reach the new project, and no
+/// sidecar may stay behind under the old hash. Unix-only: Windows refuses to
+/// rename a file another handle keeps open.
+#[cfg(unix)]
+#[test]
+fn migrate_project_carries_uncheckpointed_wal_writes() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "WAL survives migration"])
+        .assert()
+        .success();
+
+    let src = state.join(format!("{from_hash}.sqlite"));
+    let holder = tj_core::db::open(&src).unwrap();
+    holder
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    holder
+        .execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES (?1, 't', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+    // Keep the connection open for the rest of the test so its WAL is never
+    // checkpointed or deleted on close.
+    std::mem::forget(holder);
+    let wal = |hash: &str| state.join(format!("{hash}.sqlite-wal"));
+    assert!(wal(&from_hash).exists(), "precondition: source WAL present");
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    for suffix in ["-wal", "-shm"] {
+        let left = state.join(format!("{from_hash}.sqlite{suffix}"));
+        assert!(!left.exists(), "sidecar left behind: {left:?}");
+    }
+    let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dream_state WHERE project_hash = ?1",
+            [&to_hash],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "the WAL-only write was lost in migration");
+}
+
+// Unix only: the stand-in for a failing move (renaming a directory over a
+// file) is refused on Unix but allowed on Windows, where the real failure is a
+// sharing violation that a test can't stage portably.
+#[cfg(unix)]
+#[test]
+fn migrate_project_force_keeps_destination_when_the_move_fails() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let events = xdg.path().join("task-journal").join("events");
+
+    // A directory cannot be renamed over a file, so the move must fail.
+    std::fs::create_dir_all(events.join(format!("{from_hash}.jsonl"))).unwrap();
+    let dst = events.join(format!("{to_hash}.jsonl"));
+    std::fs::write(&dst, "destination data\n").unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+            "--force",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        "destination data\n",
+        "a failed --force move must leave the destination intact"
+    );
+}
+
+/// The JSONL is the source of truth: `--force` keeps the journal it replaces
+/// as `<dst>.jsonl.bak-<timestamp>` and says where it went.
+#[test]
+fn migrate_project_force_replaces_existing_destination() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, _, to_hash) = two_projects();
+
+    for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", title])
+            .assert()
+            .success();
+    }
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+            "--force",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Source task").and(contains("Overwritten task").not()));
+
+    let events = xdg.path().join("task-journal").join("events");
+    let backup = std::fs::read_dir(&events)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("{to_hash}.jsonl.bak-"))
+        })
+        .unwrap_or_else(|| panic!("no backup of the replaced journal; stdout: {out}"));
+    assert!(std::fs::read_to_string(&backup)
+        .unwrap()
+        .contains("Overwritten task"));
+    assert!(out.contains(&backup.display().to_string()), "{out}");
+}
+
+/// A destination WAL left behind by the database `--force` replaces must not
+/// be replayed into the one moving in.
+#[test]
+fn migrate_project_force_drops_the_replaced_databases_wal() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", title])
+            .assert()
+            .success();
+    }
+    drop(tj_core::db::open(state.join(format!("{from_hash}.sqlite"))).unwrap());
+
+    // A crash leftover: the destination's WAL with a write never folded in.
+    let dst_db = state.join(format!("{to_hash}.sqlite"));
+    let dst_wal = state.join(format!("{to_hash}.sqlite-wal"));
+    {
+        let conn = tj_core::db::open(&dst_db).unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        conn.execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES ('stale-wal', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let wal = std::fs::read(&dst_wal).unwrap();
+        drop(conn);
+        std::fs::write(&dst_wal, wal).unwrap();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), true);
+
+    let conn = rusqlite::Connection::open(&dst_db).unwrap();
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dream_state WHERE project_hash = 'stale-wal'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "the replaced database's WAL was replayed");
+}
+
+/// Queued chunks and the push-recall log are keyed by the project hash too.
+/// After a move the new project's worker classifies what the old one queued.
+#[test]
+fn migrate_project_rekeys_pending_entries_and_the_recall_log() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let pending = xdg.path().join("task-journal").join("pending");
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Queue host"])
+        .assert()
+        .success();
+    let queued = write_pending_entry(
+        &pending,
+        &format!("{from_hash}.01JD0000000000000000000000.json"),
+        Some(&from_hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use store-moved for the cache",
+    );
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join(format!("{from_hash}.recall-shown")), "s1 e1\n").unwrap();
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    assert!(!queued.exists(), "entry left under the old hash");
+    assert_eq!(
+        std::fs::read_to_string(state.join(format!("{to_hash}.recall-shown"))).unwrap(),
+        "s1 e1\n"
+    );
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+    let journal = project_events(xdg.path(), &to_hash);
+    assert!(journal.contains("store-moved"), "{journal}");
+}
+
 #[test]
 fn close_unknown_task_id_returns_error() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -660,6 +1340,93 @@ fn search_all_projects_finds_match_in_other_project_hash() {
         .assert()
         .success()
         .stdout(contains("aaaa1111").and(contains("bbbb2222")));
+}
+
+#[test]
+fn all_projects_search_and_rejected_warn_about_unreadable_projects() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let good = "aaaa1111aaaa1111";
+    let conn = tj_core::db::open(state.join(format!("{good}.sqlite"))).unwrap();
+    let mut e = tj_core::event::Event::new(
+        "tj-good1".to_string(),
+        tj_core::event::EventType::Open,
+        tj_core::event::Author::User,
+        tj_core::event::Source::Cli,
+        "Marker in a healthy project".to_string(),
+    );
+    e.meta = serde_json::json!({"title": "Healthy"});
+    tj_core::db::upsert_task_from_event(&conn, &e, good).unwrap();
+    tj_core::db::index_event(&conn, &e).unwrap();
+    drop(conn);
+    std::fs::write(state.join("cccc3333cccc3333.sqlite"), b"not a database").unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stdout(contains(good))
+        .stderr(contains("warning: skipping project cccc3333cccc3333"));
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["rejected", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stderr(contains("warning: skipping project cccc3333cccc3333"));
+}
+
+#[test]
+fn rejected_warns_about_a_row_it_cannot_read_and_keeps_the_rest() {
+    use tj_core::event::{Author, Event, EventType, Source};
+    let dir = assert_fs::TempDir::new().unwrap();
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let hash = "aaaa1111aaaa1111";
+    let conn = tj_core::db::open(state.join(format!("{hash}.sqlite"))).unwrap();
+
+    for task_id in ["tj-good1", "tj-bad1"] {
+        let mut open = Event::new(
+            task_id,
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "t".into(),
+        );
+        open.meta = serde_json::json!({"title": task_id});
+        let rejection = Event::new(
+            task_id,
+            EventType::Rejection,
+            Author::User,
+            Source::Cli,
+            format!("Marker rejected in {task_id}"),
+        );
+        for e in [&open, &rejection] {
+            tj_core::db::upsert_task_from_event(&conn, e, hash).unwrap();
+            tj_core::db::index_event(&conn, e).unwrap();
+        }
+    }
+    // A BLOB title cannot be read as text, so this task's row fails to map.
+    conn.execute(
+        "UPDATE tasks SET title = x'00' WHERE task_id = 'tj-bad1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["rejected", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stdout(contains("tj-good1"))
+        .stderr(contains("warning:").and(contains(hash)));
 }
 
 #[test]
@@ -1109,6 +1876,17 @@ fn post_model_switch_records_a_constraint_on_the_active_task() {
         .stdout(contains(
             "Model switched (auto): claude-opus-5 → claude-haiku-4-5",
         ));
+
+    // Marked so readers of the journal can tell it from a real constraint.
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    let journal = project_events(dir.path(), &hash);
+    let switch: serde_json::Value = journal
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["type"] == "constraint")
+        .expect("model switch recorded");
+    assert_eq!(switch["meta"]["kind"], "model_switch", "{switch}");
+    assert_eq!(switch["meta"]["session_id"], "s-switch", "{switch}");
 }
 
 /// No open task → a model switch is not a reason to start one.
@@ -1489,6 +2267,253 @@ fn ingest_hook_drains_pending_queue_via_mock() {
     );
 }
 
+/// A legacy entry is a classifier failure waiting for `pending retry`; a
+/// live hook must not throw it away.
+#[test]
+fn ingest_hook_keeps_legacy_pending_entries_for_pending_retry() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "01failed", "We decided to adopt PKCE flow.", 1);
+
+    for kind in ["UserPromptSubmit", "PostToolUse"] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+            .current_dir(proj.path())
+            .args(["ingest-hook", "--kind", kind, "--text", "next chunk"])
+            .assert()
+            .success();
+    }
+
+    let entry = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("01failed.json");
+    assert!(
+        entry.exists(),
+        "the failed chunk must wait for pending retry"
+    );
+}
+
+/// The mock drain only removes an entry it turned into an event.
+#[test]
+fn ingest_hook_mock_drain_keeps_entries_it_cannot_record() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "01empty", "", 0);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "ingest-hook",
+            "--kind",
+            "Stop",
+            "--text",
+            "Live chunk",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            "tj-mock",
+        ])
+        .assert()
+        .success();
+
+    let entry = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("01empty.json");
+    assert!(
+        entry.exists(),
+        "an entry that wrote no event must stay queued"
+    );
+}
+
+/// Run one `ingest-hook` payload of `kind` with `TJ_MOD_ACTIVE` set to
+/// `mod_value` (None = unset), in a fresh project with an open task and a
+/// transcript. True when the hook left any trace: stdout, a pending entry,
+/// or a new journal line.
+fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Mod host"])
+        .assert()
+        .success();
+    let transcript = proj.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","uuid":"u1","timestamp":"2099-01-01T00:00:00.000Z","sessionId":"s1","message":{"content":"the refund flow needs idempotency keys"}}"#,
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": kind,
+        "session_id": "s1",
+        "transcript_path": transcript.to_str().unwrap(),
+        "reason": "clear",
+        "prompt": "We decided to adopt the PKCE flow.",
+        "tool_name": "Bash",
+        "tool_input": { "command": "cargo test" },
+        "tool_response": { "output": "ok" },
+        "from_model": "claude-opus",
+        "to_model": "claude-sonnet",
+    });
+    let journal = xdg.path().join("task-journal").join("events");
+    let journal_len = || -> u64 {
+        std::fs::read_dir(&journal)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let before = journal_len();
+
+    let mut cmd = Command::cargo_bin("task-journal").unwrap();
+    cmd.env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(proj.path());
+    if let Some(v) = mod_value {
+        cmd.env("TJ_MOD_ACTIVE", v);
+    }
+    let out = cmd
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let pending = std::fs::read_dir(xdg.path().join("task-journal").join("pending"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    !out.is_empty() || pending > 0 || journal_len() != before
+}
+
+/// The Claude Code mod captures in-process and sets TJ_MOD_ACTIVE for the
+/// hooks it starts; the classic capture must then stand down. (Nothing here
+/// echoes a prior entry, so push-recall stays quiet too.)
+#[test]
+fn mod_active_silences_the_classic_capture_hooks() {
+    for kind in [
+        "UserPromptSubmit",
+        "PostToolUse",
+        "Stop",
+        "PreCompact",
+        "SessionEnd",
+    ] {
+        assert!(!hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
+        assert!(hook_leaves_a_trace(kind, Some("0")), "{kind}, mod \"0\"");
+        assert!(hook_leaves_a_trace(kind, None), "{kind}, mod unset");
+    }
+}
+
+/// Resume packs and the model-switch constraint are not the mod's job.
+#[test]
+fn mod_active_keeps_session_start_and_model_switch() {
+    for kind in ["SessionStart", "PostModelSwitch"] {
+        assert!(hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
+    }
+}
+
+/// The mod takes over capture, not push-recall: a tool call that echoes a
+/// prior rejection still gets the recall on both paths, and nothing is queued.
+#[test]
+fn mod_active_keeps_push_recall() {
+    let (dir, _task_id) = seed_axum_rejection();
+
+    for tool in ["Bash", "mcp__x__do"] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": "let's switch the server to axum" },
+            "tool_response": { "output": "" }
+        });
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+            .env("TJ_MOD_ACTIVE", "1")
+            .args(["ingest-hook", "--backend", "heuristic"])
+            .write_stdin(payload.to_string())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("previously rejected"), "{tool}: {out}");
+    }
+
+    let pending = std::fs::read_dir(dir.path().join("task-journal").join("pending"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(pending, 0, "the mod queues tool calls itself");
+}
+
+/// `/rewind` is the user rolling back a path — the mod doesn't record that,
+/// so the correction event still lands.
+#[test]
+fn mod_active_keeps_the_rewind_correction() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Rewind host"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .env("TJ_MOD_ACTIVE", "1")
+        .current_dir(proj.path())
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "/rewind go back to plan A",
+            })
+            .to_string(),
+        )
+        .assert()
+        .success();
+
+    let journal = project_events(xdg.path(), &hash);
+    assert_eq!(session_ids_of(&journal, "correction").len(), 1, "{journal}");
+}
+
+#[test]
+fn mod_active_silences_the_nudge() {
+    for (mod_value, silent) in [(Some("1"), true), (Some("0"), false), (None, false)] {
+        let xdg = assert_fs::TempDir::new().unwrap();
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", xdg.path());
+        if let Some(v) = mod_value {
+            cmd.env("TJ_MOD_ACTIVE", v);
+        }
+        let out = cmd
+            .arg("nudge")
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(out.is_empty(), silent, "TJ_MOD_ACTIVE={mod_value:?}");
+    }
+}
+
 #[test]
 fn stats_command_shows_classifier_counts() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -1645,8 +2670,8 @@ fn ingest_hook_session_start_emits_resume_pack_json() {
 
 #[test]
 fn session_start_emits_neither_session_title_nor_initial_message() {
-    // 0.14.3: the SessionStart envelope carries ONLY additionalContext
-    // (+ optional watchPaths). It must never set sessionTitle (which
+    // 0.14.3: the SessionStart envelope carries ONLY additionalContext.
+    // It must never set sessionTitle (which
     // overrode Claude Code's own session name with our task id) nor
     // initialUserMessage (which seeded garbage "[Task Journal resumed: …]"
     // task titles).
@@ -1805,6 +2830,70 @@ fn close_with_outcome_renders_outcome_block() {
 }
 
 #[test]
+fn close_records_the_outcome_only_through_the_close_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let out = tj()
+        .args(["create", "Close me", "--goal", "g"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+    let close = |outcome: &str| {
+        let mut cmd = tj();
+        cmd.args([
+            "close",
+            &task_id,
+            "--outcome",
+            outcome,
+            "--outcome-tag",
+            "done",
+        ]);
+        cmd
+    };
+
+    // The close append fails: the journal is read-only.
+    let journal = std::fs::read_dir(dir.path().join("task-journal").join("events"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let writable = std::fs::metadata(&journal).unwrap().permissions();
+    let mut read_only = writable.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(&journal, read_only).unwrap();
+    close("must not stick").assert().failure();
+    std::fs::set_permissions(&journal, writable).unwrap();
+
+    let state = std::fs::read_dir(dir.path().join("task-journal").join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "sqlite"))
+        .unwrap();
+    let conn = tj_core::db::open(&state).unwrap();
+    let meta = tj_core::db::task_metadata(&conn, &task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.outcome, None, "failed close left an outcome behind");
+    drop(conn);
+
+    // A real close keeps its outcome through a rebuild from the journal.
+    close("shipped").assert().success();
+    std::fs::remove_dir_all(dir.path().join("task-journal").join("state")).unwrap();
+    tj().args(["pack", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("**Outcome** [done]: shipped"));
+}
+
+#[test]
 fn close_rejects_invalid_outcome_tag() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
@@ -1906,6 +2995,56 @@ fn external_add_appends_references() {
 }
 
 #[test]
+fn goal_and_external_survive_deleting_the_state_db() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let wipe_state = || {
+        let _ = std::fs::remove_dir_all(dir.path().join("task-journal").join("state"));
+    };
+    let out = tj()
+        .args(["create", "Rebuildable", "--goal", "first goal"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+
+    wipe_state();
+    tj().args(["pack", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: first goal"));
+
+    tj().args(["goal", &task_id, "second goal"])
+        .assert()
+        .success();
+    tj().args(["external", &task_id, "--add", "beads:rb-1"])
+        .assert()
+        .success();
+    wipe_state();
+
+    tj().args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: second goal"))
+        .stdout(contains("**External**: beads:rb-1"))
+        .stdout(contains("amend").not());
+    tj().args(["pack", "--external", "beads:rb-1"])
+        .assert()
+        .success()
+        .stdout(contains("Rebuildable"));
+    tj().args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("goal: second goal"));
+}
+
+#[test]
 fn ingest_hook_short_circuits_when_in_classifier_env_set() {
     // Recursion guard: classifier sets TJ_IN_CLASSIFIER=1 before
     // spawning claude. The nested claude re-fires our hooks; without
@@ -1964,6 +3103,22 @@ fn ingest_hook_short_circuits_when_in_classifier_env_set() {
         !body.contains("should not be ingested"),
         "TJ_IN_CLASSIFIER must short-circuit before any write: {body}"
     );
+}
+
+#[test]
+fn nudge_is_silent_inside_a_classifier_child() {
+    // A `claude -p` / `codex exec` spawned by the classifier re-runs the
+    // user's UserPromptSubmit hooks; the nudge must not inject into it.
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_IN_CLASSIFIER", "1")
+        .args(["nudge"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("");
 }
 
 #[test]
@@ -2222,6 +3377,54 @@ fn events_list_shows_recent_events() {
         .assert()
         .success()
         .stdout(contains("First task").and(contains("Second task")));
+}
+
+#[test]
+fn events_list_skips_malformed_jsonl_lines_with_a_warning() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Listed despite a bad line"])
+        .assert()
+        .success();
+    append_jsonl_line(xdg.path(), "{not json");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Listed despite a bad line"))
+        .stderr(contains("skipping malformed JSONL line 2"));
+}
+
+#[test]
+fn events_list_prints_snake_case_event_types() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Typed listing"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("[open]").and(contains("[Open]").not()));
 }
 
 #[test]
@@ -2539,6 +3742,17 @@ fn auto_open_links_to_prior_task_referencing_same_issue() {
         // current status annotated next to the id.
         .stdout(contains("**Linked**:"))
         .stdout(contains(format!("- {} [closed]", prior)));
+
+    // Goal and link ride in the journal: a state rebuilt from it keeps both.
+    std::fs::remove_dir_all(dir.path().join("task-journal").join("state")).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &new_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: (not set)").not())
+        .stdout(contains(format!("- {} [closed]", prior)));
 }
 
 #[test]
@@ -2728,7 +3942,14 @@ fn ingest_hook_returns_fast_in_async_mode() {
     let entries: Vec<_> = std::fs::read_dir(&pending)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        // A worker that already claimed the entry renamed it to `.processing`:
+        // still queued, just being classified.
+        .filter(|e| {
+            matches!(
+                e.path().extension().and_then(|s| s.to_str()),
+                Some("json" | "processing")
+            )
+        })
         .collect();
     // Worker may have already drained; in that case at least the
     // worker should have left a v1 pending entry from /bin/false
@@ -2784,28 +4005,11 @@ fn classify_worker_handles_classifier_failure_cleanly() {
         .args(["classify-worker", "--backend", "hybrid"])
         .assert()
         .success();
-
-    // Lockfile must not be left behind.
-    let state = dir.path().join("task-journal").join("state");
-    if state.exists() {
-        for e in std::fs::read_dir(&state).unwrap() {
-            let p = e.unwrap().path();
-            assert!(
-                !p.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .ends_with(".lock"),
-                "lockfile must be removed after worker exits, found: {p:?}"
-            );
-        }
-    }
 }
 
-/// Lockfile prevents concurrent workers in the same project. We can't
-/// easily race two real spawns deterministically in a unit test, so
-/// instead simulate a held lock by writing a lockfile with our own
-/// (live) PID, then run classify-worker and assert it exits cleanly
-/// without draining the queue.
+/// One worker per project, enforced by an OS lock on the lock file, not by
+/// what the file says: while another process holds the lock, a worker
+/// leaves the queue alone — even when the file names a dead pid.
 #[test]
 fn classify_worker_respects_existing_lock() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -2837,13 +4041,19 @@ fn classify_worker_respects_existing_lock() {
     )
     .unwrap();
 
-    // Hand-roll a lockfile with this process's (live) PID. The
-    // worker should see the live PID and bail without touching the
-    // pending entry.
+    // Hold the lock from this process, over a file naming a dead pid.
     let state = dir.path().join("task-journal").join("state");
     std::fs::create_dir_all(&state).unwrap();
     let lock_path = state.join(format!("classifier-{project_hash}.lock"));
-    std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+    std::fs::write(&lock_path, format!("{}\n", i32::MAX)).unwrap();
+    let mut lock = fd_lock::RwLock::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap(),
+    );
+    let _held = lock.try_write().unwrap();
 
     Command::cargo_bin("task-journal")
         .unwrap()
@@ -2864,6 +4074,512 @@ fn classify_worker_respects_existing_lock() {
         lock_path.exists(),
         "lockfile must survive — bailing worker must not delete others' locks"
     );
+}
+
+/// A lock file nobody holds is a finished or crashed worker's leftover —
+/// whatever it says (empty, or a pid that is alive again under another
+/// program) the next worker takes over: the OS released the lock with the
+/// process.
+#[test]
+fn classify_worker_takes_over_a_leftover_lock_file() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let project_hash = tj_core::project_hash::from_path(&cwd).expect("compute project hash");
+
+    let pending = dir.path().join("task-journal").join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let events_path = dir
+        .path()
+        .join("task-journal")
+        .join("events")
+        .join(format!("{project_hash}.jsonl"));
+    std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let lock_path = state.join(format!("classifier-{project_hash}.lock"));
+
+    for leftover in [String::new(), format!("{}\n", std::process::id())] {
+        let entry = pending.join("01leftoverlock.json");
+        std::fs::write(
+            &entry,
+            serde_json::json!({
+                "schema": "v2",
+                "kind": "PostToolUse",
+                "text": "leftover lock marker",
+                "project_hash": project_hash,
+                "events_path": events_path.to_string_lossy(),
+                "backend": "heuristic",
+                "queued_at": "2026-05-08T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(&lock_path, &leftover).unwrap();
+
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["classify-worker", "--backend", "heuristic"])
+            .assert()
+            .success();
+
+        assert!(!entry.exists(), "lock file {leftover:?} is taken over");
+    }
+}
+
+/// Workers started at once on one queue — over a crashed worker's leftover
+/// lock — record each entry exactly once: no duplicate classifier calls, no
+/// duplicate events.
+#[test]
+fn classify_workers_started_together_record_each_entry_once() {
+    const ENTRIES: usize = 12;
+    const WORKERS: usize = 8;
+
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Worker race host"])
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    for i in 0..ENTRIES {
+        write_pending_entry(
+            &pending,
+            &format!("{hash}.01JB{i:022}.json"),
+            Some(&hash),
+            true,
+            "UserPromptSubmit",
+            &format!("We decided to use store-{i:02} for the cache"),
+        );
+    }
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join(format!("classifier-{hash}.lock")),
+        format!("{}\n", i32::MAX),
+    )
+    .unwrap();
+
+    let start = std::sync::Barrier::new(WORKERS);
+    std::thread::scope(|s| {
+        for _ in 0..WORKERS {
+            s.spawn(|| {
+                let mut cmd = Command::cargo_bin("task-journal").unwrap();
+                cmd.env("XDG_DATA_HOME", dir.path())
+                    .current_dir(&workdir)
+                    .args(["classify-worker", "--backend", "heuristic"]);
+                start.wait();
+                cmd.assert().success();
+            });
+        }
+    });
+
+    // The race can leave an entry to the next worker, never record it twice.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    let journal = project_events(dir.path(), &hash);
+    for i in 0..ENTRIES {
+        let marker = format!("store-{i:02}");
+        let n = journal.lines().filter(|l| l.contains(&marker)).count();
+        assert_eq!(n, 1, "{marker} recorded {n} times:\n{journal}");
+    }
+}
+
+/// A worker claims an entry (`<name>.processing`) before classifying it. A
+/// failed entry goes back under its own name; one a crashed worker left
+/// claimed is put back in the queue by the next worker and recorded.
+#[test]
+fn classify_worker_requeues_failed_and_orphaned_claims() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Claim host"])
+        .assert()
+        .success();
+    let pending = dir.path().join("task-journal").join("pending");
+    let worker = |backend: &str| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["classify-worker", "--backend", backend])
+            .assert()
+            .success();
+    };
+
+    let queued = write_pending_entry(
+        &pending,
+        &format!("{hash}.01JC0000000000000000000000.json"),
+        Some(&hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use store-failed for the cache",
+    );
+    worker("no-such-backend");
+    assert!(queued.exists(), "a failed entry is back under its own name");
+
+    let orphan = write_pending_entry(
+        &pending,
+        &format!("{hash}.01JC0000000000000000000001.json.processing"),
+        Some(&hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use store-orphan for the cache",
+    );
+    worker("heuristic");
+
+    assert!(!queued.exists() && !orphan.exists());
+    let journal = project_events(dir.path(), &hash);
+    for marker in ["store-failed", "store-orphan"] {
+        let n = journal.lines().filter(|l| l.contains(marker)).count();
+        assert_eq!(n, 1, "{marker} recorded {n} times:\n{journal}");
+    }
+}
+
+// ---------------- pending/ is global: every consumer is project-scoped ----------------
+
+/// Write a pending entry. `project_hash: None` leaves the field out (an
+/// entry from before the queue knew about projects).
+fn write_pending_entry(
+    pending: &std::path::Path,
+    file_name: &str,
+    project_hash: Option<&str>,
+    schema_v2: bool,
+    kind: &str,
+    text: &str,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(pending).unwrap();
+    let mut body = serde_json::json!({
+        "kind": kind,
+        "text": text,
+        "backend": "heuristic",
+        "queued_at": "2026-05-08T00:00:00Z",
+    });
+    if schema_v2 {
+        body["schema"] = serde_json::json!("v2");
+    }
+    if let Some(h) = project_hash {
+        body["project_hash"] = serde_json::json!(h);
+        body["events_path"] = serde_json::json!(format!("/nowhere/{h}.jsonl"));
+    }
+    let path = pending.join(file_name);
+    std::fs::write(&path, body.to_string()).unwrap();
+    path
+}
+
+fn project_events(xdg: &std::path::Path, project_hash: &str) -> String {
+    std::fs::read_to_string(
+        xdg.join("task-journal")
+            .join("events")
+            .join(format!("{project_hash}.jsonl")),
+    )
+    .unwrap_or_default()
+}
+
+const OTHER_PROJECT: &str = "0123456789abcdef";
+
+#[test]
+fn classify_worker_only_processes_its_own_projects_entries() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+    let pending = dir.path().join("task-journal").join("pending");
+
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        true,
+        "UserPromptSubmit",
+        "We decided to use sqlite for the project A store",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        true,
+        "UserPromptSubmit",
+        "We decided to use postgres for the project B store",
+    );
+    let legacy_foreign = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000002.json",
+        Some(OTHER_PROJECT),
+        true,
+        "UserPromptSubmit",
+        "We decided to use mongodb for the project B cache",
+    );
+    let legacy_no_project = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000003.json",
+        None,
+        true,
+        "UserPromptSubmit",
+        "We decided to use redis for the unknown project cache",
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    assert!(!own.exists(), "the project's own entry is processed");
+    assert!(
+        foreign.exists(),
+        "another project's entry must be left alone"
+    );
+    assert!(
+        legacy_foreign.exists(),
+        "a legacy entry of another project too"
+    );
+    assert!(
+        legacy_no_project.exists(),
+        "a legacy entry without project_hash is left for `pending retry`"
+    );
+    let journal = project_events(dir.path(), &hash_a);
+    assert!(journal.contains("sqlite"), "own entry recorded: {journal}");
+    for other in ["postgres", "mongodb", "redis"] {
+        assert!(
+            !journal.contains(other),
+            "{other} belongs to another project: {journal}"
+        );
+    }
+}
+
+#[test]
+fn statusline_counts_only_this_projects_pending_entries() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Statusline scope"])
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    for i in 0..2 {
+        write_pending_entry(
+            &pending,
+            &format!("{hash_a}.01JA000000000000000000000{i}.json"),
+            Some(&hash_a),
+            true,
+            "PostToolUse",
+            "own",
+        );
+    }
+    for i in 0..3 {
+        write_pending_entry(
+            &pending,
+            &format!("{OTHER_PROJECT}.01JA000000000000000000000{i}.json"),
+            Some(OTHER_PROJECT),
+            true,
+            "PostToolUse",
+            "foreign",
+        );
+    }
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["statusline"])
+        .assert()
+        .success()
+        .stdout(contains("pending: 2"));
+}
+
+#[test]
+fn pending_list_retry_and_hook_drain_skip_other_projects() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Project A"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        false,
+        "Stop",
+        "own legacy-v1 chunk alpha",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        false,
+        "Stop",
+        "foreign chunk bravo",
+    );
+    let legacy_foreign = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000002.json",
+        Some(OTHER_PROJECT),
+        false,
+        "Stop",
+        "foreign legacy chunk charlie",
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["pending", "list"])
+        .assert()
+        .success()
+        .stdout(contains("alpha"))
+        .stdout(contains("bravo").not())
+        .stdout(contains("charlie").not());
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "pending",
+            "retry",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+    assert!(!own.exists(), "own entry drained");
+
+    // The hook's mock drain is project-scoped too.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "ingest-hook",
+            "--kind",
+            "Stop",
+            "--text",
+            "Live chunk",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        foreign.exists(),
+        "another project's entry must be left alone"
+    );
+    assert!(
+        legacy_foreign.exists(),
+        "a legacy entry of another project too"
+    );
+    let journal = project_events(dir.path(), &hash_a);
+    assert!(journal.contains("alpha"), "own entry recorded: {journal}");
+    assert!(
+        !journal.contains("bravo") && !journal.contains("charlie"),
+        "foreign chunks leaked into project A: {journal}"
+    );
+}
+
+#[test]
+fn pending_gc_is_project_scoped_unless_all() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+    let pending = dir.path().join("task-journal").join("pending");
+
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        true,
+        "PostToolUse",
+        "own",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        true,
+        "PostToolUse",
+        "foreign",
+    );
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    for p in [&own, &foreign] {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    let gc = |extra: &[&str]| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["pending-gc", "--days", "1"])
+            .args(extra)
+            .assert()
+            .success();
+    };
+
+    gc(&[]);
+    assert!(!own.exists(), "own stale entry collected");
+    assert!(
+        foreign.exists(),
+        "another project's entry is not ours to collect"
+    );
+
+    gc(&["--all"]);
+    assert!(!foreign.exists(), "--all collects every project");
 }
 
 // =====================================================================
@@ -2977,6 +4693,7 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
                         .unwrap_or("")
                         .contains("Conversation compacted at")
                 {
+                    assert_eq!(v["meta"]["kind"], "compaction_marker", "{v}");
                     marker_lines += 1;
                 }
             }
@@ -3000,6 +4717,10 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
                 .not()
                 .and(contains("single reasoning unit").not()),
         );
+
+    // It is bookkeeping, not a change the PR made.
+    let pr = tj_stdout(dir.path(), &workdir, &["export-pr", &task_id]);
+    assert!(!pr.contains("Conversation compacted at"), "{pr}");
 }
 
 #[test]
@@ -3308,6 +5029,92 @@ fn rewind_prompt_appends_correction_event() {
         .stdout(contains("[correction]").and(contains("/rewind")));
 }
 
+/// `meta.session_id` of the journal's events of `etype`.
+fn session_ids_of(journal: &str, etype: &str) -> Vec<Option<String>> {
+    journal
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["type"] == etype)
+        .map(|e| e["meta"]["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn hook_written_events_carry_the_session_id() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    let hook = |prompt: &str| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_INGEST_SYNC", "1")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .current_dir(&workdir)
+            .args(["ingest-hook", "--backend", "heuristic"])
+            .write_stdin(
+                serde_json::json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "sess-hook",
+                    "prompt": prompt,
+                })
+                .to_string(),
+            )
+            .assert()
+            .success();
+    };
+
+    // No open task: the prompt auto-opens one and is classified inline.
+    hook("We decided to use postgres for the journal store going forward");
+    hook("/rewind go back to plan A");
+
+    let journal = project_events(dir.path(), &hash);
+    let want = vec![Some("sess-hook".to_string())];
+    assert_eq!(session_ids_of(&journal, "open"), want, "auto-open event");
+    assert_eq!(
+        session_ids_of(&journal, "decision"),
+        want,
+        "sync-classified"
+    );
+    assert_eq!(session_ids_of(&journal, "correction"), want, "/rewind");
+}
+
+#[test]
+fn worker_auto_open_carries_the_chunk_session_id() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let entry = write_pending_entry(
+        &pending,
+        &format!("{hash}.01JA0000000000000000000000.json"),
+        Some(&hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use postgres for the journal store going forward",
+    );
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&entry).unwrap()).unwrap();
+    v["session_id"] = serde_json::json!("sess-chunk");
+    std::fs::write(&entry, v.to_string()).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    let journal = project_events(dir.path(), &hash);
+    let want = vec![Some("sess-chunk".to_string())];
+    assert_eq!(session_ids_of(&journal, "open"), want, "auto-open event");
+    assert_eq!(session_ids_of(&journal, "decision"), want, "classified");
+}
+
 #[test]
 fn install_hooks_wires_precompact_event() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -3530,6 +5337,123 @@ fn export_pr_omits_optional_sections_when_no_data() {
         );
 }
 
+/// Run `task-journal <args>` in `workdir` under `xdg` and return trimmed stdout.
+fn tj_stdout(xdg: &std::path::Path, workdir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .current_dir(workdir)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap().trim().to_string()
+}
+
+#[test]
+fn export_pr_leaves_out_corrected_events() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let xdg = dir.path();
+
+    let task = tj_stdout(xdg, &workdir, &["create", "Corrected PR", "--goal", "g"]);
+    for (ty, text) in [
+        ("decision", "Wrong decision: use Mongo"),
+        ("rejection", "Wrong rejection: SQLite too slow"),
+        ("evidence", "Wrong evidence: bench 5ms"),
+    ] {
+        let id = tj_stdout(
+            xdg,
+            &workdir,
+            &["event", &task, "--type", ty, "--text", text],
+        );
+        tj_stdout(
+            xdg,
+            &workdir,
+            &[
+                "event-correct",
+                "--corrects",
+                &id,
+                "--task",
+                &task,
+                "--text",
+                "That was a mistake",
+            ],
+        );
+    }
+    tj_stdout(
+        xdg,
+        &workdir,
+        &["event", &task, "--type", "decision", "--text", "Use SQLite"],
+    );
+
+    let pr = tj_stdout(xdg, &workdir, &["export-pr", &task]);
+    assert!(!pr.contains("Wrong "), "{pr}");
+    assert!(pr.contains("- Use SQLite"), "{pr}");
+}
+
+#[test]
+fn export_pr_lists_the_same_decisions_and_rejections_as_the_pack() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let xdg = dir.path();
+
+    let task = tj_stdout(xdg, &workdir, &["create", "Same selection", "--goal", "g"]);
+    let event = |ty: &str, text: &str| {
+        tj_stdout(
+            xdg,
+            &workdir,
+            &["event", &task, "--type", ty, "--text", text],
+        )
+    };
+    let ts = event("decision", "Adopt TypeScript");
+    tj_stdout(
+        xdg,
+        &workdir,
+        &[
+            "event",
+            &task,
+            "--type",
+            "supersede",
+            "--text",
+            "TS replaced",
+            "--supersedes",
+            &ts,
+        ],
+    );
+    event("decision", "Adopt Rust");
+    event("decision", "Adopt Rust");
+    // Classifier guesses, not yet confirmed.
+    for (ty, text) in [
+        (tj_core::event::EventType::Decision, "Maybe cache packs"),
+        (tj_core::event::EventType::Rejection, "Maybe drop Postgres"),
+    ] {
+        let mut e = tj_core::event::Event::new(
+            task.clone(),
+            ty,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text.to_string(),
+        );
+        e.status = tj_core::event::EventStatus::Suggested;
+        append_jsonl_line(xdg, &serde_json::to_string(&e).unwrap());
+    }
+
+    let pr = tj_stdout(xdg, &workdir, &["export-pr", &task]);
+    let changes = pr.split("## ").find(|s| s.starts_with("Changes")).unwrap();
+    assert!(!changes.contains("Adopt TypeScript"), "{pr}");
+    assert_eq!(changes.matches("Adopt Rust").count(), 1, "{pr}");
+    assert!(
+        changes.contains("- Maybe cache packs _(unconfirmed)_\n"),
+        "{pr}"
+    );
+    assert!(pr.contains("- Maybe drop Postgres _(unconfirmed)_"), "{pr}");
+}
+
 #[test]
 fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -3555,12 +5479,9 @@ fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
         .stderr(contains("task not found: tj-zzzz"));
 }
 
-// v0.10.0: asyncRewake backlog signal. PostToolUse hook configured with
-// asyncRewake:true in hooks.json sets TJ_ASYNC_REWAKE=1; when pending/
-// has more than PENDING_OVERFLOW_THRESHOLD (25) entries already queued,
-// ingest-hook exits 2 with a wake-message on stdout. Sync hooks (or
-// CLI invocations without the env var) must NEVER exit 2 — that would
-// block the operation in Claude Code's hook contract.
+// The PostToolUse hook used to exit 2 on a large pending backlog to wake the
+// model (TJ_ASYNC_REWAKE). Nothing installs that env var, so the signal was
+// dead code; a backlog must never turn the hook into a non-zero exit.
 fn seed_pending_chunks(pending_dir: &std::path::Path, count: usize) {
     std::fs::create_dir_all(pending_dir).unwrap();
     for i in 0..count {
@@ -3592,82 +5513,19 @@ fn posttooluse_payload() -> String {
 }
 
 #[test]
-fn session_start_emits_watch_paths_for_existing_marker_files() {
-    // v0.10.2 X4: SessionStart envelope must include `watchPaths` with
-    // existing marker files (CLAUDE.md, README.md, .docs/plans). Files
-    // that don't exist are skipped — Claude Code's watcher logs an
-    // error and gives up on missing paths, so we don't emit them.
+fn session_start_does_not_emit_watch_paths() {
+    // install-hooks never registers FileChanged, so asking Claude Code to
+    // watch marker files only made it watch them for nothing.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(workdir.join(".docs").join("plans")).unwrap();
-    std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
-    // README.md intentionally absent — must NOT appear in watchPaths.
-
-    let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .current_dir(&workdir)
-            .args(["create", "Watch paths test"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-    let _ = task_id;
-
-    let body = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .current_dir(&workdir)
-            .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap();
-    let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
-    let watches = v["hookSpecificOutput"]["watchPaths"]
-        .as_array()
-        .expect("watchPaths must be present when at least one marker exists");
-    let joined: String = watches
-        .iter()
-        .filter_map(|x| x.as_str())
-        .collect::<Vec<_>>()
-        .join("|");
-    assert!(
-        joined.contains("CLAUDE.md"),
-        "CLAUDE.md must be watched: {joined}"
-    );
-    assert!(
-        joined.contains("plans"),
-        ".docs/plans must be watched: {joined}"
-    );
-    assert!(
-        !joined.contains("README.md"),
-        "README.md does not exist, must NOT be watched: {joined}"
-    );
-}
-
-#[test]
-fn session_start_omits_watch_paths_when_disabled_via_env() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    let workdir = dir.path().join("proj");
-    std::fs::create_dir_all(&workdir).unwrap();
     std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
 
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Watch paths env-disabled"])
+        .args(["create", "Watch paths test"])
         .assert()
         .success();
 
@@ -3675,7 +5533,6 @@ fn session_start_omits_watch_paths_when_disabled_via_env() {
         Command::cargo_bin("task-journal")
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
-            .env("TJ_WATCH_PATHS", "0")
             .current_dir(&workdir)
             .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
             .assert()
@@ -3688,19 +5545,18 @@ fn session_start_omits_watch_paths_when_disabled_via_env() {
     let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
     assert!(
         v["hookSpecificOutput"]["watchPaths"].is_null(),
-        "TJ_WATCH_PATHS=0 must suppress watchPaths emission"
+        "SessionStart must not emit watchPaths: {body}"
     );
     assert!(
         v["hookSpecificOutput"]["additionalContext"].is_string(),
-        "additionalContext still emitted independently of watchPaths"
+        "resume context is still emitted: {body}"
     );
 }
 
 #[test]
-fn file_changed_hook_appends_evidence_to_active_task() {
-    // v0.10.2 X4: FileChanged hook handler should append an evidence
-    // event to the most-recent open task with the changed path
-    // (trimmed project-relative) and the change kind.
+fn file_changed_payload_is_ignored() {
+    // No FileChanged handler any more: the payload carries no text, so the
+    // hook writes nothing even with an open task.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3710,7 +5566,7 @@ fn file_changed_hook_appends_evidence_to_active_task() {
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .current_dir(&workdir)
-            .args(["create", "FileChanged evidence test"])
+            .args(["create", "Watched file ignored"])
             .assert()
             .success()
             .get_output()
@@ -3723,7 +5579,6 @@ fn file_changed_hook_appends_evidence_to_active_task() {
 
     let touched = workdir.join("CLAUDE.md");
     std::fs::write(&touched, "# rules v2").unwrap();
-
     let stdin_payload = serde_json::json!({
         "hook_event_name": "FileChanged",
         "file_path": touched.to_str().unwrap(),
@@ -3734,8 +5589,9 @@ fn file_changed_hook_appends_evidence_to_active_task() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
+        .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(stdin_payload)
         .assert()
         .success();
@@ -3747,8 +5603,7 @@ fn file_changed_hook_appends_evidence_to_active_task() {
         .args(["pack", &task_id, "--mode", "full"])
         .assert()
         .success()
-        .stdout(contains("FileChanged (change)"))
-        .stdout(contains("CLAUDE.md"));
+        .stdout(contains("FileChanged").not());
 }
 
 #[test]
@@ -3788,7 +5643,7 @@ fn file_changed_hook_with_no_open_task_is_no_op() {
 }
 
 #[test]
-fn asyncrewake_below_threshold_exits_zero() {
+fn post_tool_use_backlog_never_exits_two() {
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3797,41 +5652,11 @@ fn asyncrewake_below_threshold_exits_zero() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Async wake test below threshold"])
+        .args(["create", "Backlog test"])
         .assert()
         .success();
 
-    // Seed 5 entries — well under the 25 threshold.
-    let pending = dir.path().join("task-journal").join("pending");
-    seed_pending_chunks(&pending, 5);
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .env("TJ_ASYNC_REWAKE", "1")
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
-        .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
-        .write_stdin(posttooluse_payload())
-        .assert()
-        .success(); // exit 0, no wake
-}
-
-#[test]
-fn asyncrewake_overflow_exits_two_with_drain_hint() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    let workdir = dir.path().join("proj");
-    std::fs::create_dir_all(&workdir).unwrap();
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .current_dir(&workdir)
-        .args(["create", "Async wake overflow test"])
-        .assert()
-        .success();
-
-    // Seed 30 entries — over the 25 threshold.
+    // Seed 30 entries — over the old 25-entry wake threshold.
     let pending = dir.path().join("task-journal").join("pending");
     seed_pending_chunks(&pending, 30);
 
@@ -3841,21 +5666,56 @@ fn asyncrewake_overflow_exits_two_with_drain_hint() {
         .env("TJ_ASYNC_REWAKE", "1")
         .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
+        .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(posttooluse_payload())
         .assert()
-        .failure()
-        .code(2)
-        .stdout(contains("Task Journal pending queue"))
-        .stdout(contains("pending-gc"));
+        .success()
+        .stdout(contains("pending queue").not());
 }
 
 #[test]
-fn asyncrewake_overflow_without_env_does_not_exit_two() {
-    // Sync hook safety: without TJ_ASYNC_REWAKE=1 we must NEVER exit 2
-    // even on overflow, because exit 2 from a sync hook blocks the
-    // operation in Claude Code. CLI invocations and the PreCompact/Stop
-    // hooks (which stay sync) rely on this guarantee.
+fn post_tool_use_queues_truncated_text() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "big.rs"},
+        "tool_response": {"content": "ж".repeat(10_000)},
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let entries: Vec<_> = std::fs::read_dir(&pending).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let body = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let chars = v["text"].as_str().unwrap().chars().count();
+    assert!(
+        chars <= 2000,
+        "PostToolUse text must be capped, got {chars}"
+    );
+    assert!(
+        chars > 100,
+        "the start of the tool call is kept, got {chars}"
+    );
+}
+
+#[test]
+fn post_tool_use_output_wording_is_not_a_constraint() {
+    // "must be" / "requires" inside tool output used to become constraint
+    // events whose text was raw tool JSON.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3864,23 +5724,33 @@ fn asyncrewake_overflow_without_env_does_not_exit_two() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Sync hook safety test"])
+        .args(["create", "Tool output noise"])
         .assert()
         .success();
 
-    let pending = dir.path().join("task-journal").join("pending");
-    seed_pending_chunks(&pending, 30);
-
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "schema.json"},
+        "tool_response": {"content": "the id field must be unique and requires an index"},
+    })
+    .to_string();
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
-        .env_remove("TJ_ASYNC_REWAKE")
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .env("TJ_INGEST_SYNC", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
-        .write_stdin(posttooluse_payload())
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload)
         .assert()
-        .success(); // exit 0, no wake — must not block sync hooks
+        .success();
+
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    let journal = project_events(dir.path(), &hash);
+    assert!(
+        !journal.contains("\"constraint\""),
+        "tool output must not become a constraint: {journal}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3919,6 +5789,68 @@ fn search_does_not_crash_on_hyphenated_identifier() {
         .assert()
         .success()
         .stdout(contains("tj-"));
+}
+
+#[test]
+fn search_with_an_empty_query_lists_tasks_newest_first() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path()).current_dir(&workdir);
+        cmd
+    };
+    let create = |title: &str| {
+        let out = tj().args(["create", title]).assert().success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let search = |args: &[&str]| {
+        let out = tj().arg("search").args(args).assert().success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    let older = create("Older task");
+    let newer = create("Newer task");
+    assert_eq!(search(&[""]), [newer.clone(), older.clone()]);
+
+    tj().args(["event", &older, "--type", "decision", "--text", "Pick X"])
+        .assert()
+        .success();
+    assert_eq!(search(&["   "]), [older.clone(), newer.clone()]);
+    assert_eq!(search(&["", "--type", "decision"]), [older.as_str()]);
+    assert_eq!(search(&["", "--limit", "1"]), [older]);
+}
+
+#[test]
+fn search_in_a_project_without_a_journal_creates_no_state_db() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    for query in ["", "anything"] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["search", query])
+            .assert()
+            .success()
+            .stdout("");
+    }
+
+    let state = dir.path().join("task-journal").join("state");
+    let created: Vec<_> = std::fs::read_dir(&state)
+        .map(|rd| rd.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(created.is_empty(), "{created:?}");
 }
 
 #[test]
@@ -4442,6 +6374,109 @@ fn post_tool_use_emits_recall_additional_context() {
             .and_then(|s| s.as_str()),
         Some("PostToolUse"),
     );
+}
+
+/// One real (non-mock) PostToolUse hook run; `session: None` sends no
+/// session id at all. Returns stdout.
+fn post_tool_use(dir: &std::path::Path, session: Option<&str>, tool: &str, input: &str) -> String {
+    let mut payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": tool,
+        "tool_input": { "command": input },
+        "tool_response": { "output": "" }
+    });
+    if let Some(sid) = session {
+        payload["session_id"] = sid.into();
+    }
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir)
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+/// After every tool call the same hits used to come back, flooding the
+/// agent's context. A session sees each hit once, on either recall path.
+#[test]
+fn push_recall_shows_each_hit_once_per_session() {
+    let (dir, _task_id) = seed_axum_rejection();
+    let axum = "let's switch the server to axum";
+
+    let first = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
+    assert!(first.contains("⚠ recall"), "{first}");
+
+    let again = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
+    assert!(!again.contains("recall"), "{again}");
+    let via_mcp = post_tool_use(dir.path(), Some("s-a"), "mcp__x__do", axum);
+    assert!(!via_mcp.contains("recall"), "{via_mcp}");
+
+    let other = post_tool_use(dir.path(), Some("s-b"), "Bash", axum);
+    assert!(other.contains("⚠ recall"), "{other}");
+}
+
+#[test]
+fn push_recall_without_a_session_id_repeats_as_before() {
+    let (dir, _task_id) = seed_axum_rejection();
+    let axum = "let's switch the server to axum";
+
+    for _ in 0..2 {
+        let out = post_tool_use(dir.path(), None, "Bash", axum);
+        assert!(out.contains("⚠ recall"), "{out}");
+    }
+}
+
+/// The agent just wrote that rejection on its own task in this session —
+/// echoing it back is noise. Another session still gets it.
+#[test]
+fn push_recall_skips_what_this_session_wrote_on_its_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Own session host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-own",
+        "prompt": "Tried switching the server to axum but it broke rmcp stdio."
+    });
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--mock-event-type",
+            "rejection",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success();
+    let axum = "let's switch the server to axum";
+
+    let own = post_tool_use(dir.path(), Some("s-own"), "Bash", axum);
+    assert!(!own.contains("recall"), "{own}");
+
+    let other = post_tool_use(dir.path(), Some("s-other"), "Bash", axum);
+    assert!(other.contains("⚠ recall"), "{other}");
 }
 
 #[test]
@@ -5160,6 +7195,94 @@ fn export_memory_missing_task_exits_1() {
         .failure()
         .code(1)
         .stderr(contains("task not found"));
+}
+
+#[test]
+fn export_memory_lists_the_same_decisions_as_the_pack_and_real_constraints() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+    let (x, p) = (xdg.path(), proj.path());
+
+    let task = tj_stdout(x, p, &["create", "Memory selection", "--goal", "g"]);
+    let event =
+        |ty: &str, text: &str| tj_stdout(x, p, &["event", &task, "--type", ty, "--text", text]);
+    let ts = event("decision", "Adopt TypeScript");
+    tj_stdout(
+        x,
+        p,
+        &[
+            "event",
+            &task,
+            "--type",
+            "supersede",
+            "--text",
+            "TS replaced",
+            "--supersedes",
+            &ts,
+        ],
+    );
+    for (ty, text) in [
+        ("decision", "Wrong decision: use Mongo"),
+        ("constraint", "Wrong constraint: no disk"),
+    ] {
+        let id = event(ty, text);
+        tj_stdout(
+            x,
+            p,
+            &[
+                "event-correct",
+                "--corrects",
+                &id,
+                "--task",
+                &task,
+                "--text",
+                "That was a mistake",
+            ],
+        );
+    }
+    for (ty, text, kind) in [
+        (
+            tj_core::event::EventType::Decision,
+            "Conversation compacted at 2026-01-01T00:00:00Z",
+            "compaction_marker",
+        ),
+        (
+            tj_core::event::EventType::Constraint,
+            "Model switched (auto): opus → haiku",
+            "model_switch",
+        ),
+    ] {
+        let mut e = tj_core::event::Event::new(
+            task.clone(),
+            ty,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text.to_string(),
+        );
+        e.meta = serde_json::json!({ "kind": kind });
+        append_jsonl_line(x, &serde_json::to_string(&e).unwrap());
+    }
+    event("decision", "Adopt Rust");
+    event("constraint", "Must run offline");
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", x)
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(p)
+        .args(["export-memory", "--task", &task, "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    for gone in ["TypeScript", "Wrong ", "compacted", "Model switched"] {
+        assert!(!out.contains(gone), "{gone} must be left out: {out}");
+    }
+    assert!(out.contains("- Adopt Rust\n"), "{out}");
+    assert!(out.contains("- Must run offline\n"), "{out}");
 }
 
 #[test]
@@ -5923,6 +8046,48 @@ fn complete_command_runs_and_skips_cleanly_without_sessions() {
 }
 
 #[test]
+fn complete_enrich_without_claude_code_sessions_says_codex_is_not_read() {
+    // A Codex-only project has no `~/.claude/projects/<path>` dir: --enrich
+    // must say why it read nothing. `anthropic` without a key = no backend,
+    // so no model is ever called.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Enrich me", "--goal", "g"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    for args in [
+        vec!["complete", task_id.as_str(), "--enrich"],
+        vec!["complete", "--enrich", "--yes"],
+    ] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .env("CLAUDE_CONFIG_DIR", claude.path())
+            .env_remove("ANTHROPIC_API_KEY")
+            .args(args)
+            .args(["--backend", "anthropic"])
+            .assert()
+            .success()
+            .stderr(contains("Claude Code").and(contains("Codex")));
+    }
+}
+
+#[test]
 fn complete_unknown_task_errors() {
     // A non-existent id is a hard error, not a silent no-op.
     let dir = assert_fs::TempDir::new().unwrap();
@@ -6179,4 +8344,148 @@ fn artifact_add_renders_clickable_link_in_pack() {
         .assert()
         .success()
         .stdout(contains("[Design spec](https://example.com/spec.md) (doc)"));
+}
+
+#[test]
+fn state_reports_the_sessions_own_task_as_json() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let state = |session: &str| -> serde_json::Value {
+        let out = tj()
+            .args(["state", "--session", session])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap()
+    };
+
+    let empty = state("s1");
+    assert_eq!(empty["schema"], "tj-state/1");
+    assert!(empty["active"].is_null());
+    assert!(
+        !dir.path().join("task-journal").join("state").exists(),
+        "no journal yet, so no state DB either"
+    );
+
+    let out = tj()
+        .args(["create", "Fix refresh", "--goal", "Stop dropping the token"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+    tj().args([
+        "event",
+        &task_id,
+        "--type",
+        "decision",
+        "--text",
+        "Use <= on expiry",
+        "--session",
+        "s1",
+    ])
+    .assert()
+    .success();
+
+    let mine = state("s1");
+    assert_eq!(mine["active"]["task_id"], task_id.as_str());
+    assert_eq!(mine["active"]["goal"], "Stop dropping the token");
+    assert_eq!(mine["active"]["counts"]["decision"], 1);
+    assert_eq!(mine["active"]["recent"][0]["text"], "Use <= on expiry");
+    assert_eq!(mine["open_tasks"], 1);
+
+    let other = state("s2");
+    assert!(
+        other["active"].is_null(),
+        "another session must not inherit the task"
+    );
+    assert_eq!(other["open_tasks"], 1);
+}
+
+#[test]
+fn event_can_record_a_suggested_entry_for_a_session() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let out = tj()
+        .args(["create", "Distill target"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+
+    tj().args([
+        "event",
+        &task_id,
+        "--type",
+        "rejection",
+        "--text",
+        "Ruled out a cache",
+        "--suggested",
+        "--session",
+        "s9",
+        "--origin",
+        "mod-distill",
+    ])
+    .assert()
+    .success();
+
+    let events_dir = dir.path().join("task-journal").join("events");
+    let journal = std::fs::read_dir(&events_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let last: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(journal)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(last["type"], "rejection");
+    assert_eq!(last["status"], "suggested");
+    assert_eq!(last["author"], "classifier");
+    assert_eq!(last["meta"]["session_id"], "s9");
+    assert_eq!(last["meta"]["origin"], "mod-distill");
+}
+
+#[test]
+fn event_on_an_unknown_task_fails_and_writes_nothing() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    tj().args(["create", "Real task"]).assert().success();
+    let events_dir = dir.path().join("task-journal").join("events");
+    let journal = std::fs::read_dir(&events_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let before = std::fs::read_to_string(&journal).unwrap();
+
+    tj().args(["event", "tj-typo", "--type", "decision", "--text", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("task not found: tj-typo"));
+
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
 }

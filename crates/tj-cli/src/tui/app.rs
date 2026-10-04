@@ -10,13 +10,13 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tj_core::session::{discovery, parser};
 
 use super::chat_view::ChatView;
@@ -42,6 +42,8 @@ pub struct App {
     pub session_list: Option<SessionList>,
     pub chat_view: Option<ChatView>,
     pub should_quit: bool,
+    /// The project this UI browses (`ui --project`, else cwd).
+    project_path: PathBuf,
 }
 
 impl App {
@@ -68,6 +70,7 @@ impl App {
             session_list: None,
             chat_view: None,
             should_quit: false,
+            project_path: project_path.to_path_buf(),
         })
     }
 
@@ -108,6 +111,7 @@ impl App {
             session_list: Some(SessionList::new(items, project_str)),
             chat_view: None,
             should_quit: false,
+            project_path: project_path.to_path_buf(),
         })
     }
 
@@ -120,9 +124,14 @@ impl App {
 
         let result = self.main_loop(&mut terminal);
 
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
+        run_restore_steps(
+            &mut terminal,
+            &[
+                |_| disable_raw_mode(),
+                |t| execute!(t.backend_mut(), LeaveAlternateScreen),
+                |t| t.show_cursor(),
+            ],
+        )?;
 
         result
     }
@@ -154,18 +163,7 @@ impl App {
 
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        self.should_quit = true;
-                    }
-
-                    match &self.screen {
-                        Screen::TaskList => self.handle_task_list_input(key.code),
-                        Screen::TaskDetail => self.handle_task_detail_input(key.code),
-                        Screen::SessionList => self.handle_session_list_input(key.code),
-                        Screen::Chat => self.handle_chat_input(key.code),
-                    }
+                    self.handle_key(key);
                 }
             }
 
@@ -174,6 +172,25 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        // Terminals that report key releases (Windows) would otherwise fire
+        // every key twice.
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+        }
+
+        match &self.screen {
+            Screen::TaskList => self.handle_task_list_input(key.code),
+            Screen::TaskDetail => self.handle_task_detail_input(key.code),
+            Screen::SessionList => self.handle_session_list_input(key.code),
+            Screen::Chat => self.handle_chat_input(key.code),
+        }
     }
 
     fn handle_task_list_input(&mut self, key: KeyCode) {
@@ -226,8 +243,7 @@ impl App {
         // The state SQLite already exists (App::new opened it).
         // Re-resolve through paths to avoid storing the connection
         // on App and dealing with !Send across the render loop.
-        let cwd = std::env::current_dir()?;
-        let project_hash = tj_core::project_hash::from_path(&cwd)?;
+        let project_hash = tj_core::project_hash::from_path(&self.project_path)?;
         let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
         let conn = tj_core::db::open(&state_path)?;
         // Full mode: show the complete reasoning chain — every event,
@@ -323,5 +339,101 @@ impl App {
             KeyCode::End => cv.scroll_bottom(),
             _ => {}
         }
+    }
+}
+
+/// Terminal restore sequence on exit. Every step runs even when an earlier
+/// one fails — a half-restored terminal (raw mode, alternate screen, hidden
+/// cursor) is worse than a late error — and the first error is reported.
+fn run_restore_steps<T>(target: &mut T, steps: &[fn(&mut T) -> io::Result<()>]) -> io::Result<()> {
+    let mut first = Ok(());
+
+    for step in steps {
+        let result = step(target);
+        if first.is_ok() {
+            first = result;
+        }
+    }
+
+    first
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_runs_every_step_and_reports_the_first_error() {
+        let mut log: Vec<&str> = Vec::new();
+        let err = run_restore_steps(
+            &mut log,
+            &[
+                |log| {
+                    log.push("raw mode");
+                    Err(io::Error::other("raw mode failed"))
+                },
+                |log| {
+                    log.push("alt screen");
+                    Err(io::Error::other("alt screen failed"))
+                },
+                |log| {
+                    log.push("cursor");
+                    Ok(())
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(log, ["raw mode", "alt screen", "cursor"]);
+        assert_eq!(err.to_string(), "raw mode failed");
+    }
+
+    #[test]
+    fn task_detail_reads_the_project_passed_to_ui_not_cwd() {
+        let data = tempfile::TempDir::new().unwrap();
+        let proj = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(proj.path().join(".git")).unwrap();
+        // The only test in this binary that resolves the data dir.
+        std::env::set_var("TASK_JOURNAL_DATA_DIR", data.path());
+
+        let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+        let state = tj_core::paths::state_dir()
+            .unwrap()
+            .join(format!("{hash}.sqlite"));
+        let conn = tj_core::db::open(&state).unwrap();
+        let open = tj_core::event::Event::new(
+            "tj-ui1".to_string(),
+            tj_core::event::EventType::Open,
+            tj_core::event::Author::User,
+            tj_core::event::Source::Cli,
+            "Picked via --project".to_string(),
+        );
+        tj_core::db::upsert_task_from_event(&conn, &open, &hash).unwrap();
+        tj_core::db::index_event(&conn, &open).unwrap();
+        drop(conn);
+
+        let app = App::new(proj.path()).unwrap();
+        let pack = app.assemble_pack("tj-ui1").unwrap();
+        assert!(pack.contains("Picked via --project"), "{pack}");
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let mut app = App {
+            screen: Screen::TaskList,
+            task_list: Some(TaskList::new(vec![], "proj".into())),
+            task_detail: None,
+            session_list: None,
+            chat_view: None,
+            should_quit: false,
+            project_path: PathBuf::from("proj"),
+        };
+        let q = |kind| KeyEvent::new_with_kind(KeyCode::Char('q'), KeyModifiers::NONE, kind);
+
+        app.handle_key(q(KeyEventKind::Release));
+        assert!(!app.should_quit, "a key release must not act as a press");
+
+        app.handle_key(q(KeyEventKind::Press));
+        assert!(app.should_quit);
     }
 }

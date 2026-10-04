@@ -14,6 +14,8 @@ struct DoctorReport {
     task_journal_version: &'static str,
     claude_in_path: bool,
     claude_version: Option<String>,
+    /// Informational only: needed just for `--backend codex`.
+    codex_in_path: bool,
     data_dir: PathBuf,
     events_dir: PathBuf,
     state_dir: PathBuf,
@@ -46,6 +48,14 @@ impl DoctorReport {
                     .unwrap_or_else(|| "found (version unknown)".into())
             } else {
                 "NOT FOUND in PATH".into()
+            }
+        );
+        println!(
+            "  codex binary     {}",
+            if self.codex_in_path {
+                "found"
+            } else {
+                "not found in PATH (only needed for the codex backend)"
             }
         );
         println!("  data dir         {}", self.data_dir.display());
@@ -112,6 +122,32 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     r
 }
 
+/// Read a project's JSONL event log. Malformed lines are skipped with a
+/// warning on stderr, the same policy as `rebuild_state`, so one bad line
+/// cannot abort a read-only command.
+fn read_events_lenient(
+    path: &std::path::Path,
+    command: &str,
+) -> Result<Vec<tj_core::event::Event>> {
+    let body = std::fs::read_to_string(path)?;
+    let mut events = Vec::new();
+
+    for (i, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(e) => events.push(e),
+            Err(err) => eprintln!(
+                "warning: skipping malformed JSONL line {} in {command}: {err}",
+                i + 1
+            ),
+        }
+    }
+
+    Ok(events)
+}
+
 /// Move all on-disk data for one project_hash to another. Used by the
 /// `migrate-project` subcommand when a project's directory has been
 /// moved on disk and the canonical-path hash no longer matches.
@@ -131,7 +167,8 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
     let state_dir = tj_core::paths::state_dir()?;
     let metrics_dir = tj_core::paths::metrics_dir()?;
 
-    // (source, destination) tuples to attempt to rename.
+    // (source, destination) tuples to attempt to rename. The SQLite runs in
+    // WAL mode, so its `-wal` / `-shm` sidecars travel with it.
     let pairs = [
         (
             events_dir.join(format!("{from_hash}.jsonl")),
@@ -140,6 +177,18 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         (
             state_dir.join(format!("{from_hash}.sqlite")),
             state_dir.join(format!("{to_hash}.sqlite")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.sqlite-wal")),
+            state_dir.join(format!("{to_hash}.sqlite-wal")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.sqlite-shm")),
+            state_dir.join(format!("{to_hash}.sqlite-shm")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.recall-shown")),
+            state_dir.join(format!("{to_hash}.recall-shown")),
         ),
         (
             metrics_dir.join(format!("{from_hash}.jsonl")),
@@ -159,6 +208,39 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         }
     }
 
+    // Fold uncheckpointed writes into the main file before it moves. When
+    // no one else holds the DB, closing this connection also deletes the
+    // sidecars; any that survive are moved with it below.
+    let src_state_path = state_dir.join(format!("{from_hash}.sqlite"));
+    if src_state_path.exists() {
+        let conn = rusqlite::Connection::open(&src_state_path)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .with_context(|| format!("checkpoint WAL of {src_state_path:?}"))?;
+    }
+
+    // --force: the JSONL is the source of truth, so keep the journal being
+    // replaced. A copy, so a failed move still leaves the destination intact.
+    let (src_jsonl, dst_jsonl) = &pairs[0];
+    let mut backup = None;
+    if src_jsonl.exists() && dst_jsonl.metadata().is_ok_and(|m| m.len() > 0) {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let bak = dst_jsonl.with_file_name(format!("{to_hash}.jsonl.bak-{stamp}"));
+        std::fs::copy(dst_jsonl, &bak).with_context(|| format!("back up {dst_jsonl:?}"))?;
+        backup = Some(bak);
+    }
+
+    // --force: a destination `-wal` / `-shm` belongs to the database being
+    // replaced. Left next to the one moving in, SQLite would replay it into
+    // it; the source's own sidecars, if any, are moved in below.
+    if src_state_path.exists() {
+        for suffix in ["-wal", "-shm"] {
+            let stale = state_dir.join(format!("{to_hash}.sqlite{suffix}"));
+            if stale.exists() {
+                std::fs::remove_file(&stale).with_context(|| format!("remove {stale:?}"))?;
+            }
+        }
+    }
+
     let mut moved: Vec<String> = Vec::new();
     for (src, dst) in &pairs {
         if !src.exists() {
@@ -167,23 +249,64 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if dst.exists() && force {
-            std::fs::remove_file(dst).with_context(|| format!("remove existing {dst:?}"))?;
-        }
+        // No remove-then-rename: rename replaces an existing destination
+        // atomically (POSIX rename, MOVEFILE_REPLACE_EXISTING on Windows), so
+        // a failed move under --force leaves the destination intact.
         std::fs::rename(src, dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
         moved.push(dst.display().to_string());
+    }
+
+    // Queued chunks carry the hash in their name and, for the worker's
+    // ownership check, in their `project_hash`.
+    let pending_dir = events_dir.with_file_name("pending");
+    if pending_dir.exists() {
+        let prefix = format!("{from_hash}.");
+        for src in std::fs::read_dir(&pending_dir)?.flatten().map(|e| e.path()) {
+            let Some(rest) = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(&prefix))
+            else {
+                continue;
+            };
+            let dst = pending_dir.join(format!("{to_hash}.{rest}"));
+
+            let body = std::fs::read_to_string(&src)?;
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if v["project_hash"] == from_hash.as_str() {
+                    v["project_hash"] = to_hash.clone().into();
+                    std::fs::write(&src, serde_json::to_string_pretty(&v)?)?;
+                }
+            }
+
+            std::fs::rename(&src, &dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
+            moved.push(dst.display().to_string());
+        }
     }
 
     // Re-key the project_hash columns inside the (now renamed) SQLite.
     let new_state_path = state_dir.join(format!("{to_hash}.sqlite"));
     if new_state_path.exists() {
         let conn = tj_core::db::open(&new_state_path)?;
-        conn.execute(
-            "UPDATE tasks SET project_hash = ?1 WHERE project_hash = ?2",
-            rusqlite::params![to_hash, from_hash],
-        )?;
-        conn.execute(
-            "UPDATE index_state SET project_hash = ?1 WHERE project_hash = ?2",
+        for table in [
+            "tasks",
+            "index_state",
+            "projection_state",
+            "embeddings",
+            "dream_state",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET project_hash = ?1 WHERE project_hash = ?2"),
+                rusqlite::params![to_hash, from_hash],
+            )?;
+        }
+    }
+
+    // The global cross-project index keys its rows by project_hash too.
+    let memory_path = tj_core::paths::memory_db()?;
+    if memory_path.exists() {
+        tj_core::memory::open(&memory_path)?.execute(
+            "UPDATE global_memory SET project_hash = ?1 WHERE project_hash = ?2",
             rusqlite::params![to_hash, from_hash],
         )?;
     }
@@ -196,6 +319,9 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             println!("  {path}");
         }
         println!("  project_hash {from_hash} -> {to_hash}");
+    }
+    if let Some(bak) = backup {
+        println!("kept the replaced journal as {}", bak.display());
     }
     Ok(())
 }
@@ -244,6 +370,36 @@ time { font-family: ui-monospace, monospace; color: var(--muted); margin-right: 
 .suggested::after { content: " ?"; color: var(--muted); }
 "#;
 
+/// Title and status of one task for the md/html export, folded over its
+/// events with the same rules as the SQLite projection
+/// (`tj_core::db::upsert_task_from_event`): the first `open` sets the title,
+/// a later `rename` replaces it, and the last `close`/`reopen` decides status.
+fn export_title_and_status(task_events: &[&tj_core::event::Event]) -> (String, &'static str) {
+    use tj_core::event::EventType;
+
+    let mut title: Option<String> = None;
+    let mut status = "open";
+
+    for e in task_events {
+        let named = || {
+            e.meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&e.text)
+                .to_string()
+        };
+        match e.event_type {
+            EventType::Open if title.is_none() => title = Some(named()),
+            EventType::Rename if title.is_some() => title = Some(named()),
+            EventType::Close => status = "closed",
+            EventType::Reopen => status = "open",
+            _ => {}
+        }
+    }
+
+    (title.unwrap_or_else(|| "(untitled)".into()), status)
+}
+
 fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
     use std::collections::BTreeMap;
 
@@ -266,23 +422,7 @@ fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
     out.push_str("<main>");
 
     for (task_id, task_events) in &tasks {
-        let title = task_events
-            .iter()
-            .find(|e| e.event_type == tj_core::event::EventType::Open)
-            .and_then(|e| {
-                e.meta
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or_else(|| Some(e.text.clone()))
-            })
-            .unwrap_or_else(|| "(untitled)".into());
-
-        let closed = task_events
-            .last()
-            .map(|e| e.event_type == tj_core::event::EventType::Close)
-            .unwrap_or(false);
-        let status = if closed { "closed" } else { "open" };
+        let (title, status) = export_title_and_status(task_events);
 
         let created = task_events
             .first()
@@ -343,23 +483,63 @@ fn pending_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// The current project's entries in the global `pending/` dir. New entries
+/// are named `<project_hash>.<ulid>.json` (`….dead.json` once retries are
+/// exhausted); a legacy bare `<ulid>.json` counts as ours unless its JSON
+/// names another project. Callers filter schema / dead state on top.
+fn project_pending_entries(
+    dir: &std::path::Path,
+    project_hash: &str,
+) -> Result<Vec<std::path::PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let stem = stem.strip_suffix(".dead").unwrap_or(stem);
+        let (ulid, ours) = match stem.split_once('.') {
+            Some((prefix, ulid)) => (ulid, prefix == project_hash),
+            None => (stem, !legacy_pending_is_foreign(&path, project_hash)),
+        };
+        if ours {
+            out.push((ulid.to_string(), path));
+        }
+    }
+
+    // ULIDs sort by creation time: oldest first, so a user prompt is
+    // classified before the assistant turn that answered it.
+    out.sort();
+    Ok(out.into_iter().map(|(_, path)| path).collect())
+}
+
+/// A legacy (un-prefixed) entry belongs to another project only when its
+/// JSON says so; one without `project_hash` stays visible here.
+fn legacy_pending_is_foreign(path: &std::path::Path, project_hash: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("project_hash")?.as_str().map(|h| h != project_hash))
+        .unwrap_or(false)
+}
+
 fn run_pending_list() -> Result<()> {
     let dir = pending_dir()?;
-    if !dir.exists() {
-        println!("(no pending entries)");
-        return Ok(());
-    }
+    let project_hash = tj_core::project_hash::from_path(std::env::current_dir()?)?;
     let mut entries: Vec<(String, String, String, u32)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
+    for path in project_pending_entries(&dir, &project_hash)? {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+        let id = stem
+            .strip_prefix(&format!("{project_hash}."))
+            .unwrap_or(stem)
             .to_string();
         let body = std::fs::read_to_string(&path)?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
@@ -376,9 +556,7 @@ fn run_pending_list() -> Result<()> {
             .take(72)
             .collect();
         let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-        let dead_marker = if id.ends_with(".dead") { " [DEAD]" } else { "" };
         entries.push((id, queued_at, text_preview, attempts));
-        let _ = dead_marker;
     }
     if entries.is_empty() {
         println!("(no pending entries)");
@@ -392,6 +570,7 @@ fn run_pending_list() -> Result<()> {
 }
 
 fn run_pending_retry(
+    backend: &str,
     mock_etype: Option<&str>,
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
@@ -405,15 +584,27 @@ fn run_pending_retry(
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
 
+    // The CI-safe mock branch needs no classifier. Without a usable backend
+    // a retry can't do better than the attempt that queued the entry, so
+    // leave everything as it is rather than burn attempts toward `.dead`.
+    let classifier = match (mock_etype, mock_tid) {
+        (Some(_), Some(_)) => None,
+        _ => match retry_classifier(backend)? {
+            Some(c) => Some(c),
+            None => {
+                println!(
+                    "pending retry: no classifier backend available for `{backend}` \
+                     (no `claude` on PATH, no ANTHROPIC_API_KEY) — entries left untouched"
+                );
+                return Ok(());
+            }
+        },
+    };
+
     let mut succeeded = 0usize;
     let mut died = 0usize;
     let mut still_pending = 0usize;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    for path in project_pending_entries(&dir, &project_hash)? {
         if path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -436,11 +627,14 @@ fn run_pending_retry(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
+        let kind = v
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .unwrap_or("Stop")
+            .to_string();
 
-        // The real retry path would call the classifier. The CI-safe
-        // mock branch lets tests drive a deterministic outcome.
-        let outcome: anyhow::Result<()> = match (mock_etype, mock_tid) {
-            (Some(etype), Some(tid)) => {
+        let outcome: anyhow::Result<()> = match (mock_etype, mock_tid, &classifier) {
+            (Some(etype), Some(tid), _) => {
                 let mut event = tj_core::event::Event::new(
                     tid,
                     parse_event_type(etype)?,
@@ -455,9 +649,18 @@ fn run_pending_retry(
                 writer.flush_durable()?;
                 Ok(())
             }
-            _ => Err(anyhow::anyhow!(
-                "no real classifier wired in retry path yet — pass --mock-* for tests, or run install-hooks and let the hook drain the queue"
-            )),
+            (_, _, Some(classifier)) => match classify_chunk(
+                classifier.as_ref(),
+                &events_path,
+                &project_hash,
+                &kind,
+                &text,
+                None,
+            )? {
+                ChunkOutcome::Unplaced(err) => Err(anyhow::anyhow!(err)),
+                ChunkOutcome::Recorded | ChunkOutcome::Dropped => Ok(()),
+            },
+            _ => unreachable!("a missing classifier returns before the loop"),
         };
 
         match outcome {
@@ -491,6 +694,24 @@ fn run_pending_retry(
         "pending retry: {succeeded} drained, {still_pending} still pending, {died} marked dead"
     );
     Ok(())
+}
+
+/// The classifier `pending retry` runs, or `None` when the backend has
+/// nothing beyond what already failed: hybrid without an LLM fallback, or
+/// agent-sdk / api without `claude` / a key.
+fn retry_classifier(
+    backend: &str,
+) -> anyhow::Result<Option<Box<dyn tj_core::classifier::Classifier>>> {
+    Ok(match backend {
+        "hybrid" | "" => {
+            let hybrid = tj_core::classifier::hybrid::HybridClassifier::from_env();
+            hybrid
+                .has_llm_fallback()
+                .then(|| Box::new(hybrid) as Box<dyn tj_core::classifier::Classifier>)
+        }
+        "agent-sdk" | "api" => build_classifier(backend).ok(),
+        other => Some(build_classifier(other)?),
+    })
 }
 
 fn run_doctor() -> Result<DoctorReport> {
@@ -561,6 +782,7 @@ fn run_doctor() -> Result<DoctorReport> {
         task_journal_version: env!("CARGO_PKG_VERSION"),
         claude_in_path,
         claude_version,
+        codex_in_path: tj_core::llm::codex_on_path(),
         data_dir,
         events_dir,
         state_dir,
@@ -712,6 +934,30 @@ enum Commands {
         /// Optional event id this supersedes (for type=supersede).
         #[arg(long)]
         supersedes: Option<String>,
+        /// Record it as `suggested` by a classifier rather than confirmed
+        /// by a person: what a model inferred after the fact.
+        #[arg(long)]
+        suggested: bool,
+        /// Session the event belongs to; defaults to the live session id
+        /// (CLAUDE_CODE_SESSION_ID, then Codex's CODEX_THREAD_ID).
+        #[arg(long)]
+        session: Option<String>,
+        /// Who wrote it, kept as `meta.origin` (e.g. `mod-distill`).
+        #[arg(long)]
+        origin: Option<String>,
+    },
+    /// Print a session's journal state as JSON: its active task (the open
+    /// task it last wrote to), that task's counts and latest entries, and
+    /// how many tasks are open. Read by the Claude Code mod; schema
+    /// `tj-state/1`.
+    State {
+        /// Session id; defaults to the live session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// Keep this task as the active one while it is open (the task the
+        /// caller already shows), instead of the session's latest write.
+        #[arg(long)]
+        prefer: Option<String>,
     },
     /// Close a task (writes a `close` event).
     Close {
@@ -761,14 +1007,17 @@ enum Commands {
         #[arg(long, default_value_t = 7)]
         days: i64,
     },
-    /// Garbage-collect the pending classifier queue. Removes entries
-    /// older than N days OR marked dead by retry exhaustion. Run after
-    /// classifier auth was broken for a while and the queue grew
-    /// stale.
+    /// Garbage-collect the current project's pending classifier queue.
+    /// Removes entries older than N days OR marked dead by retry
+    /// exhaustion. Run after classifier auth was broken for a while and
+    /// the queue grew stale.
     PendingGc {
         /// Age threshold in days. Default 7.
         #[arg(long, default_value_t = 7)]
         days: i64,
+        /// Collect every project's entries, not just the current one's.
+        #[arg(long)]
+        all: bool,
     },
     /// Set or update the goal of an existing task.
     Goal {
@@ -794,7 +1043,7 @@ enum Commands {
     Reclassify { task_id: String },
     /// Full-text search across events (FTS5).
     Search {
-        /// Query string.
+        /// Query string. Empty lists the tasks instead, newest first.
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -1104,7 +1353,12 @@ enum PendingCmd {
     List,
     /// Re-feed every pending entry through the classifier. Marks an
     /// entry as `<id>.dead.json` after PENDING_MAX_ATTEMPTS failures.
+    /// With no usable backend, entries are left untouched.
     Retry {
+        /// Classifier backend: "hybrid", "agent-sdk", "api", or "heuristic".
+        /// Defaults to hybrid.
+        #[arg(long, default_value = "hybrid")]
+        backend: String,
         /// Test/dev override: bypass classifier and force this event
         /// type. Hidden from --help.
         #[arg(long, hide = true)]
@@ -1182,23 +1436,16 @@ fn real_main() -> Result<()> {
             if let Some(ref parent_id) = parent {
                 meta["parent_id"] = serde_json::Value::String(parent_id.clone());
             }
+            // The goal rides in the open event, so ingest (and a rebuild
+            // from the JSONL) restores it.
+            if let Some(g) = goal {
+                meta["goal"] = serde_json::Value::String(g);
+            }
             event.meta = meta;
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
-
-            // If --goal was provided, ingest the open event into SQLite
-            // (so the row exists) and write the goal column. Skipping
-            // this when --goal is absent keeps the SQLite hot path
-            // exclusive to ingest-hook / pack callers.
-            if let Some(g) = goal {
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                tj_core::db::set_task_goal(&conn, &task_id, &g)?;
-            }
 
             println!("{}", task_id);
         }
@@ -1234,12 +1481,7 @@ fn real_main() -> Result<()> {
                     println!("(no events yet)");
                     return Ok(());
                 }
-                let body = std::fs::read_to_string(&events_path)?;
-                let mut events: Vec<tj_core::event::Event> = body
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(serde_json::from_str)
-                    .collect::<Result<_, _>>()?;
+                let mut events = read_events_lenient(&events_path, "events list")?;
                 events.reverse();
                 for e in events.into_iter().take(limit) {
                     let title = e
@@ -1248,7 +1490,11 @@ fn real_main() -> Result<()> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| e.text.clone());
-                    println!("{}  [{:?}]  {}", e.timestamp, e.event_type, title);
+                    let etype = serde_json::to_value(e.event_type)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| "?".into());
+                    println!("{}  [{etype}]  {}", e.timestamp, title);
                 }
             }
         },
@@ -1469,27 +1715,79 @@ fn real_main() -> Result<()> {
             text,
             corrects,
             supersedes,
+            suggested,
+            session,
+            origin,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-            std::fs::create_dir_all(events_path.parent().unwrap())?;
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
 
+            // Same guard as the MCP tool: a mistyped id must not leave an
+            // orphan event behind.
             let event_type = parse_event_type(&r#type)?;
-            let mut event = tj_core::event::Event::new(
-                &task_id,
-                event_type,
-                tj_core::event::Author::User,
-                tj_core::event::Source::Cli,
-                text,
-            );
+            if !events_path.exists() {
+                anyhow::bail!("task not found: {task_id}");
+            }
+            let conn = tj_core::db::open(&state_path)?;
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            if !tj_core::db::task_exists(&conn, &task_id)? {
+                anyhow::bail!("task not found: {task_id}");
+            }
+
+            let (author, source) = if suggested {
+                (
+                    tj_core::event::Author::Classifier,
+                    tj_core::event::Source::Hook,
+                )
+            } else {
+                (tj_core::event::Author::User, tj_core::event::Source::Cli)
+            };
+            let mut event = tj_core::event::Event::new(&task_id, event_type, author, source, text);
             event.corrects = corrects;
             event.supersedes = supersedes;
+            if suggested {
+                event.status = tj_core::event::EventStatus::Suggested;
+            }
+            if let Some(origin) = origin {
+                event.meta["origin"] = serde_json::Value::String(origin);
+            }
+            let session = session.or_else(tj_core::session_id::session_id_from_env);
+            tj_core::session_id::stamp_session_id(&mut event.meta, session.as_deref());
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
             println!("{}", event.event_id);
+        }
+        Commands::State { session, prefer } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let session = session.or_else(tj_core::session_id::session_id_from_env);
+
+            // No journal yet: an empty state, and no state DB created for it.
+            let state = if events_path.exists() {
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                tj_core::session_state::session_state(
+                    &conn,
+                    &project_hash,
+                    session.as_deref(),
+                    prefer.as_deref(),
+                )?
+            } else {
+                tj_core::session_state::SessionState {
+                    schema: tj_core::session_state::SCHEMA,
+                    session_id: session,
+                    open_tasks: 0,
+                    active: None,
+                }
+            };
+
+            println!("{}", serde_json::to_string(&state)?);
         }
         Commands::ArtifactAdd {
             task_id,
@@ -1550,13 +1848,6 @@ fn real_main() -> Result<()> {
             if !tj_core::db::task_exists(&conn, &task_id)? {
                 anyhow::bail!("task not found: {task_id}");
             }
-            // Persist outcome BEFORE the close event so the cache wipe
-            // inside set_task_outcome doesn't compete with subsequent
-            // assemble calls. Both columns optional — caller can pass
-            // neither and just get the close event.
-            if let Some(o) = outcome.as_deref() {
-                tj_core::db::set_task_outcome(&conn, &task_id, o, outcome_tag.as_deref())?;
-            }
             let open_kids = tj_core::db::count_open_children(&conn, &task_id)?;
             drop(conn);
 
@@ -1570,6 +1861,15 @@ fn real_main() -> Result<()> {
             let mut meta = serde_json::Map::new();
             if let Some(r) = reason {
                 meta.insert("reason".into(), serde_json::Value::String(r));
+            }
+            // outcome + tag ride in the close event's meta and reach the task
+            // row only when that event is ingested, so a failed append never
+            // leaves an open task with an outcome and a rebuild keeps it.
+            if let Some(o) = outcome {
+                meta.insert("outcome".into(), serde_json::Value::String(o));
+            }
+            if let Some(t) = outcome_tag {
+                meta.insert("outcome_tag".into(), serde_json::Value::String(t));
             }
             // Layer-2 close harvest: stamp deterministic git/gh refs (commit,
             // branch, PR) so the closed pack reads as a clickable ledger of
@@ -1642,7 +1942,7 @@ fn real_main() -> Result<()> {
                 );
             }
         }
-        Commands::PendingGc { days } => {
+        Commands::PendingGc { days, all } => {
             let pending_dir = tj_core::paths::events_dir()?
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("events_dir has no parent"))?
@@ -1651,20 +1951,23 @@ fn real_main() -> Result<()> {
                 println!("(no pending dir — nothing to gc)");
                 return Ok(());
             }
+            let entries: Vec<std::path::PathBuf> = if all {
+                std::fs::read_dir(&pending_dir)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                    .collect()
+            } else {
+                let project_hash = tj_core::project_hash::from_path(std::env::current_dir()?)?;
+                project_pending_entries(&pending_dir, &project_hash)?
+            };
             let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
             let mut removed = 0usize;
-            for entry in std::fs::read_dir(&pending_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
+            for path in entries {
                 // Prefer the file's mtime over JSON parsing — pending
                 // payloads include their own queued_at but are not
                 // guaranteed parseable when the classifier corrupted
                 // input mid-stream.
-                let mtime = entry
-                    .metadata()
+                let mtime = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| {
@@ -1729,7 +2032,22 @@ fn real_main() -> Result<()> {
             if !tj_core::db::task_exists(&conn, &task_id)? {
                 anyhow::bail!("task not found: {task_id}");
             }
-            tj_core::db::set_task_goal(&conn, &task_id, &text)?;
+
+            // An amend event carries the change, so a rebuild from the
+            // JSONL restores it; ingest applies it to the task row.
+            let mut event = tj_core::event::Event::new(
+                &task_id,
+                tj_core::event::EventType::Amend,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                format!("goal: {text}"),
+            );
+            event.meta = serde_json::json!({ "goal": text });
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             println!("ok");
         }
         Commands::External { task_id, add } => {
@@ -1745,7 +2063,20 @@ fn real_main() -> Result<()> {
             if !tj_core::db::task_exists(&conn, &task_id)? {
                 anyhow::bail!("task not found: {task_id}");
             }
-            tj_core::db::add_task_external(&conn, &task_id, &add)?;
+
+            let mut event = tj_core::event::Event::new(
+                &task_id,
+                tj_core::event::EventType::Amend,
+                tj_core::event::Author::User,
+                tj_core::event::Source::Cli,
+                format!("external: +{add}"),
+            );
+            event.meta = serde_json::json!({ "external_add": [add] });
+            let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+            writer.append(&event)?;
+            writer.flush_durable()?;
+
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             println!("ok");
         }
         Commands::Reclassify { task_id } => {
@@ -2134,11 +2465,13 @@ fn real_main() -> Result<()> {
                 run_pending_list()?;
             }
             PendingCmd::Retry {
+                backend,
                 mock_event_type,
                 mock_task_id,
                 mock_confidence,
             } => {
                 run_pending_retry(
+                    &backend,
                     mock_event_type.as_deref(),
                     mock_task_id.as_deref(),
                     mock_confidence,
@@ -2176,6 +2509,17 @@ fn real_main() -> Result<()> {
                 (Some(k), Some(t)) => (k, t, serde_json::Value::Null),
                 _ => parse_hook_stdin()?,
             };
+
+            // The Claude Code mod captures in-process and marks the hooks it
+            // starts; the classic capture stands down where the mod does the
+            // same work: the Stop / PreCompact / SessionEnd transcript
+            // catch-up (and the compaction marker) here, per-message queueing
+            // and auto-open further down. Push-recall, the `/rewind`
+            // correction, resume packs and model switches stay ours.
+            let mod_on = mod_active();
+            if mod_on && matches!(kind.as_str(), "Stop" | "PreCompact" | "SessionEnd") {
+                return Ok(());
+            }
 
             // Emergency capture kill-switch: a `.capture-disabled` marker in the
             // data dir no-ops realtime capture (the read-only SessionStart
@@ -2232,6 +2576,12 @@ fn real_main() -> Result<()> {
                         &text,
                         tj_core::recall::DEFAULT_MAX_HITS,
                     ) {
+                        let hits = fresh_recall_hits(
+                            hits,
+                            live_session_id.as_deref(),
+                            &events_path,
+                            &project_hash,
+                        );
                         if !hits.is_empty() {
                             let mut ctx = String::new();
                             for h in &hits {
@@ -2264,8 +2614,12 @@ fn real_main() -> Result<()> {
             // mcp__ tools) — gated MCP-only, falls through to the queue path so
             // event capture is unaffected. Disabled by TJ_PUSH_RECALL=0.
             if kind == "PostToolUse" && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0") {
-                if let Some(envelope) = push_recall_envelope(&payload, &events_path, &project_hash)
-                {
+                if let Some(envelope) = push_recall_envelope(
+                    &payload,
+                    &events_path,
+                    &project_hash,
+                    live_session_id.as_deref(),
+                ) {
                     println!("{}", serde_json::to_string(&envelope)?);
                 }
             }
@@ -2294,7 +2648,8 @@ fn real_main() -> Result<()> {
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 3)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 3, live_session_id.as_deref())?;
                 if recent.is_empty() {
                     if !prefs_block.is_empty() {
                         emit_session_context(&prefs_block);
@@ -2370,33 +2725,6 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     bundle.push_str("\n\n");
                 }
 
-                // v0.10.2 X4: emit `watchPaths` so Claude Code starts
-                // monitoring our marker files (CLAUDE.md, README.md,
-                // .docs/plans). When any of them changes, Claude Code
-                // fires a FileChanged hook event — our ingest-hook
-                // handler below treats those as `evidence` entries on
-                // the active task so the journal captures
-                // "instructions were updated mid-session" without the
-                // user manually logging it. Only paths that exist at
-                // SessionStart time are emitted (no point watching a
-                // non-existent file — Claude Code logs `watcher error`
-                // and gives up on it). Gated by TJ_WATCH_PATHS=0.
-                let allow_watch_paths = std::env::var("TJ_WATCH_PATHS").as_deref() != Ok("0");
-                let watch_candidates = [
-                    cwd.join("CLAUDE.md"),
-                    cwd.join("README.md"),
-                    cwd.join(".docs").join("plans"),
-                ];
-                let watch_paths: Vec<String> = if allow_watch_paths {
-                    watch_candidates
-                        .iter()
-                        .filter(|p| p.exists())
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
                 // We deliberately DO NOT emit `sessionTitle` or
                 // `initialUserMessage` here. The v0.10.1 X2 experiment set
                 // `sessionTitle` to "TJ — <task_id> (<n> open)", which
@@ -2408,81 +2736,14 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // title. The resume context the model actually needs already
                 // rides in `additionalContext`; the tab label belongs to
                 // Claude Code, not to us. (0.14.3)
-                let mut hook_specific = serde_json::json!({
+                let hook_specific = serde_json::json!({
                     "hookEventName": "SessionStart",
                     "additionalContext": bundle.trim_end(),
                 });
-                if !watch_paths.is_empty() {
-                    hook_specific["watchPaths"] = serde_json::Value::Array(
-                        watch_paths
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    );
-                }
                 let envelope = serde_json::json!({
                     "hookSpecificOutput": hook_specific,
                 });
                 println!("{}", serde_json::to_string(&envelope)?);
-                return Ok(());
-            }
-
-            // v0.10.2 X4: FileChanged. Claude Code 2.1.x fires this
-            // event whenever a path in `watchPaths` (emitted on
-            // SessionStart) changes. Payload: { file_path, event:
-            // "change"|"add"|"unlink" }. We translate it into an
-            // `evidence` event on the active task — captures
-            // "the user/agent edited CLAUDE.md mid-session" without
-            // anyone typing anything. Schema verified in 2.1.160:
-            // `literal("FileChanged"), file_path: y.string(), event:
-            // y.enum(["change","add","unlink"])`.
-            //
-            // No active task → drop silently (we're not opening a
-            // task just because a watched file moved). No events_path
-            // → ditto, fresh project.
-            if kind == "FileChanged" {
-                if !events_path.exists() {
-                    return Ok(());
-                }
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
-                let Some(tc) = recent.into_iter().next() else {
-                    return Ok(());
-                };
-                let file_path = payload
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown)");
-                let change = payload
-                    .get("event")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("change");
-                // Trim noisy absolute paths to project-relative when
-                // possible — the journal is per-project so the prefix
-                // is redundant and just steals tokens from the pack.
-                let display_path = cwd
-                    .to_str()
-                    .and_then(|c| file_path.strip_prefix(c))
-                    .map(|s| s.trim_start_matches('/').to_string())
-                    .unwrap_or_else(|| file_path.to_string());
-                let evidence_text = format!("FileChanged ({change}): {display_path}");
-                let mut event = tj_core::event::Event::new(
-                    &tc.task_id,
-                    tj_core::event::EventType::Evidence,
-                    tj_core::event::Author::Classifier,
-                    tj_core::event::Source::Hook,
-                    evidence_text,
-                );
-                event.confidence = Some(0.9);
-                event.status = tj_core::event::EventStatus::Confirmed;
-                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
-                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
-                writer.append(&event)?;
-                writer.flush_durable()?;
-                println!("{}", event.event_id);
                 return Ok(());
             }
 
@@ -2493,7 +2754,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             // "why did this stretch come out shallow" is usually answered by
             // "it ran on a fallback model". Recorded as a `constraint`: it's an
             // external condition the work happened under, not a decision.
-            // No active task → drop silently, same rule as FileChanged.
+            // No active task → drop silently.
             if kind == "PostModelSwitch" {
                 if !events_path.exists() {
                     return Ok(());
@@ -2502,7 +2763,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -2521,7 +2783,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     .get("source")
                     .and_then(|v| v.as_str())
                     .unwrap_or("user");
-                let text = format!("Model switched ({switch_source}): {from_model} → {to_model}");
+                let text = format!(
+                    "{}{switch_source}): {from_model} → {to_model}",
+                    tj_core::reminder::MODEL_SWITCH_TEXT_PREFIX
+                );
                 let mut event = tj_core::event::Event::new(
                     &tc.task_id,
                     tj_core::event::EventType::Constraint,
@@ -2531,6 +2796,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(0.9);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                // Kept in the journal, but left out of the constraint lists
+                // (resume reminder, classifier context) — see
+                // MODEL_SWITCH_TEXT_PREFIX.
+                event.meta = serde_json::json!({ "kind": "model_switch" });
                 tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
@@ -2556,7 +2825,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -2646,6 +2916,9 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(1.0);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                // Bookkeeping, not a decision: kept out of active decisions,
+                // export-pr, recall and global memory — see db::is_bookkeeping.
+                event.meta = serde_json::json!({ "kind": "compaction_marker" });
                 tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
@@ -2693,7 +2966,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -2745,9 +3019,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
             }
 
-            // Drain any pending entries first (Task 10 fills the real-classifier branch).
+            // Mock path only: drain legacy pending entries first.
             drain_pending(
                 &events_path,
+                &project_hash,
                 mock_event_type.as_deref(),
                 mock_task_id.as_deref(),
                 mock_confidence,
@@ -2779,7 +3054,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -2792,12 +3068,26 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(1.0);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
                 println!("{}", event.event_id);
                 return Ok(());
             }
+
+            // The mod classifies prompts and tool calls itself (see above).
+            if mod_on && matches!(kind.as_str(), "UserPromptSubmit" | "PostToolUse") {
+                return Ok(());
+            }
+
+            // A tool call arrives as its full input + response JSON; cap it
+            // so one big file read or command output can't flood the queue.
+            let text: String = if kind == "PostToolUse" {
+                text.chars().take(POST_TOOL_USE_TEXT_MAX).collect()
+            } else {
+                text
+            };
 
             // v0.6.2 fork-bomb fix. The real-classifier path used to run
             // `claude -p` synchronously inside the hook, blocking each
@@ -2828,25 +3118,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // Fire-and-forget worker. Errors here are best-effort —
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
-                let _ = spawn_classify_worker(&backend);
-
-                // v0.10.0 asyncRewake backlog signal. Only the PostToolUse
-                // hook runs as asyncRewake (hooks.json sets TJ_ASYNC_REWAKE=1
-                // there), so other kinds — and direct CLI invocations —
-                // never exit 2 even on overflow. Exit code 2 from a sync
-                // hook would BLOCK the operation; only asyncRewake hooks
-                // treat code 2 as "wake the model with rewakeMessage". stdout
-                // is appended to the wake message, so the user sees the
-                // drain command without us reaching into stderr.
-                let allow_wake = std::env::var("TJ_ASYNC_REWAKE").as_deref() == Ok("1");
-                if allow_wake && kind == "PostToolUse" {
-                    let pending_count = count_pending_entries(&events_path).unwrap_or(0);
-                    if pending_count > PENDING_OVERFLOW_THRESHOLD {
-                        println!(
-                            "Task Journal pending queue: {pending_count} entries. Classifier behind — run `task-journal pending-gc --days 0` to drain.",
-                        );
-                        std::process::exit(2);
-                    }
+                if std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
+                    let _ = spawn_classify_worker(&backend);
                 }
                 return Ok(());
             }
@@ -2858,159 +3131,130 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 "assistant"
             };
 
-            let (etype, task_id, confidence, evidence_strength, suggested_text) = if let (
-                Some(t),
-                Some(tid),
-            ) =
-                (mock_event_type.as_deref(), mock_task_id.as_deref())
-            {
-                (
-                    parse_event_type(t)?,
-                    tid.to_string(),
-                    mock_confidence.unwrap_or(1.0),
-                    None,
-                    None,
-                )
-            } else {
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                if events_path.exists() {
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                }
-                let mut recent = recent_task_contexts(&conn, 5)?;
-                if recent.is_empty() {
-                    // No open tasks. v0.5.0 Phase A: auto-open a new
-                    // task from the user's prompt so subsequent
-                    // events have somewhere to land. Without this
-                    // every fresh session was a black hole — events
-                    // dropped silently because there was nothing to
-                    // classify against. Opt-out via
-                    // TJ_AUTO_OPEN_TASKS=0; only fires for
-                    // UserPromptSubmit (assistant tool calls
-                    // shouldn't conjure tasks).
-                    let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
-                        .ok()
-                        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-                        .unwrap_or(false);
-                    if auto_open_disabled || !kind.contains("UserPrompt") {
-                        return Ok(());
+            let (etype, task_id, confidence, evidence_strength, suggested_text) =
+                if let (Some(t), Some(tid)) = (mock_event_type.as_deref(), mock_task_id.as_deref())
+                {
+                    (
+                        parse_event_type(t)?,
+                        tid.to_string(),
+                        mock_confidence.unwrap_or(1.0),
+                        None,
+                        None,
+                    )
+                } else {
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    if events_path.exists() {
+                        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     }
-                    let Some(new_task) =
-                        auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?
-                    else {
-                        // Prompt was only machine noise — nothing worth a task.
+                    let mut recent =
+                        recent_task_contexts(&conn, &project_hash, 5, live_session_id.as_deref())?;
+                    if recent.is_empty() {
+                        // No open tasks. v0.5.0 Phase A: auto-open a new
+                        // task from the user's prompt so subsequent
+                        // events have somewhere to land. Without this
+                        // every fresh session was a black hole — events
+                        // dropped silently because there was nothing to
+                        // classify against. Opt-out via
+                        // TJ_AUTO_OPEN_TASKS=0; only fires for
+                        // UserPromptSubmit (assistant tool calls
+                        // shouldn't conjure tasks).
+                        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+                            .ok()
+                            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                            .unwrap_or(false);
+                        if auto_open_disabled || !kind.contains("UserPrompt") {
+                            return Ok(());
+                        }
+                        let Some(new_task) = auto_open_task_from_prompt(
+                            &events_path,
+                            &project_hash,
+                            &conn,
+                            &text,
+                            live_session_id.as_deref(),
+                        )?
+                        else {
+                            // Prompt was only machine noise — nothing worth a task.
+                            return Ok(());
+                        };
+                        recent.push(new_task);
+                    }
+
+                    let classifier = build_classifier(&backend)?;
+                    let input = tj_core::classifier::ClassifyInput {
+                        text: text.clone(),
+                        author_hint: author_hint.into(),
+                        recent_tasks: recent,
+                        tool_output: kind == "PostToolUse",
+                    };
+                    let out = match classifier.classify(&input) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &e.to_string(),
+                            )?;
+                            return Ok(());
+                        }
+                    };
+
+                    let Some(tid) = out.task_id_guess else {
                         return Ok(());
                     };
-                    recent.push(new_task);
-                }
 
-                use tj_core::classifier::Classifier;
-                let classifier: Box<dyn Classifier> = match backend.as_str() {
-                    // v0.8.0: hybrid is the new default. Heuristic
-                    // pattern-matching first (free), Anthropic API
-                    // fallback when uncertain (requires ANTHROPIC_API_KEY).
-                    // No background spawn of `claude -p` — that subprocess
-                    // now bills tokens separately from Pro/Max.
-                    "hybrid" | "" => {
-                        Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env())
+                    // Journal-integrity safeguards. The classifier sometimes
+                    // mis-attributes events to old or closed tasks (no fault
+                    // of the model — its prompt only sees recent_tasks). We
+                    // reject three patterns that produce confusing journals:
+                    //
+                    //   1. Stop-hook → Close event. The Stop hook fires at
+                    //      every Claude Code session end. Session ending
+                    //      != task done. Closes happen via explicit
+                    //      `task-journal close <id>` only.
+                    //   2. task_id_guess pointing at a non-existent task —
+                    //      route to pending so the user can decide later.
+                    //   3. task_id_guess pointing at a CLOSED task — same
+                    //      treatment; closed tasks must stay closed.
+                    use tj_core::event::EventType;
+                    if matches!(out.event_type, EventType::Close) && kind == "Stop" {
+                        return Ok(());
                     }
-                    "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
-                    "agent-sdk" => Box::new(
-                        tj_core::classifier::agent_sdk::ClaudeCliClassifier::from_env()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "agent-sdk backend selected but no `claude` binary on PATH — \
-                                     install Claude Code (https://claude.com/claude-code) or pick another --backend"
-                                )
-                            })?,
-                    ),
-                    "heuristic" => {
-                        // Heuristic-only: no LLM at all. Trades coverage
-                        // for absolute zero-cost / offline operation.
-                        use tj_core::classifier::heuristic::try_heuristic;
-                        use tj_core::classifier::{ClassifyInput, ClassifyOutput};
-                        struct HeuristicOnly;
-                        impl Classifier for HeuristicOnly {
-                            fn classify(
-                                &self,
-                                input: &ClassifyInput,
-                            ) -> anyhow::Result<ClassifyOutput> {
-                                try_heuristic(input).ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "heuristic uncertain (heuristic-only mode has no LLM fallback)"
-                                        )
-                                    })
-                            }
+                    match tj_core::db::task_status(&conn, &tid)? {
+                        None => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &format!("task_id_guess `{tid}` not found"),
+                            )?;
+                            return Ok(());
                         }
-                        Box::new(HeuristicOnly)
+                        Some(s) if s == "closed" => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &format!("task_id_guess `{tid}` is closed"),
+                            )?;
+                            return Ok(());
+                        }
+                        _ => {}
                     }
-                    other => anyhow::bail!(
-                        "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
-                    ),
-                };
-                let input = tj_core::classifier::ClassifyInput {
-                    text: text.clone(),
-                    author_hint: author_hint.into(),
-                    recent_tasks: recent,
-                };
-                let out = match classifier.classify(&input) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        persist_pending(&events_path, &text, &e.to_string())?;
-                        return Ok(());
-                    }
-                };
 
-                let Some(tid) = out.task_id_guess else {
-                    return Ok(());
+                    (
+                        out.event_type,
+                        tid,
+                        out.confidence,
+                        out.evidence_strength,
+                        Some(out.suggested_text),
+                    )
                 };
-
-                // Journal-integrity safeguards. The classifier sometimes
-                // mis-attributes events to old or closed tasks (no fault
-                // of the model — its prompt only sees recent_tasks). We
-                // reject three patterns that produce confusing journals:
-                //
-                //   1. Stop-hook → Close event. The Stop hook fires at
-                //      every Claude Code session end. Session ending
-                //      != task done. Closes happen via explicit
-                //      `task-journal close <id>` only.
-                //   2. task_id_guess pointing at a non-existent task —
-                //      route to pending so the user can decide later.
-                //   3. task_id_guess pointing at a CLOSED task — same
-                //      treatment; closed tasks must stay closed.
-                use tj_core::event::EventType;
-                if matches!(out.event_type, EventType::Close) && kind == "Stop" {
-                    return Ok(());
-                }
-                match tj_core::db::task_status(&conn, &tid)? {
-                    None => {
-                        persist_pending(
-                            &events_path,
-                            &text,
-                            &format!("task_id_guess `{tid}` not found"),
-                        )?;
-                        return Ok(());
-                    }
-                    Some(s) if s == "closed" => {
-                        persist_pending(
-                            &events_path,
-                            &text,
-                            &format!("task_id_guess `{tid}` is closed"),
-                        )?;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-
-                (
-                    out.event_type,
-                    tid,
-                    out.confidence,
-                    out.evidence_strength,
-                    Some(out.suggested_text),
-                )
-            };
 
             // Use classifier's suggested_text if available (it's more concise and specific),
             // fall back to raw hook text for mock/manual events.
@@ -3026,6 +3270,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             event.confidence = Some(confidence);
             event.status = tj_core::classifier::decide_status(confidence);
             event.evidence_strength = evidence_strength;
+            tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
@@ -3095,12 +3340,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 anyhow::bail!("no events file at {events_path:?}");
             }
 
-            let body = std::fs::read_to_string(&events_path)?;
-            let all_events: Vec<tj_core::event::Event> = body
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(serde_json::from_str)
-                .collect::<Result<_, _>>()?;
+            let all_events = read_events_lenient(&events_path, "export")?;
 
             // Filter to specific task if requested.
             let events: Vec<&tj_core::event::Event> = if let Some(ref tid) = task {
@@ -3133,29 +3373,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     }
 
                     for (task_id, task_events) in &tasks {
-                        // Derive title from the first open event's meta, or text.
-                        let title = task_events
-                            .iter()
-                            .find(|e| e.event_type == tj_core::event::EventType::Open)
-                            .and_then(|e| {
-                                e.meta
-                                    .get("title")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                                    .or_else(|| Some(e.text.clone()))
-                            })
-                            .unwrap_or_else(|| "(untitled)".into());
-
-                        // Determine status: closed if last event is close, else open.
-                        let status = if task_events
-                            .last()
-                            .map(|e| e.event_type == tj_core::event::EventType::Close)
-                            .unwrap_or(false)
-                        {
-                            "closed"
-                        } else {
-                            "open"
-                        };
+                        let (title, status) = export_title_and_status(task_events);
 
                         // Created timestamp from first event.
                         let created = task_events
@@ -3231,7 +3449,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     let path = state_dir.join(format!("{hash}.sqlite"));
                     let conn = match rusqlite::Connection::open(&path) {
                         Ok(c) => c,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn_skipped_project(&hash, e);
+                            continue;
+                        }
                     };
                     let ids = match run_search(
                         &conn,
@@ -3241,7 +3462,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                         limit,
                     ) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn_skipped_project(&hash, e);
+                            continue;
+                        }
                     };
                     for id in ids {
                         println!("{hash}\t{id}");
@@ -3254,11 +3478,14 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
                 let state_path =
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                // No journal, no tasks — and no empty state DB left behind to
+                // show up in `--all-projects` and project lists later.
+                if !events_path.exists() {
+                    return Ok(());
+                }
 
                 let conn = tj_core::db::open(&state_path)?;
-                if events_path.exists() {
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                }
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 let ids = run_search(&conn, &fts_query, &like_query, event_type.as_deref(), limit)?;
                 for id in ids {
                     println!("{id}");
@@ -3319,7 +3546,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 Some(d) => d,
                 None => {
                     eprintln!(
-                        "No Claude Code sessions found for: {}",
+                        "No Claude Code sessions found for: {} — backfill reads Claude Code \
+transcripts only (Codex sessions are not read yet)",
                         project_path.display()
                     );
                     eprintln!(
@@ -3332,10 +3560,37 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 }
             };
 
-            // List available sessions.
+            // Check which sessions are already imported (idempotent): a session
+            // counts once some event is tagged with it in `meta.session_id` —
+            // not merely mentioned in some unrelated event's text.
+            let already_imported: std::collections::HashSet<String> =
+                std::fs::read_to_string(&events_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<tj_core::event::Event>(l).ok())
+                    .filter_map(|e| {
+                        e.meta
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
+
+            // List available sessions. --limit counts only sessions not yet
+            // imported, so a rerun reaches older ones; imported ones stay in
+            // the list and are reported as skipped below.
             let mut sessions = discovery::list_sessions(&proj_dir)?;
             if let Some(max) = limit {
-                sessions.truncate(max);
+                let mut fresh = 0;
+                sessions.retain(|p| {
+                    let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                    if already_imported.contains(id) {
+                        return true;
+                    }
+
+                    fresh += 1;
+                    fresh <= max
+                });
             }
 
             if sessions.is_empty() {
@@ -3348,18 +3603,6 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 sessions.len(),
                 project_path.display()
             );
-
-            // Check which sessions are already imported (idempotent).
-            let already_imported = if events_path.exists() {
-                let content = std::fs::read_to_string(&events_path).unwrap_or_default();
-                sessions
-                    .iter()
-                    .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
-                    .filter(|sid| content.contains(sid))
-                    .collect::<std::collections::HashSet<_>>()
-            } else {
-                std::collections::HashSet::new()
-            };
 
             let mut total_tasks = 0;
             let mut total_events = 0;
@@ -3452,6 +3695,13 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 eprintln!("Run without --dry-run to import.");
             } else {
+                // Index the appended events so search / pack see them now.
+                if total_tasks > 0 {
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                }
                 eprintln!("\nImported {total_tasks} task(s) with {total_events} event(s).");
             }
         }
@@ -3556,20 +3806,19 @@ fn run_statusline() -> anyhow::Result<String> {
         })
         .count();
 
-    // Pending dir is global — one entry per queued classifier failure.
-    // No project filter (matches the brief; per-project counting would
-    // need extra metadata in each pending file).
+    // Pending dir is global; this project's entries carry its hash as a
+    // filename prefix, so counting stays a cheap readdir with no JSON
+    // parsing. Legacy un-prefixed entries are not counted.
+    let prefix = format!("{project_hash}.");
     let pending_count = pending_dir()
         .ok()
         .and_then(|d| std::fs::read_dir(&d).ok())
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .map(|x| x == "json")
-                        .unwrap_or(false)
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(&prefix) && name.ends_with(".json")
                 })
                 .count()
         })
@@ -3613,6 +3862,23 @@ fn run_search(
     event_type: Option<&str>,
     limit: usize,
 ) -> Result<Vec<String>> {
+    // No query: list the tasks, newest first, like MCP task_search. FTS5
+    // rejects an empty MATCH, so it must not reach it.
+    if fts_query.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT task_id FROM tasks \
+             WHERE ?1 IS NULL OR task_id IN (SELECT task_id FROM events_index WHERE type = ?1) \
+             ORDER BY last_event_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let ids = stmt
+            .query_map(rusqlite::params![event_type, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        return Ok(ids);
+    }
+
     let (fts_sql, fts_uses_type) = match event_type {
         Some(_) => (
             "SELECT DISTINCT task_id FROM search_fts \
@@ -3672,6 +3938,12 @@ fn run_search(
     Ok(ids_like)
 }
 
+/// Cross-project reads keep going past a project they cannot read, but say
+/// so on stderr instead of dropping it silently.
+fn warn_skipped_project(hash: &str, err: impl std::fmt::Display) {
+    eprintln!("warning: skipping project {hash}: {err}");
+}
+
 fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64>) -> Result<()> {
     let cutoff: Option<String> = since.map(|d| {
         (chrono::Utc::now() - chrono::Duration::days(d))
@@ -3704,11 +3976,21 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
     // attached DBs would be faster but rusqlite's bundled build doesn't
     // ship ATTACH-friendly ergonomics; per-project loop is fine here.
     let mut hits: Vec<(String, String, String, String, String)> = Vec::new();
+    // Only the --all-projects sweep reports a skipped project: the current
+    // project of a fresh clone legitimately has no tables yet.
+    let skip = |hash: &str, e: rusqlite::Error| {
+        if all_projects {
+            warn_skipped_project(hash, e);
+        }
+    };
     for hash in hashes {
         let path = state_dir.join(format!("{hash}.sqlite"));
         let conn = match rusqlite::Connection::open(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
 
         let use_fts = topic_is_fts_safe(topic);
@@ -3734,7 +4016,10 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
 
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
         let bind_q = if use_fts {
             topic.to_string()
@@ -3751,10 +4036,23 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
             ))
         }) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
-        for row in rows.flatten() {
-            hits.push(row);
+        // Keep going past a row that fails to map, but say so once.
+        let mut first_err = None;
+        for row in rows {
+            match row {
+                Ok(row) => hits.push(row),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            eprintln!("warning: skipped unreadable rejection row(s) in project {hash}: {e}");
         }
     }
 
@@ -3809,32 +4107,37 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     let meta = tj_core::db::task_metadata(&conn, task_id)?.unwrap_or_default();
     let summary = meta.goal.unwrap_or_else(|| title.clone());
 
-    // Pull all events ordered ASC so the PR description reads like a
-    // narrative (oldest decision first → newest).
+    // Changes / Why list exactly the pack's Active decisions / Rejected,
+    // reversed so the PR description reads like a narrative (oldest first).
+    let one_lines = |choices: Vec<tj_core::pack::Choice>| -> Vec<String> {
+        choices
+            .iter()
+            .rev()
+            .filter_map(|c| {
+                let one_line = c.text.lines().next().unwrap_or("").trim();
+                (!one_line.is_empty()).then(|| format!("{one_line}{}", c.marker()))
+            })
+            .collect()
+    };
+    let decisions = one_lines(tj_core::pack::active_decisions(&conn, task_id)?);
+    let rejections = one_lines(tj_core::pack::rejections(&conn, task_id)?);
+
     let mut stmt = conn.prepare(
-        "SELECT ei.type, sf.text FROM events_index ei
+        "SELECT sf.text FROM events_index ei
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.task_id = ?1 ORDER BY ei.timestamp ASC",
+         WHERE ei.task_id = ?1 AND ei.type = 'evidence' AND ei.corrected_by IS NULL
+         ORDER BY ei.timestamp ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
-        let ty: String = r.get(0)?;
-        let txt: Option<String> = r.get(1)?;
-        Ok((ty, txt.unwrap_or_default()))
+        let txt: Option<String> = r.get(0)?;
+        Ok(txt.unwrap_or_default())
     })?;
-    let mut decisions: Vec<String> = Vec::new();
-    let mut rejections: Vec<String> = Vec::new();
     let mut evidence: Vec<String> = Vec::new();
     for row in rows {
-        let (ty, text) = row?;
+        let text = row?;
         let one_line: String = text.lines().next().unwrap_or("").trim().to_string();
-        if one_line.is_empty() {
-            continue;
-        }
-        match ty.as_str() {
-            "decision" => decisions.push(one_line),
-            "rejection" => rejections.push(one_line),
-            "evidence" => evidence.push(one_line),
-            _ => {}
+        if !one_line.is_empty() {
+            evidence.push(one_line);
         }
     }
 
@@ -4061,31 +4364,35 @@ fn run_export_memory(task: Option<&str>, _all_closed: bool, dry_run: bool) -> Re
         )?;
         let meta = tj_core::db::task_metadata(&conn, id)?.unwrap_or_default();
 
-        // decision + constraint one-liners, oldest-first (== run_export_pr style).
+        // One-liners, oldest-first (== run_export_pr style). Decisions are the
+        // pack's Active decisions; constraints skip bookkeeping (model
+        // switches) and corrected ones by the same rules.
+        let decisions: Vec<String> = tj_core::pack::active_decisions(&conn, id)?
+            .iter()
+            .rev()
+            .filter_map(|c| {
+                let line = c.text.lines().next().unwrap_or("").trim();
+                (!line.is_empty()).then(|| format!("{line}{}", c.marker()))
+            })
+            .take(MAX_ITEMS)
+            .collect();
+
         let mut stmt = conn.prepare(
-            "SELECT ei.type, sf.text FROM events_index ei
+            "SELECT sf.text FROM events_index ei
              LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-             WHERE ei.task_id = ?1 AND ei.type IN ('decision','constraint')
+             WHERE ei.task_id = ?1 AND ei.type = 'constraint'
+               AND ei.bookkeeping = 0 AND ei.corrected_by IS NULL
              ORDER BY ei.timestamp ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
+            Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default())
         })?;
-        let mut decisions = Vec::new();
         let mut constraints = Vec::new();
         for row in rows {
-            let (ty, text) = row?;
+            let text = row?;
             let line = text.lines().next().unwrap_or("").trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            match ty.as_str() {
-                "decision" if decisions.len() < MAX_ITEMS => decisions.push(line),
-                "constraint" if constraints.len() < MAX_ITEMS => constraints.push(line),
-                _ => {}
+            if !line.is_empty() && constraints.len() < MAX_ITEMS {
+                constraints.push(line);
             }
         }
 
@@ -4114,15 +4421,26 @@ fn run_export_memory(task: Option<&str>, _all_closed: bool, dry_run: bool) -> Re
 /// the classifier prompt. Kept small so the prompt stays bounded.
 const CONSTRAINT_CONTEXT_LIMIT: i64 = 5;
 
+/// The open tasks a hook works with, newest first — except that the task
+/// this session last wrote to comes first, so two sessions in one project
+/// each see (and classify into) their own task, not just the newest one.
 fn recent_task_contexts(
     conn: &rusqlite::Connection,
+    project_hash: &str,
     limit: usize,
+    session: Option<&str>,
 ) -> anyhow::Result<Vec<tj_core::classifier::TaskContext>> {
+    let own = match session {
+        Some(sid) => tj_core::db::active_task_for_session(conn, project_hash, sid)?,
+        None => None,
+    };
+
     let mut stmt = conn.prepare(
-        "SELECT task_id, title FROM tasks WHERE status='open' ORDER BY last_event_at DESC LIMIT ?1",
+        "SELECT task_id, title FROM tasks WHERE status='open'
+         ORDER BY (task_id = ?2) DESC, last_event_at DESC LIMIT ?1",
     )?;
     let task_rows: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![limit as i64], |r| {
+        .query_map(rusqlite::params![limit as i64, own], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .collect::<Result<_, _>>()?;
@@ -4153,17 +4471,22 @@ fn recent_task_contexts(
             "SELECT sf.text FROM events_index ei
              LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
              WHERE ei.task_id = ?1 AND ei.type = 'constraint'
+             AND COALESCE(sf.text, '') NOT LIKE ?3
              ORDER BY ei.timestamp DESC LIMIT ?2",
         )?;
+        let model_switch = format!("{}%", tj_core::reminder::MODEL_SWITCH_TEXT_PREFIX);
         let constraints: Vec<String> = c_stmt
-            .query_map(rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT], |r| {
-                let txt: Option<String> = r.get(0)?;
-                Ok(txt
-                    .unwrap_or_default()
-                    .chars()
-                    .take(120)
-                    .collect::<String>())
-            })?
+            .query_map(
+                rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT, model_switch],
+                |r| {
+                    let txt: Option<String> = r.get(0)?;
+                    Ok(txt
+                        .unwrap_or_default()
+                        .chars()
+                        .take(120)
+                        .collect::<String>())
+                },
+            )?
             .collect::<Result<Vec<String>, _>>()?
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -4241,11 +4564,27 @@ fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usiz
         .count()
 }
 
+/// True when the Claude Code mod (`plugin/hooks/register.ts`) runs in this
+/// session: it sets `TJ_MOD_ACTIVE` for every hook it starts. Codex never does.
+fn mod_active() -> bool {
+    std::env::var("TJ_MOD_ACTIVE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Adaptive UserPromptSubmit nudge (caveman pattern, non-blocking, free): always
 /// emit the base "record as you go" reminder, and — when the session has done
 /// substantial work but logged little — escalate. All signals are cheap (a file
 /// size + a tail scan); no model, never blocks the prompt.
 fn run_nudge() -> anyhow::Result<()> {
+    // Recursion guard, same as recall-hook: never inject into our own
+    // classifier child (`claude -p` / `codex exec` re-run the user's hooks).
+    if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
+        return Ok(());
+    }
+    // The Claude Code mod nudges by itself (after N turns without an entry).
+    if mod_active() {
+        return Ok(());
+    }
+
     let mut ctx = NUDGE_BASE.to_string();
     let escalation = (|| -> Option<String> {
         use std::io::{IsTerminal, Read};
@@ -4303,7 +4642,10 @@ fn run_session_end_catchup(
     let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
     let conn = tj_core::db::open(&state_path)?;
     tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
-    let Some(tc) = recent_task_contexts(&conn, 1)?.into_iter().next() else {
+    let Some(tc) = recent_task_contexts(&conn, project_hash, 1, live_session_id)?
+        .into_iter()
+        .next()
+    else {
         return Ok(());
     };
     let last_event_ts: Option<String> = conn
@@ -4498,7 +4840,10 @@ fn run_dream_op(
     // 1. Resolve session files in scope.
     let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
     let Some(project_dir) = project_dir else {
-        println!("dream: no Claude Code sessions found for this project");
+        println!(
+            "dream: no Claude Code session directory for this project — dream mines \
+Claude Code transcripts only (Codex sessions are not read yet)"
+        );
         return Ok(());
     };
     let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;
@@ -4524,11 +4869,13 @@ fn run_dream_op(
             Some(tj_core::dream::scope::SessionFile { path: p, mtime })
         })
         .collect();
+    let mtimes: std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> =
+        scoped.iter().map(|s| (s.path.clone(), s.mtime)).collect();
     let in_scope = tj_core::dream::scope::in_scope(scoped, since_time, limit);
 
     // 2. Assemble (session_id, BackfillInput) per session.
     let run_id = ulid::Ulid::new().to_string();
-    let sessions = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
+    let (sessions, unreadable) = build_dream_inputs(&events_path, &in_scope, task.as_deref())?;
 
     let opts = tj_core::dream::DreamOptions {
         project_hash: project_hash.clone(),
@@ -4561,16 +4908,42 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
         &run_id,
     )?;
 
-    // 4. Advance watermark to now (only reached on success).
-    tj_core::dream::state::set_last_dream_at(
-        &conn,
-        &project_hash,
-        &chrono::Utc::now().to_rfc3339(),
-    )?;
-    println!(
+    // 4. Advance the watermark — only on an unscoped run (--task / --limit /
+    // --since skip sessions they never looked at), and only to the newest
+    // session such that it and every older in-scope one were mined cleanly.
+    if since.is_none() && task.is_none() && limit.is_none() {
+        let mined: Vec<(std::time::SystemTime, bool)> = in_scope
+            .iter()
+            .map(|p| {
+                let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let clean = !unreadable.iter().any(|u| u == id)
+                    && !report.failed_sessions.iter().any(|f| f == id);
+                (mtimes[p], clean)
+            })
+            .collect();
+        if let Some(t) = tj_core::dream::scope::next_watermark(&mined) {
+            let at = chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339();
+            tj_core::dream::state::set_last_dream_at(&conn, &project_hash, &at)?;
+        }
+    }
+
+    let mut summary = format!(
         "dream: {} session(s) processed, {} event(s) backfilled",
         report.sessions_processed, report.events_backfilled
     );
+    if report.events_dropped_unknown_task > 0 {
+        summary.push_str(&format!(
+            ", {} dropped (unknown task id)",
+            report.events_dropped_unknown_task
+        ));
+    }
+    if !report.failed_sessions.is_empty() {
+        summary.push_str(&format!(
+            ", {} only partly mined (retried next run)",
+            report.failed_sessions.len()
+        ));
+    }
+    println!("{summary}");
     Ok(())
 }
 
@@ -4702,7 +5075,7 @@ fn task_sessions(
         })
         .collect();
     let in_scope = tj_core::dream::scope::in_scope(scoped, None, None);
-    build_dream_inputs(events_path, &in_scope, Some(task_id))
+    Ok(build_dream_inputs(events_path, &in_scope, Some(task_id))?.0)
 }
 
 /// Enrich a single task from every session that touched it. Unlike `dream`,
@@ -4930,6 +5303,23 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
     );
 }
 
+/// The Claude Code session dir that `--enrich` reads. With `--enrich` and no
+/// such dir, say why nothing gets enriched instead of staying silent.
+fn complete_project_dir(
+    cwd: &std::path::Path,
+    enrich: bool,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let dir = tj_core::session::discovery::find_project_dir(cwd)?;
+    if enrich && dir.is_none() {
+        eprintln!(
+            "complete: no Claude Code session directory for this project — --enrich reads \
+Claude Code transcripts only (Codex sessions are not read yet)"
+        );
+    }
+
+    Ok(dir)
+}
+
 /// `complete <id>` — finalize a single task.
 fn run_complete_single(
     task_id: &str,
@@ -4948,7 +5338,7 @@ fn run_complete_single(
     if !tj_core::db::task_exists(&conn, task_id)? {
         anyhow::bail!("task not found: {task_id}");
     }
-    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+    let project_dir = complete_project_dir(&cwd, enrich)?;
     let ctx = ProjectCtx {
         conn: &conn,
         events_path: &events_path,
@@ -4994,7 +5384,7 @@ fn run_complete_batch(
         return Ok(());
     }
 
-    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+    let project_dir = complete_project_dir(&cwd, enrich)?;
 
     // Show the numbered list with event/session counts so the user can judge
     // what to keep before anything is touched.
@@ -5254,6 +5644,7 @@ fn auto_open_task_from_prompt(
     project_hash: &str,
     conn: &rusqlite::Connection,
     prompt: &str,
+    session_id: Option<&str>,
 ) -> anyhow::Result<Option<tj_core::classifier::TaskContext>> {
     // Title/goal must read like a human wrote them on purpose. When the
     // prompt is only machine noise — session-start scrollback
@@ -5266,41 +5657,20 @@ fn auto_open_task_from_prompt(
     };
     let goal: String = tj_core::title::humanize_goal(prompt, 200).unwrap_or_else(|| title.clone());
 
-    let task_id = tj_core::new_task_id();
-    let mut event = tj_core::event::Event::new(
-        task_id.clone(),
-        tj_core::event::EventType::Open,
-        tj_core::event::Author::User,
-        tj_core::event::Source::Cli,
-        title.clone(),
-    );
-    event.meta = serde_json::json!({ "title": title, "auto_opened": true });
-
-    let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
-    writer.append(&event)?;
-    writer.flush_durable()?;
-
-    tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
-    if !goal.is_empty() {
-        tj_core::db::set_task_goal(conn, &task_id, &goal)?;
-    }
-
     // v0.5.0 Phase C / v0.6.0: score-based linking. Pull artifacts
     // from the prompt — ticket ids, commit hashes, file paths — then
     // ask the journal which prior tasks share enough signal to be a
     // probable continuation. Anything with score > 0 gets linked via
     // External; the strongest closed match also triggers a stderr
     // hint so the user can reopen instead of accumulating duplicates.
+    // Resolved before the open event is written so the links ride in it.
+    let mut linked: Vec<String> = Vec::new();
     let prompt_arts = tj_core::artifacts::extract(prompt);
     if !prompt_arts.is_empty() {
         let related = tj_core::db::find_related_tasks(conn, &prompt_arts)?;
         let mut warned = false;
         for r in related.iter().take(5) {
-            if r.task_id == task_id {
-                continue;
-            }
-            let _ =
-                tj_core::db::add_task_external(conn, &task_id, &format!("linked:{}", r.task_id));
+            linked.push(format!("linked:{}", r.task_id));
             if !warned && r.status == "closed" {
                 eprintln!(
                     "task-journal: this prompt looks like a continuation of closed task {} \
@@ -5312,6 +5682,30 @@ fn auto_open_task_from_prompt(
         }
     }
 
+    let task_id = tj_core::new_task_id();
+    let mut event = tj_core::event::Event::new(
+        task_id.clone(),
+        tj_core::event::EventType::Open,
+        tj_core::event::Author::User,
+        tj_core::event::Source::Cli,
+        title.clone(),
+    );
+    // Goal and links ride in the open event, so a rebuild restores them.
+    event.meta = serde_json::json!({ "title": title, "auto_opened": true });
+    if !goal.is_empty() {
+        event.meta["goal"] = serde_json::Value::String(goal);
+    }
+    if !linked.is_empty() {
+        event.meta["external"] = serde_json::json!(linked);
+    }
+    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
+
+    let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+    writer.append(&event)?;
+    writer.flush_durable()?;
+
+    tj_core::db::ingest_new_events(conn, events_path, project_hash)?;
+
     Ok(Some(tj_core::classifier::TaskContext {
         task_id,
         title,
@@ -5320,7 +5714,13 @@ fn auto_open_task_from_prompt(
     }))
 }
 
-fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyhow::Result<()> {
+fn persist_pending(
+    events_path: &std::path::Path,
+    project_hash: &str,
+    kind: &str,
+    text: &str,
+    err: &str,
+) -> anyhow::Result<()> {
     let pending_dir = events_path
         .parent()
         .unwrap()
@@ -5329,9 +5729,10 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
         .join("pending");
     std::fs::create_dir_all(&pending_dir)?;
     let id = ulid::Ulid::new().to_string();
-    let payload = serde_json::json!({"text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
+    // `kind` lets `pending retry` classify the chunk the way the hook would.
+    let payload = serde_json::json!({"kind": kind, "text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
     std::fs::write(
-        pending_dir.join(format!("{id}.json")),
+        pending_dir.join(format!("{project_hash}.{id}.json")),
         serde_json::to_string_pretty(&payload)?,
     )?;
     Ok(())
@@ -5340,41 +5741,6 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
 /// v0.6.2: queue an ingest event for the detached classify-worker. The
 /// hook returns immediately after writing this entry so it does not
 /// block Claude Code's hook timeout (was 5-30s, now <100ms). Schema "v2"
-/// Threshold for the v0.10.0 asyncRewake backlog signal. When the
-/// PostToolUse hook (configured with `asyncRewake: true` in
-/// `hooks.json`) finds more than this many entries already queued
-/// in `pending/`, it exits with code 2 to wake the model with a
-/// system reminder pointing at `task-journal pending-gc`. Tuned so
-/// that normal load (<5 in-flight at any moment) never trips, but
-/// a stuck classifier surfaces visibly before the queue grows into
-/// the hundreds (the v0.6.2 fork-bomb era saw 515 entries before a
-/// user noticed).
-const PENDING_OVERFLOW_THRESHOLD: usize = 25;
-
-/// Count `.json` (and `.json.dead`) entries currently sitting in
-/// `pending/` next to `events_path`. Best-effort: any IO error
-/// returns 0 so a borked filesystem never wakes the model with
-/// noise. Used by the asyncRewake backlog signal.
-fn count_pending_entries(events_path: &std::path::Path) -> anyhow::Result<usize> {
-    let dir = events_path
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("events_path has no grandparent"))?
-        .join("pending");
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut count = 0usize;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some("json") = path.extension().and_then(|e| e.to_str()) {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// distinguishes async-ingest entries from legacy v1 (text+error) ones
 /// the `pending retry` path knows how to handle.
 fn persist_pending_v2(
@@ -5405,7 +5771,9 @@ fn persist_pending_v2(
     if let Some(sid) = session_id {
         payload["session_id"] = serde_json::Value::String(sid.to_string());
     }
-    let path = pending_dir.join(format!("{id}.json"));
+    // `pending/` is shared by every project: the hash prefix tells each
+    // project's worker which entries are its own.
+    let path = pending_dir.join(format!("{project_hash}.{id}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
     Ok(path)
 }
@@ -5492,83 +5860,36 @@ fn spawn_classify_worker(backend: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// File-lock guard for the classify-worker. Holds the lockfile until
-/// dropped; ensures cleanup on panic. One worker per project_hash.
-struct WorkerLock {
-    path: std::path::PathBuf,
-}
-
-impl WorkerLock {
-    /// Try to acquire the lock. Returns Ok(Some(_)) on success, Ok(None)
-    /// if another live worker holds it, Err on filesystem failure.
-    fn try_acquire(project_hash: &str) -> anyhow::Result<Option<Self>> {
-        let dir = tj_core::paths::state_dir()?;
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("classifier-{project_hash}.lock"));
-
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", std::process::id());
-                    return Ok(Some(Self { path }));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Inspect existing lockfile. If PID is alive → another
-                    // worker is running; back off. If dead/missing →
-                    // remove stale file and retry.
-                    let body = std::fs::read_to_string(&path).unwrap_or_default();
-                    let pid: Option<u32> = body.trim().parse().ok();
-                    if let Some(pid) = pid {
-                        if pid_is_alive(pid) {
-                            return Ok(None);
-                        }
-                    }
-                    // Stale (no PID, or dead PID) — remove and retry.
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-}
-
-impl Drop for WorkerLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
-    // kill(pid, 0) probes existence without sending a signal.
-    // SAFETY: libc::kill is a thin syscall wrapper, no aliasing concerns.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    // Conservative on non-Unix: assume alive so we don't double-spawn.
-    // The lockfile gets cleaned up on Drop in the normal exit path.
-    true
-}
+/// Characters of a PostToolUse chunk (tool input + response) that get queued.
+const POST_TOOL_USE_TEXT_MAX: usize = 2000;
 
 /// classify-worker: drain pending v2 entries by running the real
 /// classifier. v1 entries (legacy text+error shape) are left for
-/// `pending retry`. Holds a project-scoped file lock so only one
+/// `pending retry`. Holds a project-scoped OS lock so only one
 /// worker per project runs at a time.
 fn run_classify_worker(backend: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
 
-    let lock = match WorkerLock::try_acquire(&project_hash)? {
-        Some(l) => l,
-        None => return Ok(()), // another worker is running
+    // An advisory lock held for the worker's lifetime. The OS releases it
+    // when the process exits or dies, so a leftover file never blocks the
+    // next worker and needs no stale-pid check. The file is never deleted:
+    // a worker could lock the unlinked file while another creates and
+    // locks a fresh one.
+    let state_dir = tj_core::paths::state_dir()?;
+    std::fs::create_dir_all(&state_dir)?;
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_dir.join(format!("classifier-{project_hash}.lock")))?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _held = match lock.try_write() {
+        Ok(guard) => guard,
+        // Another worker of this project is running.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        Err(e) => return Err(e.into()),
     };
 
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -5578,19 +5899,32 @@ fn run_classify_worker(backend: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("events_dir has no grandparent"))?
         .join("pending");
     if !pending.exists() {
-        drop(lock);
         return Ok(());
     }
 
-    // Snapshot entries up front so concurrent re-queues don't loop us.
-    let mut entries: Vec<std::path::PathBuf> = Vec::new();
-    for e in std::fs::read_dir(&pending)? {
-        let e = e?;
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("json") {
-            entries.push(p);
+    // A worker that died mid-entry left it claimed. We hold the lock, so no
+    // other worker of this project is on it: put it back in the queue.
+    for claimed in std::fs::read_dir(&pending)?.flatten().map(|e| e.path()) {
+        let Some(name) = claimed
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".processing"))
+        else {
+            continue;
+        };
+        let ours = std::fs::read_to_string(&claimed)
+            .ok()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v["project_hash"] == project_hash.as_str());
+        if ours {
+            let _ = std::fs::rename(&claimed, pending.join(name));
         }
     }
+
+    // Snapshot entries up front so concurrent re-queues don't loop us.
+    // Only this project's entries: the lock is per project, so a worker
+    // of another project may be draining the same directory right now.
+    let entries = project_pending_entries(&pending, &project_hash)?;
 
     for path in entries {
         if let Err(err) = process_pending_entry(&path, &events_path, &project_hash, backend) {
@@ -5601,7 +5935,6 @@ fn run_classify_worker(backend: &str) -> Result<()> {
         }
     }
 
-    drop(lock);
     Ok(())
 }
 
@@ -5620,6 +5953,11 @@ fn process_pending_entry(
     if schema != "v2" {
         return Ok(()); // legacy entry, handled by `pending retry`
     }
+    // A legacy un-prefixed entry is ours only when it names this project;
+    // one without `project_hash` is left for `pending retry`.
+    if v.get("project_hash").and_then(|x| x.as_str()) != Some(project_hash) {
+        return Ok(());
+    }
 
     let kind = v
         .get("kind")
@@ -5635,41 +5973,54 @@ fn process_pending_entry(
     // Inherit the session id queued on the v2 chunk (additive; absent → None).
     let chunk_session_id = tj_core::session_id::session_id_from_payload(&v);
 
-    // Mirror the synchronous flow that used to live in IngestHook —
-    // see commit history of v0.6.1 for the original. Auto-open, run
-    // classifier, apply integrity safeguards, persist event, telemetry.
-    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-    let conn = tj_core::db::open(&state_path)?;
-    if events_path.exists() {
-        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    // Claim the entry before the classifier call: a rename succeeds for one
+    // process only, so an entry is never classified (and recorded) twice.
+    let claimed = path.with_extension("json.processing");
+    if std::fs::rename(path, &claimed).is_err() {
+        return Ok(()); // someone else took it
     }
 
-    let mut recent = recent_task_contexts(&conn, 5)?;
-    if recent.is_empty() {
-        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
-            .ok()
-            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        if auto_open_disabled || !kind.contains("UserPrompt") {
-            // Nothing to do — drop the entry silently.
-            std::fs::remove_file(path)?;
-            return Ok(());
+    let classified = (|| -> anyhow::Result<()> {
+        let classifier = build_classifier(backend)?;
+        let outcome = classify_chunk(
+            classifier.as_ref(),
+            events_path,
+            project_hash,
+            &kind,
+            &text,
+            chunk_session_id.as_deref(),
+        )?;
+        if let ChunkOutcome::Unplaced(err) = outcome {
+            // Persist as legacy v1 pending entry so `pending retry`
+            // surfaces it; remove the v2 source.
+            persist_pending(events_path, project_hash, &kind, &text, &err)?;
         }
-        let Some(new_task) = auto_open_task_from_prompt(events_path, project_hash, &conn, &text)?
-        else {
-            // Prompt was only machine noise — drop the entry silently.
-            std::fs::remove_file(path)?;
-            return Ok(());
-        };
-        recent.push(new_task);
+        Ok(())
+    })();
+    if classified.is_err() {
+        // Back in the queue under its own name for the next worker.
+        let _ = std::fs::rename(&claimed, path);
+        return classified;
     }
 
-    let author_hint = if kind.contains("UserPrompt") {
-        "user"
-    } else {
-        "assistant"
-    };
+    std::fs::remove_file(&claimed)?;
+    Ok(())
+}
 
+/// What became of one classified chunk.
+enum ChunkOutcome {
+    /// An event was written to the journal.
+    Recorded,
+    /// Nothing worth recording: no task to attach to, machine noise, no
+    /// task guess, or a session-end "close".
+    Dropped,
+    /// The classifier failed or guessed a missing / closed task; the reason
+    /// goes back into `pending/` with the chunk.
+    Unplaced(String),
+}
+
+/// The classifier behind a `--backend` name.
+fn build_classifier(backend: &str) -> anyhow::Result<Box<dyn tj_core::classifier::Classifier>> {
     use tj_core::classifier::Classifier;
     let classifier: Box<dyn Classifier> = match backend {
         "hybrid" | "" => Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env()),
@@ -5701,50 +6052,83 @@ fn process_pending_entry(
             "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
         ),
     };
+    Ok(classifier)
+}
+
+/// Classify one chunk against the project's open tasks and record the
+/// event. Shared by classify-worker and `pending retry`, so both auto-open,
+/// check attribution, stamp the session and write telemetry the same way.
+fn classify_chunk(
+    classifier: &dyn tj_core::classifier::Classifier,
+    events_path: &std::path::Path,
+    project_hash: &str,
+    kind: &str,
+    text: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<ChunkOutcome> {
+    // Mirror the synchronous flow that used to live in IngestHook —
+    // see commit history of v0.6.1 for the original. Auto-open, run
+    // classifier, apply integrity safeguards, persist event, telemetry.
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    }
+
+    let mut recent = recent_task_contexts(&conn, project_hash, 5, session_id)?;
+    if recent.is_empty() {
+        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+            .ok()
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if auto_open_disabled || !kind.contains("UserPrompt") {
+            // Nothing to do — drop the entry silently.
+            return Ok(ChunkOutcome::Dropped);
+        }
+        let Some(new_task) =
+            auto_open_task_from_prompt(events_path, project_hash, &conn, text, session_id)?
+        else {
+            // Prompt was only machine noise — drop the entry silently.
+            return Ok(ChunkOutcome::Dropped);
+        };
+        recent.push(new_task);
+    }
+
+    let author_hint = if kind.contains("UserPrompt") {
+        "user"
+    } else {
+        "assistant"
+    };
+
     let input = tj_core::classifier::ClassifyInput {
-        text: text.clone(),
+        text: text.to_string(),
         author_hint: author_hint.into(),
         recent_tasks: recent,
+        tool_output: kind == "PostToolUse",
     };
     let out = match classifier.classify(&input) {
         Ok(o) => o,
-        Err(e) => {
-            // Persist as legacy v1 pending entry so `pending retry`
-            // surfaces it; remove the v2 source.
-            persist_pending(events_path, &text, &e.to_string())?;
-            std::fs::remove_file(path)?;
-            return Ok(());
-        }
+        Err(e) => return Ok(ChunkOutcome::Unplaced(e.to_string())),
     };
 
     let Some(tid) = out.task_id_guess else {
-        std::fs::remove_file(path)?;
-        return Ok(());
+        return Ok(ChunkOutcome::Dropped);
     };
 
     use tj_core::event::EventType;
     if matches!(out.event_type, EventType::Close) && kind == "Stop" {
-        std::fs::remove_file(path)?;
-        return Ok(());
+        return Ok(ChunkOutcome::Dropped);
     }
     match tj_core::db::task_status(&conn, &tid)? {
         None => {
-            persist_pending(
-                events_path,
-                &text,
-                &format!("task_id_guess `{tid}` not found"),
-            )?;
-            std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(ChunkOutcome::Unplaced(format!(
+                "task_id_guess `{tid}` not found"
+            )))
         }
         Some(s) if s == "closed" => {
-            persist_pending(
-                events_path,
-                &text,
-                &format!("task_id_guess `{tid}` is closed"),
-            )?;
-            std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(ChunkOutcome::Unplaced(format!(
+                "task_id_guess `{tid}` is closed"
+            )))
         }
         _ => {}
     }
@@ -5764,7 +6148,7 @@ fn process_pending_entry(
     event.confidence = Some(confidence);
     event.status = tj_core::classifier::decide_status(confidence);
     event.evidence_strength = evidence_strength;
-    tj_core::session_id::stamp_session_id(&mut event.meta, chunk_session_id.as_deref());
+    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
 
     let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
     writer.append(&event)?;
@@ -5792,33 +6176,32 @@ fn process_pending_entry(
         },
     );
 
-    std::fs::remove_file(path)?;
-    Ok(())
+    Ok(ChunkOutcome::Recorded)
 }
 
+/// Mock-only drain: with the mock flags, turn this project's legacy (v1)
+/// pending entries into events. Without them it does nothing — a v1 entry is
+/// a classifier failure waiting for `pending retry`, and v2 entries belong to
+/// classify-worker. An entry is removed only after its event is written.
 fn drain_pending(
     events_path: &std::path::Path,
+    project_hash: &str,
     mock_etype: Option<&str>,
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
 ) -> anyhow::Result<()> {
+    let (Some(t), Some(tid)) = (mock_etype, mock_tid) else {
+        return Ok(());
+    };
     let pending_dir = events_path
         .parent()
         .unwrap()
         .parent()
         .unwrap()
         .join("pending");
-    if !pending_dir.exists() {
-        return Ok(());
-    }
 
-    for entry in std::fs::read_dir(&pending_dir)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-
-        let body = std::fs::read_to_string(entry.path())?;
+    for path in project_pending_entries(&pending_dir, project_hash)? {
+        let body = std::fs::read_to_string(&path)?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
         // v0.6.2: skip v2 entries — those are owned by classify-worker.
         // Removing them here would silently drop async-queued events.
@@ -5830,23 +6213,24 @@ fn drain_pending(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        if !text.is_empty() {
-            if let (Some(t), Some(tid)) = (mock_etype, mock_tid) {
-                let mut event = tj_core::event::Event::new(
-                    tid,
-                    parse_event_type(t)?,
-                    tj_core::event::Author::Classifier,
-                    tj_core::event::Source::Hook,
-                    text,
-                );
-                event.confidence = mock_conf;
-                event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
-                let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
-                writer.append(&event)?;
-                writer.flush_durable()?;
-            }
+        if text.is_empty() {
+            continue;
         }
-        std::fs::remove_file(entry.path())?;
+
+        let mut event = tj_core::event::Event::new(
+            tid,
+            parse_event_type(t)?,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text,
+        );
+        event.confidence = mock_conf;
+        event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
+        let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+        writer.append(&event)?;
+        writer.flush_durable()?;
+
+        std::fs::remove_file(&path)?;
     }
     Ok(())
 }
@@ -5879,6 +6263,7 @@ fn push_recall_envelope(
     payload: &serde_json::Value,
     events_path: &std::path::Path,
     project_hash: &str,
+    session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     // MCP-only gate: Claude Code prefixes MCP tools `mcp__<server>__<tool>`.
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str())?;
@@ -5909,6 +6294,7 @@ fn push_recall_envelope(
     let hits =
         tj_core::recall::relevant_recall(&conn, &query_text, tj_core::recall::DEFAULT_MAX_HITS)
             .ok()?;
+    let hits = fresh_recall_hits(hits, session_id, events_path, project_hash);
     if hits.is_empty() {
         return None;
     }
@@ -5919,6 +6305,83 @@ fn push_recall_envelope(
             "updatedMCPToolOutput": updated,
         }
     }))
+}
+
+/// Most `<session> <event_id>` lines the shown-recall log keeps.
+const RECALL_SHOWN_CAP: usize = 2000;
+
+/// The recall hits still worth pushing to `session_id`: each one at most once
+/// per session (remembered in `<state_dir>/<project>.recall-shown`, newest
+/// [`RECALL_SHOWN_CAP`] lines), and never an event the session wrote on its
+/// current task — the agent just wrote it. Without a session id every hit
+/// passes, as before. Best-effort: an unreadable log never hides a hit.
+fn fresh_recall_hits(
+    hits: Vec<tj_core::recall::RecallHit>,
+    session_id: Option<&str>,
+    events_path: &std::path::Path,
+    project_hash: &str,
+) -> Vec<tj_core::recall::RecallHit> {
+    let Some(sid) = session_id else {
+        return hits;
+    };
+    if hits.is_empty() {
+        return hits;
+    }
+    let Ok(log) =
+        tj_core::paths::state_dir().map(|d| d.join(format!("{project_hash}.recall-shown")))
+    else {
+        return hits;
+    };
+
+    let own = session_task_event_ids(events_path, sid);
+    let body = std::fs::read_to_string(&log).unwrap_or_default();
+    let shown: std::collections::HashSet<&str> = body.lines().collect();
+    let fresh: Vec<_> = hits
+        .into_iter()
+        .filter(|h| !own.contains(&h.event_id))
+        .filter(|h| !shown.contains(format!("{sid} {}", h.event_id).as_str()))
+        .collect();
+    if fresh.is_empty() {
+        return fresh;
+    }
+
+    // ponytail: read-modify-write without a lock; two parallel hooks can
+    // re-show a hit once. Add a file lock if that ever shows up in practice.
+    let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+    lines.extend(fresh.iter().map(|h| format!("{sid} {}", h.event_id)));
+    let keep = &lines[lines.len().saturating_sub(RECALL_SHOWN_CAP)..];
+    let _ = std::fs::write(&log, keep.join("\n") + "\n");
+
+    fresh
+}
+
+/// Ids of the events session `sid` wrote on its current task — the task of
+/// its latest event — read from the journal by `meta.session_id`.
+fn session_task_event_ids(
+    events_path: &std::path::Path,
+    sid: &str,
+) -> std::collections::HashSet<String> {
+    let body = std::fs::read_to_string(events_path).unwrap_or_default();
+    let mine: Vec<(String, String)> = body
+        .lines()
+        .filter(|l| l.contains(sid))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["meta"]["session_id"].as_str() == Some(sid))
+        .filter_map(|e| {
+            Some((
+                e["event_id"].as_str()?.into(),
+                e["task_id"].as_str()?.into(),
+            ))
+        })
+        .collect();
+
+    let Some((_, current)) = mine.last() else {
+        return Default::default();
+    };
+    mine.iter()
+        .filter(|(_, task)| task == current)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// One ⚠ line per recall hit (mirrors the close-gate / SessionStart convention).
@@ -6064,26 +6527,18 @@ fn task_matches_session(
     })
 }
 
-/// Read the project's events from `events_path`, group by `task_id`, and
-/// return candidate task contexts for sessions whose events match this
-/// session (precise session_id, or legacy time-window). Each context
-/// carries the task title and up to the last ~20 event texts (dedup
-/// context for the backend).
-fn candidate_tasks_for_session(
+/// Read the project's events from `events_path`, grouped by `task_id`.
+/// Read once per run and shared by every session's candidate lookup.
+fn events_by_task(
     events_path: &std::path::Path,
-    session_id: &str,
-    first_ts: Option<&str>,
-    last_ts: Option<&str>,
-) -> anyhow::Result<Vec<tj_core::dream::backend::BackfillTaskContext>> {
-    use std::collections::BTreeMap;
-    use tj_core::dream::backend::BackfillTaskContext;
-    use tj_core::event::{Event, EventType};
+) -> anyhow::Result<std::collections::BTreeMap<String, Vec<tj_core::event::Event>>> {
+    use tj_core::event::Event;
 
+    let mut by_task = std::collections::BTreeMap::new();
     if !events_path.exists() {
-        return Ok(Vec::new());
+        return Ok(by_task);
     }
     let body = std::fs::read_to_string(events_path)?;
-    let mut by_task: BTreeMap<String, Vec<Event>> = BTreeMap::new();
     for line in body.lines() {
         if line.trim().is_empty() {
             continue;
@@ -6092,10 +6547,25 @@ fn candidate_tasks_for_session(
             by_task.entry(e.task_id.clone()).or_default().push(e);
         }
     }
+    Ok(by_task)
+}
+
+/// Candidate task contexts for the tasks whose events match this session
+/// (precise session_id, or legacy time-window). Each context carries the
+/// task title and up to the last ~20 event texts (dedup context for the
+/// backend).
+fn candidate_tasks_for_session(
+    by_task: &std::collections::BTreeMap<String, Vec<tj_core::event::Event>>,
+    session_id: &str,
+    first_ts: Option<&str>,
+    last_ts: Option<&str>,
+) -> Vec<tj_core::dream::backend::BackfillTaskContext> {
+    use tj_core::dream::backend::BackfillTaskContext;
+    use tj_core::event::EventType;
 
     let mut out = Vec::new();
     for (task_id, events) in by_task {
-        if !task_matches_session(&events, session_id, first_ts, last_ts) {
+        if !task_matches_session(events, session_id, first_ts, last_ts) {
             continue;
         }
         // Title from the Open event when present, else the first event's text.
@@ -6113,39 +6583,56 @@ fn candidate_tasks_for_session(
             .map(|e| e.text.clone())
             .collect();
         out.push(BackfillTaskContext {
-            task_id,
+            task_id: task_id.clone(),
             title,
             existing_events,
         });
     }
-    Ok(out)
+    out
 }
 
+/// Per-session `(session_id, BackfillInput)` pairs fed to `run_dream`.
+type DreamInputs = Vec<(String, tj_core::dream::backend::BackfillInput)>;
+
 /// Assemble per-session `(session_id, BackfillInput)` from the in-scope
-/// session transcripts and the project's existing events.
+/// session transcripts and the project's existing events. Also returns the
+/// ids of sessions skipped as unreadable.
 fn build_dream_inputs(
     events_path: &std::path::Path,
     sessions: &[std::path::PathBuf],
     task_filter: Option<&str>,
-) -> anyhow::Result<Vec<(String, tj_core::dream::backend::BackfillInput)>> {
+) -> anyhow::Result<(DreamInputs, Vec<String>)> {
     use tj_core::dream::backend::BackfillInput;
     use tj_core::session::parser::parse_session;
 
+    let by_task = events_by_task(events_path)?;
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     for path in sessions {
         let session_id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let parsed = parse_session(path)?;
+        // One unreadable transcript must not abort mining the rest.
+        let parsed = match parse_session(path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "dream: skipping unreadable session {}: {e:#}",
+                    path.display()
+                );
+                unreadable.push(session_id);
+                continue;
+            }
+        };
 
         let candidates = candidate_tasks_for_session(
-            events_path,
+            &by_task,
             &session_id,
             parsed.first_timestamp.as_deref(),
             parsed.last_timestamp.as_deref(),
-        )?;
+        );
         let tasks: Vec<_> = candidates
             .into_iter()
             .filter(|t| task_filter.is_none_or(|f| f == t.task_id))
@@ -6157,7 +6644,7 @@ fn build_dream_inputs(
         let transcript = flatten_transcript(&parsed);
         out.push((session_id, BackfillInput { tasks, transcript }));
     }
-    Ok(out)
+    Ok((out, unreadable))
 }
 
 #[cfg(test)]
@@ -6310,6 +6797,61 @@ mod inline_tests {
     }
 
     #[test]
+    fn candidate_tasks_come_from_events_loaded_once() {
+        // The events log is grouped once per run and reused for every
+        // session, so candidate lookup takes the grouped map, not a path.
+        use tj_core::event::{Author, Event, EventType, Source};
+        let mut tagged = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "Task one".into(),
+        );
+        tagged.meta = serde_json::json!({"session_id": "sess-1"});
+        let by_task = std::collections::BTreeMap::from([("tj-1".to_string(), vec![tagged])]);
+
+        let hit = candidate_tasks_for_session(&by_task, "sess-1", None, None);
+        let miss = candidate_tasks_for_session(&by_task, "sess-2", None, None);
+
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].task_id, "tj-1");
+        assert_eq!(hit[0].title, "Task one");
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn build_dream_inputs_skips_an_unreadable_session() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("h.jsonl");
+        let mut ev = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task".into(),
+        );
+        ev.meta = serde_json::json!({"session_id": "good"});
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        writer.append(&ev).unwrap();
+        writer.flush_durable().unwrap();
+
+        // Invalid UTF-8 makes parse_session fail for this one file.
+        let bad = dir.path().join("bad.jsonl");
+        std::fs::write(&bad, [0xff, 0xfe, b'\n']).unwrap();
+        let good = dir.path().join("good.jsonl");
+        std::fs::write(&good,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+
+        let (inputs, unreadable) = build_dream_inputs(&events_path, &[bad, good], None).unwrap();
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0, "good");
+        assert_eq!(unreadable, vec!["bad".to_string()]);
+    }
+
+    #[test]
     fn persist_pending_v2_includes_session_id_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join("events").join("h.jsonl");
@@ -6345,6 +6887,59 @@ mod inline_tests {
     }
 
     #[test]
+    fn pending_entries_are_named_after_their_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+
+        persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
+        persist_pending(&events_path, "h", "Stop", "txt", "err").unwrap();
+
+        let pending = dir.path().join("pending");
+        let names: Vec<String> = std::fs::read_dir(&pending)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|n| n.starts_with("h.")), "{names:?}");
+        assert_eq!(
+            project_pending_entries(&pending, "h").unwrap().len(),
+            2,
+            "both entries belong to project h"
+        );
+        assert!(project_pending_entries(&pending, "other")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_entries_come_back_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // ULID order == queue order; legacy un-prefixed names interleave by
+        // their ULID, not by the hash prefix of the new names.
+        let mut expected = Vec::new();
+        for i in 0..20u32 {
+            let ulid = format!("01JA{i:022}");
+            let name = if i % 5 == 0 {
+                format!("{ulid}.json")
+            } else {
+                format!("h.{ulid}.json")
+            };
+            expected.push(name);
+        }
+        for name in expected.iter().rev() {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+
+        let got: Vec<String> = project_pending_entries(dir.path(), "h")
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
     fn is_rewind_prompt_simple() {
         assert!(is_rewind_prompt("/rewind"));
         assert!(is_rewind_prompt("/rewind back to plan A"));
@@ -6364,6 +6959,51 @@ mod inline_tests {
         assert!(!is_rewind_prompt("hello /rewind"));
         assert!(!is_rewind_prompt(""));
         assert!(!is_rewind_prompt("/rewinder"));
+    }
+
+    #[test]
+    fn recent_task_contexts_puts_the_sessions_own_task_first() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+
+        // s1 works on the older task; another session touched tj-2 later.
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        for (task, at, session) in [
+            ("tj-1", "2026-01-01T00:00:00Z", Some("s1")),
+            ("tj-2", "2026-01-01T00:00:05Z", Some("s2")),
+        ] {
+            let mut open = Event::new(
+                task,
+                EventType::Open,
+                Author::Agent,
+                Source::Chat,
+                task.into(),
+            );
+            open.timestamp = at.into();
+            tj_core::session_id::stamp_session_id(&mut open.meta, session);
+            writer.append(&open).unwrap();
+        }
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, "h").unwrap();
+
+        let first = |session| {
+            recent_task_contexts(&conn, "h", 2, session).unwrap()[0]
+                .task_id
+                .clone()
+        };
+        assert_eq!(first(Some("s1")), "tj-1", "s1 sees its own task first");
+        assert_eq!(first(Some("s2")), "tj-2");
+        assert_eq!(
+            first(Some("s9")),
+            "tj-2",
+            "an unknown session falls back to the newest"
+        );
+        assert_eq!(first(None), "tj-2");
     }
 
     #[test]
@@ -6409,7 +7049,7 @@ mod inline_tests {
         let conn = tj_core::db::open(&state_path).unwrap();
         tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
 
-        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctxs = recent_task_contexts(&conn, "h", 5, None).unwrap();
         let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
         assert!(
             ctx.constraints
@@ -6462,7 +7102,7 @@ mod inline_tests {
         let conn = tj_core::db::open(&state_path).unwrap();
         tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
 
-        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctxs = recent_task_contexts(&conn, "h", 5, None).unwrap();
         let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
         assert_eq!(
             ctx.constraints.len(),
@@ -6482,6 +7122,59 @@ mod inline_tests {
             .constraints
             .iter()
             .any(|s| s.contains("constraint number 1")));
+    }
+
+    #[test]
+    fn recent_task_contexts_skips_model_switch_constraints() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        let mut open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task one".into(),
+        );
+        open.meta = serde_json::json!({ "title": "task one" });
+        open.timestamp = "2026-01-01T00:00:00Z".into();
+        writer.append(&open).unwrap();
+        for i in 0..8 {
+            // Five real constraints, then three newer model switches.
+            let text = if i < 5 {
+                format!("constraint number {i}")
+            } else {
+                format!("Model switched (auto): opus → haiku {i}")
+            };
+            let mut cons = Event::new(
+                "tj-1",
+                EventType::Constraint,
+                Author::Agent,
+                Source::Hook,
+                text,
+            );
+            cons.timestamp = format!("2026-01-01T00:00:1{i}Z");
+            writer.append(&cons).unwrap();
+        }
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, "h").unwrap();
+
+        let ctxs = recent_task_contexts(&conn, "h", 5, None).unwrap();
+        let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
+        assert_eq!(ctx.constraints.len(), 5, "{:?}", ctx.constraints);
+        assert!(
+            ctx.constraints
+                .iter()
+                .all(|s| s.starts_with("constraint number")),
+            "{:?}",
+            ctx.constraints
+        );
     }
 
     #[test]

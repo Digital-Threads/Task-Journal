@@ -150,6 +150,56 @@ CREATE INDEX IF NOT EXISTS idx_emb_project_tier ON embeddings(project_hash, tier
 ALTER TABLE events_index ADD COLUMN memory_tier TEXT NOT NULL DEFAULT 'episodic';
 "#;
 
+/// v0.30.0 per-session queries — `session_id` projects an event's
+/// `meta.session_id`. Clearing `index_state` makes the next
+/// `ingest_new_events` replay the whole log (every projection is an
+/// idempotent upsert), which fills the column for events indexed before.
+const MIGRATION_009: &str = r#"
+ALTER TABLE events_index ADD COLUMN session_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_events_session_time ON events_index(session_id, timestamp);
+DELETE FROM index_state;
+"#;
+
+/// v0.30.0 corrections — `corrected_by` holds the `event_id` of the
+/// `correction` event whose `corrects` points at this event, so packs leave
+/// the corrected event out without re-reading the log. Clearing
+/// `index_state` replays the log once to fill it for existing events.
+const MIGRATION_010: &str = r#"
+ALTER TABLE events_index ADD COLUMN corrected_by TEXT;
+DELETE FROM index_state;
+"#;
+
+/// v0.30.0 bookkeeping — `bookkeeping` flags machine-written events that are
+/// not reasoning (see [`is_bookkeeping`]) so active decisions, export-pr,
+/// recall and the global memory can skip them. Clearing `index_state`
+/// replays the log once to flag existing events.
+const MIGRATION_011: &str = r#"
+ALTER TABLE events_index ADD COLUMN bookkeeping INTEGER NOT NULL DEFAULT 0;
+DELETE FROM index_state;
+"#;
+
+/// v0.30.0 pack cache holds only the stable body; the header and the gaps
+/// are rendered on every call. Rows cached as the whole pack text go.
+const MIGRATION_012: &str = r#"
+DELETE FROM task_pack_cache;
+"#;
+
+/// v0.30.0 projection marker — `projection_state` holds the `index_state` row
+/// as this version last wrote it. An older binary still running (or a
+/// downgrade) ingests or rebuilds without the 0.30 columns and moves
+/// `index_state`; the mismatch makes the next ingest replay the log to
+/// re-derive them. It starts empty, so the first ingest after the upgrade
+/// replays the log once — which also fills `author`, the event's writer, so
+/// only deliberate writes bind a session to a task.
+const MIGRATION_013: &str = r#"
+CREATE TABLE IF NOT EXISTS projection_state (
+  project_hash          TEXT PRIMARY KEY,
+  last_indexed_event_id TEXT NOT NULL,
+  updated_at            TEXT NOT NULL
+);
+ALTER TABLE events_index ADD COLUMN author TEXT;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -185,6 +235,26 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         sql: MIGRATION_008,
     },
+    Migration {
+        version: 9,
+        sql: MIGRATION_009,
+    },
+    Migration {
+        version: 10,
+        sql: MIGRATION_010,
+    },
+    Migration {
+        version: 11,
+        sql: MIGRATION_011,
+    },
+    Migration {
+        version: 12,
+        sql: MIGRATION_012,
+    },
+    Migration {
+        version: 13,
+        sql: MIGRATION_013,
+    },
 ];
 
 fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
@@ -211,9 +281,27 @@ fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
         if applied.contains(&migration.version) {
             continue;
         }
-        conn.execute_batch(migration.sql)
+
+        // One IMMEDIATE transaction per migration: it takes the write lock up
+        // front, so a second process opening the same fresh DB waits here and
+        // then sees the version as applied instead of re-running its ALTERs.
+        // The migration and its row commit together — a failure halfway rolls
+        // the whole migration back instead of leaving a partial schema.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .with_context(|| format!("begin schema migration v{:03}", migration.version))?;
+        let already_applied: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            rusqlite::params![migration.version],
+            |r| r.get(0),
+        )?;
+        if already_applied {
+            continue;
+        }
+
+        tx.execute_batch(migration.sql)
             .with_context(|| format!("apply schema migration v{:03}", migration.version))?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![
                 migration.version,
@@ -226,6 +314,8 @@ fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
                 migration.version
             )
         })?;
+        tx.commit()
+            .with_context(|| format!("commit schema migration v{:03}", migration.version))?;
     }
     Ok(())
 }
@@ -258,6 +348,27 @@ pub fn upsert_task_from_event(
                  ON CONFLICT(task_id) DO UPDATE SET last_event_at = ?4",
                 rusqlite::params![event.task_id, title, project_hash, event.timestamp, parent_id],
             )?;
+
+            // Goal and external refs given at creation ride in the open
+            // event's meta so a rebuild from the JSONL restores them. A replay
+            // over an existing row keeps a goal changed since.
+            if let Some(goal) = event.meta.get("goal").and_then(|v| v.as_str()) {
+                conn.execute(
+                    "UPDATE tasks SET goal = COALESCE(goal, ?2) WHERE task_id = ?1",
+                    rusqlite::params![event.task_id, goal],
+                )?;
+            }
+            for reference in meta_strings(&event.meta, "external") {
+                add_task_external(conn, &event.task_id, reference)?;
+            }
+        }
+        EventType::Amend => {
+            if let Some(goal) = event.meta.get("goal").and_then(|v| v.as_str()) {
+                set_task_goal(conn, &event.task_id, goal)?;
+            }
+            for reference in meta_strings(&event.meta, "external_add") {
+                add_task_external(conn, &event.task_id, reference)?;
+            }
         }
         EventType::Close => {
             conn.execute(
@@ -304,6 +415,15 @@ pub fn upsert_task_from_event(
     Ok(())
 }
 
+/// The string items of the JSON array at `meta[key]`; empty when absent.
+fn meta_strings<'a>(meta: &'a serde_json::Value, key: &str) -> impl Iterator<Item = &'a str> {
+    meta.get(key)
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+}
+
 use std::io::BufRead;
 
 pub fn list_all_projects(state_dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
@@ -324,55 +444,44 @@ pub fn list_all_projects(state_dir: impl AsRef<Path>) -> anyhow::Result<Vec<Stri
     Ok(out)
 }
 
+/// Replay the whole log from scratch: `search_fts` is cleared once, then every
+/// event is indexed again. Commits in chunks like [`ingest_new_events`].
 pub fn rebuild_state(
     conn: &Connection,
     jsonl_path: impl AsRef<Path>,
     project_hash: &str,
 ) -> anyhow::Result<usize> {
-    let f = match std::fs::File::open(&jsonl_path) {
-        Ok(f) => f,
-        // A fresh project has no events log on disk yet — there is simply nothing
-        // to read, which is not an error (this is what crashed task_create the
-        // first time the journal was touched in a new worktree).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref())))
-        }
-    };
-    let reader = std::io::BufReader::new(f);
+    replay(conn, jsonl_path.as_ref(), project_hash, true)
+}
 
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0;
-    let mut last_event_id: Option<String> = None;
-    for (i, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("read line {i}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Malformed JSONL lines are skipped with a warning so that one bad
-        // event cannot abort an otherwise-recoverable rebuild. SQL errors
-        // still propagate — those indicate schema/integrity problems.
-        let event: Event = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(
-                    line_number = i + 1,
-                    error = %err,
-                    "skipping malformed JSONL line in rebuild_state"
-                );
-                continue;
+/// The events of a JSONL log in order. Malformed lines are skipped with a
+/// warning so that one bad event cannot abort an otherwise-recoverable replay;
+/// read errors still propagate.
+fn log_events(f: std::fs::File) -> impl Iterator<Item = anyhow::Result<Event>> {
+    std::io::BufReader::new(f)
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let line = match line.with_context(|| format!("read line {i}")) {
+                Ok(line) => line,
+                Err(e) => return Some(Err(e)),
+            };
+            if line.trim().is_empty() {
+                return None;
             }
-        };
-        upsert_task_from_event(&tx, &event, project_hash)?;
-        index_event(&tx, &event)?;
-        last_event_id = Some(event.event_id.clone());
-        count += 1;
-    }
-    if let Some(eid) = last_event_id.as_deref() {
-        record_last_indexed(&tx, project_hash, eid)?;
-    }
-    tx.commit()?;
-    Ok(count)
+
+            match serde_json::from_str(&line) {
+                Ok(event) => Some(Ok(event)),
+                Err(err) => {
+                    tracing::warn!(
+                        line_number = i + 1,
+                        error = %err,
+                        "skipping malformed JSONL line"
+                    );
+                    None
+                }
+            }
+        })
 }
 
 /// Returns whether a task with this id has been recorded in the derived
@@ -437,17 +546,30 @@ pub fn set_task_outcome(
 }
 
 /// Append an external reference to `tasks.external`. The column is
-/// stored as a comma-separated list — small, append-mostly, no
-/// uniqueness constraint. Acceptable shapes (loose, not enforced):
-/// `beads:claude-memory-rsw`, `github:#42`, `jira:PROJ-1234`.
+/// stored as a comma-separated list — small, append-mostly. A reference
+/// already in the list is not added again, so replaying the events that
+/// carry it is idempotent; an unknown task is a no-op. Acceptable shapes
+/// (loose, not enforced): `beads:claude-memory-rsw`, `github:#42`,
+/// `jira:PROJ-1234`.
 pub fn add_task_external(conn: &Connection, task_id: &str, reference: &str) -> anyhow::Result<()> {
-    let current: Option<String> = conn
+    let current: Option<Option<String>> = conn
         .query_row(
             "SELECT external FROM tasks WHERE task_id = ?1",
             rusqlite::params![task_id],
             |r| r.get::<_, Option<String>>(0),
         )
+        .optional()
         .with_context(|| format!("read external for {task_id}"))?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if current
+        .as_deref()
+        .is_some_and(|s| s.split(',').any(|r| r == reference))
+    {
+        return Ok(());
+    }
+
     let next = match current {
         Some(s) if !s.is_empty() => format!("{s},{reference}"),
         _ => reference.to_string(),
@@ -473,6 +595,32 @@ pub fn task_id_by_external(conn: &Connection, reference: &str) -> anyhow::Result
         .query_row(
             "SELECT task_id FROM tasks WHERE ',' || external || ',' LIKE ?1 ORDER BY rowid DESC LIMIT 1",
             rusqlite::params![pattern],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// The open task of `project_hash` whose most recent event carries
+/// `meta.session_id == session_id` — the task a live agent session is
+/// working on. `None` when the session has no event on an open task.
+///
+/// Only deliberate writes count: hooks and the classifier fall back to the
+/// newest open task and stamp the current session, so their events (and
+/// bookkeeping) would bind a fresh session to another session's task.
+pub fn active_task_for_session(
+    conn: &Connection,
+    project_hash: &str,
+    session_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT ei.task_id FROM events_index ei
+             JOIN tasks t ON t.task_id = ei.task_id
+             WHERE ei.session_id = ?2 AND t.project_hash = ?1 AND t.status = 'open'
+               AND ei.author IN ('user', 'agent') AND ei.bookkeeping = 0
+             ORDER BY ei.timestamp DESC LIMIT 1",
+            rusqlite::params![project_hash, session_id],
             |r| r.get::<_, String>(0),
         )
         .optional()?;
@@ -725,14 +873,15 @@ pub fn reclassify_task_artifacts(conn: &Connection, task_id: &str) -> anyhow::Re
 /// branches) across every event of a task, deduplicated. Reads the
 /// per-event JSON payload that `ingest_new_events` populated. Skips
 /// events whose `artifacts` column is NULL or unparseable rather than
-/// failing the pack render.
+/// failing the pack render, and corrected events, so a wrong hash or path
+/// stops raising a gap once a correction retires it.
 pub fn task_artifacts(
     conn: &Connection,
     task_id: &str,
 ) -> anyhow::Result<crate::artifacts::Artifacts> {
     let mut stmt = conn.prepare(
         "SELECT artifacts FROM events_index
-         WHERE task_id = ?1 AND artifacts IS NOT NULL
+         WHERE task_id = ?1 AND artifacts IS NOT NULL AND corrected_by IS NULL
          ORDER BY timestamp ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
@@ -746,47 +895,68 @@ pub fn task_artifacts(
     Ok(acc)
 }
 
-/// Look up the most recent `event_id` we've ingested for this project.
-/// Returns `None` when the project has never been indexed (first call,
-/// or migration v002 just landed on an existing 0.1.x DB).
-fn last_indexed_event_id(conn: &Connection, project_hash: &str) -> anyhow::Result<Option<String>> {
-    let mut stmt =
-        conn.prepare("SELECT last_indexed_event_id FROM index_state WHERE project_hash = ?1")?;
-    let mut rows = stmt.query(rusqlite::params![project_hash])?;
-    if let Some(row) = rows.next()? {
-        Ok(Some(row.get::<_, String>(0)?))
-    } else {
-        Ok(None)
-    }
+/// How far the log is indexed for a project: the `index_state` row as
+/// `(last_indexed_event_id, updated_at)`. `None` when the project has never
+/// been indexed (first call, or a migration cleared the marker).
+type IndexMark = (String, String);
+
+/// The mark stored in `table`: `index_state`, which every version writes, or
+/// `projection_state`, the copy only this version writes.
+fn read_mark(
+    conn: &Connection,
+    table: &str,
+    project_hash: &str,
+) -> anyhow::Result<Option<IndexMark>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT last_indexed_event_id, updated_at FROM {table} WHERE project_hash = ?1"
+            ),
+            rusqlite::params![project_hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
 }
 
 fn record_last_indexed(
     conn: &Connection,
     project_hash: &str,
     event_id: &str,
-) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT INTO index_state(project_hash, last_indexed_event_id, updated_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(project_hash) DO UPDATE SET
-             last_indexed_event_id = excluded.last_indexed_event_id,
-             updated_at = excluded.updated_at",
-        rusqlite::params![
-            project_hash,
-            event_id,
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        ],
-    )?;
-    Ok(())
+) -> anyhow::Result<IndexMark> {
+    let mark = (
+        event_id.to_string(),
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
+    for table in ["index_state", "projection_state"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO {table}(project_hash, last_indexed_event_id, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(project_hash) DO UPDATE SET
+                     last_indexed_event_id = excluded.last_indexed_event_id,
+                     updated_at = excluded.updated_at"
+            ),
+            rusqlite::params![project_hash, mark.0, mark.1],
+        )?;
+    }
+
+    Ok(mark)
 }
+
+/// Events a replay indexes per transaction. Each commit moves the marker, so
+/// a replay killed partway (a hook timeout) resumes after its last chunk
+/// instead of starting over, and other writers wait one chunk at most.
+const REPLAY_CHUNK: usize = 500;
 
 /// Read only the tail of the JSONL log since the last call. The cheap path
 /// for hot loops (every MCP tool invocation): scan to the marker, ingest
 /// the rest, update the marker.
 ///
-/// Falls back to a full [`rebuild_state`] in two cases:
-/// - No marker yet for this project (first call after migration v002 or
-///   on a brand-new install).
+/// Falls back to a full replay (see [`rebuild_state`]) in three cases:
+/// - No marker yet for this project (first call after a migration cleared
+///   it, or a brand-new install).
+/// - The marker is not the one this version last wrote: an older binary
+///   ingested or rebuilt without the columns it does not know.
 /// - The stored marker is not present in the JSONL (corrupted / truncated
 ///   file). A `tracing::warn!` is emitted so the operator notices.
 pub fn ingest_new_events(
@@ -794,77 +964,151 @@ pub fn ingest_new_events(
     jsonl_path: impl AsRef<Path>,
     project_hash: &str,
 ) -> anyhow::Result<usize> {
-    let marker = match last_indexed_event_id(conn, project_hash)? {
-        Some(id) => id,
-        None => return rebuild_state(conn, jsonl_path, project_hash),
-    };
+    replay(conn, jsonl_path.as_ref(), project_hash, false)
+}
 
-    let f = match std::fs::File::open(&jsonl_path) {
-        Ok(f) => f,
-        // A fresh project has no events log on disk yet — there is simply nothing
-        // to read, which is not an error (this is what crashed task_create the
-        // first time the journal was touched in a new worktree).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!("open {:?}", jsonl_path.as_ref())))
-        }
-    };
-    let reader = std::io::BufReader::new(f);
-
-    // First pass: confirm the marker still exists in the file. If it does
-    // not, the JSONL has been rewritten under us — we can't trust the
-    // marker, so we fall back to a full rebuild.
-    let tx = conn.unchecked_transaction()?;
-    let mut found_marker = false;
+/// Index the log after the marker — or all of it when `from_scratch` or there
+/// is no usable marker, clearing `search_fts` first — in chunks of
+/// [`REPLAY_CHUNK`] events. Returns how many events it indexed.
+fn replay(
+    conn: &Connection,
+    jsonl_path: &Path,
+    project_hash: &str,
+    mut from_scratch: bool,
+) -> anyhow::Result<usize> {
     let mut count = 0;
-    let mut last_event_id: Option<String> = None;
-    for (i, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("read line {i}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: Event = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(
-                    line_number = i + 1,
-                    error = %err,
-                    "skipping malformed JSONL line in ingest_new_events"
-                );
-                continue;
-            }
+
+    'pass: loop {
+        let f = match std::fs::File::open(jsonl_path) {
+            Ok(f) => f,
+            // A fresh project has no events log on disk yet — there is simply nothing
+            // to read, which is not an error (this is what crashed task_create the
+            // first time the journal was touched in a new worktree).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(count),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("open {jsonl_path:?}"))),
         };
-        if !found_marker {
-            if event.event_id == marker {
-                found_marker = true;
+        let mut events = log_events(f);
+        let mut committed: Option<IndexMark> = None;
+
+        loop {
+            // IMMEDIATE: the marker is read under the write lock, so two
+            // processes never index the same chunk.
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let mark = read_mark(&tx, "index_state", project_hash)?;
+
+            if committed.is_none() {
+                let ours = mark == read_mark(&tx, "projection_state", project_hash)?;
+                if mark.is_some() && !ours {
+                    tracing::warn!(
+                        project_hash = project_hash,
+                        "index_state was written by another version — replaying the log"
+                    );
+                }
+
+                match mark.filter(|_| !from_scratch && ours) {
+                    None => clear_search_fts(&tx, project_hash)?,
+                    Some((marker, _)) => {
+                        let mut found = false;
+                        for event in events.by_ref() {
+                            if event?.event_id == marker {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            tracing::warn!(
+                                project_hash = project_hash,
+                                marker = marker.as_str(),
+                                "last_indexed_event_id not found in JSONL — falling back to full rebuild"
+                            );
+                            from_scratch = true;
+                            continue 'pass;
+                        }
+                    }
+                }
+            } else if mark != committed {
+                // Another process indexed past our last chunk: go on from its marker.
+                from_scratch = false;
+                continue 'pass;
             }
-            continue;
+
+            let mut in_chunk = 0;
+            let mut last_event_id = None;
+            for event in events.by_ref().take(REPLAY_CHUNK) {
+                let event = event?;
+                upsert_task_from_event(&tx, &event, project_hash)?;
+                index_event(&tx, &event)?;
+                last_event_id = Some(event.event_id);
+                in_chunk += 1;
+            }
+
+            if let Some(eid) = last_event_id {
+                committed = Some(record_last_indexed(&tx, project_hash, &eid)?);
+            }
+            tx.commit()?;
+            count += in_chunk;
+
+            if in_chunk < REPLAY_CHUNK {
+                return Ok(count);
+            }
         }
-        upsert_task_from_event(&tx, &event, project_hash)?;
-        index_event(&tx, &event)?;
-        last_event_id = Some(event.event_id.clone());
-        count += 1;
+    }
+}
+
+/// Drop this project's rows from `search_fts` before a replay re-inserts
+/// them: one scan, where deleting per event scanned the table every time.
+fn clear_search_fts(conn: &Connection, project_hash: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM search_fts
+         WHERE task_id NOT IN (SELECT task_id FROM tasks WHERE project_hash <> ?1)",
+        rusqlite::params![project_hash],
+    )?;
+
+    Ok(())
+}
+
+/// The `search_fts` rowid of an event: a stable FNV-1a hash of its id.
+/// `event_id` is UNINDEXED, so finding an event's row by it scans the whole
+/// table; by rowid, re-indexing an event replaces its row in O(log n).
+// ponytail: two ids hashing alike (odds ~n²/2^64) would share one search row;
+// a mapping table removes that if it ever matters.
+fn fts_rowid(event_id: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in event_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
 
-    if !found_marker {
-        // Discard the (empty) tx and rebuild from scratch.
-        drop(tx);
-        tracing::warn!(
-            project_hash = project_hash,
-            marker = marker.as_str(),
-            "last_indexed_event_id not found in JSONL — falling back to full rebuild"
-        );
-        return rebuild_state(conn, jsonl_path, project_hash);
-    }
+    (hash >> 1) as i64
+}
 
-    if let Some(eid) = last_event_id.as_deref() {
-        record_last_indexed(&tx, project_hash, eid)?;
+/// Machine-written bookkeeping, not reasoning: the PreCompact boundary marker
+/// (a `decision`) and the model-switch note (a `constraint`). Known by
+/// `meta.kind`; events written before the writers set it, by text prefix.
+pub fn is_bookkeeping(event: &Event) -> bool {
+    match event.meta.get("kind").and_then(|v| v.as_str()) {
+        Some(kind) => matches!(kind, "compaction_marker" | "model_switch"),
+        None => match event.event_type {
+            EventType::Decision => event.text.starts_with("Conversation compacted at"),
+            EventType::Constraint => event
+                .text
+                .starts_with(crate::reminder::MODEL_SWITCH_TEXT_PREFIX),
+            _ => false,
+        },
     }
-    tx.commit()?;
-    Ok(count)
 }
 
 pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
+    // An amend only changes task metadata, which upsert_task_from_event
+    // applies. It is not reasoning: keeping it out of events_index and
+    // search_fts keeps it out of packs, search, recall and memory sync.
+    if event.event_type == EventType::Amend {
+        return invalidate_pack_cascade(conn, &event.task_id);
+    }
+
     let type_str = serde_json::to_value(event.event_type)?
         .as_str()
         .unwrap()
@@ -895,22 +1139,32 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     } else {
         Some(serde_json::to_string(&artifacts)?)
     };
+    let session_id = event.meta.get("session_id").and_then(|v| v.as_str());
+    let author_str = serde_json::to_value(event.author)?
+        .as_str()
+        .unwrap()
+        .to_string();
     conn.execute(
-        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status, artifacts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status, artifacts, session_id, bookkeeping, author)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             event.event_id, event.task_id, type_str,
-            event.timestamp, event.confidence, status_str, artifacts_json
+            event.timestamp, event.confidence, status_str, artifacts_json, session_id,
+            is_bookkeeping(event), author_str
         ],
     )?;
-    // search_fts has no PK; clear then insert to keep idempotent across rebuild_state replays.
+    // search_fts has no PK; replacing by the event's own rowid keeps it
+    // idempotent across replays.
     conn.execute(
-        "DELETE FROM search_fts WHERE event_id=?1",
-        rusqlite::params![event.event_id],
-    )?;
-    conn.execute(
-        "INSERT INTO search_fts(task_id, event_id, text, type) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![event.task_id, event.event_id, event.text, type_str],
+        "INSERT OR REPLACE INTO search_fts(rowid, task_id, event_id, text, type)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            fts_rowid(&event.event_id),
+            event.task_id,
+            event.event_id,
+            event.text,
+            type_str
+        ],
     )?;
 
     if event.event_type == EventType::Decision {
@@ -934,6 +1188,27 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
                 "UPDATE decisions SET status='superseded', superseded_by=?1 WHERE decision_id=?2",
                 rusqlite::params![event.event_id, target],
             )?;
+        }
+    }
+
+    // A correction retires the event it corrects from packs and export-pr.
+    // The target may sit in another task, whose cached pack is now stale too.
+    if event.event_type == EventType::Correction {
+        if let Some(target) = &event.corrects {
+            conn.execute(
+                "UPDATE events_index SET corrected_by=?1 WHERE event_id=?2",
+                rusqlite::params![event.event_id, target],
+            )?;
+            let target_task: Option<String> = conn
+                .query_row(
+                    "SELECT task_id FROM events_index WHERE event_id=?1",
+                    rusqlite::params![target],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(t) = target_task.filter(|t| *t != event.task_id) {
+                invalidate_pack_cascade(conn, &t)?;
+            }
         }
     }
 
@@ -962,13 +1237,33 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Switch the DB to WAL. On a fresh file that needs an exclusive lock, and
+/// SQLite answers SQLITE_BUSY at once — no busy handler, to avoid a deadlock —
+/// when another connection is switching the same file: two processes opening
+/// a fresh DB together. Retry briefly; once the file is in WAL it is a no-op.
+fn enable_wal(conn: &Connection) -> anyhow::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 100 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            res => return res.context("set WAL journal mode"),
+        }
+    }
+}
+
 pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     if let Some(parent) = path.as_ref().parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create dir {parent:?}"))?;
     }
     let conn =
         Connection::open(&path).with_context(|| format!("open SQLite at {:?}", path.as_ref()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    enable_wal(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     apply_migrations(&conn).context("apply schema migrations")?;
     Ok(conn)
 }
@@ -1489,6 +1784,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_migration_failing_halfway_leaves_no_partial_schema() {
+        let d = TempDir::new().unwrap();
+        let conn = Connection::open(d.path().join("state.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+             INSERT INTO schema_migrations VALUES (1, 'x'), (2, 'x');",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_001).unwrap();
+        conn.execute_batch(MIGRATION_002).unwrap();
+        // v003 adds goal, then outcome: make its second ALTER fail.
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN outcome TEXT;")
+            .unwrap();
+
+        assert!(apply_migrations(&conn).is_err());
+
+        let goal_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'goal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(goal_cols, 0, "v003's first ALTER must roll back");
+        let v3: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v3, 0);
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_fresh_db_both_succeed() {
+        let d = TempDir::new().unwrap();
+
+        for round in 0..20 {
+            let path = d.path().join(format!("state-{round}.sqlite"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        open(&path).map(|_| ())
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                let res = h.join().unwrap();
+                assert!(res.is_ok(), "round {round}: {:#}", res.unwrap_err());
+            }
+        }
+    }
+
     fn make_text_event(text: &str) -> crate::event::Event {
         crate::event::Event::new(
             "tj-x",
@@ -1528,6 +1882,24 @@ mod tests {
             arts.branch_names.iter().any(|b| b == "feat/clean-pack"),
             "branch merged"
         );
+    }
+
+    #[test]
+    fn task_artifacts_leave_out_corrected_events() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let wrong = make_text_event("fixed in commit dead00beef, see src/gone.rs");
+        let kept = make_text_event("also touched src/kept.rs");
+        let mut corr = make_text_event("the hash and path above were wrong");
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        for e in [&wrong, &kept, &corr] {
+            index_event(&conn, e).unwrap();
+        }
+
+        let arts = task_artifacts(&conn, "tj-x").unwrap();
+        assert!(arts.commit_hashes.is_empty(), "{:?}", arts.commit_hashes);
+        assert_eq!(arts.files, vec!["src/kept.rs".to_string()]);
     }
 
     #[test]
@@ -1989,6 +2361,132 @@ mod tests {
         }
     }
 
+    /// A log of `n` events: an open every 30 events, findings in between.
+    fn write_synthetic_log(path: &Path, n: usize) -> Vec<crate::event::Event> {
+        let mut events = Vec::with_capacity(n);
+        let mut task = String::new();
+        for i in 0..n {
+            if i % 30 == 0 {
+                task = format!("tj-syn{i}");
+                events.push(make_open_event(&task, &task));
+            } else {
+                let mut e = make_text_event(&format!(
+                    "step {i}: replay chunk marker in crates/tj-core/src/db.rs, commit {i:07x}ab"
+                ));
+                e.task_id = task.clone();
+                events.push(e);
+            }
+        }
+
+        let mut f = std::fs::File::create(path).unwrap();
+        for e in &events {
+            write_event_line(&mut f, e);
+        }
+
+        events
+    }
+
+    fn count_rows(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Seconds a replay of an already indexed `n`-event log takes once
+    /// `index_state` is cleared, as the v009–v011 upgrade migrations do.
+    fn upgrade_replay_seconds(n: usize) -> f64 {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+        write_synthetic_log(&jsonl, n);
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch("DELETE FROM index_state").unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(ingest_new_events(&conn, &jsonl, ph).unwrap(), n);
+        let secs = started.elapsed().as_secs_f64();
+
+        assert_eq!(count_rows(&conn, "search_fts"), n as i64);
+        secs
+    }
+
+    #[test]
+    fn a_full_replay_grows_linearly_with_the_log() {
+        // Best of two runs each, to keep scheduler noise out of the ratio.
+        let small = upgrade_replay_seconds(1500).min(upgrade_replay_seconds(1500));
+        let large = upgrade_replay_seconds(3000).min(upgrade_replay_seconds(3000));
+
+        // Linear work doubles; the old per-event FTS scan quadrupled it.
+        assert!(
+            large < small * 3.0,
+            "replay of 2x events took {:.2}x as long ({small:.3}s -> {large:.3}s)",
+            large / small
+        );
+    }
+
+    #[test]
+    fn a_replay_killed_partway_resumes_after_its_last_committed_chunk() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+        let events = write_synthetic_log(&jsonl, 1200);
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        // The process dies while indexing an event of the second chunk.
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER kill BEFORE INSERT ON events_index WHEN NEW.event_id = '{}'
+             BEGIN SELECT RAISE(ABORT, 'killed'); END;",
+            events[700].event_id
+        ))
+        .unwrap();
+        assert!(ingest_new_events(&conn, &jsonl, ph).is_err());
+        conn.execute_batch("DROP TRIGGER kill").unwrap();
+
+        let committed = count_rows(&conn, "events_index");
+        assert!(
+            committed > 0 && committed <= 700,
+            "the chunks before the kill stay committed, got {committed}"
+        );
+
+        let resumed = ingest_new_events(&conn, &jsonl, ph).unwrap();
+        assert_eq!(
+            resumed as i64,
+            1200 - committed,
+            "the resumed replay must not redo committed chunks"
+        );
+        assert_eq!(count_rows(&conn, "events_index"), 1200);
+        assert_eq!(count_rows(&conn, "search_fts"), 1200);
+    }
+
+    #[test]
+    fn concurrent_replays_share_the_work_without_locking_errors_or_duplicates() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        write_synthetic_log(&jsonl, 2000);
+        drop(open(&db).unwrap());
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let (jsonl, db, barrier) = (jsonl.clone(), db.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let conn = open(&db).unwrap();
+                    barrier.wait();
+                    ingest_new_events(&conn, &jsonl, "feedfacefeedface").map(|_| ())
+                })
+            })
+            .collect();
+        for h in handles {
+            let res = h.join().unwrap();
+            assert!(res.is_ok(), "{:#}", res.unwrap_err());
+        }
+
+        let conn = open(&db).unwrap();
+        assert_eq!(count_rows(&conn, "events_index"), 2000);
+        assert_eq!(count_rows(&conn, "search_fts"), 2000);
+    }
+
     #[test]
     fn rebuild_state_skips_malformed_jsonl_lines() {
         use std::io::Write;
@@ -2213,6 +2711,447 @@ mod tests {
         assert_eq!(task_id_by_external(&conn, "loom:t-other").unwrap(), None);
         // no false-positive on a substring of a token
         assert_eq!(task_id_by_external(&conn, "loom:t-xy").unwrap(), None);
+    }
+
+    /// An event of `task_id` stamped with `session` at a fixed `timestamp`.
+    fn session_event(task_id: &str, session: &str, timestamp: &str) -> crate::event::Event {
+        let mut e = make_text_event("work");
+        e.task_id = task_id.into();
+        e.timestamp = timestamp.into();
+        e.meta = serde_json::json!({"session_id": session});
+        e
+    }
+
+    fn indexed_session_id(conn: &Connection, event_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT session_id FROM events_index WHERE event_id = ?1",
+            rusqlite::params![event_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn index_event_stores_the_session_id_from_meta() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+
+        let stamped = session_event("tj-s", "sess-1", "2026-01-01T00:00:00.000Z");
+        let plain = make_text_event("no session");
+        index_event(&conn, &stamped).unwrap();
+        index_event(&conn, &plain).unwrap();
+
+        assert_eq!(
+            indexed_session_id(&conn, &stamped.event_id).as_deref(),
+            Some("sess-1")
+        );
+        assert_eq!(indexed_session_id(&conn, &plain.event_id), None);
+    }
+
+    #[test]
+    fn active_task_for_session_picks_the_open_task_with_its_latest_event() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+
+        for id in ["tj-a", "tj-b", "tj-c"] {
+            upsert_task_from_event(&conn, &make_open_event(id, id), ph).unwrap();
+        }
+        upsert_task_from_event(&conn, &make_open_event("tj-other", "o"), "otherproject0000")
+            .unwrap();
+        let events = [
+            session_event("tj-a", "s1", "2026-01-01T00:00:01.000Z"),
+            session_event("tj-b", "s1", "2026-01-01T00:00:02.000Z"),
+            session_event("tj-a", "s2", "2026-01-01T00:00:03.000Z"),
+            session_event("tj-c", "s1", "2026-01-01T00:00:04.000Z"),
+            session_event("tj-other", "s1", "2026-01-01T00:00:05.000Z"),
+        ];
+        for e in &events {
+            upsert_task_from_event(&conn, e, ph).unwrap();
+            index_event(&conn, e).unwrap();
+        }
+        let mut close = make_text_event("done");
+        close.task_id = "tj-c".into();
+        close.event_type = crate::event::EventType::Close;
+        upsert_task_from_event(&conn, &close, ph).unwrap();
+
+        // tj-c has s1's latest event but is closed; tj-other is another project.
+        assert_eq!(
+            active_task_for_session(&conn, ph, "s1").unwrap().as_deref(),
+            Some("tj-b")
+        );
+        assert_eq!(
+            active_task_for_session(&conn, ph, "s2").unwrap().as_deref(),
+            Some("tj-a")
+        );
+        assert_eq!(active_task_for_session(&conn, ph, "s3").unwrap(), None);
+    }
+
+    #[test]
+    fn hook_and_classifier_writes_never_bind_a_session_to_a_task() {
+        use crate::event::{Author, EventType};
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+        upsert_task_from_event(&conn, &make_open_event("tj-t1", "T1"), ph).unwrap();
+
+        // Session S1 works on T1 through the agent.
+        let mut work = session_event("tj-t1", "s1", "2026-01-01T00:00:01.000Z");
+        work.author = Author::Agent;
+        // A fresh session S2: its PostModelSwitch note and a Stop catch-up
+        // classifier event fall back to the newest open task, T1.
+        let mut switch = session_event("tj-t1", "s2", "2026-01-01T00:00:02.000Z");
+        switch.author = Author::Classifier;
+        switch.event_type = EventType::Constraint;
+        switch.meta = serde_json::json!({"session_id": "s2", "kind": "model_switch"});
+        let mut caught_up = session_event("tj-t1", "s2", "2026-01-01T00:00:03.000Z");
+        caught_up.author = Author::Classifier;
+        for e in [&work, &switch, &caught_up] {
+            upsert_task_from_event(&conn, e, ph).unwrap();
+            index_event(&conn, e).unwrap();
+        }
+
+        assert_eq!(active_task_for_session(&conn, ph, "s2").unwrap(), None);
+        assert_eq!(
+            active_task_for_session(&conn, ph, "s1").unwrap().as_deref(),
+            Some("tj-t1")
+        );
+    }
+
+    #[test]
+    fn upgrading_an_existing_db_backfills_session_ids_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-up", "Upgrade");
+        let stamped = session_event("tj-up", "sess-old", "2026-01-01T00:00:01.000Z");
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &open_ev);
+        write_event_line(&mut f, &stamped);
+        drop(f);
+
+        // A pre-session_id database that has already indexed the whole log.
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        // Written straight to SQLite by older versions: the replay must keep them.
+        set_task_goal(&conn, "tj-up", "legacy goal").unwrap();
+        add_task_external(&conn, "tj-up", "loom:t-legacy").unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_events_session_time;
+             ALTER TABLE events_index DROP COLUMN session_id;
+             DELETE FROM schema_migrations WHERE version = 9;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        assert_eq!(
+            indexed_session_id(&conn, &stamped.event_id).as_deref(),
+            Some("sess-old")
+        );
+        assert_eq!(
+            active_task_for_session(&conn, ph, "sess-old")
+                .unwrap()
+                .as_deref(),
+            Some("tj-up")
+        );
+        let meta = task_metadata(&conn, "tj-up").unwrap().unwrap();
+        assert_eq!(meta.goal.as_deref(), Some("legacy goal"));
+        assert_eq!(meta.external.as_deref(), Some("loom:t-legacy"));
+    }
+
+    #[test]
+    fn upgrading_an_existing_db_links_corrections_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-x", "Upgrade");
+        let wrong = make_text_event("Migration done (wrong)");
+        let mut corr = make_text_event("Migration NOT done");
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        for e in [&open_ev, &wrong, &corr] {
+            write_event_line(&mut f, e);
+        }
+        drop(f);
+
+        // A pre-corrected_by database that has already indexed the whole log.
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events_index DROP COLUMN corrected_by;
+             DELETE FROM schema_migrations WHERE version = 10;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        let corrected_by: Option<String> = conn
+            .query_row(
+                "SELECT corrected_by FROM events_index WHERE event_id = ?1",
+                rusqlite::params![wrong.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(corrected_by.as_deref(), Some(corr.event_id.as_str()));
+    }
+
+    #[test]
+    fn upgrading_wipes_packs_cached_as_whole_text() {
+        let d = TempDir::new().unwrap();
+        let db = d.path().join("s.sqlite");
+        let conn = open(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+             VALUES ('tj-x', 'compact', '# Old whole pack', '', 1);
+             DELETE FROM schema_migrations WHERE version = 12;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_pack_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0);
+    }
+
+    #[test]
+    fn upgrading_an_existing_db_flags_old_bookkeeping_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+
+        // Written before the writers set meta.kind: known by text alone.
+        let open_ev = make_open_event("tj-x", "Upgrade");
+        let mut marker = make_text_event("Conversation compacted at 2026-01-01T00:00:00Z; …");
+        marker.event_type = crate::event::EventType::Decision;
+        let mut switch = make_text_event("Model switched (user): opus → sonnet");
+        switch.event_type = crate::event::EventType::Constraint;
+        let real = make_text_event("Use SQLite");
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        for e in [&open_ev, &marker, &switch, &real] {
+            write_event_line(&mut f, e);
+        }
+        drop(f);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events_index DROP COLUMN bookkeeping;
+             DELETE FROM schema_migrations WHERE version = 11;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        let flagged: Vec<String> = conn
+            .prepare("SELECT event_id FROM events_index WHERE bookkeeping = 1 ORDER BY event_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected = vec![marker.event_id.clone(), switch.event_id.clone()];
+        expected.sort();
+        assert_eq!(flagged, expected);
+    }
+
+    #[test]
+    fn a_rebuild_by_an_older_binary_is_repaired_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-old", "Old binary");
+        let mut wrong = session_event("tj-old", "sess-1", "2026-01-01T00:00:01.000Z");
+        wrong.event_type = crate::event::EventType::Decision;
+        let mut corr = make_text_event("Not this");
+        corr.task_id = "tj-old".into();
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        let amend = amend_event("tj-old", serde_json::json!({"goal": "g"}));
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        for e in [&open_ev, &wrong, &corr, &amend] {
+            write_event_line(&mut f, e);
+        }
+        drop(f);
+
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        // A 0.29 server cannot parse the trailing amend, so it misses the
+        // marker and rebuilds: its rows lack the 0.30 columns, and it records
+        // the last event it could read.
+        conn.execute_batch(
+            "UPDATE events_index SET session_id = NULL, corrected_by = NULL, bookkeeping = 0;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE index_state SET last_indexed_event_id = ?1, updated_at = '2026-01-02T00:00:00.000Z'",
+            rusqlite::params![corr.event_id],
+        )
+        .unwrap();
+
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        assert_eq!(
+            active_task_for_session(&conn, ph, "sess-1")
+                .unwrap()
+                .as_deref(),
+            Some("tj-old")
+        );
+        let corrected_by: Option<String> = conn
+            .query_row(
+                "SELECT corrected_by FROM events_index WHERE event_id = ?1",
+                rusqlite::params![wrong.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(corrected_by.as_deref(), Some(corr.event_id.as_str()));
+        assert_eq!(
+            ingest_new_events(&conn, &jsonl, ph).unwrap(),
+            0,
+            "once repaired, the projection is in sync again"
+        );
+    }
+
+    #[test]
+    fn upgrading_from_0_29_replays_the_log_exactly_once() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+        let events = write_synthetic_log(&jsonl, 40);
+
+        // A 0.29 database (schema v008) that has indexed the whole log.
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_events_session_time;
+             ALTER TABLE events_index DROP COLUMN session_id;
+             ALTER TABLE events_index DROP COLUMN corrected_by;
+             ALTER TABLE events_index DROP COLUMN bookkeeping;
+             ALTER TABLE events_index DROP COLUMN author;
+             DROP TABLE projection_state;
+             DELETE FROM schema_migrations WHERE version >= 9;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        assert_eq!(ingest_new_events(&conn, &jsonl, ph).unwrap(), 40);
+        assert_eq!(ingest_new_events(&conn, &jsonl, ph).unwrap(), 0);
+
+        let authored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_index WHERE author = 'user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(authored, events.len() as i64);
+    }
+
+    #[test]
+    fn open_meta_goal_and_external_are_restored_by_a_rebuild() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+
+        let mut open_ev = make_open_event("tj-g", "Goal task");
+        open_ev.meta = serde_json::json!({
+            "title": "Goal task",
+            "goal": "Ship PKCE",
+            "external": ["loom:t-42", "github:#7"],
+        });
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &open_ev);
+        drop(f);
+
+        let conn = open(d.path().join("fresh.sqlite")).unwrap();
+        rebuild_state(&conn, &jsonl, ph).unwrap();
+
+        let meta = task_metadata(&conn, "tj-g").unwrap().unwrap();
+        assert_eq!(meta.goal.as_deref(), Some("Ship PKCE"));
+        assert_eq!(meta.external.as_deref(), Some("loom:t-42,github:#7"));
+        assert_eq!(
+            task_id_by_external(&conn, "loom:t-42").unwrap().as_deref(),
+            Some("tj-g")
+        );
+    }
+
+    fn amend_event(task_id: &str, meta: serde_json::Value) -> crate::event::Event {
+        let mut e = crate::event::Event::new(
+            task_id,
+            crate::event::EventType::Amend,
+            crate::event::Author::User,
+            crate::event::Source::Cli,
+            "amend".into(),
+        );
+        e.meta = meta;
+        e
+    }
+
+    #[test]
+    fn amend_events_are_replayed_idempotently_and_stay_out_of_the_index() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+
+        let mut open_ev = make_open_event("tj-am", "Amended");
+        open_ev.meta = serde_json::json!({"title": "Amended", "goal": "first goal"});
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        write_event_line(&mut f, &open_ev);
+        write_event_line(
+            &mut f,
+            &amend_event("tj-am", serde_json::json!({"goal": "second goal"})),
+        );
+        for _ in 0..2 {
+            write_event_line(
+                &mut f,
+                &amend_event("tj-am", serde_json::json!({"external_add": ["beads:x"]})),
+            );
+        }
+        // An amend for a task that does not exist must not break ingest.
+        write_event_line(
+            &mut f,
+            &amend_event("tj-ghost", serde_json::json!({"external_add": ["beads:y"]})),
+        );
+        drop(f);
+
+        let conn = open(d.path().join("fresh.sqlite")).unwrap();
+        rebuild_state(&conn, &jsonl, ph).unwrap();
+        // Replaying over an existing DB (e.g. after a migration) changes nothing.
+        rebuild_state(&conn, &jsonl, ph).unwrap();
+
+        let meta = task_metadata(&conn, "tj-am").unwrap().unwrap();
+        assert_eq!(meta.goal.as_deref(), Some("second goal"));
+        assert_eq!(meta.external.as_deref(), Some("beads:x"));
+
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_index WHERE type = 'amend'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 0, "amend is metadata, not a pack/search event");
+        let pack = crate::pack::assemble(&conn, "tj-am", crate::pack::PackMode::Full).unwrap();
+        assert!(pack.text.contains("**Goal**: second goal"), "{}", pack.text);
+        assert!(!pack.text.contains("[amend]"), "{}", pack.text);
     }
 
     #[test]

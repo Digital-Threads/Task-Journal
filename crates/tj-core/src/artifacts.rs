@@ -11,6 +11,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 /// Structured artifacts collected from one or many events. All vectors
 /// are deduplicated (case-sensitive) by the `merge` constructor — the
@@ -102,8 +103,10 @@ pub fn extract(text: &str) -> Artifacts {
     // Word boundary on \b avoids matching inside longer non-hex tokens
     // (e.g. ULIDs are base32, but adjacent digits + letters could
     // technically pass — the boundary keeps matches clean).
+    static COMMIT_HASH: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b[0-9a-f]{7,40}\b").unwrap());
     static_re(
-        r"\b[0-9a-f]{7,40}\b",
+        &COMMIT_HASH,
         |m| {
             // Reject if all-digits (could be a year, an ID, a port).
             // A real abbreviated commit always has at least one letter.
@@ -116,31 +119,28 @@ pub fn extract(text: &str) -> Artifacts {
     );
 
     // GitHub / GitLab PR URLs.
-    static_re(
-        r"https?://[A-Za-z0-9.\-]+/[A-Za-z0-9_./\-]+/(?:pull|merge_requests)/\d+",
-        |m| a.pr_urls.push(m.to_string()),
-        text,
-    );
+    static PR_URL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"https?://[A-Za-z0-9.\-]+/[A-Za-z0-9_./\-]+/(?:pull|merge_requests)/\d+")
+            .unwrap()
+    });
+    static_re(&PR_URL, |m| a.pr_urls.push(m.to_string()), text);
 
     // Short PR references: "PR #51", "PR#51", "pull request #51". Anchored to
     // the PR / "pull request" keyword so a bare "#3" in prose (step #3, issue
     // #3) is NOT captured. Normalised to "PR #<n>" so it dedupes cleanly and
     // renders next to full URLs under the same `PRs:` group.
-    if let Ok(re) = Regex::new(r"(?i)\b(?:PR|pull request)\s*#(\d+)\b") {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                a.pr_urls.push(format!("PR #{}", m.as_str()));
-            }
+    static PR_REF: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\b(?:PR|pull request)\s*#(\d+)\b").unwrap());
+    for cap in PR_REF.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            a.pr_urls.push(format!("PR #{}", m.as_str()));
         }
     }
 
     // Ticket IDs: ABC-123. At least 2 letters to avoid matching version
     // strings like v1-2 and minimum 1 digit.
-    static_re(
-        r"\b[A-Z]{2,}-\d+\b",
-        |m| a.linked_issues.push(m.to_string()),
-        text,
-    );
+    static TICKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]{2,}-\d+\b").unwrap());
+    static_re(&TICKET, |m| a.linked_issues.push(m.to_string()), text);
 
     // File paths — heuristic: path-like tokens with at least one slash
     // (and an extension) OR a leading ./ . Path segments allow a
@@ -148,8 +148,11 @@ pub fn extract(text: &str) -> Artifacts {
     // etc are captured as artifacts. Tight enough to skip prose, loose
     // enough to catch the common cases (src/foo.rs, ./bar.ts,
     // crates/tj-core/src/db.rs).
+    static FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:\./|\.?[A-Za-z0-9_\-]+/)+[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,8}\b").unwrap()
+    });
     static_re(
-        r"(?:\./|\.?[A-Za-z0-9_\-]+/)+[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,8}\b",
+        &FILE_PATH,
         |m| {
             // Reject version-dir lookalikes: a numeric-only "extension"
             // (foo/1.0.0, …/superpowers/5.1.0) is a version number, not a
@@ -170,13 +173,12 @@ pub fn extract(text: &str) -> Artifacts {
     // branch. The bare-`branch <name>` form is intentionally dropped —
     // it caused too many false positives in journal events that
     // mention the word "branch" without naming one.
-    if let Ok(re) =
-        Regex::new(r"\bgit\s+(?:checkout\s+-b|switch\s+-c|branch)\s+([A-Za-z0-9._/\-]+)")
-    {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                a.branch_names.push(m.as_str().to_string());
-            }
+    static BRANCH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\bgit\s+(?:checkout\s+-b|switch\s+-c|branch)\s+([A-Za-z0-9._/\-]+)").unwrap()
+    });
+    for cap in BRANCH.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            a.branch_names.push(m.as_str().to_string());
         }
     }
 
@@ -194,11 +196,9 @@ fn dedup(v: &mut Vec<String>) {
     v.retain(|x| seen.insert(x.clone()));
 }
 
-fn static_re(pat: &str, mut f: impl FnMut(&str), text: &str) {
-    if let Ok(re) = Regex::new(pat) {
-        for m in re.find_iter(text) {
-            f(m.as_str());
-        }
+fn static_re(re: &Regex, mut f: impl FnMut(&str), text: &str) {
+    for m in re.find_iter(text) {
+        f(m.as_str());
     }
 }
 

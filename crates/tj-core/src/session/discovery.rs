@@ -37,7 +37,8 @@ pub fn encode_project_path(path: &str) -> String {
 }
 
 /// Find the project directory for a given filesystem path.
-/// Tries exact match first, then prefix match for worktree variants.
+/// Tries an exact match first, then a case-insensitive one (WSL paths can
+/// differ in case). Worktrees are not matched to their main checkout.
 pub fn find_project_dir(project_path: &Path) -> anyhow::Result<Option<PathBuf>> {
     let projects = projects_dir()?;
     if !projects.exists() {
@@ -98,35 +99,6 @@ pub fn list_sessions(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(sessions.into_iter().map(|(p, _)| p).collect())
 }
 
-/// List all project directories in Claude Code config.
-pub fn list_all_projects() -> anyhow::Result<Vec<(String, PathBuf)>> {
-    let projects = projects_dir()?;
-    if !projects.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut result = Vec::new();
-    for entry in std::fs::read_dir(&projects)? {
-        let entry = entry?;
-        if entry.path().is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Decode the project name back to a readable path.
-            let decoded = decode_project_path(&name);
-            result.push((decoded, entry.path()));
-        }
-    }
-    result.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(result)
-}
-
-/// Decode an encoded project directory name back to a readable path.
-/// This is approximate — we can't distinguish `-` from original `/`.
-fn decode_project_path(encoded: &str) -> String {
-    // Common pattern: leading `--` means the path started with a path separator.
-    // Replace double dashes carefully.
-    encoded.to_string()
-}
-
 fn dirs_home() -> anyhow::Result<PathBuf> {
     directories::BaseDirs::new()
         .map(|d| d.home_dir().to_path_buf())
@@ -136,16 +108,6 @@ fn dirs_home() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialize every test that touches `CLAUDE_CONFIG_DIR`. Cargo runs
-    /// unit tests in parallel by default; two tests mutating the same
-    /// process env race (set in A, observed in B) and flaked Windows CI
-    /// (saw "C:\Users\runneradmin\.claude" when expecting the override).
-    /// Tests that touch the env take this lock before the first set_var.
-    /// `lock().unwrap_or_else(|p| p.into_inner())` swallows poisoning
-    /// from a panicking sibling test — env is restored regardless.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn encode_path_replaces_separators() {
@@ -195,15 +157,19 @@ mod tests {
     fn list_sessions_sorted_by_mtime_newest_first() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Create files with different modification times.
-        let older = dir.path().join("older.jsonl");
-        std::fs::write(&older, "{}").unwrap();
-
-        // Sleep briefly to ensure different mtime.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let newer = dir.path().join("newer.jsonl");
-        std::fs::write(&newer, "{}").unwrap();
+        // Set the mtimes explicitly: a sleep between two writes is not enough
+        // when the wall clock steps back (seen on WSL), and it slows the test.
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for (name, secs) in [("older.jsonl", 0), ("newer.jsonl", 60)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
 
         let sessions = list_sessions(dir.path()).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -229,45 +195,11 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- list_all_projects() ---
-
-    #[test]
-    fn list_all_projects_with_temp_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        // Override CLAUDE_CONFIG_DIR for this test.
-        let config_dir = dir.path();
-        let projects = config_dir.join("projects");
-        std::fs::create_dir_all(&projects).unwrap();
-
-        // Create project directories.
-        std::fs::create_dir(projects.join("-home-user-project-alpha")).unwrap();
-        std::fs::create_dir(projects.join("-home-user-project-beta")).unwrap();
-        // Create a file (should be skipped — not a directory).
-        std::fs::write(projects.join("not-a-dir.txt"), "").unwrap();
-
-        // We can't easily test list_all_projects() because it uses projects_dir()
-        // which reads CLAUDE_CONFIG_DIR. Instead, test the directory listing logic directly.
-        let mut result = Vec::new();
-        for entry in std::fs::read_dir(&projects).unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let decoded = decode_project_path(&name);
-                result.push((decoded, entry.path()));
-            }
-        }
-        result.sort_by(|a, b| a.0.cmp(&b.0));
-
-        assert_eq!(result.len(), 2);
-        assert!(result[0].0.contains("alpha"));
-        assert!(result[1].0.contains("beta"));
-    }
-
     // --- find_project_dir() with CLAUDE_CONFIG_DIR env override ---
 
     #[test]
     fn find_project_dir_with_env_override() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -292,7 +224,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_returns_none_when_no_match() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -308,7 +240,7 @@ mod tests {
 
     #[test]
     fn find_project_dir_returns_none_when_projects_dir_missing() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         // Don't create a "projects" subdir — it doesn't exist.
 
@@ -319,15 +251,6 @@ mod tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         assert!(result.unwrap().is_none());
-    }
-
-    // --- decode_project_path ---
-
-    #[test]
-    fn decode_project_path_returns_same_string() {
-        // Current implementation is identity — just verify it doesn't panic.
-        let decoded = decode_project_path("-home-user-project");
-        assert_eq!(decoded, "-home-user-project");
     }
 
     // --- claude_config_dir ---
@@ -341,9 +264,9 @@ mod tests {
     /// than the hardcoded "/tmp/..." that doesn't exist on Windows.
     #[test]
     fn claude_config_dir_handles_env_var() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: the ENV_LOCK above serializes us against the other
-        // CLAUDE_CONFIG_DIR tests in this module; prev → restore at
+        let _g = crate::test_env_lock();
+        // SAFETY: the shared env lock serializes us against the other
+        // env-touching tests; prev → restore at
         // the end gives a clean exit regardless of panic.
         let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
 

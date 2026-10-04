@@ -42,6 +42,38 @@ fn plugin_manifests_carry_the_crate_version() {
     );
 }
 
+/// `cargo publish` uploads tj-cli and tj-mcp with their `task-journal-core`
+/// requirement taken from the version literal, which Cargo cannot inherit
+/// from `workspace.package.version`. A stale literal ships binaries built
+/// against the previous core release.
+#[test]
+fn internal_dependency_pins_carry_the_crate_version() {
+    let want = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
+
+    for rel in [
+        "Cargo.toml",
+        "crates/tj-cli/Cargo.toml",
+        "crates/tj-mcp/Cargo.toml",
+    ] {
+        let body = std::fs::read_to_string(repo_root().join(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+
+        let pins = body.lines().filter(|l| {
+            l.contains("package = \"task-journal-") || l.trim_start().starts_with("task-journal-")
+        });
+
+        for line in pins {
+            if line.contains("workspace = true") {
+                continue;
+            }
+            assert!(
+                line.contains(&want),
+                "{rel}: internal dependency pin is stale: {line}"
+            );
+        }
+    }
+}
+
 /// The MCP server is declared once, in `plugin.json`. A second declaration in
 /// `plugin/.mcp.json` made Claude Code see the same stdio server twice.
 #[test]
