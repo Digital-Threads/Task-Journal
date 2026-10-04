@@ -184,6 +184,20 @@ const MIGRATION_012: &str = r#"
 DELETE FROM task_pack_cache;
 "#;
 
+/// v0.30.0 projection marker — `projection_state` holds the `index_state` row
+/// as this version last wrote it. An older binary still running (or a
+/// downgrade) ingests or rebuilds without the 0.30 columns and moves
+/// `index_state`; the mismatch makes the next ingest replay the log to
+/// re-derive them. It starts empty, so the first ingest after the upgrade
+/// replays the log once.
+const MIGRATION_013: &str = r#"
+CREATE TABLE IF NOT EXISTS projection_state (
+  project_hash          TEXT PRIMARY KEY,
+  last_indexed_event_id TEXT NOT NULL,
+  updated_at            TEXT NOT NULL
+);
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -234,6 +248,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 12,
         sql: MIGRATION_012,
+    },
+    Migration {
+        version: 13,
+        sql: MIGRATION_013,
     },
 ];
 
@@ -874,10 +892,18 @@ pub fn task_artifacts(
 /// been indexed (first call, or a migration cleared the marker).
 type IndexMark = (String, String);
 
-fn index_mark(conn: &Connection, project_hash: &str) -> anyhow::Result<Option<IndexMark>> {
+/// The mark stored in `table`: `index_state`, which every version writes, or
+/// `projection_state`, the copy only this version writes.
+fn read_mark(
+    conn: &Connection,
+    table: &str,
+    project_hash: &str,
+) -> anyhow::Result<Option<IndexMark>> {
     Ok(conn
         .query_row(
-            "SELECT last_indexed_event_id, updated_at FROM index_state WHERE project_hash = ?1",
+            &format!(
+                "SELECT last_indexed_event_id, updated_at FROM {table} WHERE project_hash = ?1"
+            ),
             rusqlite::params![project_hash],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -893,14 +919,18 @@ fn record_last_indexed(
         event_id.to_string(),
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     );
-    conn.execute(
-        "INSERT INTO index_state(project_hash, last_indexed_event_id, updated_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(project_hash) DO UPDATE SET
-             last_indexed_event_id = excluded.last_indexed_event_id,
-             updated_at = excluded.updated_at",
-        rusqlite::params![project_hash, mark.0, mark.1],
-    )?;
+    for table in ["index_state", "projection_state"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO {table}(project_hash, last_indexed_event_id, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(project_hash) DO UPDATE SET
+                     last_indexed_event_id = excluded.last_indexed_event_id,
+                     updated_at = excluded.updated_at"
+            ),
+            rusqlite::params![project_hash, mark.0, mark.1],
+        )?;
+    }
 
     Ok(mark)
 }
@@ -914,9 +944,11 @@ const REPLAY_CHUNK: usize = 500;
 /// for hot loops (every MCP tool invocation): scan to the marker, ingest
 /// the rest, update the marker.
 ///
-/// Falls back to a full replay (see [`rebuild_state`]) in two cases:
+/// Falls back to a full replay (see [`rebuild_state`]) in three cases:
 /// - No marker yet for this project (first call after a migration cleared
 ///   it, or a brand-new install).
+/// - The marker is not the one this version last wrote: an older binary
+///   ingested or rebuilt without the columns it does not know.
 /// - The stored marker is not present in the JSONL (corrupted / truncated
 ///   file). A `tracing::warn!` is emitted so the operator notices.
 pub fn ingest_new_events(
@@ -957,10 +989,18 @@ fn replay(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
-            let mark = index_mark(&tx, project_hash)?;
+            let mark = read_mark(&tx, "index_state", project_hash)?;
 
             if committed.is_none() {
-                match mark.filter(|_| !from_scratch) {
+                let ours = mark == read_mark(&tx, "projection_state", project_hash)?;
+                if mark.is_some() && !ours {
+                    tracing::warn!(
+                        project_hash = project_hash,
+                        "index_state was written by another version — replaying the log"
+                    );
+                }
+
+                match mark.filter(|_| !from_scratch && ours) {
                     None => clear_search_fts(&tx, project_hash)?,
                     Some((marker, _)) => {
                         let mut found = false;
@@ -2866,6 +2906,65 @@ mod tests {
         let mut expected = vec![marker.event_id.clone(), switch.event_id.clone()];
         expected.sort();
         assert_eq!(flagged, expected);
+    }
+
+    #[test]
+    fn a_rebuild_by_an_older_binary_is_repaired_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-old", "Old binary");
+        let mut wrong = session_event("tj-old", "sess-1", "2026-01-01T00:00:01.000Z");
+        wrong.event_type = crate::event::EventType::Decision;
+        let mut corr = make_text_event("Not this");
+        corr.task_id = "tj-old".into();
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        let amend = amend_event("tj-old", serde_json::json!({"goal": "g"}));
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        for e in [&open_ev, &wrong, &corr, &amend] {
+            write_event_line(&mut f, e);
+        }
+        drop(f);
+
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        // A 0.29 server cannot parse the trailing amend, so it misses the
+        // marker and rebuilds: its rows lack the 0.30 columns, and it records
+        // the last event it could read.
+        conn.execute_batch(
+            "UPDATE events_index SET session_id = NULL, corrected_by = NULL, bookkeeping = 0;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE index_state SET last_indexed_event_id = ?1, updated_at = '2026-01-02T00:00:00.000Z'",
+            rusqlite::params![corr.event_id],
+        )
+        .unwrap();
+
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        assert_eq!(
+            active_task_for_session(&conn, ph, "sess-1")
+                .unwrap()
+                .as_deref(),
+            Some("tj-old")
+        );
+        let corrected_by: Option<String> = conn
+            .query_row(
+                "SELECT corrected_by FROM events_index WHERE event_id = ?1",
+                rusqlite::params![wrong.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(corrected_by.as_deref(), Some(corr.event_id.as_str()));
+        assert_eq!(
+            ingest_new_events(&conn, &jsonl, ph).unwrap(),
+            0,
+            "once repaired, the projection is in sync again"
+        );
     }
 
     #[test]
