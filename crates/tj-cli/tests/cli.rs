@@ -2290,6 +2290,29 @@ fn events_list_skips_malformed_jsonl_lines_with_a_warning() {
 }
 
 #[test]
+fn events_list_prints_snake_case_event_types() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Typed listing"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("[open]").and(contains("[Open]").not()));
+}
+
+#[test]
 fn rebuild_state_creates_sqlite_with_one_task() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")

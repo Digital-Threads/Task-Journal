@@ -1269,7 +1269,11 @@ fn real_main() -> Result<()> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| e.text.clone());
-                    println!("{}  [{:?}]  {}", e.timestamp, e.event_type, title);
+                    let etype = serde_json::to_value(e.event_type)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| "?".into());
+                    println!("{}  [{etype}]  {}", e.timestamp, title);
                 }
             }
         },
