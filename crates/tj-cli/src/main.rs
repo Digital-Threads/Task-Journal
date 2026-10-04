@@ -2925,169 +2925,129 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 "assistant"
             };
 
-            let (etype, task_id, confidence, evidence_strength, suggested_text) = if let (
-                Some(t),
-                Some(tid),
-            ) =
-                (mock_event_type.as_deref(), mock_task_id.as_deref())
-            {
-                (
-                    parse_event_type(t)?,
-                    tid.to_string(),
-                    mock_confidence.unwrap_or(1.0),
-                    None,
-                    None,
-                )
-            } else {
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                if events_path.exists() {
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                }
-                let mut recent = recent_task_contexts(&conn, 5)?;
-                if recent.is_empty() {
-                    // No open tasks. v0.5.0 Phase A: auto-open a new
-                    // task from the user's prompt so subsequent
-                    // events have somewhere to land. Without this
-                    // every fresh session was a black hole — events
-                    // dropped silently because there was nothing to
-                    // classify against. Opt-out via
-                    // TJ_AUTO_OPEN_TASKS=0; only fires for
-                    // UserPromptSubmit (assistant tool calls
-                    // shouldn't conjure tasks).
-                    let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
-                        .ok()
-                        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-                        .unwrap_or(false);
-                    if auto_open_disabled || !kind.contains("UserPrompt") {
-                        return Ok(());
+            let (etype, task_id, confidence, evidence_strength, suggested_text) =
+                if let (Some(t), Some(tid)) = (mock_event_type.as_deref(), mock_task_id.as_deref())
+                {
+                    (
+                        parse_event_type(t)?,
+                        tid.to_string(),
+                        mock_confidence.unwrap_or(1.0),
+                        None,
+                        None,
+                    )
+                } else {
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    if events_path.exists() {
+                        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     }
-                    let Some(new_task) = auto_open_task_from_prompt(
-                        &events_path,
-                        &project_hash,
-                        &conn,
-                        &text,
-                        live_session_id.as_deref(),
-                    )?
-                    else {
-                        // Prompt was only machine noise — nothing worth a task.
+                    let mut recent = recent_task_contexts(&conn, 5)?;
+                    if recent.is_empty() {
+                        // No open tasks. v0.5.0 Phase A: auto-open a new
+                        // task from the user's prompt so subsequent
+                        // events have somewhere to land. Without this
+                        // every fresh session was a black hole — events
+                        // dropped silently because there was nothing to
+                        // classify against. Opt-out via
+                        // TJ_AUTO_OPEN_TASKS=0; only fires for
+                        // UserPromptSubmit (assistant tool calls
+                        // shouldn't conjure tasks).
+                        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+                            .ok()
+                            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                            .unwrap_or(false);
+                        if auto_open_disabled || !kind.contains("UserPrompt") {
+                            return Ok(());
+                        }
+                        let Some(new_task) = auto_open_task_from_prompt(
+                            &events_path,
+                            &project_hash,
+                            &conn,
+                            &text,
+                            live_session_id.as_deref(),
+                        )?
+                        else {
+                            // Prompt was only machine noise — nothing worth a task.
+                            return Ok(());
+                        };
+                        recent.push(new_task);
+                    }
+
+                    let classifier = build_classifier(&backend)?;
+                    let input = tj_core::classifier::ClassifyInput {
+                        text: text.clone(),
+                        author_hint: author_hint.into(),
+                        recent_tasks: recent,
+                        tool_output: kind == "PostToolUse",
+                    };
+                    let out = match classifier.classify(&input) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &e.to_string(),
+                            )?;
+                            return Ok(());
+                        }
+                    };
+
+                    let Some(tid) = out.task_id_guess else {
                         return Ok(());
                     };
-                    recent.push(new_task);
-                }
 
-                use tj_core::classifier::Classifier;
-                let classifier: Box<dyn Classifier> = match backend.as_str() {
-                    // v0.8.0: hybrid is the new default. Heuristic
-                    // pattern-matching first (free), Anthropic API
-                    // fallback when uncertain (requires ANTHROPIC_API_KEY).
-                    // No background spawn of `claude -p` — that subprocess
-                    // now bills tokens separately from Pro/Max.
-                    "hybrid" | "" => {
-                        Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env())
+                    // Journal-integrity safeguards. The classifier sometimes
+                    // mis-attributes events to old or closed tasks (no fault
+                    // of the model — its prompt only sees recent_tasks). We
+                    // reject three patterns that produce confusing journals:
+                    //
+                    //   1. Stop-hook → Close event. The Stop hook fires at
+                    //      every Claude Code session end. Session ending
+                    //      != task done. Closes happen via explicit
+                    //      `task-journal close <id>` only.
+                    //   2. task_id_guess pointing at a non-existent task —
+                    //      route to pending so the user can decide later.
+                    //   3. task_id_guess pointing at a CLOSED task — same
+                    //      treatment; closed tasks must stay closed.
+                    use tj_core::event::EventType;
+                    if matches!(out.event_type, EventType::Close) && kind == "Stop" {
+                        return Ok(());
                     }
-                    "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
-                    "agent-sdk" => Box::new(
-                        tj_core::classifier::agent_sdk::ClaudeCliClassifier::from_env()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "agent-sdk backend selected but no `claude` binary on PATH — \
-                                     install Claude Code (https://claude.com/claude-code) or pick another --backend"
-                                )
-                            })?,
-                    ),
-                    "heuristic" => {
-                        // Heuristic-only: no LLM at all. Trades coverage
-                        // for absolute zero-cost / offline operation.
-                        use tj_core::classifier::heuristic::try_heuristic;
-                        use tj_core::classifier::{ClassifyInput, ClassifyOutput};
-                        struct HeuristicOnly;
-                        impl Classifier for HeuristicOnly {
-                            fn classify(
-                                &self,
-                                input: &ClassifyInput,
-                            ) -> anyhow::Result<ClassifyOutput> {
-                                try_heuristic(input).ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "heuristic uncertain (heuristic-only mode has no LLM fallback)"
-                                        )
-                                    })
-                            }
+                    match tj_core::db::task_status(&conn, &tid)? {
+                        None => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &format!("task_id_guess `{tid}` not found"),
+                            )?;
+                            return Ok(());
                         }
-                        Box::new(HeuristicOnly)
+                        Some(s) if s == "closed" => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &format!("task_id_guess `{tid}` is closed"),
+                            )?;
+                            return Ok(());
+                        }
+                        _ => {}
                     }
-                    other => anyhow::bail!(
-                        "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
-                    ),
-                };
-                let input = tj_core::classifier::ClassifyInput {
-                    text: text.clone(),
-                    author_hint: author_hint.into(),
-                    recent_tasks: recent,
-                    tool_output: kind == "PostToolUse",
-                };
-                let out = match classifier.classify(&input) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        persist_pending(&events_path, &project_hash, &kind, &text, &e.to_string())?;
-                        return Ok(());
-                    }
-                };
 
-                let Some(tid) = out.task_id_guess else {
-                    return Ok(());
+                    (
+                        out.event_type,
+                        tid,
+                        out.confidence,
+                        out.evidence_strength,
+                        Some(out.suggested_text),
+                    )
                 };
-
-                // Journal-integrity safeguards. The classifier sometimes
-                // mis-attributes events to old or closed tasks (no fault
-                // of the model — its prompt only sees recent_tasks). We
-                // reject three patterns that produce confusing journals:
-                //
-                //   1. Stop-hook → Close event. The Stop hook fires at
-                //      every Claude Code session end. Session ending
-                //      != task done. Closes happen via explicit
-                //      `task-journal close <id>` only.
-                //   2. task_id_guess pointing at a non-existent task —
-                //      route to pending so the user can decide later.
-                //   3. task_id_guess pointing at a CLOSED task — same
-                //      treatment; closed tasks must stay closed.
-                use tj_core::event::EventType;
-                if matches!(out.event_type, EventType::Close) && kind == "Stop" {
-                    return Ok(());
-                }
-                match tj_core::db::task_status(&conn, &tid)? {
-                    None => {
-                        persist_pending(
-                            &events_path,
-                            &project_hash,
-                            &kind,
-                            &text,
-                            &format!("task_id_guess `{tid}` not found"),
-                        )?;
-                        return Ok(());
-                    }
-                    Some(s) if s == "closed" => {
-                        persist_pending(
-                            &events_path,
-                            &project_hash,
-                            &kind,
-                            &text,
-                            &format!("task_id_guess `{tid}` is closed"),
-                        )?;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-
-                (
-                    out.event_type,
-                    tid,
-                    out.confidence,
-                    out.evidence_strength,
-                    Some(out.suggested_text),
-                )
-            };
 
             // Use classifier's suggested_text if available (it's more concise and specific),
             // fall back to raw hook text for mock/manual events.
