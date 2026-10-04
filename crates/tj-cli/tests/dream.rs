@@ -14,6 +14,7 @@ struct Fixture {
     /// `<claude>/projects/<encoded project path>` — where transcripts live.
     sessions_dir: PathBuf,
     events_path: PathBuf,
+    state_path: PathBuf,
 }
 
 /// A project with an (empty) Claude Code sessions dir and events log dir.
@@ -39,12 +40,18 @@ fn fixture() -> Fixture {
         .join("events")
         .join(format!("{hash}.jsonl"));
     std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+    let state_path = xdg
+        .path()
+        .join("task-journal")
+        .join("state")
+        .join(format!("{hash}.sqlite"));
     Fixture {
         xdg,
         proj,
         claude,
         sessions_dir,
         events_path,
+        state_path,
     }
 }
 
@@ -151,4 +158,61 @@ fn dream_session_with_a_failed_chunk_is_mined_again() {
     // must stay in scope.
     let second = dream(&fx, &server.url(), &[]);
     assert!(second.contains("1 session(s) processed"), "{second}");
+}
+
+fn backfill(fx: &Fixture) -> String {
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .current_dir(fx.proj.path())
+        .env("XDG_DATA_HOME", fx.xdg.path())
+        .env("CLAUDE_CONFIG_DIR", fx.claude.path())
+        .args(["backfill"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn backfill_imports_a_session_only_mentioned_in_unrelated_text() {
+    use tj_core::event::{Author, Event, EventType, Source};
+    let fx = fixture();
+    write_session(&fx, "sess-mention", "hello", 60);
+    // Another task's text names the session id; it was never imported.
+    let e = Event::new(
+        "tj-other",
+        EventType::Finding,
+        Author::User,
+        Source::Cli,
+        "see sess-mention for the repro".into(),
+    );
+    let mut w = tj_core::storage::JsonlWriter::open(&fx.events_path).unwrap();
+    w.append(&e).unwrap();
+    w.flush_durable().unwrap();
+
+    let first = backfill(&fx);
+    assert!(first.contains("Imported 1 task(s)"), "{first}");
+
+    // Now it really was imported (its events carry meta.session_id).
+    let second = backfill(&fx);
+    assert!(second.contains("already imported"), "{second}");
+    assert!(second.contains("Imported 0 task(s)"), "{second}");
+}
+
+#[test]
+fn backfill_indexes_imported_tasks_into_sqlite() {
+    let fx = fixture();
+    write_session(&fx, "sess-index", "hello", 60);
+
+    let out = backfill(&fx);
+    assert!(out.contains("Imported 1 task(s)"), "{out}");
+
+    // search / pack read SQLite, so the task must be there right away.
+    let conn = rusqlite::Connection::open(&fx.state_path).unwrap();
+    let tasks: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tasks, 1);
 }

@@ -3349,17 +3349,21 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 project_path.display()
             );
 
-            // Check which sessions are already imported (idempotent).
-            let already_imported = if events_path.exists() {
-                let content = std::fs::read_to_string(&events_path).unwrap_or_default();
-                sessions
-                    .iter()
-                    .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
-                    .filter(|sid| content.contains(sid))
-                    .collect::<std::collections::HashSet<_>>()
-            } else {
-                std::collections::HashSet::new()
-            };
+            // Check which sessions are already imported (idempotent): a session
+            // counts once some event is tagged with it in `meta.session_id` —
+            // not merely mentioned in some unrelated event's text.
+            let already_imported: std::collections::HashSet<String> =
+                std::fs::read_to_string(&events_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<tj_core::event::Event>(l).ok())
+                    .filter_map(|e| {
+                        e.meta
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
 
             let mut total_tasks = 0;
             let mut total_events = 0;
@@ -3452,6 +3456,13 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 eprintln!("Run without --dry-run to import.");
             } else {
+                // Index the appended events so search / pack see them now.
+                if total_tasks > 0 {
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                }
                 eprintln!("\nImported {total_tasks} task(s) with {total_events} event(s).");
             }
         }
