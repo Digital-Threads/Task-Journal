@@ -18,5 +18,21 @@
       "command": "task-journal-mcp"
     }
   },
-  "skills": "./skills/"
+  "skills": "./skills/",
+  "userConfig": {
+    "nudge_after_turns": {
+      "type": "number",
+      "title": "Remind after turns",
+      "description": "With the mod on (Claude Code 2.1.287+): remind the agent to log after this many of your prompts without a journal entry. 0 turns the reminder off.",
+      "default": 6,
+      "min": 0,
+      "max": 50
+    },
+    "distill_on_compact": {
+      "type": "boolean",
+      "title": "Catch up before compaction",
+      "description": "With the mod on: before the conversation is compacted, ask the model which decisions, rejections and findings were not logged, and record them as suggested events. One extra model call per compaction, mostly served from the prompt cache.",
+      "default": true
+    }
+  }
 }
