@@ -99,7 +99,7 @@ task-journal install-hooks --scope user --uninstall
 # add --client codex to remove them from ~/.codex/hooks.json
 ```
 
-This removes only the `hooks` block from `settings.json` (keeps theme, other servers, everything else).
+This removes only task-journal's own hook entries (and its `TJ_CLASSIFIER_CLI` env key) from `~/.claude/settings.json`, or from `~/.codex/hooks.json` with `--client codex`. Other plugins' hooks, theme, servers and everything else stay as they are. With `--scope project` the file is `.claude/settings.json` or `.codex/hooks.json` in the current directory.
 
 ## Where data lives
 
