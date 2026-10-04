@@ -92,8 +92,13 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
         Ok((t, s))
     })?;
     let mut count = 0;
+    let mut seen: HashSet<String> = HashSet::new();
     for row in rows {
         let (t, s) = row?;
+        // Same noise / repeat filter as Active decisions and Rejected.
+        if is_noise(&t) || !seen.insert(t.trim().to_string()) {
+            continue;
+        }
         out.push_str(&format!("- {t} ({s})\n"));
         count += 1;
     }
@@ -227,12 +232,13 @@ fn render_alternatives(raw: Option<&str>) -> Option<String> {
     let raw = raw?;
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
     let arr = parsed.as_array()?;
-    if arr.is_empty() {
-        return None;
-    }
     let mut block = String::from("  - considered:\n");
+    let header_len = block.len();
     for entry in arr {
-        let option = entry.get("option").and_then(|v| v.as_str())?;
+        // Skip only the entry without an option, not the whole block.
+        let Some(option) = entry.get("option").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let chosen = entry
             .get("chosen")
             .and_then(|v| v.as_bool())
@@ -244,7 +250,8 @@ fn render_alternatives(raw: Option<&str>) -> Option<String> {
             None => block.push_str(&format!("    - {marker} {option}\n")),
         }
     }
-    Some(block)
+
+    (block.len() > header_len).then_some(block)
 }
 
 fn render_lifecycle(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
@@ -1524,5 +1531,39 @@ mod tests {
         assert!(!first.text.contains("## Completeness"), "{}", first.text);
         assert!(second.metadata.cache_hit);
         assert!(second.text.contains("1 pending entry"), "{}", second.text);
+    }
+
+    #[test]
+    fn one_bad_alternative_does_not_hide_the_others() {
+        let raw = r#"[
+            {"chosen": true, "rationale": "no option field"},
+            {"option": "SQLite", "chosen": true},
+            {"option": "Postgres", "rationale": "too heavy"}
+        ]"#;
+        let block = render_alternatives(Some(raw)).expect("good entries still render");
+        assert!(block.contains("✓ chose SQLite"), "{block}");
+        assert!(block.contains("✗ Postgres — too heavy"), "{block}");
+        assert!(!block.contains("no option field"), "{block}");
+    }
+
+    #[test]
+    fn evidence_drops_noise_and_repeats() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-ev2", "Evidence");
+        for text in [
+            "Tests green: 142 passed",
+            "Tests green: 142 passed",
+            "Conversation compacted at 2026-01-01T00:00:00Z; preceding events…",
+        ] {
+            put(&conn, &ev("tj-ev2", EventType::Evidence, text));
+        }
+
+        let pack = assemble(&conn, "tj-ev2", PackMode::Full).unwrap();
+        let evidence = section(&pack.text, "Evidence");
+        assert_eq!(evidence.matches("Tests green").count(), 1, "{evidence}");
+        assert!(!evidence.contains("Conversation compacted"), "{evidence}");
     }
 }
