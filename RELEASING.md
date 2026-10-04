@@ -58,6 +58,8 @@ git push origin v0.1.1
 - **`.github/workflows/release.yml`** — собирает pre-built бинарники под Linux/macOS-x86_64/macOS-arm64/Windows и публикует GitHub Release с прикреплёнными `tar.gz`/`.zip` + `checksums.txt`.
 - **`.github/workflows/publish.yml`** — публикует все 3 crate'а на crates.io (нужен `CRATES_IO_TOKEN` secret).
 
+Оба workflow сначала гоняют свой job `test` (fmt, clippy `-D warnings`, `cargo test --workspace --all-targets`); если он красный — ни бинарники, ни crate'ы не публикуются.
+
 ### 3. Если автопубликация не нужна — руками
 
 ```bash

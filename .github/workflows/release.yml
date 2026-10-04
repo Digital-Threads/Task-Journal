@@ -17,8 +17,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A tag doesn't wait for CI, so a tag on a red commit would ship binaries.
+  # Gate on the same checks as ci.yml's test job.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
   build:
     name: build (${{ matrix.target }})
+    needs: test
     strategy:
       fail-fast: false
       matrix:
