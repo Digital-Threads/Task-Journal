@@ -3959,7 +3959,8 @@ fn run_export_pr(task_id: &str) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT ei.type, sf.text FROM events_index ei
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.task_id = ?1 ORDER BY ei.timestamp ASC",
+         WHERE ei.task_id = ?1 AND ei.corrected_by IS NULL
+         ORDER BY ei.timestamp ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
         let ty: String = r.get(0)?;

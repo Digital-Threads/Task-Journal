@@ -5007,6 +5007,64 @@ fn export_pr_omits_optional_sections_when_no_data() {
         );
 }
 
+/// Run `task-journal <args>` in `workdir` under `xdg` and return trimmed stdout.
+fn tj_stdout(xdg: &std::path::Path, workdir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .current_dir(workdir)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap().trim().to_string()
+}
+
+#[test]
+fn export_pr_leaves_out_corrected_events() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let xdg = dir.path();
+
+    let task = tj_stdout(xdg, &workdir, &["create", "Corrected PR", "--goal", "g"]);
+    for (ty, text) in [
+        ("decision", "Wrong decision: use Mongo"),
+        ("rejection", "Wrong rejection: SQLite too slow"),
+        ("evidence", "Wrong evidence: bench 5ms"),
+    ] {
+        let id = tj_stdout(
+            xdg,
+            &workdir,
+            &["event", &task, "--type", ty, "--text", text],
+        );
+        tj_stdout(
+            xdg,
+            &workdir,
+            &[
+                "event-correct",
+                "--corrects",
+                &id,
+                "--task",
+                &task,
+                "--text",
+                "That was a mistake",
+            ],
+        );
+    }
+    tj_stdout(
+        xdg,
+        &workdir,
+        &["event", &task, "--type", "decision", "--text", "Use SQLite"],
+    );
+
+    let pr = tj_stdout(xdg, &workdir, &["export-pr", &task]);
+    assert!(!pr.contains("Wrong "), "{pr}");
+    assert!(pr.contains("- Use SQLite"), "{pr}");
+}
+
 #[test]
 fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
     let dir = assert_fs::TempDir::new().unwrap();

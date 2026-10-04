@@ -160,6 +160,15 @@ CREATE INDEX IF NOT EXISTS idx_events_session_time ON events_index(session_id, t
 DELETE FROM index_state;
 "#;
 
+/// v0.30.0 corrections — `corrected_by` holds the `event_id` of the
+/// `correction` event whose `corrects` points at this event, so packs leave
+/// the corrected event out without re-reading the log. Clearing
+/// `index_state` replays the log once to fill it for existing events.
+const MIGRATION_010: &str = r#"
+ALTER TABLE events_index ADD COLUMN corrected_by TEXT;
+DELETE FROM index_state;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -198,6 +207,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 9,
         sql: MIGRATION_009,
+    },
+    Migration {
+        version: 10,
+        sql: MIGRATION_010,
     },
 ];
 
@@ -1040,6 +1053,27 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
                 "UPDATE decisions SET status='superseded', superseded_by=?1 WHERE decision_id=?2",
                 rusqlite::params![event.event_id, target],
             )?;
+        }
+    }
+
+    // A correction retires the event it corrects from packs and export-pr.
+    // The target may sit in another task, whose cached pack is now stale too.
+    if event.event_type == EventType::Correction {
+        if let Some(target) = &event.corrects {
+            conn.execute(
+                "UPDATE events_index SET corrected_by=?1 WHERE event_id=?2",
+                rusqlite::params![event.event_id, target],
+            )?;
+            let target_task: Option<String> = conn
+                .query_row(
+                    "SELECT task_id FROM events_index WHERE event_id=?1",
+                    rusqlite::params![target],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(t) = target_task.filter(|t| *t != event.task_id) {
+                invalidate_pack_cascade(conn, &t)?;
+            }
         }
     }
 
@@ -2518,6 +2552,47 @@ mod tests {
         let meta = task_metadata(&conn, "tj-up").unwrap().unwrap();
         assert_eq!(meta.goal.as_deref(), Some("legacy goal"));
         assert_eq!(meta.external.as_deref(), Some("loom:t-legacy"));
+    }
+
+    #[test]
+    fn upgrading_an_existing_db_links_corrections_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-x", "Upgrade");
+        let wrong = make_text_event("Migration done (wrong)");
+        let mut corr = make_text_event("Migration NOT done");
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        for e in [&open_ev, &wrong, &corr] {
+            write_event_line(&mut f, e);
+        }
+        drop(f);
+
+        // A pre-corrected_by database that has already indexed the whole log.
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events_index DROP COLUMN corrected_by;
+             DELETE FROM schema_migrations WHERE version = 10;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        let corrected_by: Option<String> = conn
+            .query_row(
+                "SELECT corrected_by FROM events_index WHERE event_id = ?1",
+                rusqlite::params![wrong.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(corrected_by.as_deref(), Some(corr.event_id.as_str()));
     }
 
     #[test]

@@ -47,7 +47,8 @@ fn render_recent_events(conn: &Connection, task_id: &str, limit: usize) -> anyho
     let mut stmt = conn.prepare(
         "SELECT ei.timestamp, ei.type, ei.status, sf.text FROM events_index ei
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.task_id=?1 ORDER BY ei.timestamp DESC LIMIT ?2",
+         WHERE ei.task_id=?1 AND ei.corrected_by IS NULL
+         ORDER BY ei.timestamp DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id, limit as i64], |r| {
         let ts: String = r.get(0)?;
@@ -80,7 +81,10 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     // v0.10.3: newest evidence first (ULID DESC). Matches the
     // decision-ordering fix so truncation prefers older rows.
     let mut stmt = conn.prepare(
-        "SELECT text, strength FROM evidence WHERE task_id=?1 ORDER BY evidence_id DESC",
+        "SELECT e.text, e.strength FROM evidence e
+         JOIN events_index ei ON ei.event_id = e.evidence_id
+         WHERE e.task_id=?1 AND ei.corrected_by IS NULL
+         ORDER BY e.evidence_id DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
         let t: String = r.get(0)?;
@@ -106,7 +110,7 @@ fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     // OLDEST rejections, not the latest decision the agent recorded.
     let mut id_stmt = conn.prepare(
         "SELECT event_id FROM events_index
-         WHERE task_id=?1 AND type='rejection'
+         WHERE task_id=?1 AND type='rejection' AND corrected_by IS NULL
          ORDER BY timestamp DESC",
     )?;
     let mut text_stmt = conn.prepare("SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1")?;
@@ -137,7 +141,10 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
     // event the agent records just before close is now the FIRST line
     // of this section, surviving end-of-pack truncation.
     let mut stmt = conn.prepare(
-        "SELECT text, alternatives FROM decisions WHERE task_id=?1 AND status='active' ORDER BY decision_id DESC",
+        "SELECT d.text, d.alternatives FROM decisions d
+         JOIN events_index ei ON ei.event_id = d.decision_id
+         WHERE d.task_id=?1 AND d.status='active' AND ei.corrected_by IS NULL
+         ORDER BY d.decision_id DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
@@ -1207,5 +1214,87 @@ mod tests {
         );
         assert_eq!(pack.metadata.source_event_count, 1);
         assert!(!pack.metadata.cache_hit);
+    }
+
+    /// Upsert + index one event, the way the tests above do inline.
+    fn put(conn: &Connection, e: &crate::event::Event) {
+        crate::db::upsert_task_from_event(conn, e, "feedface").unwrap();
+        crate::db::index_event(conn, e).unwrap();
+    }
+
+    fn ev(task: &str, ty: crate::event::EventType, text: &str) -> crate::event::Event {
+        crate::event::Event::new(
+            task,
+            ty,
+            crate::event::Author::Agent,
+            crate::event::Source::Chat,
+            text.into(),
+        )
+    }
+
+    fn open_task(conn: &Connection, task: &str, title: &str) {
+        let mut e = ev(task, crate::event::EventType::Open, "x");
+        e.meta = serde_json::json!({ "title": title });
+        put(conn, &e);
+    }
+
+    #[test]
+    fn corrected_events_drop_out_of_every_pack_section() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-cx", "Corrected");
+
+        let wrong = [
+            ev("tj-cx", EventType::Decision, "Wrong decision: use Mongo"),
+            ev(
+                "tj-cx",
+                EventType::Rejection,
+                "Wrong rejection: SQLite too slow",
+            ),
+            ev("tj-cx", EventType::Evidence, "Wrong evidence: bench 5ms"),
+            ev("tj-cx", EventType::Finding, "Wrong finding: migration done"),
+        ];
+        for w in &wrong {
+            put(&conn, w);
+            let mut c = ev("tj-cx", EventType::Correction, "That was a mistake");
+            c.corrects = Some(w.event_id.clone());
+            put(&conn, &c);
+        }
+        put(&conn, &ev("tj-cx", EventType::Decision, "Use SQLite"));
+
+        let pack = assemble(&conn, "tj-cx", PackMode::Full).unwrap();
+        assert!(!pack.text.contains("Wrong "), "{}", pack.text);
+        assert!(pack.text.contains("Use SQLite"), "{}", pack.text);
+        assert_eq!(
+            pack.text.matches("[correction] That was a mistake").count(),
+            4,
+            "{}",
+            pack.text
+        );
+    }
+
+    #[test]
+    fn correcting_another_tasks_event_refreshes_that_tasks_cached_pack() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-a", "A");
+        open_task(&conn, "tj-b", "B");
+        let wrong = ev("tj-a", EventType::Decision, "Wrong decision in A");
+        put(&conn, &wrong);
+        assert!(assemble(&conn, "tj-a", PackMode::Full)
+            .unwrap()
+            .text
+            .contains("Wrong decision in A"));
+
+        let mut c = ev("tj-b", EventType::Correction, "A's decision was wrong");
+        c.corrects = Some(wrong.event_id.clone());
+        put(&conn, &c);
+
+        let pack = assemble(&conn, "tj-a", PackMode::Full).unwrap();
+        assert!(!pack.text.contains("Wrong decision in A"), "{}", pack.text);
     }
 }
