@@ -1105,6 +1105,10 @@ fn migrate_project_carries_uncheckpointed_wal_writes() {
     assert_eq!(rows, 1, "the WAL-only write was lost in migration");
 }
 
+// Unix only: the stand-in for a failing move (renaming a directory over a
+// file) is refused on Unix but allowed on Windows, where the real failure is a
+// sharing violation that a test can't stage portably.
+#[cfg(unix)]
 #[test]
 fn migrate_project_force_keeps_destination_when_the_move_fails() {
     let xdg = assert_fs::TempDir::new().unwrap();
@@ -3938,7 +3942,14 @@ fn ingest_hook_returns_fast_in_async_mode() {
     let entries: Vec<_> = std::fs::read_dir(&pending)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        // A worker that already claimed the entry renamed it to `.processing`:
+        // still queued, just being classified.
+        .filter(|e| {
+            matches!(
+                e.path().extension().and_then(|s| s.to_str()),
+                Some("json" | "processing")
+            )
+        })
         .collect();
     // Worker may have already drained; in that case at least the
     // worker should have left a v1 pending entry from /bin/false
