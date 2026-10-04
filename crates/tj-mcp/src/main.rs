@@ -179,6 +179,10 @@ pub struct TaskPackResult {
 pub struct TaskPackMetadata {
     pub source_event_count: Option<usize>,
     pub cache_hit: Option<bool>,
+    /// RFC 3339 time the pack text was assembled.
+    pub generated_at: Option<String>,
+    /// True when the pack was cut to fit its size budget.
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -451,6 +455,8 @@ impl TaskJournalServer {
                     metadata: TaskPackMetadata {
                         source_event_count: Some(pack.metadata.source_event_count),
                         cache_hit: Some(pack.metadata.cache_hit),
+                        generated_at: Some(pack.metadata.generated_at),
+                        truncated: Some(pack.metadata.truncated),
                     },
                 })
             })
@@ -1176,6 +1182,8 @@ mod tests {
             metadata: TaskPackMetadata {
                 source_event_count: None,
                 cache_hit: None,
+                generated_at: None,
+                truncated: None,
             },
         };
         let pack_v = serde_json::to_value(&pack).unwrap();
@@ -1525,6 +1533,42 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(res.note.as_deref(), Some("note: 1 open subtask(s)"));
+    }
+
+    #[tokio::test]
+    async fn task_pack_reports_generated_at_and_truncated() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Pack metadata".into(),
+                initial_context: None,
+                goal: Some("g".into()),
+                parent: None,
+                session_id: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+
+        let pack = server
+            .task_pack(Parameters(TaskPackParams {
+                task_id: task,
+                mode: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let meta = serde_json::to_value(&pack.metadata).unwrap();
+        assert!(
+            meta["generated_at"].as_str().is_some_and(|s| !s.is_empty()),
+            "{meta}"
+        );
+        assert_eq!(meta["truncated"], false, "{meta}");
+        assert!(meta["cache_hit"].is_boolean(), "{meta}");
+        assert!(meta["source_event_count"].is_number(), "{meta}");
     }
 
     #[tokio::test]

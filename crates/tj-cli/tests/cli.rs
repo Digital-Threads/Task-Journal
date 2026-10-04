@@ -4368,6 +4368,7 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
                         .unwrap_or("")
                         .contains("Conversation compacted at")
                 {
+                    assert_eq!(v["meta"]["kind"], "compaction_marker", "{v}");
                     marker_lines += 1;
                 }
             }
@@ -4391,6 +4392,10 @@ fn precompact_hook_appends_marker_decision_to_open_task() {
                 .not()
                 .and(contains("single reasoning unit").not()),
         );
+
+    // It is bookkeeping, not a change the PR made.
+    let pr = tj_stdout(dir.path(), &workdir, &["export-pr", &task_id]);
+    assert!(!pr.contains("Conversation compacted at"), "{pr}");
 }
 
 #[test]
@@ -5005,6 +5010,123 @@ fn export_pr_omits_optional_sections_when_no_data() {
                 .and(contains("## Verification").not())
                 .and(contains("## Affected").not()),
         );
+}
+
+/// Run `task-journal <args>` in `workdir` under `xdg` and return trimmed stdout.
+fn tj_stdout(xdg: &std::path::Path, workdir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .current_dir(workdir)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap().trim().to_string()
+}
+
+#[test]
+fn export_pr_leaves_out_corrected_events() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let xdg = dir.path();
+
+    let task = tj_stdout(xdg, &workdir, &["create", "Corrected PR", "--goal", "g"]);
+    for (ty, text) in [
+        ("decision", "Wrong decision: use Mongo"),
+        ("rejection", "Wrong rejection: SQLite too slow"),
+        ("evidence", "Wrong evidence: bench 5ms"),
+    ] {
+        let id = tj_stdout(
+            xdg,
+            &workdir,
+            &["event", &task, "--type", ty, "--text", text],
+        );
+        tj_stdout(
+            xdg,
+            &workdir,
+            &[
+                "event-correct",
+                "--corrects",
+                &id,
+                "--task",
+                &task,
+                "--text",
+                "That was a mistake",
+            ],
+        );
+    }
+    tj_stdout(
+        xdg,
+        &workdir,
+        &["event", &task, "--type", "decision", "--text", "Use SQLite"],
+    );
+
+    let pr = tj_stdout(xdg, &workdir, &["export-pr", &task]);
+    assert!(!pr.contains("Wrong "), "{pr}");
+    assert!(pr.contains("- Use SQLite"), "{pr}");
+}
+
+#[test]
+fn export_pr_lists_the_same_decisions_and_rejections_as_the_pack() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let xdg = dir.path();
+
+    let task = tj_stdout(xdg, &workdir, &["create", "Same selection", "--goal", "g"]);
+    let event = |ty: &str, text: &str| {
+        tj_stdout(
+            xdg,
+            &workdir,
+            &["event", &task, "--type", ty, "--text", text],
+        )
+    };
+    let ts = event("decision", "Adopt TypeScript");
+    tj_stdout(
+        xdg,
+        &workdir,
+        &[
+            "event",
+            &task,
+            "--type",
+            "supersede",
+            "--text",
+            "TS replaced",
+            "--supersedes",
+            &ts,
+        ],
+    );
+    event("decision", "Adopt Rust");
+    event("decision", "Adopt Rust");
+    // Classifier guesses, not yet confirmed.
+    for (ty, text) in [
+        (tj_core::event::EventType::Decision, "Maybe cache packs"),
+        (tj_core::event::EventType::Rejection, "Maybe drop Postgres"),
+    ] {
+        let mut e = tj_core::event::Event::new(
+            task.clone(),
+            ty,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text.to_string(),
+        );
+        e.status = tj_core::event::EventStatus::Suggested;
+        append_jsonl_line(xdg, &serde_json::to_string(&e).unwrap());
+    }
+
+    let pr = tj_stdout(xdg, &workdir, &["export-pr", &task]);
+    let changes = pr.split("## ").find(|s| s.starts_with("Changes")).unwrap();
+    assert!(!changes.contains("Adopt TypeScript"), "{pr}");
+    assert_eq!(changes.matches("Adopt Rust").count(), 1, "{pr}");
+    assert!(
+        changes.contains("- Maybe cache packs _(unconfirmed)_\n"),
+        "{pr}"
+    );
+    assert!(pr.contains("- Maybe drop Postgres _(unconfirmed)_"), "{pr}");
 }
 
 #[test]

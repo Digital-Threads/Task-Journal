@@ -160,6 +160,30 @@ CREATE INDEX IF NOT EXISTS idx_events_session_time ON events_index(session_id, t
 DELETE FROM index_state;
 "#;
 
+/// v0.30.0 corrections — `corrected_by` holds the `event_id` of the
+/// `correction` event whose `corrects` points at this event, so packs leave
+/// the corrected event out without re-reading the log. Clearing
+/// `index_state` replays the log once to fill it for existing events.
+const MIGRATION_010: &str = r#"
+ALTER TABLE events_index ADD COLUMN corrected_by TEXT;
+DELETE FROM index_state;
+"#;
+
+/// v0.30.0 bookkeeping — `bookkeeping` flags machine-written events that are
+/// not reasoning (see [`is_bookkeeping`]) so active decisions, export-pr,
+/// recall and the global memory can skip them. Clearing `index_state`
+/// replays the log once to flag existing events.
+const MIGRATION_011: &str = r#"
+ALTER TABLE events_index ADD COLUMN bookkeeping INTEGER NOT NULL DEFAULT 0;
+DELETE FROM index_state;
+"#;
+
+/// v0.30.0 pack cache holds only the stable body; the header and the gaps
+/// are rendered on every call. Rows cached as the whole pack text go.
+const MIGRATION_012: &str = r#"
+DELETE FROM task_pack_cache;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -198,6 +222,18 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 9,
         sql: MIGRATION_009,
+    },
+    Migration {
+        version: 10,
+        sql: MIGRATION_010,
+    },
+    Migration {
+        version: 11,
+        sql: MIGRATION_011,
+    },
+    Migration {
+        version: 12,
+        sql: MIGRATION_012,
     },
 ];
 
@@ -962,6 +998,22 @@ pub fn ingest_new_events(
     Ok(count)
 }
 
+/// Machine-written bookkeeping, not reasoning: the PreCompact boundary marker
+/// (a `decision`) and the model-switch note (a `constraint`). Known by
+/// `meta.kind`; events written before the writers set it, by text prefix.
+pub fn is_bookkeeping(event: &Event) -> bool {
+    match event.meta.get("kind").and_then(|v| v.as_str()) {
+        Some(kind) => matches!(kind, "compaction_marker" | "model_switch"),
+        None => match event.event_type {
+            EventType::Decision => event.text.starts_with("Conversation compacted at"),
+            EventType::Constraint => event
+                .text
+                .starts_with(crate::reminder::MODEL_SWITCH_TEXT_PREFIX),
+            _ => false,
+        },
+    }
+}
+
 pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     // An amend only changes task metadata, which upsert_task_from_event
     // applies. It is not reasoning: keeping it out of events_index and
@@ -1002,11 +1054,12 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     };
     let session_id = event.meta.get("session_id").and_then(|v| v.as_str());
     conn.execute(
-        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status, artifacts, session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status, artifacts, session_id, bookkeeping)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             event.event_id, event.task_id, type_str,
-            event.timestamp, event.confidence, status_str, artifacts_json, session_id
+            event.timestamp, event.confidence, status_str, artifacts_json, session_id,
+            is_bookkeeping(event)
         ],
     )?;
     // search_fts has no PK; clear then insert to keep idempotent across rebuild_state replays.
@@ -1040,6 +1093,27 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
                 "UPDATE decisions SET status='superseded', superseded_by=?1 WHERE decision_id=?2",
                 rusqlite::params![event.event_id, target],
             )?;
+        }
+    }
+
+    // A correction retires the event it corrects from packs and export-pr.
+    // The target may sit in another task, whose cached pack is now stale too.
+    if event.event_type == EventType::Correction {
+        if let Some(target) = &event.corrects {
+            conn.execute(
+                "UPDATE events_index SET corrected_by=?1 WHERE event_id=?2",
+                rusqlite::params![event.event_id, target],
+            )?;
+            let target_task: Option<String> = conn
+                .query_row(
+                    "SELECT task_id FROM events_index WHERE event_id=?1",
+                    rusqlite::params![target],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(t) = target_task.filter(|t| *t != event.task_id) {
+                invalidate_pack_cascade(conn, &t)?;
+            }
         }
     }
 
@@ -2518,6 +2592,111 @@ mod tests {
         let meta = task_metadata(&conn, "tj-up").unwrap().unwrap();
         assert_eq!(meta.goal.as_deref(), Some("legacy goal"));
         assert_eq!(meta.external.as_deref(), Some("loom:t-legacy"));
+    }
+
+    #[test]
+    fn upgrading_an_existing_db_links_corrections_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+
+        let open_ev = make_open_event("tj-x", "Upgrade");
+        let wrong = make_text_event("Migration done (wrong)");
+        let mut corr = make_text_event("Migration NOT done");
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        for e in [&open_ev, &wrong, &corr] {
+            write_event_line(&mut f, e);
+        }
+        drop(f);
+
+        // A pre-corrected_by database that has already indexed the whole log.
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events_index DROP COLUMN corrected_by;
+             DELETE FROM schema_migrations WHERE version = 10;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        let corrected_by: Option<String> = conn
+            .query_row(
+                "SELECT corrected_by FROM events_index WHERE event_id = ?1",
+                rusqlite::params![wrong.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(corrected_by.as_deref(), Some(corr.event_id.as_str()));
+    }
+
+    #[test]
+    fn upgrading_wipes_packs_cached_as_whole_text() {
+        let d = TempDir::new().unwrap();
+        let db = d.path().join("s.sqlite");
+        let conn = open(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+             VALUES ('tj-x', 'compact', '# Old whole pack', '', 1);
+             DELETE FROM schema_migrations WHERE version = 12;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_pack_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0);
+    }
+
+    #[test]
+    fn upgrading_an_existing_db_flags_old_bookkeeping_on_the_next_ingest() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+
+        // Written before the writers set meta.kind: known by text alone.
+        let open_ev = make_open_event("tj-x", "Upgrade");
+        let mut marker = make_text_event("Conversation compacted at 2026-01-01T00:00:00Z; …");
+        marker.event_type = crate::event::EventType::Decision;
+        let mut switch = make_text_event("Model switched (user): opus → sonnet");
+        switch.event_type = crate::event::EventType::Constraint;
+        let real = make_text_event("Use SQLite");
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        for e in [&open_ev, &marker, &switch, &real] {
+            write_event_line(&mut f, e);
+        }
+        drop(f);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events_index DROP COLUMN bookkeeping;
+             DELETE FROM schema_migrations WHERE version = 11;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+
+        let flagged: Vec<String> = conn
+            .prepare("SELECT event_id FROM events_index WHERE bookkeeping = 1 ORDER BY event_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected = vec![marker.event_id.clone(), switch.event_id.clone()];
+        expected.sort();
+        assert_eq!(flagged, expected);
     }
 
     #[test]
