@@ -6071,26 +6071,18 @@ fn task_matches_session(
     })
 }
 
-/// Read the project's events from `events_path`, group by `task_id`, and
-/// return candidate task contexts for sessions whose events match this
-/// session (precise session_id, or legacy time-window). Each context
-/// carries the task title and up to the last ~20 event texts (dedup
-/// context for the backend).
-fn candidate_tasks_for_session(
+/// Read the project's events from `events_path`, grouped by `task_id`.
+/// Read once per run and shared by every session's candidate lookup.
+fn events_by_task(
     events_path: &std::path::Path,
-    session_id: &str,
-    first_ts: Option<&str>,
-    last_ts: Option<&str>,
-) -> anyhow::Result<Vec<tj_core::dream::backend::BackfillTaskContext>> {
-    use std::collections::BTreeMap;
-    use tj_core::dream::backend::BackfillTaskContext;
-    use tj_core::event::{Event, EventType};
+) -> anyhow::Result<std::collections::BTreeMap<String, Vec<tj_core::event::Event>>> {
+    use tj_core::event::Event;
 
+    let mut by_task = std::collections::BTreeMap::new();
     if !events_path.exists() {
-        return Ok(Vec::new());
+        return Ok(by_task);
     }
     let body = std::fs::read_to_string(events_path)?;
-    let mut by_task: BTreeMap<String, Vec<Event>> = BTreeMap::new();
     for line in body.lines() {
         if line.trim().is_empty() {
             continue;
@@ -6099,10 +6091,25 @@ fn candidate_tasks_for_session(
             by_task.entry(e.task_id.clone()).or_default().push(e);
         }
     }
+    Ok(by_task)
+}
+
+/// Candidate task contexts for the tasks whose events match this session
+/// (precise session_id, or legacy time-window). Each context carries the
+/// task title and up to the last ~20 event texts (dedup context for the
+/// backend).
+fn candidate_tasks_for_session(
+    by_task: &std::collections::BTreeMap<String, Vec<tj_core::event::Event>>,
+    session_id: &str,
+    first_ts: Option<&str>,
+    last_ts: Option<&str>,
+) -> Vec<tj_core::dream::backend::BackfillTaskContext> {
+    use tj_core::dream::backend::BackfillTaskContext;
+    use tj_core::event::EventType;
 
     let mut out = Vec::new();
     for (task_id, events) in by_task {
-        if !task_matches_session(&events, session_id, first_ts, last_ts) {
+        if !task_matches_session(events, session_id, first_ts, last_ts) {
             continue;
         }
         // Title from the Open event when present, else the first event's text.
@@ -6120,12 +6127,12 @@ fn candidate_tasks_for_session(
             .map(|e| e.text.clone())
             .collect();
         out.push(BackfillTaskContext {
-            task_id,
+            task_id: task_id.clone(),
             title,
             existing_events,
         });
     }
-    Ok(out)
+    out
 }
 
 /// Assemble per-session `(session_id, BackfillInput)` from the in-scope
@@ -6138,6 +6145,7 @@ fn build_dream_inputs(
     use tj_core::dream::backend::BackfillInput;
     use tj_core::session::parser::parse_session;
 
+    let by_task = events_by_task(events_path)?;
     let mut out = Vec::new();
     for path in sessions {
         let session_id = path
@@ -6158,11 +6166,11 @@ fn build_dream_inputs(
         };
 
         let candidates = candidate_tasks_for_session(
-            events_path,
+            &by_task,
             &session_id,
             parsed.first_timestamp.as_deref(),
             parsed.last_timestamp.as_deref(),
-        )?;
+        );
         let tasks: Vec<_> = candidates
             .into_iter()
             .filter(|t| task_filter.is_none_or(|f| f == t.task_id))
@@ -6324,6 +6332,30 @@ mod inline_tests {
             Some("2026-02-01T00:00:00Z"),
             Some("2026-02-01T00:01:00Z"),
         ));
+    }
+
+    #[test]
+    fn candidate_tasks_come_from_events_loaded_once() {
+        // The events log is grouped once per run and reused for every
+        // session, so candidate lookup takes the grouped map, not a path.
+        use tj_core::event::{Author, Event, EventType, Source};
+        let mut tagged = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "Task one".into(),
+        );
+        tagged.meta = serde_json::json!({"session_id": "sess-1"});
+        let by_task = std::collections::BTreeMap::from([("tj-1".to_string(), vec![tagged])]);
+
+        let hit = candidate_tasks_for_session(&by_task, "sess-1", None, None);
+        let miss = candidate_tasks_for_session(&by_task, "sess-2", None, None);
+
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].task_id, "tj-1");
+        assert_eq!(hit[0].title, "Task one");
+        assert!(miss.is_empty());
     }
 
     #[test]
