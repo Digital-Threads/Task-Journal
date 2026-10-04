@@ -5057,6 +5057,30 @@ fn search_with_an_empty_query_lists_tasks_newest_first() {
 }
 
 #[test]
+fn search_in_a_project_without_a_journal_creates_no_state_db() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    for query in ["", "anything"] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["search", query])
+            .assert()
+            .success()
+            .stdout("");
+    }
+
+    let state = dir.path().join("task-journal").join("state");
+    let created: Vec<_> = std::fs::read_dir(&state)
+        .map(|rd| rd.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(created.is_empty(), "{created:?}");
+}
+
+#[test]
 fn search_does_not_crash_on_slash_or_colon() {
     // Same B1 family — paths and `ttl:30s`-style tokens used to crash.
     let dir = assert_fs::TempDir::new().unwrap();

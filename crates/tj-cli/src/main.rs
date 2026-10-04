@@ -3334,11 +3334,14 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
                 let state_path =
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                // No journal, no tasks — and no empty state DB left behind to
+                // show up in `--all-projects` and project lists later.
+                if !events_path.exists() {
+                    return Ok(());
+                }
 
                 let conn = tj_core::db::open(&state_path)?;
-                if events_path.exists() {
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                }
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 let ids = run_search(&conn, &fts_query, &like_query, event_type.as_deref(), limit)?;
                 for id in ids {
                     println!("{id}");

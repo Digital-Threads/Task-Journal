@@ -524,14 +524,17 @@ impl TaskJournalServer {
                     Some(dir) => resolve_project_paths(Path::new(dir))?,
                     None => project_paths()?,
                 };
+                // No journal, no tasks — and no empty state DB left behind to
+                // show up in project lists later.
+                if !events_path.exists() {
+                    return Ok(Vec::new());
+                }
 
                 let conn_arc = cached_open(&state_path)?;
                 let conn = conn_arc
                     .lock()
                     .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
-                if events_path.exists() {
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                }
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
 
                 // No query: list the project's tasks, newest first. FTS5
                 // rejects an empty MATCH, so it must not reach it.
@@ -1803,6 +1806,25 @@ mod tests {
 
         let after = std::fs::read_to_string(&events_path).unwrap();
         assert_eq!(after, before, "no orphan event may reach the journal");
+    }
+
+    #[tokio::test]
+    async fn task_search_of_a_project_without_a_journal_creates_no_state_db() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let other = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(other.path().join(".git")).unwrap();
+        let (_, _, other_state) = resolve_project_paths(other.path()).unwrap();
+        let other_dir = other.path().to_str().unwrap();
+
+        for query in ["", "anything"] {
+            let res = search(&server, query, None, Some(other_dir), None)
+                .await
+                .unwrap();
+            assert!(res.results.is_empty(), "{:?}", res.results);
+        }
+        assert!(!other_state.exists(), "created {other_state:?}");
     }
 
     #[tokio::test]
