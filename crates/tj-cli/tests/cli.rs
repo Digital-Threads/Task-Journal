@@ -361,13 +361,22 @@ fn pending_retry_marks_dead_after_max_attempts() {
     let proj = assert_fs::TempDir::new().unwrap();
     // Already at attempts=2; one more failure should rename to *.dead.json.
     write_pending(xdg.path(), "tj-dying", "any text", 2);
+    // An open task, so the chunk reaches the classifier at all.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Dying host"])
+        .assert()
+        .success();
 
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", xdg.path())
         .current_dir(proj.path())
-        // No --mock-* flags → retry fails → attempts becomes 3 → dead.
-        .args(["pending", "retry"])
+        // The heuristic can't place "any text" → a real classifier failure
+        // → attempts becomes 3 → dead.
+        .args(["pending", "retry", "--backend", "heuristic"])
         .assert()
         .success()
         .stdout(contains("1 marked dead"));
@@ -377,6 +386,81 @@ fn pending_retry_marks_dead_after_max_attempts() {
     let dead = pending_dir.join("tj-dying.dead.json");
     assert!(!live.exists(), "live file must be gone after dead-rename");
     assert!(dead.exists(), "dead file must exist: {dead:?}");
+}
+
+#[test]
+fn pending_retry_without_a_backend_leaves_entries_untouched() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "tj-waiting", "any text", 2);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        // Hybrid with no LLM fallback can only repeat the heuristic that
+        // already failed — that is "no backend", not a failed attempt.
+        .env("TJ_HYBRID_LLM_ORDER", "none")
+        .env_remove("ANTHROPIC_API_KEY")
+        .current_dir(proj.path())
+        .args(["pending", "retry"])
+        .assert()
+        .success()
+        .stdout(contains("no classifier backend"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    let live = pending_dir.join("tj-waiting.json");
+    assert!(live.exists(), "entry must stay queued");
+    assert!(!pending_dir.join("tj-waiting.dead.json").exists());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&live).unwrap()).unwrap();
+    assert_eq!(v["attempts"], 2, "no attempt is burned without a backend");
+}
+
+#[test]
+fn pending_retry_classifies_through_the_real_backend() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Retry host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    write_pending(
+        xdg.path(),
+        "tj-retry-real",
+        "After review we decided to use postgres for the journal store",
+        1,
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pending", "retry", "--backend", "heuristic"])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+
+    let pending_dir = xdg.path().join("task-journal").join("pending");
+    assert!(!pending_dir.join("tj-retry-real.json").exists());
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("[decision]").and(contains("postgres")));
 }
 
 #[test]

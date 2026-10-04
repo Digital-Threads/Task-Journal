@@ -430,6 +430,7 @@ fn run_pending_list() -> Result<()> {
 }
 
 fn run_pending_retry(
+    backend: &str,
     mock_etype: Option<&str>,
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
@@ -442,6 +443,23 @@ fn run_pending_retry(
     let cwd = std::env::current_dir()?;
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+
+    // The CI-safe mock branch needs no classifier. Without a usable backend
+    // a retry can't do better than the attempt that queued the entry, so
+    // leave everything as it is rather than burn attempts toward `.dead`.
+    let classifier = match (mock_etype, mock_tid) {
+        (Some(_), Some(_)) => None,
+        _ => match retry_classifier(backend)? {
+            Some(c) => Some(c),
+            None => {
+                println!(
+                    "pending retry: no classifier backend available for `{backend}` \
+                     (no `claude` on PATH, no ANTHROPIC_API_KEY) — entries left untouched"
+                );
+                return Ok(());
+            }
+        },
+    };
 
     let mut succeeded = 0usize;
     let mut died = 0usize;
@@ -469,11 +487,14 @@ fn run_pending_retry(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
+        let kind = v
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .unwrap_or("Stop")
+            .to_string();
 
-        // The real retry path would call the classifier. The CI-safe
-        // mock branch lets tests drive a deterministic outcome.
-        let outcome: anyhow::Result<()> = match (mock_etype, mock_tid) {
-            (Some(etype), Some(tid)) => {
+        let outcome: anyhow::Result<()> = match (mock_etype, mock_tid, &classifier) {
+            (Some(etype), Some(tid), _) => {
                 let mut event = tj_core::event::Event::new(
                     tid,
                     parse_event_type(etype)?,
@@ -488,9 +509,18 @@ fn run_pending_retry(
                 writer.flush_durable()?;
                 Ok(())
             }
-            _ => Err(anyhow::anyhow!(
-                "no real classifier wired in retry path yet — pass --mock-* for tests, or run install-hooks and let the hook drain the queue"
-            )),
+            (_, _, Some(classifier)) => match classify_chunk(
+                classifier.as_ref(),
+                &events_path,
+                &project_hash,
+                &kind,
+                &text,
+                None,
+            )? {
+                ChunkOutcome::Unplaced(err) => Err(anyhow::anyhow!(err)),
+                ChunkOutcome::Recorded | ChunkOutcome::Dropped => Ok(()),
+            },
+            _ => unreachable!("a missing classifier returns before the loop"),
         };
 
         match outcome {
@@ -524,6 +554,24 @@ fn run_pending_retry(
         "pending retry: {succeeded} drained, {still_pending} still pending, {died} marked dead"
     );
     Ok(())
+}
+
+/// The classifier `pending retry` runs, or `None` when the backend has
+/// nothing beyond what already failed: hybrid without an LLM fallback, or
+/// agent-sdk / api without `claude` / a key.
+fn retry_classifier(
+    backend: &str,
+) -> anyhow::Result<Option<Box<dyn tj_core::classifier::Classifier>>> {
+    Ok(match backend {
+        "hybrid" | "" => {
+            let hybrid = tj_core::classifier::hybrid::HybridClassifier::from_env();
+            hybrid
+                .has_llm_fallback()
+                .then(|| Box::new(hybrid) as Box<dyn tj_core::classifier::Classifier>)
+        }
+        "agent-sdk" | "api" => build_classifier(backend).ok(),
+        other => Some(build_classifier(other)?),
+    })
 }
 
 fn run_doctor() -> Result<DoctorReport> {
@@ -1140,7 +1188,12 @@ enum PendingCmd {
     List,
     /// Re-feed every pending entry through the classifier. Marks an
     /// entry as `<id>.dead.json` after PENDING_MAX_ATTEMPTS failures.
+    /// With no usable backend, entries are left untouched.
     Retry {
+        /// Classifier backend: "hybrid", "agent-sdk", "api", or "heuristic".
+        /// Defaults to hybrid.
+        #[arg(long, default_value = "hybrid")]
+        backend: String,
         /// Test/dev override: bypass classifier and force this event
         /// type. Hidden from --help.
         #[arg(long, hide = true)]
@@ -2173,11 +2226,13 @@ fn real_main() -> Result<()> {
                 run_pending_list()?;
             }
             PendingCmd::Retry {
+                backend,
                 mock_event_type,
                 mock_task_id,
                 mock_confidence,
             } => {
                 run_pending_retry(
+                    &backend,
                     mock_event_type.as_deref(),
                     mock_task_id.as_deref(),
                     mock_confidence,
@@ -2908,7 +2963,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 let out = match classifier.classify(&input) {
                     Ok(o) => o,
                     Err(e) => {
-                        persist_pending(&events_path, &project_hash, &text, &e.to_string())?;
+                        persist_pending(&events_path, &project_hash, &kind, &text, &e.to_string())?;
                         return Ok(());
                     }
                 };
@@ -2939,6 +2994,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                         persist_pending(
                             &events_path,
                             &project_hash,
+                            &kind,
                             &text,
                             &format!("task_id_guess `{tid}` not found"),
                         )?;
@@ -2948,6 +3004,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                         persist_pending(
                             &events_path,
                             &project_hash,
+                            &kind,
                             &text,
                             &format!("task_id_guess `{tid}` is closed"),
                         )?;
@@ -5289,6 +5346,7 @@ fn auto_open_task_from_prompt(
 fn persist_pending(
     events_path: &std::path::Path,
     project_hash: &str,
+    kind: &str,
     text: &str,
     err: &str,
 ) -> anyhow::Result<()> {
@@ -5300,7 +5358,8 @@ fn persist_pending(
         .join("pending");
     std::fs::create_dir_all(&pending_dir)?;
     let id = ulid::Ulid::new().to_string();
-    let payload = serde_json::json!({"text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
+    // `kind` lets `pending retry` classify the chunk the way the hook would.
+    let payload = serde_json::json!({"kind": kind, "text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
     std::fs::write(
         pending_dir.join(format!("{project_hash}.{id}.json")),
         serde_json::to_string_pretty(&payload)?,
@@ -5593,47 +5652,39 @@ fn process_pending_entry(
     // Inherit the session id queued on the v2 chunk (additive; absent → None).
     let chunk_session_id = tj_core::session_id::session_id_from_payload(&v);
 
-    // Mirror the synchronous flow that used to live in IngestHook —
-    // see commit history of v0.6.1 for the original. Auto-open, run
-    // classifier, apply integrity safeguards, persist event, telemetry.
-    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-    let conn = tj_core::db::open(&state_path)?;
-    if events_path.exists() {
-        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    let classifier = build_classifier(backend)?;
+    let outcome = classify_chunk(
+        classifier.as_ref(),
+        events_path,
+        project_hash,
+        &kind,
+        &text,
+        chunk_session_id.as_deref(),
+    )?;
+    if let ChunkOutcome::Unplaced(err) = outcome {
+        // Persist as legacy v1 pending entry so `pending retry`
+        // surfaces it; remove the v2 source.
+        persist_pending(events_path, project_hash, &kind, &text, &err)?;
     }
 
-    let mut recent = recent_task_contexts(&conn, 5)?;
-    if recent.is_empty() {
-        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
-            .ok()
-            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        if auto_open_disabled || !kind.contains("UserPrompt") {
-            // Nothing to do — drop the entry silently.
-            std::fs::remove_file(path)?;
-            return Ok(());
-        }
-        let Some(new_task) = auto_open_task_from_prompt(
-            events_path,
-            project_hash,
-            &conn,
-            &text,
-            chunk_session_id.as_deref(),
-        )?
-        else {
-            // Prompt was only machine noise — drop the entry silently.
-            std::fs::remove_file(path)?;
-            return Ok(());
-        };
-        recent.push(new_task);
-    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
 
-    let author_hint = if kind.contains("UserPrompt") {
-        "user"
-    } else {
-        "assistant"
-    };
+/// What became of one classified chunk.
+enum ChunkOutcome {
+    /// An event was written to the journal.
+    Recorded,
+    /// Nothing worth recording: no task to attach to, machine noise, no
+    /// task guess, or a session-end "close".
+    Dropped,
+    /// The classifier failed or guessed a missing / closed task; the reason
+    /// goes back into `pending/` with the chunk.
+    Unplaced(String),
+}
 
+/// The classifier behind a `--backend` name.
+fn build_classifier(backend: &str) -> anyhow::Result<Box<dyn tj_core::classifier::Classifier>> {
     use tj_core::classifier::Classifier;
     let classifier: Box<dyn Classifier> = match backend {
         "hybrid" | "" => Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env()),
@@ -5665,53 +5716,83 @@ fn process_pending_entry(
             "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
         ),
     };
+    Ok(classifier)
+}
+
+/// Classify one chunk against the project's open tasks and record the
+/// event. Shared by classify-worker and `pending retry`, so both auto-open,
+/// check attribution, stamp the session and write telemetry the same way.
+fn classify_chunk(
+    classifier: &dyn tj_core::classifier::Classifier,
+    events_path: &std::path::Path,
+    project_hash: &str,
+    kind: &str,
+    text: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<ChunkOutcome> {
+    // Mirror the synchronous flow that used to live in IngestHook —
+    // see commit history of v0.6.1 for the original. Auto-open, run
+    // classifier, apply integrity safeguards, persist event, telemetry.
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    }
+
+    let mut recent = recent_task_contexts(&conn, 5)?;
+    if recent.is_empty() {
+        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+            .ok()
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if auto_open_disabled || !kind.contains("UserPrompt") {
+            // Nothing to do — drop the entry silently.
+            return Ok(ChunkOutcome::Dropped);
+        }
+        let Some(new_task) =
+            auto_open_task_from_prompt(events_path, project_hash, &conn, text, session_id)?
+        else {
+            // Prompt was only machine noise — drop the entry silently.
+            return Ok(ChunkOutcome::Dropped);
+        };
+        recent.push(new_task);
+    }
+
+    let author_hint = if kind.contains("UserPrompt") {
+        "user"
+    } else {
+        "assistant"
+    };
+
     let input = tj_core::classifier::ClassifyInput {
-        text: text.clone(),
+        text: text.to_string(),
         author_hint: author_hint.into(),
         recent_tasks: recent,
         tool_output: kind == "PostToolUse",
     };
     let out = match classifier.classify(&input) {
         Ok(o) => o,
-        Err(e) => {
-            // Persist as legacy v1 pending entry so `pending retry`
-            // surfaces it; remove the v2 source.
-            persist_pending(events_path, project_hash, &text, &e.to_string())?;
-            std::fs::remove_file(path)?;
-            return Ok(());
-        }
+        Err(e) => return Ok(ChunkOutcome::Unplaced(e.to_string())),
     };
 
     let Some(tid) = out.task_id_guess else {
-        std::fs::remove_file(path)?;
-        return Ok(());
+        return Ok(ChunkOutcome::Dropped);
     };
 
     use tj_core::event::EventType;
     if matches!(out.event_type, EventType::Close) && kind == "Stop" {
-        std::fs::remove_file(path)?;
-        return Ok(());
+        return Ok(ChunkOutcome::Dropped);
     }
     match tj_core::db::task_status(&conn, &tid)? {
         None => {
-            persist_pending(
-                events_path,
-                project_hash,
-                &text,
-                &format!("task_id_guess `{tid}` not found"),
-            )?;
-            std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(ChunkOutcome::Unplaced(format!(
+                "task_id_guess `{tid}` not found"
+            )))
         }
         Some(s) if s == "closed" => {
-            persist_pending(
-                events_path,
-                project_hash,
-                &text,
-                &format!("task_id_guess `{tid}` is closed"),
-            )?;
-            std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(ChunkOutcome::Unplaced(format!(
+                "task_id_guess `{tid}` is closed"
+            )))
         }
         _ => {}
     }
@@ -5731,7 +5812,7 @@ fn process_pending_entry(
     event.confidence = Some(confidence);
     event.status = tj_core::classifier::decide_status(confidence);
     event.evidence_strength = evidence_strength;
-    tj_core::session_id::stamp_session_id(&mut event.meta, chunk_session_id.as_deref());
+    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
 
     let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
     writer.append(&event)?;
@@ -5759,8 +5840,7 @@ fn process_pending_entry(
         },
     );
 
-    std::fs::remove_file(path)?;
-    Ok(())
+    Ok(ChunkOutcome::Recorded)
 }
 
 fn drain_pending(
@@ -6319,7 +6399,7 @@ mod inline_tests {
         std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
 
         persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
-        persist_pending(&events_path, "h", "txt", "err").unwrap();
+        persist_pending(&events_path, "h", "Stop", "txt", "err").unwrap();
 
         let pending = dir.path().join("pending");
         let names: Vec<String> = std::fs::read_dir(&pending)
