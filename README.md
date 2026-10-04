@@ -171,7 +171,7 @@ task-journal pack tj-x9rz1f --mode full
 | Command | What it does |
 |---------|--------------|
 | `create <title> [--goal "..."] [--modules a,b]` | Open a task with optional goal and modules |
-| `module list [--json] \| show <id> \| save <id> [--name] [--description] [--path P] [--term T] [--state] [--status] [--merged-into] \| link <task> [--add M] [--remove M] \| candidates [--limit N]` | The project chronicle: module map, module pages, creating and linking modules, tasks without a module |
+| `module list [--json] \| show <id> \| save <id> [--name] [--description] [--path P] [--term T] [--state] [--status] [--merged-into] \| link <task> [--add M] [--remove M] \| candidates [--limit N] [--offset N]` | The project chronicle: module map, module pages, creating and linking modules, tasks without a module |
 | `goal <id> "..."` | Set or replace a task's goal |
 | `event <id> --type X --text Y [--suggested] [--session S] [--origin O]` | Append a typed event |
 | `state [--session S]` | The session's active task, counts and latest entries as JSON (what the mod reads) |
