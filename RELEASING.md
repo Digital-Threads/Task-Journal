@@ -5,9 +5,9 @@
 ## Pre-release (один раз для проекта)
 
 1. **GitHub repo создан**, origin подключён.
-2. **crates.io аккаунт** заведён → Settings → API Tokens → создать токен `task-journal-publish` с scope `publish-new`.
+2. **crates.io аккаунт** заведён → Settings → API Tokens → создать токен `task-journal-publish` со scopes `publish-new` и `publish-update` (без `publish-update` новые версии уже существующих crate'ов не опубликуются).
 3. **GitHub Secrets** (Settings → Secrets and variables → Actions → New repository secret):
-   - `CRATES_IO_TOKEN` = токен из шага 2.
+   - `CRATES_IO_TOKEN` = токен из шага 2. `publish.yml` читает именно этот secret и передаёт его cargo как env `CARGO_REGISTRY_TOKEN` — поэтому ошибка «`CARGO_REGISTRY_TOKEN is empty`» значит, что не задан `CRATES_IO_TOKEN`.
 4. **Crate names проверены** — `cargo search task-journal-core task-journal-cli task-journal-mcp` показывает что свободны. Если заняты — поменять в Cargo.toml каждого crate (`name = "..."`).
 
 ## Per-release flow
@@ -26,17 +26,19 @@ cargo fmt --all --check
 # ВАЖНО: версия плагина НЕ наследуется из Cargo.toml — синхронь вручную, иначе
 # `/plugin update` будет показывать старую версию (см. историю: 0.10.3 vs 0.12.0).
 # Обнови до той же версии:
+#   - Cargo.toml [workspace.dependencies]      → tj-core version (cargo publish
+#                                                 заливает её как требование на core)
 #   - plugin/.claude-plugin/plugin.json        → "version"
 #   - plugin/package.json                      → "version"
 #   - .claude-plugin/marketplace.json          → metadata.version И plugins[0].version
 #
-# Проверка (падает, если хоть один манифест отстал):
+# Проверка (падает, если хоть один манифест или пин отстал):
 cargo test -p task-journal-cli --test plugin_metadata
 
 # Плагин целиком — манифест, MCP-объявления, frontmatter скиллов и команд:
 claude plugin validate plugin --json
 
-git add Cargo.toml plugin/.claude-plugin/plugin.json plugin/package.json .claude-plugin/marketplace.json
+git add Cargo.toml Cargo.lock plugin/.claude-plugin/plugin.json plugin/package.json .claude-plugin/marketplace.json
 git commit -m "chore: bump version to v0.1.1"
 git push
 ```
@@ -56,13 +58,16 @@ git push origin v0.1.1
 - **`.github/workflows/release.yml`** — собирает pre-built бинарники под Linux/macOS-x86_64/macOS-arm64/Windows и публикует GitHub Release с прикреплёнными `tar.gz`/`.zip` + `checksums.txt`.
 - **`.github/workflows/publish.yml`** — публикует все 3 crate'а на crates.io (нужен `CRATES_IO_TOKEN` secret).
 
+Оба workflow сначала гоняют свой job `test` (fmt, clippy `-D warnings`, `cargo test --workspace --all-targets`); если он красный — ни бинарники, ни crate'ы не публикуются.
+
 ### 3. Если автопубликация не нужна — руками
 
 ```bash
 cargo login   # paste crates.io token
 cargo publish -p task-journal-core
-sleep 30
+sleep 60   # как в publish.yml: crates.io должен проиндексировать core
 cargo publish -p task-journal-cli
+sleep 30
 cargo publish -p task-journal-mcp
 ```
 
@@ -84,7 +89,7 @@ cargo publish -p task-journal-mcp
 ## Post-release
 
 Для каждой следующей версии:
-- Обнови `version` в `Cargo.toml` workspace
+- Пройди шаг 1 целиком: `Cargo.toml` (workspace `version` и пин `tj-core`) **и** три манифеста плагина, `plugin_metadata` зелёный
 - `git tag vX.Y.Z && git push origin vX.Y.Z`
 - CI делает остальное
 
@@ -94,5 +99,5 @@ cargo publish -p task-journal-mcp
 |---------|---------------|
 | `cargo publish` падает с "name already taken" | Имя crate занято на crates.io. Поменяй `name = "..."` в Cargo.toml на другое. |
 | Release workflow не запустился | Тэг должен начинаться с `v` (например `v0.1.0`, не `0.1.0` или `release-0.1.0`). |
-| `cargo publish -p task-journal-cli` падает с "task-journal-core not found" | Не подождал `sleep 30` после публикации `task-journal-core` — повтори через минуту. |
+| `cargo publish -p task-journal-cli` падает с "task-journal-core not found" | Не подождал `sleep 60` после публикации `task-journal-core` — повтори через минуту. |
 | Pre-built binary не работает на macOS — "killed" | Apple Silicon vs Intel — скачай правильный target (`aarch64-apple-darwin` для M1/M2/M3, `x86_64-apple-darwin` для Intel). |

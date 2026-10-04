@@ -35,10 +35,11 @@
   },
   "files": [
     ".claude-plugin/",
+    "agents/",
     "commands/",
+    "hooks/",
     "skills/",
-    "scripts/",
-    "README.md"
+    "scripts/"
   ],
   "scripts": {
     "postinstall": "node scripts/postinstall.mjs"
