@@ -1,0 +1,9 @@
+# cargo-audit configuration (read by `cargo audit` and the CI audit job).
+
+[advisories]
+ignore = [
+    # rmcp < 1.4: DNS rebinding in the Streamable HTTP *server* transport.
+    # task-journal-mcp only serves over stdio (transport-io), which the
+    # advisory states is not affected. Drop this once rmcp is upgraded to 1.x.
+    "RUSTSEC-2026-0189",
+]
