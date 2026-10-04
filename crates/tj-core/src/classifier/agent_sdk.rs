@@ -397,6 +397,7 @@ mod tests {
             text: "We adopted Rust for the journal core.".into(),
             author_hint: "assistant".into(),
             recent_tasks: vec![],
+            tool_output: false,
         }
     }
 

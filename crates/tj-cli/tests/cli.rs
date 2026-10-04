@@ -4162,6 +4162,86 @@ fn post_tool_use_backlog_never_exits_two() {
         .stdout(contains("pending queue").not());
 }
 
+#[test]
+fn post_tool_use_queues_truncated_text() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "big.rs"},
+        "tool_response": {"content": "ж".repeat(10_000)},
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let entries: Vec<_> = std::fs::read_dir(&pending).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let body = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let chars = v["text"].as_str().unwrap().chars().count();
+    assert!(
+        chars <= 2000,
+        "PostToolUse text must be capped, got {chars}"
+    );
+    assert!(
+        chars > 100,
+        "the start of the tool call is kept, got {chars}"
+    );
+}
+
+#[test]
+fn post_tool_use_output_wording_is_not_a_constraint() {
+    // "must be" / "requires" inside tool output used to become constraint
+    // events whose text was raw tool JSON.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Tool output noise"])
+        .assert()
+        .success();
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "schema.json"},
+        "tool_response": {"content": "the id field must be unique and requires an index"},
+    })
+    .to_string();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_INGEST_SYNC", "1")
+        .current_dir(&workdir)
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    let journal = project_events(dir.path(), &hash);
+    assert!(
+        !journal.contains("\"constraint\""),
+        "tool output must not become a constraint: {journal}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // v0.10.3 — search/pack quality fixes (user feedback)
 // ---------------------------------------------------------------------------

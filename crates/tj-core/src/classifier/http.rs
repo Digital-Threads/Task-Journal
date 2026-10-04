@@ -130,6 +130,7 @@ mod tests {
                 text: "We adopted Rust.".into(),
                 author_hint: "assistant".into(),
                 recent_tasks: vec![],
+                tool_output: false,
             })
             .unwrap();
 
@@ -163,6 +164,7 @@ mod tests {
             text: "x".into(),
             author_hint: "user".into(),
             recent_tasks: vec![],
+            tool_output: false,
         });
         let elapsed = start.elapsed();
 

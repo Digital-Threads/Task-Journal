@@ -122,6 +122,7 @@ mod tests {
                 last_events: vec!["[hypothesis] PKCE vs implicit".into()],
                 constraints: vec![],
             }],
+            tool_output: false,
         };
         let p = build(&input);
         assert!(p.contains("We adopted PKCE."));
@@ -145,6 +146,7 @@ mod tests {
                     constraints: vec![],
                 })
                 .collect(),
+            tool_output: false,
         };
         let p = build(&input);
         assert!(
@@ -160,6 +162,7 @@ mod tests {
             text: "anything".into(),
             author_hint: "assistant".into(),
             recent_tasks: vec![],
+            tool_output: false,
         };
         let p = build(&input);
         assert!(p.contains("## Examples"), "Examples section missing");
@@ -188,6 +191,7 @@ mod tests {
                 last_events: vec!["[decision] use ureq".into()],
                 constraints: vec!["must stay sync (no tokio)".into()],
             }],
+            tool_output: false,
         };
         let p = build(&input);
         assert!(p.contains("Known constraints for tj-9:"));
@@ -207,6 +211,7 @@ mod tests {
                 last_events: vec!["[finding] y".into()],
                 constraints: vec![],
             }],
+            tool_output: false,
         };
         let p = build(&input);
         assert!(!p.contains("Known constraints"));
@@ -219,6 +224,7 @@ mod tests {
             text: "Hello".into(),
             author_hint: "user".into(),
             recent_tasks: vec![],
+            tool_output: false,
         };
         let p = build(&input);
         assert!(p.contains("(no active tasks)"));

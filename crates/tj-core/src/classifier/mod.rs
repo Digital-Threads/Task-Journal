@@ -9,6 +9,11 @@ pub struct ClassifyInput {
     pub text: String,
     pub author_hint: String,
     pub recent_tasks: Vec<TaskContext>,
+    /// The chunk is a tool call's input + output (PostToolUse). The
+    /// heuristic stage then only trusts test results; the LLM prompt is
+    /// unchanged.
+    #[serde(skip)]
+    pub tool_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +138,7 @@ mod tests {
             text: "Adopted Rust for the journal".into(),
             author_hint: "assistant".into(),
             recent_tasks: vec![],
+            tool_output: false,
         };
         let s = serde_json::to_string(&i).unwrap();
         assert!(s.contains("Adopted Rust"));

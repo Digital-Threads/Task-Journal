@@ -2745,6 +2745,14 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 return Ok(());
             }
 
+            // A tool call arrives as its full input + response JSON; cap it
+            // so one big file read or command output can't flood the queue.
+            let text: String = if kind == "PostToolUse" {
+                text.chars().take(POST_TOOL_USE_TEXT_MAX).collect()
+            } else {
+                text
+            };
+
             // v0.6.2 fork-bomb fix. The real-classifier path used to run
             // `claude -p` synchronously inside the hook, blocking each
             // UserPromptSubmit/PostToolUse/Stop for 5-30s. Symptoms:
@@ -2882,6 +2890,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     text: text.clone(),
                     author_hint: author_hint.into(),
                     recent_tasks: recent,
+                    tool_output: kind == "PostToolUse",
                 };
                 let out = match classifier.classify(&input) {
                     Ok(o) => o,
@@ -5400,6 +5409,9 @@ fn spawn_classify_worker(backend: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Characters of a PostToolUse chunk (tool input + response) that get queued.
+const POST_TOOL_USE_TEXT_MAX: usize = 2000;
+
 /// How long an empty (pid not yet written) worker lockfile counts as held.
 const LOCK_PID_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -5630,6 +5642,7 @@ fn process_pending_entry(
         text: text.clone(),
         author_hint: author_hint.into(),
         recent_tasks: recent,
+        tool_output: kind == "PostToolUse",
     };
     let out = match classifier.classify(&input) {
         Ok(o) => o,
