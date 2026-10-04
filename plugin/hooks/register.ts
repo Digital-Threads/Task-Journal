@@ -57,7 +57,7 @@ async function cli($: EngineInterface, argv: string[]): Promise<string | null> {
 
 async function refresh($: EngineInterface): Promise<void> {
   const session = await $.session.id()
-  const out = await cli($, ['state', '--session', session, '--json'])
+  const out = await cli($, ['state', '--session', session])
   const state = out === null ? null : parseState(out)
 
   if (state === null) {

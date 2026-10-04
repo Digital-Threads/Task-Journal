@@ -870,6 +870,26 @@ enum Commands {
         /// Optional event id this supersedes (for type=supersede).
         #[arg(long)]
         supersedes: Option<String>,
+        /// Record it as `suggested` by a classifier rather than confirmed
+        /// by a person: what a model inferred after the fact.
+        #[arg(long)]
+        suggested: bool,
+        /// Session the event belongs to; defaults to the live session id
+        /// (CLAUDE_CODE_SESSION_ID, then Codex's CODEX_THREAD_ID).
+        #[arg(long)]
+        session: Option<String>,
+        /// Who wrote it, kept as `meta.origin` (e.g. `mod-distill`).
+        #[arg(long)]
+        origin: Option<String>,
+    },
+    /// Print a session's journal state as JSON: its active task (the open
+    /// task it last wrote to), that task's counts and latest entries, and
+    /// how many tasks are open. Read by the Claude Code mod; schema
+    /// `tj-state/1`.
+    State {
+        /// Session id; defaults to the live session id.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Close a task (writes a `close` event).
     Close {
@@ -1627,27 +1647,74 @@ fn real_main() -> Result<()> {
             text,
             corrects,
             supersedes,
+            suggested,
+            session,
+            origin,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-            std::fs::create_dir_all(events_path.parent().unwrap())?;
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
 
+            // Same guard as the MCP tool: a mistyped id must not leave an
+            // orphan event behind.
             let event_type = parse_event_type(&r#type)?;
-            let mut event = tj_core::event::Event::new(
-                &task_id,
-                event_type,
-                tj_core::event::Author::User,
-                tj_core::event::Source::Cli,
-                text,
-            );
+            if !events_path.exists() {
+                anyhow::bail!("task not found: {task_id}");
+            }
+            let conn = tj_core::db::open(&state_path)?;
+            tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+            if !tj_core::db::task_exists(&conn, &task_id)? {
+                anyhow::bail!("task not found: {task_id}");
+            }
+
+            let (author, source) = if suggested {
+                (
+                    tj_core::event::Author::Classifier,
+                    tj_core::event::Source::Hook,
+                )
+            } else {
+                (tj_core::event::Author::User, tj_core::event::Source::Cli)
+            };
+            let mut event = tj_core::event::Event::new(&task_id, event_type, author, source, text);
             event.corrects = corrects;
             event.supersedes = supersedes;
+            if suggested {
+                event.status = tj_core::event::EventStatus::Suggested;
+            }
+            if let Some(origin) = origin {
+                event.meta["origin"] = serde_json::Value::String(origin);
+            }
+            let session = session.or_else(tj_core::session_id::session_id_from_env);
+            tj_core::session_id::stamp_session_id(&mut event.meta, session.as_deref());
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
             writer.flush_durable()?;
             println!("{}", event.event_id);
+        }
+        Commands::State { session } => {
+            let cwd = std::env::current_dir()?;
+            let project_hash = tj_core::project_hash::from_path(&cwd)?;
+            let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+            let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+            let session = session.or_else(tj_core::session_id::session_id_from_env);
+
+            // No journal yet: an empty state, and no state DB created for it.
+            let state = if events_path.exists() {
+                let conn = tj_core::db::open(&state_path)?;
+                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                tj_core::session_state::session_state(&conn, &project_hash, session.as_deref())?
+            } else {
+                tj_core::session_state::SessionState {
+                    schema: tj_core::session_state::SCHEMA,
+                    session_id: session,
+                    open_tasks: 0,
+                    active: None,
+                }
+            };
+
+            println!("{}", serde_json::to_string(&state)?);
         }
         Commands::ArtifactAdd {
             task_id,

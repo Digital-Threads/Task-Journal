@@ -78,6 +78,7 @@ pub mod recall;
 pub mod reminder;
 pub mod session;
 pub mod session_id;
+pub mod session_state;
 pub mod storage;
 pub mod title;
 

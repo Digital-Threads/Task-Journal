@@ -7810,3 +7810,147 @@ fn artifact_add_renders_clickable_link_in_pack() {
         .success()
         .stdout(contains("[Design spec](https://example.com/spec.md) (doc)"));
 }
+
+#[test]
+fn state_reports_the_sessions_own_task_as_json() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let state = |session: &str| -> serde_json::Value {
+        let out = tj()
+            .args(["state", "--session", session])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap()
+    };
+
+    let empty = state("s1");
+    assert_eq!(empty["schema"], "tj-state/1");
+    assert!(empty["active"].is_null());
+    assert!(
+        !dir.path().join("task-journal").join("state").exists(),
+        "no journal yet, so no state DB either"
+    );
+
+    let out = tj()
+        .args(["create", "Fix refresh", "--goal", "Stop dropping the token"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+    tj().args([
+        "event",
+        &task_id,
+        "--type",
+        "decision",
+        "--text",
+        "Use <= on expiry",
+        "--session",
+        "s1",
+    ])
+    .assert()
+    .success();
+
+    let mine = state("s1");
+    assert_eq!(mine["active"]["task_id"], task_id.as_str());
+    assert_eq!(mine["active"]["goal"], "Stop dropping the token");
+    assert_eq!(mine["active"]["counts"]["decision"], 1);
+    assert_eq!(mine["active"]["recent"][0]["text"], "Use <= on expiry");
+    assert_eq!(mine["open_tasks"], 1);
+
+    let other = state("s2");
+    assert!(
+        other["active"].is_null(),
+        "another session must not inherit the task"
+    );
+    assert_eq!(other["open_tasks"], 1);
+}
+
+#[test]
+fn event_can_record_a_suggested_entry_for_a_session() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let out = tj()
+        .args(["create", "Distill target"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+
+    tj().args([
+        "event",
+        &task_id,
+        "--type",
+        "rejection",
+        "--text",
+        "Ruled out a cache",
+        "--suggested",
+        "--session",
+        "s9",
+        "--origin",
+        "mod-distill",
+    ])
+    .assert()
+    .success();
+
+    let events_dir = dir.path().join("task-journal").join("events");
+    let journal = std::fs::read_dir(&events_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let last: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(journal)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(last["type"], "rejection");
+    assert_eq!(last["status"], "suggested");
+    assert_eq!(last["author"], "classifier");
+    assert_eq!(last["meta"]["session_id"], "s9");
+    assert_eq!(last["meta"]["origin"], "mod-distill");
+}
+
+#[test]
+fn event_on_an_unknown_task_fails_and_writes_nothing() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    tj().args(["create", "Real task"]).assert().success();
+    let events_dir = dir.path().join("task-journal").join("events");
+    let journal = std::fs::read_dir(&events_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let before = std::fs::read_to_string(&journal).unwrap();
+
+    tj().args(["event", "tj-typo", "--type", "decision", "--text", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("task not found: tj-typo"));
+
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+}
