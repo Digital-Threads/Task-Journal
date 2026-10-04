@@ -37,7 +37,8 @@ pub fn encode_project_path(path: &str) -> String {
 }
 
 /// Find the project directory for a given filesystem path.
-/// Tries exact match first, then prefix match for worktree variants.
+/// Tries an exact match first, then a case-insensitive one (WSL paths can
+/// differ in case). Worktrees are not matched to their main checkout.
 pub fn find_project_dir(project_path: &Path) -> anyhow::Result<Option<PathBuf>> {
     let projects = projects_dir()?;
     if !projects.exists() {
@@ -96,35 +97,6 @@ pub fn list_sessions(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     // Sort newest first.
     sessions.sort_by_key(|s| std::cmp::Reverse(s.1));
     Ok(sessions.into_iter().map(|(p, _)| p).collect())
-}
-
-/// List all project directories in Claude Code config.
-pub fn list_all_projects() -> anyhow::Result<Vec<(String, PathBuf)>> {
-    let projects = projects_dir()?;
-    if !projects.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut result = Vec::new();
-    for entry in std::fs::read_dir(&projects)? {
-        let entry = entry?;
-        if entry.path().is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Decode the project name back to a readable path.
-            let decoded = decode_project_path(&name);
-            result.push((decoded, entry.path()));
-        }
-    }
-    result.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(result)
-}
-
-/// Decode an encoded project directory name back to a readable path.
-/// This is approximate — we can't distinguish `-` from original `/`.
-fn decode_project_path(encoded: &str) -> String {
-    // Common pattern: leading `--` means the path started with a path separator.
-    // Replace double dashes carefully.
-    encoded.to_string()
 }
 
 fn dirs_home() -> anyhow::Result<PathBuf> {
@@ -229,40 +201,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- list_all_projects() ---
-
-    #[test]
-    fn list_all_projects_with_temp_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        // Override CLAUDE_CONFIG_DIR for this test.
-        let config_dir = dir.path();
-        let projects = config_dir.join("projects");
-        std::fs::create_dir_all(&projects).unwrap();
-
-        // Create project directories.
-        std::fs::create_dir(projects.join("-home-user-project-alpha")).unwrap();
-        std::fs::create_dir(projects.join("-home-user-project-beta")).unwrap();
-        // Create a file (should be skipped — not a directory).
-        std::fs::write(projects.join("not-a-dir.txt"), "").unwrap();
-
-        // We can't easily test list_all_projects() because it uses projects_dir()
-        // which reads CLAUDE_CONFIG_DIR. Instead, test the directory listing logic directly.
-        let mut result = Vec::new();
-        for entry in std::fs::read_dir(&projects).unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let decoded = decode_project_path(&name);
-                result.push((decoded, entry.path()));
-            }
-        }
-        result.sort_by(|a, b| a.0.cmp(&b.0));
-
-        assert_eq!(result.len(), 2);
-        assert!(result[0].0.contains("alpha"));
-        assert!(result[1].0.contains("beta"));
-    }
-
     // --- find_project_dir() with CLAUDE_CONFIG_DIR env override ---
 
     #[test]
@@ -319,15 +257,6 @@ mod tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         assert!(result.unwrap().is_none());
-    }
-
-    // --- decode_project_path ---
-
-    #[test]
-    fn decode_project_path_returns_same_string() {
-        // Current implementation is identity — just verify it doesn't panic.
-        let decoded = decode_project_path("-home-user-project");
-        assert_eq!(decoded, "-home-user-project");
     }
 
     // --- claude_config_dir ---

@@ -32,16 +32,20 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     }
 }
 
-/// Drop proposed events that are near-duplicates of `existing` texts.
+/// Drop proposed events that are near-duplicates of `existing` texts or of
+/// an earlier proposal in the same batch (two chunks restating one event).
 pub fn dedup_guard(proposed: Vec<BackfillEvent>, existing: &[String]) -> Vec<BackfillEvent> {
-    proposed
-        .into_iter()
-        .filter(|p| {
-            !existing
-                .iter()
-                .any(|e| similarity(&p.text, e) >= DUP_THRESHOLD)
-        })
-        .collect()
+    let mut kept: Vec<BackfillEvent> = Vec::new();
+    for p in proposed {
+        let dup = existing
+            .iter()
+            .chain(kept.iter().map(|k| &k.text))
+            .any(|e| similarity(&p.text, e) >= DUP_THRESHOLD);
+        if !dup {
+            kept.push(p);
+        }
+    }
+    kept
 }
 
 /// Build a journal Event from a proposed backfill event, stamping dream
@@ -88,6 +92,20 @@ mod tests {
         let kept = dedup_guard(proposed, &existing);
         assert_eq!(kept.len(), 1);
         assert!(kept[0].text.contains("TTL"));
+    }
+
+    #[test]
+    fn drops_near_duplicates_among_proposals() {
+        // Two chunks of one session restating the same decision.
+        let proposed = vec![
+            ev("We decided to use SQLite instead of Postgres"),
+            ev("Decided to use SQLite instead of Postgres"),
+            ev("The cache layer needs a TTL of 60 seconds"),
+        ];
+        let kept = dedup_guard(proposed, &[]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].text.starts_with("We decided"));
+        assert!(kept[1].text.contains("TTL"));
     }
 
     #[test]

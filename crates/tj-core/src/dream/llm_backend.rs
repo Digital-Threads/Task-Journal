@@ -5,7 +5,7 @@
 
 use anyhow::Context;
 
-use crate::dream::backend::{BackfillEvent, BackfillInput, DreamBackend};
+use crate::dream::backend::{BackfillEvent, BackfillInput, BackfillOutput, DreamBackend};
 use crate::llm::LlmBackend;
 
 /// Adapts any [`LlmBackend`] into a [`DreamBackend`]: build the dream prompt,
@@ -44,8 +44,8 @@ impl LlmDreamBackend {
 const TRANSCRIPT_CHAR_BUDGET: usize = 150_000;
 
 impl DreamBackend for LlmDreamBackend {
-    fn backfill(&self, input: &BackfillInput) -> anyhow::Result<Vec<BackfillEvent>> {
-        let mut out = Vec::new();
+    fn backfill(&self, input: &BackfillInput) -> anyhow::Result<BackfillOutput> {
+        let mut out = BackfillOutput::default();
         for chunk in chunk_transcript(&input.transcript, TRANSCRIPT_CHAR_BUDGET) {
             let chunk_input = BackfillInput {
                 tasks: input.tasks.clone(),
@@ -57,17 +57,22 @@ impl DreamBackend for LlmDreamBackend {
             // (model continued the transcript dialogue) — is skipped, never
             // aborting the finalize. A genuinely broken backend still surfaces
             // at the judge step, which has its own (small, always-sized) call.
+            // Skips are counted so `dream` keeps the session in scope.
             match self.llm.complete_usage(&prompt, 1024) {
                 Ok((text, usage)) => {
                     self.usage.lock().unwrap().add(usage);
                     match parse_backfill_json(&text) {
-                        Ok(evs) => out.extend(evs),
+                        Ok(evs) => out.events.extend(evs),
                         Err(e) => {
+                            out.failed_chunks += 1;
                             tracing::warn!(error = %e, "dream backfill: skipping unparseable chunk")
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "dream backfill: skipping failed chunk"),
+                Err(e) => {
+                    out.failed_chunks += 1;
+                    tracing::warn!(error = %e, "dream backfill: skipping failed chunk")
+                }
             }
         }
         Ok(out)
@@ -176,8 +181,11 @@ mod tests {
             tasks: vec![],
             transcript: "user: hi\nassistant: hello".into(),
         };
-        let evs = b.backfill(&input).unwrap();
-        assert!(evs.is_empty());
+        let out = b.backfill(&input).unwrap();
+        assert!(out.events.is_empty());
+        // Reported, not silently swallowed, so the caller won't advance the
+        // dream watermark past this session.
+        assert_eq!(out.failed_chunks, 1);
     }
 
     #[test]
@@ -200,8 +208,9 @@ mod tests {
             tasks: vec![],
             transcript: "user: hi\nassistant: hello".into(),
         };
-        let evs = b.backfill(&input).unwrap();
-        assert!(evs.is_empty());
+        let out = b.backfill(&input).unwrap();
+        assert!(out.events.is_empty());
+        assert_eq!(out.failed_chunks, 1);
     }
 
     #[test]
@@ -251,8 +260,9 @@ mod tests {
             tasks: vec![],
             transcript,
         };
-        let evs = b.backfill(&input).unwrap();
-        assert!(evs.is_empty());
+        let out = b.backfill(&input).unwrap();
+        assert!(out.events.is_empty());
+        assert_eq!(out.failed_chunks, 0);
     }
 
     #[test]
@@ -275,7 +285,7 @@ mod tests {
             tasks: vec![],
             transcript: "x".into(),
         };
-        let evs = b.backfill(&input).unwrap();
+        let evs = b.backfill(&input).unwrap().events;
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].text, "found it");
         assert_eq!(b.backend_name(), "fake");

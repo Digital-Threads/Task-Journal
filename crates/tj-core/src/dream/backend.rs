@@ -33,19 +33,34 @@ pub struct BackfillTaskContext {
     pub existing_events: Vec<String>,
 }
 
+/// What one session's backfill call produced.
+#[derive(Debug, Default)]
+pub struct BackfillOutput {
+    pub events: Vec<BackfillEvent>,
+    /// Transcript chunks whose call failed or whose reply was unusable.
+    /// Non-zero means the session was only partly mined.
+    pub failed_chunks: usize,
+}
+
 pub trait DreamBackend {
     /// Return the events the realtime classifier missed for this session.
-    fn backfill(&self, input: &BackfillInput) -> anyhow::Result<Vec<BackfillEvent>>;
+    fn backfill(&self, input: &BackfillInput) -> anyhow::Result<BackfillOutput>;
 }
 
 /// Test backend that returns a canned list, ignoring the input.
+#[cfg(test)]
 pub struct MockDreamBackend {
     pub events: Vec<BackfillEvent>,
+    pub failed_chunks: usize,
 }
 
+#[cfg(test)]
 impl DreamBackend for MockDreamBackend {
-    fn backfill(&self, _input: &BackfillInput) -> anyhow::Result<Vec<BackfillEvent>> {
-        Ok(self.events.clone())
+    fn backfill(&self, _input: &BackfillInput) -> anyhow::Result<BackfillOutput> {
+        Ok(BackfillOutput {
+            events: self.events.clone(),
+            failed_chunks: self.failed_chunks,
+        })
     }
 }
 
@@ -62,14 +77,16 @@ mod tests {
                 text: "Chose A over B.".into(),
                 timestamp: "2026-06-08T10:00:00Z".into(),
             }],
+            failed_chunks: 0,
         };
         let input = BackfillInput {
             tasks: vec![],
             transcript: "x".into(),
         };
         let out = be.backfill(&input).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].task_id, "tj-1");
-        assert_eq!(out[0].event_type, EventType::Decision);
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events[0].task_id, "tj-1");
+        assert_eq!(out.events[0].event_type, EventType::Decision);
+        assert_eq!(out.failed_chunks, 0);
     }
 }
