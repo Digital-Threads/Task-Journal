@@ -270,6 +270,36 @@ time { font-family: ui-monospace, monospace; color: var(--muted); margin-right: 
 .suggested::after { content: " ?"; color: var(--muted); }
 "#;
 
+/// Title and status of one task for the md/html export, folded over its
+/// events with the same rules as the SQLite projection
+/// (`tj_core::db::upsert_task_from_event`): the first `open` sets the title,
+/// a later `rename` replaces it, and the last `close`/`reopen` decides status.
+fn export_title_and_status(task_events: &[&tj_core::event::Event]) -> (String, &'static str) {
+    use tj_core::event::EventType;
+
+    let mut title: Option<String> = None;
+    let mut status = "open";
+
+    for e in task_events {
+        let named = || {
+            e.meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&e.text)
+                .to_string()
+        };
+        match e.event_type {
+            EventType::Open if title.is_none() => title = Some(named()),
+            EventType::Rename if title.is_some() => title = Some(named()),
+            EventType::Close => status = "closed",
+            EventType::Reopen => status = "open",
+            _ => {}
+        }
+    }
+
+    (title.unwrap_or_else(|| "(untitled)".into()), status)
+}
+
 fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
     use std::collections::BTreeMap;
 
@@ -292,23 +322,7 @@ fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
     out.push_str("<main>");
 
     for (task_id, task_events) in &tasks {
-        let title = task_events
-            .iter()
-            .find(|e| e.event_type == tj_core::event::EventType::Open)
-            .and_then(|e| {
-                e.meta
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or_else(|| Some(e.text.clone()))
-            })
-            .unwrap_or_else(|| "(untitled)".into());
-
-        let closed = task_events
-            .last()
-            .map(|e| e.event_type == tj_core::event::EventType::Close)
-            .unwrap_or(false);
-        let status = if closed { "closed" } else { "open" };
+        let (title, status) = export_title_and_status(task_events);
 
         let created = task_events
             .first()
@@ -3153,29 +3167,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     }
 
                     for (task_id, task_events) in &tasks {
-                        // Derive title from the first open event's meta, or text.
-                        let title = task_events
-                            .iter()
-                            .find(|e| e.event_type == tj_core::event::EventType::Open)
-                            .and_then(|e| {
-                                e.meta
-                                    .get("title")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                                    .or_else(|| Some(e.text.clone()))
-                            })
-                            .unwrap_or_else(|| "(untitled)".into());
-
-                        // Determine status: closed if last event is close, else open.
-                        let status = if task_events
-                            .last()
-                            .map(|e| e.event_type == tj_core::event::EventType::Close)
-                            .unwrap_or(false)
-                        {
-                            "closed"
-                        } else {
-                            "open"
-                        };
+                        let (title, status) = export_title_and_status(task_events);
 
                         // Created timestamp from first event.
                         let created = task_events

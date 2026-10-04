@@ -531,8 +531,8 @@ fn export_html_emits_self_contained_document() {
     assert!(!html.contains("https://"), "external https url leaked");
 }
 
-/// Append a line that is not a valid event to the only JSONL log under `xdg`.
-fn append_malformed_jsonl_line(xdg: &std::path::Path) {
+/// Append a raw line to the only JSONL event log under `xdg`.
+fn append_jsonl_line(xdg: &std::path::Path, line: &str) {
     use std::io::Write;
 
     let events = xdg.join("task-journal").join("events");
@@ -543,7 +543,72 @@ fn append_malformed_jsonl_line(xdg: &std::path::Path) {
         .find(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
         .expect("events log present");
     let mut f = std::fs::OpenOptions::new().append(true).open(log).unwrap();
-    writeln!(f, "{{not json").unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+#[test]
+fn export_md_and_html_follow_close_reopen_and_rename_like_the_projection() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Original title"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Closed, then renamed: the projection says closed + new title, while the
+    // last event alone (a rename) would read as open with the old title.
+    for (etype, text) in [
+        (tj_core::event::EventType::Close, "done"),
+        (tj_core::event::EventType::Reopen, "one more fix"),
+        (tj_core::event::EventType::Close, "done again"),
+        (tj_core::event::EventType::Rename, "Renamed title"),
+    ] {
+        let e = tj_core::event::Event::new(
+            task_id.clone(),
+            etype,
+            tj_core::event::Author::User,
+            tj_core::event::Source::Cli,
+            text.to_string(),
+        );
+        append_jsonl_line(xdg.path(), &serde_json::to_string(&e).unwrap());
+    }
+
+    let export = |format: &str| {
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["export", "--format", format])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    let md = export("md");
+    assert!(
+        md.contains(&format!("## [{task_id}] Renamed title")),
+        "md title must follow the rename: {md}"
+    );
+    assert!(md.contains("**Status**: closed"), "md status: {md}");
+
+    let html = export("html");
+    assert!(
+        html.contains(&format!("{task_id}</span>Renamed title</h2>")),
+        "html title must follow the rename: {html}"
+    );
+    assert!(html.contains("status: closed"), "html status: {html}");
 }
 
 #[test]
@@ -558,7 +623,7 @@ fn export_skips_malformed_jsonl_lines_with_a_warning() {
         .args(["create", "Survives a bad line"])
         .assert()
         .success();
-    append_malformed_jsonl_line(xdg.path());
+    append_jsonl_line(xdg.path(), "{not json");
 
     Command::cargo_bin("task-journal")
         .unwrap()
@@ -2276,7 +2341,7 @@ fn events_list_skips_malformed_jsonl_lines_with_a_warning() {
         .args(["create", "Listed despite a bad line"])
         .assert()
         .success();
-    append_malformed_jsonl_line(xdg.path());
+    append_jsonl_line(xdg.path(), "{not json");
 
     Command::cargo_bin("task-journal")
         .unwrap()
