@@ -127,9 +127,39 @@ export function distillPrompt(task: ActiveTask): string {
     known,
     '',
     'From the conversation above, list the decisions, rejections, findings, evidence, constraints and hypotheses that matter for this task and are NOT already recorded.',
+    'Do not restate an entry already recorded in other words, and do not turn a recorded decision into a hypothesis or finding.',
     `Each one sentence, specific (names, files, numbers). At most ${MAX_DISTILLED}. Nothing worth adding → [].`,
     'Reply with a JSON array only: [{"type": "decision", "text": "..."}]. Allowed types: decision, rejection, finding, evidence, constraint, hypothesis.',
   ].join('\n')
+}
+
+export type TranscriptLine = { role: string; text: string }
+
+/**
+ * The newest turns of a conversation as `role: text` lines, cut to
+ * `maxChars` from the end: what a model reads when it cannot fork the
+ * session's own cached transcript.
+ */
+export function transcriptExcerpt(messages: readonly TranscriptLine[], maxChars: number): string {
+  const lines: string[] = []
+  let size = 0
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    const text = m?.text.trim() ?? ''
+    if (m === undefined || text === '') continue
+
+    const line = `${m.role}: ${text}`
+    if (size + line.length > maxChars) {
+      if (lines.length === 0) lines.push(line.slice(line.length - maxChars))
+      break
+    }
+
+    lines.push(line)
+    size += line.length + 1
+  }
+
+  return lines.reverse().join('\n')
 }
 
 function normalized(text: string): string {

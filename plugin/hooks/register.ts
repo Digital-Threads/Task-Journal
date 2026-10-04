@@ -25,11 +25,17 @@ import {
   parseState,
   sectionText,
   statusText,
+  transcriptExcerpt,
   WRITE_TOOLS,
   type JournalState,
+  type TranscriptLine,
 } from './journal'
 
 const WORK_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash'])
+
+// How much of the conversation the no-fork distill reads: the tail that
+// fits a small model's prompt comfortably.
+const EXCERPT_CHARS = 60_000
 
 // What the mod knows about the session it runs in. A module variable: it
 // lives as long as the process, which is as long as the session.
@@ -55,13 +61,19 @@ async function cli($: EngineInterface, argv: string[]): Promise<string | null> {
   }
 }
 
+// Reads the state of the session the engine names now. The id it was read
+// for is kept even when the read fails, so a missing CLI costs one spawn
+// per session, not one per request.
 async function refresh($: EngineInterface): Promise<void> {
   const session = await $.session.id()
   const out = await cli($, ['state', '--session', session])
   const state = out === null ? null : parseState(out)
 
+  mod.session = session
+  mod.state = state
+
   if (state === null) {
-    if (mod.state === null && !mod.hasWarned) {
+    if (!mod.hasWarned) {
       mod.hasWarned = true
       $.ui.log(
         'task-journal: the task-journal CLI 0.30+ was not found on PATH, so the journal mod is off. Install it with `cargo install task-journal-cli task-journal-mcp --force`.',
@@ -71,24 +83,37 @@ async function refresh($: EngineInterface): Promise<void> {
     return
   }
 
-  mod.state = state
-  mod.session = session
   $.ui.status(statusText(state))
 }
 
-// A /clear ends the session without a new session.start: catch up on the
-// first prompt under the new id.
+// The session id can change under the mod: a /clear starts a new one with
+// no session.start, and a resumed session may only take its id after
+// session.start ran. Re-read whenever the id moved.
 async function current($: EngineInterface): Promise<JournalState | null> {
-  if (mod.state === null || mod.session !== (await $.session.id())) await refresh($)
+  if (mod.session !== (await $.session.id())) await refresh($)
 
   return mod.state
 }
 
-async function distill($: EngineInterface, state: JournalState): Promise<void> {
+// Asks what the conversation decided that the journal lacks. A fork reuses
+// the session's own cached transcript; a process that has sent nothing yet
+// (a session resumed straight into /compact) has nothing to fork, and then
+// the messages being compacted go to a small model instead.
+async function distill($: EngineInterface, state: JournalState, messages: readonly TranscriptLine[]): Promise<void> {
   const task = state.active
   if (task === null) return
 
-  const reply = await $.model.fork({ prompt: distillPrompt(task) })
+  const ask = distillPrompt(task)
+  let reply = await $.model.fork({ prompt: ask })
+  if (!reply.isAnswered && reply.reason === 'nothing-to-fork') {
+    const conversation = transcriptExcerpt(messages, EXCERPT_CHARS)
+    reply = await $.model.complete({
+      model: 'haiku',
+      prompt: `<conversation>\n${conversation}\n</conversation>\n\n${ask}`,
+      maxTokens: 1024,
+      timeoutMs: 60_000,
+    })
+  }
   if (!reply.isAnswered) return
 
   const session = await $.session.id()
@@ -134,10 +159,13 @@ export const register: Register = (on, options) => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    if (mod.isOff || mod.state === null) return composed
+    if (mod.isOff) return composed
+
+    const state = await current($)
+    if (state === null) return composed
 
     return {
-      sections: [...composed.sections, { id: 'task-journal:active', text: sectionText(mod.state), scope: 'session' }],
+      sections: [...composed.sections, { id: 'task-journal:active', text: sectionText(state), scope: 'session' }],
     }
   })
 
@@ -191,7 +219,7 @@ export const register: Register = (on, options) => {
 
     if (distillOnCompact) {
       try {
-        await distill($, state)
+        await distill($, state, e.messages)
       } catch {
         // The compaction matters more than the catch-up: go on without it.
       }

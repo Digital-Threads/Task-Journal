@@ -7,6 +7,7 @@ import {
   parseState,
   sectionText,
   statusText,
+  transcriptExcerpt,
   type JournalState,
 } from './journal'
 
@@ -113,5 +114,28 @@ describe('parseDistill', () => {
   test('no array, no events', () => {
     expect(parseDistill('Nothing to add.', known)).toEqual([])
     expect(parseDistill('[not json', known)).toEqual([])
+  })
+})
+
+describe('transcriptExcerpt', () => {
+  const messages = [
+    { role: 'user', text: 'first question' },
+    { role: 'assistant', text: '' },
+    { role: 'assistant', text: 'first answer' },
+    { role: 'user', text: 'second question' },
+  ]
+
+  test('keeps the turns in order and skips empty ones', () => {
+    expect(transcriptExcerpt(messages, 1000)).toBe('user: first question\nassistant: first answer\nuser: second question')
+  })
+
+  test('keeps the newest turns when it has to cut', () => {
+    expect(transcriptExcerpt(messages, 50)).toBe('assistant: first answer\nuser: second question')
+  })
+
+  test('cuts a single huge turn from its start, keeping its end', () => {
+    const out = transcriptExcerpt([{ role: 'user', text: 'x'.repeat(100) + 'END' }], 20)
+    expect(out.length).toBe(20)
+    expect(out.endsWith('END')).toBe(true)
   })
 })
