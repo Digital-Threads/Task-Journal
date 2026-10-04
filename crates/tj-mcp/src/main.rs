@@ -471,9 +471,9 @@ impl TaskJournalServer {
 
                 // v0.10.3: sanitize FTS5 query. Hyphenated IDs like
                 // `OPS-306` previously crashed with "no such column: 306"
-                // because FTS5 reads `-` as column-prefix syntax. Wrap
-                // such queries in phrase quotes; safe queries pass
-                // through unchanged so AND semantics are preserved.
+                // because FTS5 reads `-` as column-prefix syntax. Every
+                // token is quoted on its own, so punctuation is literal
+                // and multi-word queries keep their AND semantics.
                 let fts_query = tj_core::fts::sanitize_query(&raw_query);
                 let (sql, fts_only) = match &event_type {
                     Some(_) => (
