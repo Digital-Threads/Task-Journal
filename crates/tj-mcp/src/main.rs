@@ -568,7 +568,10 @@ fn new_task_chronicle(
         } else {
             Vec::new()
         };
-        let gaps = tj_core::archive::gaps(conn, project_hash, Some(task_id))?;
+        let gaps = tj_core::archive::for_dir(
+            tj_core::archive::gaps(conn, project_hash, Some(task_id))?,
+            &project_dir()?,
+        );
 
         Ok((modules, suggested, tj_core::archive::headline(&gaps)))
     })
@@ -1227,7 +1230,10 @@ impl TaskJournalServer {
                 }
 
                 with_state(|conn, project_hash| {
-                    let gaps = tj_core::archive::gaps(conn, project_hash, None)?;
+                    let gaps = tj_core::archive::for_dir(
+                        tj_core::archive::gaps(conn, project_hash, None)?,
+                        &project_dir()?,
+                    );
 
                     Ok(Json(ModuleListResult {
                         modules: tj_core::modules::list(conn, project_hash)?,

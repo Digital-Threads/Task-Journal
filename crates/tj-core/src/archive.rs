@@ -49,6 +49,20 @@ impl Gap {
     }
 }
 
+/// `gaps` as seen from `dir`. A linked git worktree keeps a journal of its
+/// own while the map lives in the main checkout, so it is not asked to map.
+// ponytail: hides NoMap in worktrees; reading the main checkout's chronicle
+// from a worktree is the real fix.
+pub fn for_dir(gaps: Vec<Gap>, dir: &std::path::Path) -> Vec<Gap> {
+    if !crate::project_hash::is_linked_worktree(dir) {
+        return gaps;
+    }
+
+    gaps.into_iter()
+        .filter(|g| !matches!(g, Gap::NoMap { .. }))
+        .collect()
+}
+
 /// The line a session start or a tool reply shows: the most important gap.
 pub fn headline(gaps: &[Gap]) -> Option<String> {
     let first = gaps.first()?;
@@ -226,6 +240,21 @@ mod tests {
         );
         assert!(line.ends_with("(+1 more)"), "{line}");
         assert!(headline(&[]).is_none());
+    }
+
+    #[test]
+    fn a_linked_worktree_is_not_asked_to_map_the_project() {
+        // A worktree (its root holds a `.git` file) has its own journal; the
+        // map lives in the main checkout, so asking to map again is wrong.
+        let main = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(main.path().join(".git")).unwrap();
+        std::fs::write(main.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let worktree = tempfile::TempDir::new().unwrap();
+        std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let gaps = vec![Gap::NoMap { tasks: 2 }];
+
+        assert_eq!(for_dir(gaps.clone(), main.path()), gaps);
+        assert!(for_dir(gaps, worktree.path()).is_empty());
     }
 
     #[test]

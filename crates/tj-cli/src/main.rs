@@ -164,7 +164,10 @@ fn run_module(action: ModuleCmd) -> Result<()> {
             let (modules, gaps) = with_chronicle(|conn, hash| {
                 Ok((
                     tj_core::modules::list(conn, hash)?,
-                    tj_core::archive::gaps(conn, hash, None)?,
+                    tj_core::archive::for_dir(
+                        tj_core::archive::gaps(conn, hash, None)?,
+                        &std::env::current_dir()?,
+                    ),
                 ))
             })?;
             if json {
@@ -2006,7 +2009,7 @@ fn real_main() -> Result<()> {
             let session = session.or_else(tj_core::session_id::session_id_from_env);
 
             // No journal yet: an empty state, and no state DB created for it.
-            let state = if events_path.exists() {
+            let mut state = if events_path.exists() {
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 tj_core::session_state::session_state(
@@ -2025,6 +2028,7 @@ fn real_main() -> Result<()> {
                 }
             };
 
+            state.archive = tj_core::archive::for_dir(state.archive, &cwd);
             println!("{}", serde_json::to_string(&state)?);
         }
         Commands::ArtifactAdd {
@@ -2979,6 +2983,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // Advice only: it never fails the session start.
                 if let Some(line) = tj_core::archive::gaps(&conn, &project_hash, None)
                     .ok()
+                    .map(|gaps| tj_core::archive::for_dir(gaps, &cwd))
                     .and_then(|gaps| tj_core::archive::headline(&gaps))
                 {
                     bundle.push_str(&line);

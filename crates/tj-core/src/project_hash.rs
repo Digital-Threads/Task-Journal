@@ -34,6 +34,14 @@ pub fn project_root(start: &Path) -> PathBuf {
     }
 }
 
+/// Whether `dir` sits in a linked git worktree: its project root holds a
+/// `.git` file instead of a directory, and so a journal of its own.
+pub fn is_linked_worktree(dir: &Path) -> bool {
+    let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+
+    project_root(&dir).join(".git").is_file()
+}
+
 pub fn from_path(p: impl AsRef<Path>) -> anyhow::Result<String> {
     let p = p.as_ref();
     // `canonicalize` requires the path to EXIST — it returns ENOENT ("No such

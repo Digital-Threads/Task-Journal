@@ -8738,3 +8738,33 @@ fn state_carries_archive_gaps() {
         .success()
         .stdout(contains(r#""kind":"no_map""#));
 }
+
+#[test]
+fn a_worktree_session_is_not_asked_to_map_the_project() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    std::fs::write(
+        proj.path().join(".git"),
+        "gitdir: /elsewhere/.git/worktrees/x\n",
+    )
+    .unwrap();
+    let tj = chronicle_cli(&xdg, &proj);
+    tj().args(["create", "Work in a worktree"])
+        .assert()
+        .success();
+
+    let mut hook = tj();
+    hook.args(["ingest-hook", "--kind", "SessionStart", "--text", ""]);
+    let out: serde_json::Value = serde_json::from_str(&stdout_of(hook)).unwrap();
+    let ctx = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+
+    assert!(!ctx.contains("no module map"), "{ctx}");
+    tj().args(["state"])
+        .assert()
+        .success()
+        .stdout(contains("no_map").not());
+}
