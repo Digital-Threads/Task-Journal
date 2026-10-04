@@ -873,14 +873,15 @@ pub fn reclassify_task_artifacts(conn: &Connection, task_id: &str) -> anyhow::Re
 /// branches) across every event of a task, deduplicated. Reads the
 /// per-event JSON payload that `ingest_new_events` populated. Skips
 /// events whose `artifacts` column is NULL or unparseable rather than
-/// failing the pack render.
+/// failing the pack render, and corrected events, so a wrong hash or path
+/// stops raising a gap once a correction retires it.
 pub fn task_artifacts(
     conn: &Connection,
     task_id: &str,
 ) -> anyhow::Result<crate::artifacts::Artifacts> {
     let mut stmt = conn.prepare(
         "SELECT artifacts FROM events_index
-         WHERE task_id = ?1 AND artifacts IS NOT NULL
+         WHERE task_id = ?1 AND artifacts IS NOT NULL AND corrected_by IS NULL
          ORDER BY timestamp ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![task_id], |r| r.get::<_, String>(0))?;
@@ -1881,6 +1882,24 @@ mod tests {
             arts.branch_names.iter().any(|b| b == "feat/clean-pack"),
             "branch merged"
         );
+    }
+
+    #[test]
+    fn task_artifacts_leave_out_corrected_events() {
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let wrong = make_text_event("fixed in commit dead00beef, see src/gone.rs");
+        let kept = make_text_event("also touched src/kept.rs");
+        let mut corr = make_text_event("the hash and path above were wrong");
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        for e in [&wrong, &kept, &corr] {
+            index_event(&conn, e).unwrap();
+        }
+
+        let arts = task_artifacts(&conn, "tj-x").unwrap();
+        assert!(arts.commit_hashes.is_empty(), "{:?}", arts.commit_hashes);
+        assert_eq!(arts.files, vec!["src/kept.rs".to_string()]);
     }
 
     #[test]

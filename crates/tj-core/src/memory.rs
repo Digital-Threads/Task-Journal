@@ -86,7 +86,7 @@ pub fn sync_from_project(
     let sql = format!(
         "SELECT e.event_id, e.task_id, f.type, e.tier, f.text, e.model, e.dim, e.vec, e.created_at,
                 CASE WHEN d.superseded_by IS NOT NULL THEN 1 ELSE 0 END,
-                COALESCE(ei.bookkeeping, 0)
+                COALESCE(ei.bookkeeping, 0) OR ei.corrected_by IS NOT NULL
            FROM embeddings e
            JOIN search_fts f ON f.event_id = e.event_id
            LEFT JOIN decisions d ON d.decision_id = e.event_id
@@ -106,28 +106,17 @@ pub fn sync_from_project(
             r.get::<_, Vec<u8>>(7)?, // vec
             r.get::<_, String>(8)?,  // created_at
             r.get::<_, i64>(9)?,     // superseded
-            r.get::<_, bool>(10)?,   // bookkeeping
+            r.get::<_, bool>(10)?,   // bookkeeping or corrected
         ))
     })?;
 
     let mut n = 0usize;
     for row in rows {
-        let (
-            event_id,
-            task_id,
-            ty,
-            tier,
-            text,
-            model,
-            dim,
-            vec,
-            created_at,
-            superseded,
-            bookkeeping,
-        ) = row?;
-        // Compaction markers / model switches are not reasoning to recall;
-        // also drop any copy an older version already synced.
-        if bookkeeping {
+        let (event_id, task_id, ty, tier, text, model, dim, vec, created_at, superseded, retired) =
+            row?;
+        // Compaction markers / model switches are not reasoning to recall, and a
+        // corrected event is no longer true; also drop any copy synced earlier.
+        if retired {
             global.execute(
                 "DELETE FROM global_memory WHERE event_id = ?1",
                 rusqlite::params![event_id],
@@ -416,6 +405,32 @@ mod tests {
         assert_eq!(sync_from_project(&global, &proj, "ph").unwrap(), 1);
         assert_eq!(count(&global).unwrap(), 1);
         assert!(keyword_search(&global, "compacted reasoning switched", 5)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn sync_leaves_out_and_drops_corrected_events() {
+        let d = tempfile::TempDir::new().unwrap();
+        let proj = crate::db::open(d.path().join("p.sqlite")).unwrap();
+        let global = open(d.path().join("memory.sqlite")).unwrap();
+        let emb = crate::embed::HashEmbedder::new(64);
+
+        let wrong = finding("chose the kafka audit pipeline");
+        crate::db::index_event(&proj, &wrong).unwrap();
+        crate::db::embed_pending(&proj, "ph", &emb, "t", 100).unwrap();
+        assert_eq!(sync_from_project(&global, &proj, "ph").unwrap(), 1);
+
+        // Corrected after the first sync: the next sync must drop the copy.
+        let mut corr = finding("that kafka choice was a misread of the brief");
+        corr.event_type = crate::event::EventType::Correction;
+        corr.corrects = Some(wrong.event_id.clone());
+        crate::db::index_event(&proj, &corr).unwrap();
+        crate::db::embed_pending(&proj, "ph", &emb, "t", 100).unwrap();
+
+        assert_eq!(sync_from_project(&global, &proj, "ph").unwrap(), 0);
+        assert_eq!(count(&global).unwrap(), 0);
+        assert!(keyword_search(&global, "kafka audit pipeline", 5)
             .unwrap()
             .is_empty());
     }

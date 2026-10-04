@@ -7174,6 +7174,94 @@ fn export_memory_missing_task_exits_1() {
 }
 
 #[test]
+fn export_memory_lists_the_same_decisions_as_the_pack_and_real_constraints() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+    let (x, p) = (xdg.path(), proj.path());
+
+    let task = tj_stdout(x, p, &["create", "Memory selection", "--goal", "g"]);
+    let event =
+        |ty: &str, text: &str| tj_stdout(x, p, &["event", &task, "--type", ty, "--text", text]);
+    let ts = event("decision", "Adopt TypeScript");
+    tj_stdout(
+        x,
+        p,
+        &[
+            "event",
+            &task,
+            "--type",
+            "supersede",
+            "--text",
+            "TS replaced",
+            "--supersedes",
+            &ts,
+        ],
+    );
+    for (ty, text) in [
+        ("decision", "Wrong decision: use Mongo"),
+        ("constraint", "Wrong constraint: no disk"),
+    ] {
+        let id = event(ty, text);
+        tj_stdout(
+            x,
+            p,
+            &[
+                "event-correct",
+                "--corrects",
+                &id,
+                "--task",
+                &task,
+                "--text",
+                "That was a mistake",
+            ],
+        );
+    }
+    for (ty, text, kind) in [
+        (
+            tj_core::event::EventType::Decision,
+            "Conversation compacted at 2026-01-01T00:00:00Z",
+            "compaction_marker",
+        ),
+        (
+            tj_core::event::EventType::Constraint,
+            "Model switched (auto): opus → haiku",
+            "model_switch",
+        ),
+    ] {
+        let mut e = tj_core::event::Event::new(
+            task.clone(),
+            ty,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text.to_string(),
+        );
+        e.meta = serde_json::json!({ "kind": kind });
+        append_jsonl_line(x, &serde_json::to_string(&e).unwrap());
+    }
+    event("decision", "Adopt Rust");
+    event("constraint", "Must run offline");
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", x)
+        .env("CLAUDE_CONFIG_DIR", claude.path())
+        .current_dir(p)
+        .args(["export-memory", "--task", &task, "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    for gone in ["TypeScript", "Wrong ", "compacted", "Model switched"] {
+        assert!(!out.contains(gone), "{gone} must be left out: {out}");
+    }
+    assert!(out.contains("- Adopt Rust\n"), "{out}");
+    assert!(out.contains("- Must run offline\n"), "{out}");
+}
+
+#[test]
 fn embed_backfill_vectorises_events_then_idempotent() {
     // Pillar A / Phase 0: `embed --backfill` computes a vector per event using
     // the dependency-free hash embedder and stores it; a second run finds

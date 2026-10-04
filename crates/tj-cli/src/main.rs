@@ -4364,31 +4364,35 @@ fn run_export_memory(task: Option<&str>, _all_closed: bool, dry_run: bool) -> Re
         )?;
         let meta = tj_core::db::task_metadata(&conn, id)?.unwrap_or_default();
 
-        // decision + constraint one-liners, oldest-first (== run_export_pr style).
+        // One-liners, oldest-first (== run_export_pr style). Decisions are the
+        // pack's Active decisions; constraints skip bookkeeping (model
+        // switches) and corrected ones by the same rules.
+        let decisions: Vec<String> = tj_core::pack::active_decisions(&conn, id)?
+            .iter()
+            .rev()
+            .filter_map(|c| {
+                let line = c.text.lines().next().unwrap_or("").trim();
+                (!line.is_empty()).then(|| format!("{line}{}", c.marker()))
+            })
+            .take(MAX_ITEMS)
+            .collect();
+
         let mut stmt = conn.prepare(
-            "SELECT ei.type, sf.text FROM events_index ei
+            "SELECT sf.text FROM events_index ei
              LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
-             WHERE ei.task_id = ?1 AND ei.type IN ('decision','constraint')
+             WHERE ei.task_id = ?1 AND ei.type = 'constraint'
+               AND ei.bookkeeping = 0 AND ei.corrected_by IS NULL
              ORDER BY ei.timestamp ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
+            Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default())
         })?;
-        let mut decisions = Vec::new();
         let mut constraints = Vec::new();
         for row in rows {
-            let (ty, text) = row?;
+            let text = row?;
             let line = text.lines().next().unwrap_or("").trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            match ty.as_str() {
-                "decision" if decisions.len() < MAX_ITEMS => decisions.push(line),
-                "constraint" if constraints.len() < MAX_ITEMS => constraints.push(line),
-                _ => {}
+            if !line.is_empty() && constraints.len() < MAX_ITEMS {
+                constraints.push(line);
             }
         }
 
