@@ -200,6 +200,49 @@ CREATE TABLE IF NOT EXISTS projection_state (
 ALTER TABLE events_index ADD COLUMN author TEXT;
 "#;
 
+/// v0.31.0 project chronicle: modules, task ↔ module links, module history
+/// lines, and a projection mark only 0.31+ writes. 0.30 writes the older
+/// marks while skipping `module` lines it cannot parse; a mismatch with this
+/// one makes 0.31 replay the log, so no module is lost.
+const MIGRATION_014: &str = r#"
+CREATE TABLE IF NOT EXISTS modules (
+  project_hash TEXT NOT NULL,
+  module_id    TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  description  TEXT,
+  hints        TEXT NOT NULL DEFAULT '{}',
+  state        TEXT,
+  state_at     TEXT,
+  status       TEXT NOT NULL DEFAULT 'active',
+  merged_into  TEXT,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (project_hash, module_id)
+);
+CREATE TABLE IF NOT EXISTS task_modules (
+  project_hash TEXT NOT NULL,
+  task_id      TEXT NOT NULL,
+  module_id    TEXT NOT NULL,
+  PRIMARY KEY (task_id, module_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_modules_module ON task_modules(project_hash, module_id);
+CREATE TABLE IF NOT EXISTS module_notes (
+  project_hash TEXT NOT NULL,
+  event_id     TEXT NOT NULL,
+  module_id    TEXT NOT NULL,
+  task_id      TEXT NOT NULL,
+  text         TEXT NOT NULL,
+  at           TEXT NOT NULL,
+  PRIMARY KEY (event_id, module_id)
+);
+CREATE INDEX IF NOT EXISTS idx_module_notes_module ON module_notes(project_hash, module_id, at);
+CREATE TABLE IF NOT EXISTS projection_state_014 (
+  project_hash          TEXT PRIMARY KEY,
+  last_indexed_event_id TEXT NOT NULL,
+  updated_at            TEXT NOT NULL
+);
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -254,6 +297,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 13,
         sql: MIGRATION_013,
+    },
+    Migration {
+        version: 14,
+        sql: MIGRATION_014,
     },
 ];
 
@@ -327,6 +374,7 @@ pub fn upsert_task_from_event(
     event: &Event,
     project_hash: &str,
 ) -> anyhow::Result<()> {
+    crate::modules::project(conn, event, project_hash)?;
     if event.event_type == EventType::Module {
         return Ok(());
     }
@@ -904,8 +952,17 @@ pub fn task_artifacts(
 /// been indexed (first call, or a migration cleared the marker).
 type IndexMark = (String, String);
 
+/// Marks every write records: `index_state` (all versions),
+/// `projection_state` (0.30 — kept so a 0.30 binary goes on incrementally),
+/// `projection_state_014` (0.31+, which projects modules).
+const MARK_TABLES: [&str; 3] = ["index_state", "projection_state", "projection_state_014"];
+
+/// The mark only this version writes: equal to `index_state` means nothing
+/// older indexed since.
+const OWN_MARK: &str = "projection_state_014";
+
 /// The mark stored in `table`: `index_state`, which every version writes, or
-/// `projection_state`, the copy only this version writes.
+/// [`OWN_MARK`], the copy only this version writes.
 fn read_mark(
     conn: &Connection,
     table: &str,
@@ -931,7 +988,7 @@ fn record_last_indexed(
         event_id.to_string(),
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     );
-    for table in ["index_state", "projection_state"] {
+    for table in MARK_TABLES {
         conn.execute(
             &format!(
                 "INSERT INTO {table}(project_hash, last_indexed_event_id, updated_at)
@@ -960,7 +1017,8 @@ const REPLAY_CHUNK: usize = 500;
 /// - No marker yet for this project (first call after a migration cleared
 ///   it, or a brand-new install).
 /// - The marker is not the one this version last wrote: an older binary
-///   ingested or rebuilt without the columns it does not know.
+///   ingested or rebuilt without the columns or lines it does not know
+///   (0.30 skips `module` lines).
 /// - The stored marker is not present in the JSONL (corrupted / truncated
 ///   file). A `tracing::warn!` is emitted so the operator notices.
 pub fn ingest_new_events(
@@ -1004,7 +1062,7 @@ fn replay(
             let mark = read_mark(&tx, "index_state", project_hash)?;
 
             if committed.is_none() {
-                let ours = mark == read_mark(&tx, "projection_state", project_hash)?;
+                let ours = mark == read_mark(&tx, OWN_MARK, project_hash)?;
                 if mark.is_some() && !ours {
                     tracing::warn!(
                         project_hash = project_hash,
@@ -1013,7 +1071,10 @@ fn replay(
                 }
 
                 match mark.filter(|_| !from_scratch && ours) {
-                    None => clear_search_fts(&tx, project_hash)?,
+                    None => {
+                        clear_search_fts(&tx, project_hash)?;
+                        crate::modules::clear(&tx, project_hash)?;
+                    }
                     Some((marker, _)) => {
                         let mut found = false;
                         for event in events.by_ref() {

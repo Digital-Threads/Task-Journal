@@ -71,6 +71,7 @@ pub mod fts;
 pub mod harvest;
 pub mod llm;
 pub mod memory;
+pub mod modules;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;

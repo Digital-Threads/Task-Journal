@@ -292,8 +292,12 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             "tasks",
             "index_state",
             "projection_state",
+            "projection_state_014",
             "embeddings",
             "dream_state",
+            "modules",
+            "task_modules",
+            "module_notes",
         ] {
             conn.execute(
                 &format!("UPDATE {table} SET project_hash = ?1 WHERE project_hash = ?2"),

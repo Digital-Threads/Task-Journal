@@ -990,12 +990,27 @@ fn migrate_project_rekeys_embeddings_and_dream_state() {
             [&from_hash],
         )
         .unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO modules(project_hash, module_id, name, created_at, updated_at)
+               VALUES ('{from_hash}', 'stars', 'Stars', 't', 't');
+             INSERT INTO task_modules(project_hash, task_id, module_id)
+               VALUES ('{from_hash}', 'tj-1', 'stars');
+             INSERT INTO module_notes(project_hash, event_id, module_id, task_id, text, at)
+               VALUES ('{from_hash}', 'e1', 'stars', 'tj-1', 'x', 't');"
+        ))
+        .unwrap();
     }
 
     migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
 
     let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
-    for table in ["dream_state", "embeddings"] {
+    for table in [
+        "dream_state",
+        "embeddings",
+        "modules",
+        "task_modules",
+        "module_notes",
+    ] {
         let rekeyed: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE project_hash = ?1"),
