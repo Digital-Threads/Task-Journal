@@ -2819,7 +2819,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
             }
 
-            // Drain any pending entries first (Task 10 fills the real-classifier branch).
+            // Mock path only: drain legacy pending entries first.
             drain_pending(
                 &events_path,
                 &project_hash,
@@ -5954,6 +5954,10 @@ fn classify_chunk(
     Ok(ChunkOutcome::Recorded)
 }
 
+/// Mock-only drain: with the mock flags, turn this project's legacy (v1)
+/// pending entries into events. Without them it does nothing — a v1 entry is
+/// a classifier failure waiting for `pending retry`, and v2 entries belong to
+/// classify-worker. An entry is removed only after its event is written.
 fn drain_pending(
     events_path: &std::path::Path,
     project_hash: &str,
@@ -5961,6 +5965,9 @@ fn drain_pending(
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
 ) -> anyhow::Result<()> {
+    let (Some(t), Some(tid)) = (mock_etype, mock_tid) else {
+        return Ok(());
+    };
     let pending_dir = events_path
         .parent()
         .unwrap()
@@ -5981,22 +5988,23 @@ fn drain_pending(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        if !text.is_empty() {
-            if let (Some(t), Some(tid)) = (mock_etype, mock_tid) {
-                let mut event = tj_core::event::Event::new(
-                    tid,
-                    parse_event_type(t)?,
-                    tj_core::event::Author::Classifier,
-                    tj_core::event::Source::Hook,
-                    text,
-                );
-                event.confidence = mock_conf;
-                event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
-                let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
-                writer.append(&event)?;
-                writer.flush_durable()?;
-            }
+        if text.is_empty() {
+            continue;
         }
+
+        let mut event = tj_core::event::Event::new(
+            tid,
+            parse_event_type(t)?,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text,
+        );
+        event.confidence = mock_conf;
+        event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
+        let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+        writer.append(&event)?;
+        writer.flush_durable()?;
+
         std::fs::remove_file(&path)?;
     }
     Ok(())

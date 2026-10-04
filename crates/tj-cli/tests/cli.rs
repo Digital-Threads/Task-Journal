@@ -2029,6 +2029,72 @@ fn ingest_hook_drains_pending_queue_via_mock() {
     );
 }
 
+/// A legacy entry is a classifier failure waiting for `pending retry`; a
+/// live hook must not throw it away.
+#[test]
+fn ingest_hook_keeps_legacy_pending_entries_for_pending_retry() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "01failed", "We decided to adopt PKCE flow.", 1);
+
+    for kind in ["UserPromptSubmit", "PostToolUse"] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+            .current_dir(proj.path())
+            .args(["ingest-hook", "--kind", kind, "--text", "next chunk"])
+            .assert()
+            .success();
+    }
+
+    let entry = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("01failed.json");
+    assert!(
+        entry.exists(),
+        "the failed chunk must wait for pending retry"
+    );
+}
+
+/// The mock drain only removes an entry it turned into an event.
+#[test]
+fn ingest_hook_mock_drain_keeps_entries_it_cannot_record() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "01empty", "", 0);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "ingest-hook",
+            "--kind",
+            "Stop",
+            "--text",
+            "Live chunk",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            "tj-mock",
+        ])
+        .assert()
+        .success();
+
+    let entry = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("01empty.json");
+    assert!(
+        entry.exists(),
+        "an entry that wrote no event must stay queued"
+    );
+}
+
 #[test]
 fn stats_command_shows_classifier_counts() {
     let dir = assert_fs::TempDir::new().unwrap();
