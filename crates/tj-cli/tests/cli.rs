@@ -255,6 +255,57 @@ fn doctor_json_output_is_parseable_and_lists_paths() {
     assert!(v.get("issues").unwrap().is_array());
 }
 
+/// `doctor` with PATH limited to `bin`, so only what the test puts there
+/// resolves.
+fn doctor_with_path(xdg: &std::path::Path, bin: &std::path::Path, json: bool) -> String {
+    let mut args = vec!["doctor"];
+    if json {
+        args.push("--json");
+    }
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .env("PATH", bin)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn doctor_reports_missing_codex_and_claude_as_information_only() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let empty_bin = assert_fs::TempDir::new().unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&doctor_with_path(xdg.path(), empty_bin.path(), true)).unwrap();
+    assert_eq!(v["codex_in_path"], false);
+    assert_eq!(v["claude_in_path"], false);
+    assert_eq!(v["issues"].as_array().unwrap().len(), 0, "{v}");
+
+    let human = doctor_with_path(xdg.path(), empty_bin.path(), false);
+    assert!(human.contains("codex binary"), "{human}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_detects_codex_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let bin = assert_fs::TempDir::new().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\necho codex-cli 9.9.9\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&doctor_with_path(xdg.path(), bin.path(), true)).unwrap();
+    assert_eq!(v["codex_in_path"], true);
+}
+
 fn write_pending(xdg: &std::path::Path, id: &str, text: &str, attempts: u32) {
     let dir = xdg.join("task-journal").join("pending");
     std::fs::create_dir_all(&dir).unwrap();

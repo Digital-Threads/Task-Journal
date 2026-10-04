@@ -14,6 +14,8 @@ struct DoctorReport {
     task_journal_version: &'static str,
     claude_in_path: bool,
     claude_version: Option<String>,
+    /// Informational only: needed just for `--backend codex`.
+    codex_in_path: bool,
     data_dir: PathBuf,
     events_dir: PathBuf,
     state_dir: PathBuf,
@@ -46,6 +48,14 @@ impl DoctorReport {
                     .unwrap_or_else(|| "found (version unknown)".into())
             } else {
                 "NOT FOUND in PATH".into()
+            }
+        );
+        println!(
+            "  codex binary     {}",
+            if self.codex_in_path {
+                "found"
+            } else {
+                "not found in PATH (only needed for the codex backend)"
             }
         );
         println!("  data dir         {}", self.data_dir.display());
@@ -618,6 +628,7 @@ fn run_doctor() -> Result<DoctorReport> {
         task_journal_version: env!("CARGO_PKG_VERSION"),
         claude_in_path,
         claude_version,
+        codex_in_path: tj_core::llm::codex_on_path(),
         data_dir,
         events_dir,
         state_dir,
