@@ -23,6 +23,9 @@ pub struct DreamOptions {
 pub struct DreamReport {
     pub sessions_processed: usize,
     pub events_backfilled: usize,
+    /// Proposals dropped because their `task_id` was not one of the
+    /// session's candidate tasks (the model invented or misspelled it).
+    pub events_dropped_unknown_task: usize,
 }
 
 /// Run one dream Pass A over the given sessions, using the supplied
@@ -45,7 +48,14 @@ pub fn run_dream(
         if opts.dry_run {
             continue;
         }
-        let proposed = backend.backfill(&input)?;
+        let mut proposed = backend.backfill(&input)?;
+
+        // Only the session's candidate tasks may receive events; anything
+        // else would be an orphan event for a nonexistent task.
+        let before = proposed.len();
+        proposed.retain(|p| input.tasks.iter().any(|t| t.task_id == p.task_id));
+        report.events_dropped_unknown_task += before - proposed.len();
+
         // Flatten existing texts across candidate tasks for the guard.
         let existing: Vec<String> = input
             .tasks
@@ -141,6 +151,48 @@ mod tests {
         assert!(body.contains("A brand new finding."));
         assert!(body.contains("\"source\":\"dream\""));
         assert!(!body.contains("\"text\":\"Already known fact.\",\"refs\""));
+    }
+
+    #[test]
+    fn run_dream_drops_events_for_tasks_outside_the_candidates() {
+        let d = TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        let events_path = d.path().join("events.jsonl");
+        let backend = MockDreamBackend {
+            events: vec![
+                BackfillEvent {
+                    event_type: EventType::Finding,
+                    task_id: "tj-ghost".into(), // not a candidate → orphan
+                    text: "Invented task id.".into(),
+                    timestamp: "2026-06-08T10:00:00Z".into(),
+                },
+                BackfillEvent {
+                    event_type: EventType::Finding,
+                    task_id: "tj-1".into(),
+                    text: "A real finding.".into(),
+                    timestamp: "2026-06-08T10:01:00Z".into(),
+                },
+            ],
+        };
+        let opts = DreamOptions {
+            project_hash: "ph".into(),
+            dry_run: false,
+        };
+
+        let report = run_dream(
+            &conn,
+            &events_path,
+            &opts,
+            &backend,
+            vec![task_input()],
+            "run-1",
+        )
+        .unwrap();
+
+        assert_eq!(report.events_backfilled, 1);
+        assert_eq!(report.events_dropped_unknown_task, 1);
+        let body = std::fs::read_to_string(&events_path).unwrap();
+        assert!(!body.contains("tj-ghost"));
     }
 
     #[test]

@@ -4567,10 +4567,17 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
         &project_hash,
         &chrono::Utc::now().to_rfc3339(),
     )?;
-    println!(
+    let mut summary = format!(
         "dream: {} session(s) processed, {} event(s) backfilled",
         report.sessions_processed, report.events_backfilled
     );
+    if report.events_dropped_unknown_task > 0 {
+        summary.push_str(&format!(
+            ", {} dropped (unknown task id)",
+            report.events_dropped_unknown_task
+        ));
+    }
+    println!("{summary}");
     Ok(())
 }
 
