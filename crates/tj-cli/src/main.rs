@@ -157,7 +157,8 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
     let state_dir = tj_core::paths::state_dir()?;
     let metrics_dir = tj_core::paths::metrics_dir()?;
 
-    // (source, destination) tuples to attempt to rename.
+    // (source, destination) tuples to attempt to rename. The SQLite runs in
+    // WAL mode, so its `-wal` / `-shm` sidecars travel with it.
     let pairs = [
         (
             events_dir.join(format!("{from_hash}.jsonl")),
@@ -166,6 +167,14 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         (
             state_dir.join(format!("{from_hash}.sqlite")),
             state_dir.join(format!("{to_hash}.sqlite")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.sqlite-wal")),
+            state_dir.join(format!("{to_hash}.sqlite-wal")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.sqlite-shm")),
+            state_dir.join(format!("{to_hash}.sqlite-shm")),
         ),
         (
             metrics_dir.join(format!("{from_hash}.jsonl")),
@@ -183,6 +192,16 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
                 );
             }
         }
+    }
+
+    // Fold uncheckpointed writes into the main file before it moves. When
+    // no one else holds the DB, closing this connection also deletes the
+    // sidecars; any that survive are moved with it below.
+    let src_state_path = state_dir.join(format!("{from_hash}.sqlite"));
+    if src_state_path.exists() {
+        let conn = rusqlite::Connection::open(&src_state_path)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .with_context(|| format!("checkpoint WAL of {src_state_path:?}"))?;
     }
 
     let mut moved: Vec<String> = Vec::new();

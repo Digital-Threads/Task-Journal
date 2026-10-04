@@ -801,6 +801,59 @@ fn migrate_project_rekeys_embeddings_and_dream_state() {
     }
 }
 
+/// A write still sitting in `<hash>.sqlite-wal` (another process holds the
+/// DB open, so nothing checkpointed it) must reach the new project, and no
+/// sidecar may stay behind under the old hash. Unix-only: Windows refuses to
+/// rename a file another handle keeps open.
+#[cfg(unix)]
+#[test]
+fn migrate_project_carries_uncheckpointed_wal_writes() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "WAL survives migration"])
+        .assert()
+        .success();
+
+    let src = state.join(format!("{from_hash}.sqlite"));
+    let holder = tj_core::db::open(&src).unwrap();
+    holder
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    holder
+        .execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES (?1, 't', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+    // Keep the connection open for the rest of the test so its WAL is never
+    // checkpointed or deleted on close.
+    std::mem::forget(holder);
+    let wal = |hash: &str| state.join(format!("{hash}.sqlite-wal"));
+    assert!(wal(&from_hash).exists(), "precondition: source WAL present");
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    for suffix in ["-wal", "-shm"] {
+        let left = state.join(format!("{from_hash}.sqlite{suffix}"));
+        assert!(!left.exists(), "sidecar left behind: {left:?}");
+    }
+    let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dream_state WHERE project_hash = ?1",
+            [&to_hash],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "the WAL-only write was lost in migration");
+}
+
 #[test]
 fn close_unknown_task_id_returns_error() {
     let dir = assert_fs::TempDir::new().unwrap();
