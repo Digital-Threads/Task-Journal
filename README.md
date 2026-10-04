@@ -225,10 +225,13 @@ chain `agent-sdk → api`, using whichever backends are available. Reorder the c
 with `TJ_HYBRID_LLM_ORDER` (e.g. `api,agent-sdk` to prefer the API key). With no LLM
 backend available, the heuristic still runs and ambiguous chunks queue in `pending/`.
 
-The offline **`dream`** backfill (re-mining old transcripts for missed reasoning) uses
-the same `agent-sdk` path: it prefers the local `claude` CLI pinned to Haiku and only
-falls back to the `api` backend when no `claude` is on PATH — so dreaming over your
-history needs no API key either. Override its model with `TJ_DREAM_MODEL`.
+The offline **`dream`** backfill (re-mining old transcripts for missed reasoning) does
+not use this chain. It runs on one LLM backend picked with `--backend` or `TJ_BACKEND`:
+`claude-p` (the default — the local `claude` CLI pinned to Haiku, no API key), `codex`
+(local `codex exec`, model via `TJ_CODEX_MODEL` as above), `anthropic` (needs
+`ANTHROPIC_API_KEY`), `openai` (needs `OPENAI_API_KEY`) or `ollama` (free, local).
+There is no fallback: when the chosen backend is unavailable (say, no `claude` on
+PATH), `dream` says so and stops. Model overrides per backend are in the table below.
 
 | Env var | Effect | Default |
 |---------|--------|---------|
@@ -236,7 +239,10 @@ history needs no API key either. Override its model with `TJ_DREAM_MODEL`.
 | `TJ_AGENT_SDK_MODEL` | Override the model the `agent-sdk` backend passes to `claude --model`. | `claude-haiku-4-5` |
 | `TJ_HYBRID_LLM_ORDER` | Comma-separated fallback order for `--backend=hybrid`. | `agent-sdk,api` |
 | `TJ_CLASSIFIER_MODEL` | Override the Anthropic model used by the `api` backend. | `claude-haiku-4-5-20251001` |
-| `TJ_DREAM_MODEL` | Override the model used by `dream` backfill (both agent-sdk and api). | `claude-haiku-4-5` (agent-sdk) |
+| `TJ_BACKEND` | LLM backend for `dream` (and `complete`, `consolidate`): `claude-p`, `codex`, `anthropic`, `openai` or `ollama`. `--backend` overrides it. | `claude-p` |
+| `TJ_CONSOLIDATE_MODEL` | Model for `dream` on the `claude-p` and `anthropic` backends. | `claude-haiku-4-5` (claude-p), `claude-haiku-4-5-20251001` (anthropic) |
+| `TJ_OPENAI_MODEL` / `TJ_OPENAI_BASE_URL` | Model and endpoint for `dream` on the `openai` backend (any OpenAI-compatible API). | `gpt-4o-mini` / `https://api.openai.com` |
+| `TJ_OLLAMA_MODEL` / `TJ_OLLAMA_URL` | Model and endpoint for `dream` on the `ollama` backend. | `llama3.1` / `http://localhost:11434` |
 | `TJ_AUTO_OPEN_TASKS` | Set to `0` / `false` to disable auto-opening a task from `UserPromptSubmit` when no open task exists. | `1` |
 
 ## Event types
