@@ -189,13 +189,15 @@ DELETE FROM task_pack_cache;
 /// downgrade) ingests or rebuilds without the 0.30 columns and moves
 /// `index_state`; the mismatch makes the next ingest replay the log to
 /// re-derive them. It starts empty, so the first ingest after the upgrade
-/// replays the log once.
+/// replays the log once — which also fills `author`, the event's writer, so
+/// only deliberate writes bind a session to a task.
 const MIGRATION_013: &str = r#"
 CREATE TABLE IF NOT EXISTS projection_state (
   project_hash          TEXT PRIMARY KEY,
   last_indexed_event_id TEXT NOT NULL,
   updated_at            TEXT NOT NULL
 );
+ALTER TABLE events_index ADD COLUMN author TEXT;
 "#;
 
 /// All schema migrations in version order. Append new entries here; never
@@ -602,6 +604,10 @@ pub fn task_id_by_external(conn: &Connection, reference: &str) -> anyhow::Result
 /// The open task of `project_hash` whose most recent event carries
 /// `meta.session_id == session_id` — the task a live agent session is
 /// working on. `None` when the session has no event on an open task.
+///
+/// Only deliberate writes count: hooks and the classifier fall back to the
+/// newest open task and stamp the current session, so their events (and
+/// bookkeeping) would bind a fresh session to another session's task.
 pub fn active_task_for_session(
     conn: &Connection,
     project_hash: &str,
@@ -612,6 +618,7 @@ pub fn active_task_for_session(
             "SELECT ei.task_id FROM events_index ei
              JOIN tasks t ON t.task_id = ei.task_id
              WHERE ei.session_id = ?2 AND t.project_hash = ?1 AND t.status = 'open'
+               AND ei.author IN ('user', 'agent') AND ei.bookkeeping = 0
              ORDER BY ei.timestamp DESC LIMIT 1",
             rusqlite::params![project_hash, session_id],
             |r| r.get::<_, String>(0),
@@ -1132,13 +1139,17 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
         Some(serde_json::to_string(&artifacts)?)
     };
     let session_id = event.meta.get("session_id").and_then(|v| v.as_str());
+    let author_str = serde_json::to_value(event.author)?
+        .as_str()
+        .unwrap()
+        .to_string();
     conn.execute(
-        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status, artifacts, session_id, bookkeeping)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR REPLACE INTO events_index(event_id, task_id, type, timestamp, confidence, status, artifacts, session_id, bookkeeping, author)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             event.event_id, event.task_id, type_str,
             event.timestamp, event.confidence, status_str, artifacts_json, session_id,
-            is_bookkeeping(event)
+            is_bookkeeping(event), author_str
         ],
     )?;
     // search_fts has no PK; replacing by the event's own rowid keeps it
@@ -2758,6 +2769,37 @@ mod tests {
     }
 
     #[test]
+    fn hook_and_classifier_writes_never_bind_a_session_to_a_task() {
+        use crate::event::{Author, EventType};
+        let d = TempDir::new().unwrap();
+        let conn = open(d.path().join("s.sqlite")).unwrap();
+        let ph = "feedfacefeedface";
+        upsert_task_from_event(&conn, &make_open_event("tj-t1", "T1"), ph).unwrap();
+
+        // Session S1 works on T1 through the agent.
+        let mut work = session_event("tj-t1", "s1", "2026-01-01T00:00:01.000Z");
+        work.author = Author::Agent;
+        // A fresh session S2: its PostModelSwitch note and a Stop catch-up
+        // classifier event fall back to the newest open task, T1.
+        let mut switch = session_event("tj-t1", "s2", "2026-01-01T00:00:02.000Z");
+        switch.author = Author::Classifier;
+        switch.event_type = EventType::Constraint;
+        switch.meta = serde_json::json!({"session_id": "s2", "kind": "model_switch"});
+        let mut caught_up = session_event("tj-t1", "s2", "2026-01-01T00:00:03.000Z");
+        caught_up.author = Author::Classifier;
+        for e in [&work, &switch, &caught_up] {
+            upsert_task_from_event(&conn, e, ph).unwrap();
+            index_event(&conn, e).unwrap();
+        }
+
+        assert_eq!(active_task_for_session(&conn, ph, "s2").unwrap(), None);
+        assert_eq!(
+            active_task_for_session(&conn, ph, "s1").unwrap().as_deref(),
+            Some("tj-t1")
+        );
+    }
+
+    #[test]
     fn upgrading_an_existing_db_backfills_session_ids_on_the_next_ingest() {
         let d = TempDir::new().unwrap();
         let jsonl = d.path().join("events.jsonl");
@@ -2965,6 +3007,43 @@ mod tests {
             0,
             "once repaired, the projection is in sync again"
         );
+    }
+
+    #[test]
+    fn upgrading_from_0_29_replays_the_log_exactly_once() {
+        let d = TempDir::new().unwrap();
+        let jsonl = d.path().join("events.jsonl");
+        let db = d.path().join("s.sqlite");
+        let ph = "feedfacefeedface";
+        let events = write_synthetic_log(&jsonl, 40);
+
+        // A 0.29 database (schema v008) that has indexed the whole log.
+        let conn = open(&db).unwrap();
+        ingest_new_events(&conn, &jsonl, ph).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_events_session_time;
+             ALTER TABLE events_index DROP COLUMN session_id;
+             ALTER TABLE events_index DROP COLUMN corrected_by;
+             ALTER TABLE events_index DROP COLUMN bookkeeping;
+             ALTER TABLE events_index DROP COLUMN author;
+             DROP TABLE projection_state;
+             DELETE FROM schema_migrations WHERE version >= 9;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        assert_eq!(ingest_new_events(&conn, &jsonl, ph).unwrap(), 40);
+        assert_eq!(ingest_new_events(&conn, &jsonl, ph).unwrap(), 0);
+
+        let authored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_index WHERE author = 'user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(authored, events.len() as i64);
     }
 
     #[test]
