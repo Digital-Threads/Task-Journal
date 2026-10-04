@@ -204,14 +204,12 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
     let new_state_path = state_dir.join(format!("{to_hash}.sqlite"));
     if new_state_path.exists() {
         let conn = tj_core::db::open(&new_state_path)?;
-        conn.execute(
-            "UPDATE tasks SET project_hash = ?1 WHERE project_hash = ?2",
-            rusqlite::params![to_hash, from_hash],
-        )?;
-        conn.execute(
-            "UPDATE index_state SET project_hash = ?1 WHERE project_hash = ?2",
-            rusqlite::params![to_hash, from_hash],
-        )?;
+        for table in ["tasks", "index_state", "embeddings", "dream_state"] {
+            conn.execute(
+                &format!("UPDATE {table} SET project_hash = ?1 WHERE project_hash = ?2"),
+                rusqlite::params![to_hash, from_hash],
+            )?;
+        }
     }
 
     if moved.is_empty() {

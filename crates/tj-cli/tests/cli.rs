@@ -724,6 +724,83 @@ fn migrate_project_refuses_overwrite_without_force() {
         .stderr(contains("destination already exists"));
 }
 
+/// Two project dirs that each hash to themselves, plus their hashes.
+fn two_projects() -> (assert_fs::TempDir, assert_fs::TempDir, String, String) {
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+    std::fs::create_dir(proj_a.path().join(".git")).unwrap();
+    std::fs::create_dir(proj_b.path().join(".git")).unwrap();
+    let from_hash = tj_core::project_hash::from_path(proj_a.path()).unwrap();
+    let to_hash = tj_core::project_hash::from_path(proj_b.path()).unwrap();
+
+    (proj_a, proj_b, from_hash, to_hash)
+}
+
+fn migrate(xdg: &std::path::Path, from: &std::path::Path, to: &std::path::Path, force: bool) {
+    let mut args = vec![
+        "migrate-project",
+        "--from",
+        from.to_str().unwrap(),
+        "--to",
+        to.to_str().unwrap(),
+    ];
+    if force {
+        args.push("--force");
+    }
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .args(args)
+        .assert()
+        .success();
+}
+
+#[test]
+fn migrate_project_rekeys_embeddings_and_dream_state() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Re-key everything"])
+        .assert()
+        .success();
+    {
+        let conn = tj_core::db::open(state.join(format!("{from_hash}.sqlite"))).unwrap();
+        conn.execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES (?1, 't', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings(event_id, task_id, project_hash, model, dim, vec, created_at)
+             VALUES ('e1', 'tj-1', ?1, 'hash', 1, x'00000000', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
+    for table in ["dream_state", "embeddings"] {
+        let rekeyed: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE project_hash = ?1"),
+                [&to_hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rekeyed, 1,
+            "{table} row not re-keyed to the new project_hash"
+        );
+    }
+}
+
 #[test]
 fn close_unknown_task_id_returns_error() {
     let dir = assert_fs::TempDir::new().unwrap();
