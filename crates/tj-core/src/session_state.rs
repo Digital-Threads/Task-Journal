@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 /// Bumped when a field changes meaning; readers refuse other schemas.
@@ -45,11 +45,15 @@ pub struct RecentEntry {
 }
 
 /// Assemble the state of `session_id` in one project. The caller has
-/// ingested the journal into `conn` already.
+/// ingested the journal into `conn` already. `prefer` names the task the
+/// caller already shows: it stays the active one while it is open, so a
+/// session logging to a parent and a subtask in turn doesn't flip between
+/// them.
 pub fn session_state(
     conn: &Connection,
     project_hash: &str,
     session_id: Option<&str>,
+    prefer: Option<&str>,
 ) -> anyhow::Result<SessionState> {
     let open_tasks = conn.query_row(
         "SELECT COUNT(*) FROM tasks WHERE project_hash = ?1 AND status = 'open'",
@@ -57,9 +61,20 @@ pub fn session_state(
         |r| r.get::<_, i64>(0),
     )?;
 
-    let active_id = match session_id {
-        Some(sid) => crate::db::active_task_for_session(conn, project_hash, sid)?,
+    let preferred = match prefer {
+        Some(id) => conn
+            .query_row(
+                "SELECT task_id FROM tasks WHERE task_id = ?1 AND project_hash = ?2 AND status = 'open'",
+                [id, project_hash],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
         None => None,
+    };
+    let active_id = match (preferred, session_id) {
+        (Some(id), _) => Some(id),
+        (None, Some(sid)) => crate::db::active_task_for_session(conn, project_hash, sid)?,
+        (None, None) => None,
     };
     let active = active_id.map(|id| active_task(conn, &id)).transpose()?;
 
@@ -144,7 +159,7 @@ mod tests {
         write(&conn, "tj-a", EventType::Decision, "Use <=", Some("s1"));
         write(&conn, "tj-b", EventType::Open, "b", Some("s2"));
 
-        let s1 = session_state(&conn, "p", Some("s1")).unwrap();
+        let s1 = session_state(&conn, "p", Some("s1"), None).unwrap();
         let active = s1.active.expect("s1 has a task");
         assert_eq!(active.task_id, "tj-a");
         assert_eq!(active.title, "Title of tj-a");
@@ -154,9 +169,29 @@ mod tests {
         assert_eq!(active.recent[0].kind, "decision");
         assert_eq!(s1.open_tasks, 2);
 
-        let other = session_state(&conn, "p", Some("s3")).unwrap();
+        let other = session_state(&conn, "p", Some("s3"), None).unwrap();
         assert!(other.active.is_none());
         assert_eq!(other.open_tasks, 2);
+    }
+
+    #[test]
+    fn a_preferred_open_task_stays_active() {
+        let (_dir, conn) = conn();
+        write(&conn, "tj-parent", EventType::Open, "p", Some("s1"));
+        write(&conn, "tj-sub", EventType::Open, "s", Some("s1"));
+
+        // Without a preference the newest write wins; with one, the pin holds.
+        let plain = session_state(&conn, "p", Some("s1"), None).unwrap();
+        assert_eq!(plain.active.unwrap().task_id, "tj-sub");
+        let pinned = session_state(&conn, "p", Some("s1"), Some("tj-parent")).unwrap();
+        assert_eq!(pinned.active.unwrap().task_id, "tj-parent");
+
+        // A closed or unknown preference falls back to the session's own task.
+        write(&conn, "tj-parent", EventType::Close, "done", Some("s1"));
+        let closed = session_state(&conn, "p", Some("s1"), Some("tj-parent")).unwrap();
+        assert_eq!(closed.active.unwrap().task_id, "tj-sub");
+        let unknown = session_state(&conn, "p", Some("s1"), Some("tj-nope")).unwrap();
+        assert_eq!(unknown.active.unwrap().task_id, "tj-sub");
     }
 
     #[test]
@@ -165,7 +200,7 @@ mod tests {
         write(&conn, "tj-a", EventType::Open, "a", Some("s1"));
         write(&conn, "tj-a", EventType::Close, "done", Some("s1"));
 
-        let s = session_state(&conn, "p", Some("s1")).unwrap();
+        let s = session_state(&conn, "p", Some("s1"), None).unwrap();
         assert!(s.active.is_none());
         assert_eq!(s.open_tasks, 0);
     }
@@ -175,13 +210,13 @@ mod tests {
         let (_dir, conn) = conn();
         write(&conn, "tj-a", EventType::Open, "a", Some("s1"));
 
-        let v = serde_json::to_value(session_state(&conn, "p", Some("s1")).unwrap()).unwrap();
+        let v = serde_json::to_value(session_state(&conn, "p", Some("s1"), None).unwrap()).unwrap();
         assert_eq!(v["schema"], "tj-state/1");
         assert_eq!(v["session_id"], "s1");
         assert_eq!(v["active"]["task_id"], "tj-a");
         assert!(v["active"]["recent"].as_array().unwrap().is_empty());
 
-        let none = serde_json::to_value(session_state(&conn, "p", None).unwrap()).unwrap();
+        let none = serde_json::to_value(session_state(&conn, "p", None, None).unwrap()).unwrap();
         assert!(none["active"].is_null());
         assert!(none["session_id"].is_null());
     }

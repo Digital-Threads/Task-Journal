@@ -890,6 +890,10 @@ enum Commands {
         /// Session id; defaults to the live session id.
         #[arg(long)]
         session: Option<String>,
+        /// Keep this task as the active one while it is open (the task the
+        /// caller already shows), instead of the session's latest write.
+        #[arg(long)]
+        prefer: Option<String>,
     },
     /// Close a task (writes a `close` event).
     Close {
@@ -1693,7 +1697,7 @@ fn real_main() -> Result<()> {
             writer.flush_durable()?;
             println!("{}", event.event_id);
         }
-        Commands::State { session } => {
+        Commands::State { session, prefer } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
             let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -1704,7 +1708,12 @@ fn real_main() -> Result<()> {
             let state = if events_path.exists() {
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                tj_core::session_state::session_state(&conn, &project_hash, session.as_deref())?
+                tj_core::session_state::session_state(
+                    &conn,
+                    &project_hash,
+                    session.as_deref(),
+                    prefer.as_deref(),
+                )?
             } else {
                 tj_core::session_state::SessionState {
                     schema: tj_core::session_state::SCHEMA,
