@@ -182,8 +182,12 @@ pub struct TaskPackMetadata {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskSearchParams {
+    /// Full-text query. Empty or absent lists the project's tasks instead.
+    #[serde(default)]
     pub query: String,
+    /// `open`, `closed`, or `any` (the default).
     pub status: Option<String>,
+    /// Absolute path of another project directory to search instead of this one.
     pub project: Option<String>,
     /// v0.10.3+: restrict matches to a single event type
     /// (`decision`, `evidence`, `finding`, `rejection`, ...).
@@ -193,7 +197,29 @@ pub struct TaskSearchParams {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskSearchResult {
     pub query: String,
+    /// Matching task ids. Kept for older clients; `tasks` has the same ids
+    /// in the same order with enough detail to pick one.
     pub results: Vec<String>,
+    pub tasks: Vec<TaskSearchHit>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskSearchHit {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub last_event_at: String,
+    pub goal: Option<String>,
+}
+
+fn task_search_hit(r: &rusqlite::Row) -> rusqlite::Result<TaskSearchHit> {
+    Ok(TaskSearchHit {
+        task_id: r.get(0)?,
+        title: r.get(1)?,
+        status: r.get(2)?,
+        last_event_at: r.get(3)?,
+        goal: r.get(4)?,
+    })
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -449,7 +475,7 @@ impl TaskJournalServer {
 
     #[tool(
         name = "task_search",
-        description = "Full-text search tasks by query (FTS5)."
+        description = "Search tasks. `query` is full-text over event text; empty or absent lists the project's tasks, newest first. `status`: open | closed | any (default). `project`: absolute dir of another project. `tasks` gives id, title, status, last_event_at, goal per hit."
     )]
     async fn task_search(
         &self,
@@ -459,8 +485,22 @@ impl TaskJournalServer {
             let query = p.query.clone();
             let raw_query = p.query.clone();
             let event_type = p.event_type.clone();
-            let results = run_blocking(move || {
-                let (project_hash, events_path, state_path) = project_paths()?;
+            let tasks = run_blocking(move || {
+                let status = match p.status.as_deref() {
+                    None | Some("any") => None,
+                    Some(s @ ("open" | "closed")) => Some(s.to_string()),
+                    Some(other) => {
+                        anyhow::bail!("invalid status `{other}` (expected: open | closed | any)")
+                    }
+                };
+                let (project_hash, events_path, state_path) = match p.project.as_deref() {
+                    Some(dir) if !Path::new(dir).is_absolute() => {
+                        anyhow::bail!("project must be an absolute path, got `{dir}`")
+                    }
+                    Some(dir) => resolve_project_paths(Path::new(dir))?,
+                    None => project_paths()?,
+                };
+
                 let conn_arc = cached_open(&state_path)?;
                 let conn = conn_arc
                     .lock()
@@ -469,69 +509,72 @@ impl TaskJournalServer {
                     tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 }
 
+                // No query: list the project's tasks, newest first. FTS5
+                // rejects an empty MATCH, so it must not reach it.
+                if raw_query.trim().is_empty() {
+                    let mut stmt = conn.prepare(
+                        "SELECT task_id, title, status, last_event_at, goal FROM tasks \
+                         WHERE (?1 IS NULL OR status = ?1) \
+                           AND (?2 IS NULL OR task_id IN \
+                                (SELECT task_id FROM events_index WHERE type = ?2)) \
+                         ORDER BY last_event_at DESC LIMIT 50",
+                    )?;
+                    let hits = stmt
+                        .query_map(rusqlite::params![status, event_type], task_search_hit)?
+                        .collect::<Result<_, _>>()?;
+
+                    return Ok(hits);
+                }
+
                 // v0.10.3: sanitize FTS5 query. Hyphenated IDs like
                 // `OPS-306` previously crashed with "no such column: 306"
                 // because FTS5 reads `-` as column-prefix syntax. Every
                 // token is quoted on its own, so punctuation is literal
                 // and multi-word queries keep their AND semantics.
                 let fts_query = tj_core::fts::sanitize_query(&raw_query);
-                let (sql, fts_only) = match &event_type {
-                    Some(_) => (
-                        "SELECT DISTINCT task_id FROM search_fts \
-                         WHERE search_fts MATCH ?1 AND type = ?2 LIMIT 50",
-                        false,
-                    ),
-                    None => (
-                        "SELECT DISTINCT task_id FROM search_fts \
-                         WHERE search_fts MATCH ?1 LIMIT 50",
-                        true,
-                    ),
-                };
-                let mut stmt = conn.prepare(sql)?;
-                let mut ids: Vec<String> = if fts_only {
-                    stmt.query_map(rusqlite::params![fts_query], |r| r.get::<_, String>(0))?
-                        .collect::<Result<_, _>>()?
-                } else {
-                    let ty = event_type.as_deref().unwrap();
-                    stmt.query_map(rusqlite::params![fts_query, ty], |r| r.get::<_, String>(0))?
-                        .collect::<Result<_, _>>()?
-                };
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT t.task_id, t.title, t.status, t.last_event_at, t.goal \
+                     FROM search_fts JOIN tasks t ON t.task_id = search_fts.task_id \
+                     WHERE search_fts MATCH ?1 \
+                       AND (?2 IS NULL OR search_fts.type = ?2) \
+                       AND (?3 IS NULL OR t.status = ?3) LIMIT 50",
+                )?;
+                let mut hits: Vec<TaskSearchHit> = stmt
+                    .query_map(
+                        rusqlite::params![fts_query, event_type, status],
+                        task_search_hit,
+                    )?
+                    .collect::<Result<_, _>>()?;
 
                 // v0.10.3: LIKE fallback. FTS5 phrase search miss when
                 // tokenizer split differs from the user's mental model
                 // (e.g. `bulk-repack` in source vs `bulk repack` in
                 // query). On zero FTS hits, scan event text directly so
                 // hyphenated identifiers and partial-word recall work.
-                if ids.is_empty() {
+                if hits.is_empty() {
                     let like = tj_core::fts::like_pattern(&raw_query);
-                    let (sql_like, type_bind) = match &event_type {
-                        Some(_) => (
-                            "SELECT DISTINCT task_id FROM search_fts \
-                             WHERE text LIKE ?1 AND type = ?2 LIMIT 50",
-                            true,
-                        ),
-                        None => (
-                            "SELECT DISTINCT task_id FROM search_fts \
-                             WHERE text LIKE ?1 LIMIT 50",
-                            false,
-                        ),
-                    };
-                    let mut stmt_like = conn.prepare(sql_like)?;
-                    ids = if type_bind {
-                        let ty = event_type.as_deref().unwrap();
-                        stmt_like
-                            .query_map(rusqlite::params![like, ty], |r| r.get::<_, String>(0))?
-                            .collect::<Result<_, _>>()?
-                    } else {
-                        stmt_like
-                            .query_map(rusqlite::params![like], |r| r.get::<_, String>(0))?
-                            .collect::<Result<_, _>>()?
-                    };
+                    let mut stmt_like = conn.prepare(
+                        "SELECT DISTINCT t.task_id, t.title, t.status, t.last_event_at, t.goal \
+                         FROM search_fts JOIN tasks t ON t.task_id = search_fts.task_id \
+                         WHERE search_fts.text LIKE ?1 \
+                           AND (?2 IS NULL OR search_fts.type = ?2) \
+                           AND (?3 IS NULL OR t.status = ?3) LIMIT 50",
+                    )?;
+                    hits = stmt_like
+                        .query_map(rusqlite::params![like, event_type, status], task_search_hit)?
+                        .collect::<Result<_, _>>()?;
                 }
-                Ok(ids)
+
+                Ok(hits)
             })
             .await?;
-            Ok(Json(TaskSearchResult { query, results }))
+
+            let results = tasks.iter().map(|t| t.task_id.clone()).collect();
+            Ok(Json(TaskSearchResult {
+                query,
+                results,
+                tasks,
+            }))
         })
         .await
     }
@@ -1030,6 +1073,7 @@ mod tests {
         let search = TaskSearchResult {
             query: "q".into(),
             results: vec![],
+            tasks: vec![],
         };
         assert!(!keys_of(&serde_json::to_value(&search).unwrap()).contains(&"stub".to_string()));
 
@@ -1448,6 +1492,172 @@ mod tests {
             "gaps: {:?}",
             res.gaps
         );
+    }
+
+    async fn create_task(server: &TaskJournalServer, title: &str) -> String {
+        server
+            .task_create(Parameters(TaskCreateParams {
+                title: title.into(),
+                initial_context: None,
+                goal: Some(format!("goal of {title}")),
+                parent: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id
+    }
+
+    async fn search(
+        server: &TaskJournalServer,
+        query: &str,
+        status: Option<&str>,
+        project: Option<&str>,
+        event_type: Option<&str>,
+    ) -> Result<TaskSearchResult, McpError> {
+        server
+            .task_search(Parameters(TaskSearchParams {
+                query: query.into(),
+                status: status.map(Into::into),
+                project: project.map(Into::into),
+                event_type: event_type.map(Into::into),
+            }))
+            .await
+            .map(|j| j.0)
+    }
+
+    #[test]
+    fn task_search_params_accept_a_missing_query() {
+        let p: TaskSearchParams =
+            serde_json::from_value(serde_json::json!({"status": "open"})).unwrap();
+        assert_eq!(p.query, "");
+    }
+
+    #[tokio::test]
+    async fn task_search_empty_query_lists_tasks_filtered_by_status() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let open = create_task(&server, "Empty query open").await;
+        let closed = create_task(&server, "Empty query closed").await;
+        server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: closed.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+            }))
+            .await
+            .unwrap();
+
+        let res = search(&server, "  ", Some("open"), None, None)
+            .await
+            .unwrap();
+        assert!(res.results.contains(&open), "{:?}", res.results);
+        assert!(!res.results.contains(&closed), "{:?}", res.results);
+        let ids: Vec<_> = res.tasks.iter().map(|t| t.task_id.clone()).collect();
+        assert_eq!(ids, res.results, "`tasks` must follow `results` order");
+        let hit = res.tasks.iter().find(|t| t.task_id == open).unwrap();
+        assert_eq!(hit.title, "Empty query open");
+        assert_eq!(hit.status, "open");
+        assert_eq!(hit.goal.as_deref(), Some("goal of Empty query open"));
+
+        let res = search(&server, "", Some("closed"), None, None)
+            .await
+            .unwrap();
+        assert!(res.results.contains(&closed) && !res.results.contains(&open));
+
+        let res = search(&server, "", None, None, None).await.unwrap();
+        assert!(res.results.contains(&closed) && res.results.contains(&open));
+        assert!(
+            res.tasks
+                .windows(2)
+                .all(|w| w[0].last_event_at >= w[1].last_event_at),
+            "newest last_event_at first"
+        );
+
+        let res = search(&server, "", Some("any"), None, Some("close"))
+            .await
+            .unwrap();
+        assert!(res.results.contains(&closed) && !res.results.contains(&open));
+    }
+
+    #[tokio::test]
+    async fn task_search_status_filters_fts_hits_and_rejects_unknown_values() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let open = create_task(&server, "Quagga open").await;
+        let closed = create_task(&server, "Quagga closed").await;
+        server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: closed.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+            }))
+            .await
+            .unwrap();
+
+        let res = search(&server, "quagga", Some("open"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(res.results, vec![open.clone()]);
+        assert_eq!(res.tasks[0].title, "Quagga open");
+
+        let res = search(&server, "quagga", Some("closed"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(res.results, vec![closed.clone()]);
+
+        let res = search(&server, "quagga", None, None, None).await.unwrap();
+        assert_eq!(res.results.len(), 2);
+
+        let err = search(&server, "quagga", Some("pending"), None, None)
+            .await
+            .expect_err("unknown status must be rejected");
+        assert!(err.message.contains("status"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn task_search_project_searches_that_projects_journal() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let other = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(other.path().join(".git")).unwrap();
+        let (_, other_events, _) = resolve_project_paths(other.path()).unwrap();
+        std::fs::create_dir_all(other_events.parent().unwrap()).unwrap();
+        let task_id = tj_core::new_task_id();
+        let mut ev = tj_core::event::Event::new(
+            task_id.clone(),
+            tj_core::event::EventType::Open,
+            tj_core::event::Author::Agent,
+            tj_core::event::Source::Chat,
+            "Elsewhere quokka".into(),
+        );
+        ev.meta = serde_json::json!({"title": "Elsewhere quokka"});
+        let mut writer = tj_core::storage::JsonlWriter::open(&other_events).unwrap();
+        writer.append(&ev).unwrap();
+        writer.flush_durable().unwrap();
+        let other_dir = other.path().to_str().unwrap();
+
+        let res = search(&server, "quokka", None, Some(other_dir), None)
+            .await
+            .unwrap();
+        assert_eq!(res.results, vec![task_id.clone()]);
+
+        let res = search(&server, "", Some("open"), Some(other_dir), None)
+            .await
+            .unwrap();
+        assert_eq!(res.results, vec![task_id.clone()]);
+
+        let res = search(&server, "quokka", None, None, None).await.unwrap();
+        assert!(!res.results.contains(&task_id), "{:?}", res.results);
+
+        assert!(search(&server, "", None, Some("relative/dir"), None)
+            .await
+            .is_err());
     }
 
     #[test]
