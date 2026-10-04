@@ -37,6 +37,10 @@ const JOURNAL_TOOL = /^mcp__(?:plugin_task-journal_)?task-journal__([a-z_]+)$/
 
 export const WRITE_TOOLS = new Set(['task_create', 'event_add', 'artifact_add', 'task_close'])
 
+// After these the status line is re-read: the journal writes, and the module
+// tools that change which modules a task shows.
+export const REFRESH_TOOLS = new Set([...WRITE_TOOLS, 'module_link', 'module_save'])
+
 export function journalTool(tool: string): string | undefined {
   return JOURNAL_TOOL.exec(tool)?.[1]
 }

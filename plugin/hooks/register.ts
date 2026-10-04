@@ -26,6 +26,7 @@ import {
   nudgeText,
   parseDistill,
   parseState,
+  REFRESH_TOOLS,
   sectionText,
   statusText,
   transcriptExcerpt,
@@ -288,7 +289,12 @@ export const register: Register = (on, options) => {
     const session = await $.session.id()
     const call = WRITE_TOOLS.has(name) && args.session_id === undefined ? { ...e, session_id: session } : e
     const ran = await next(call)
-    if (ran.deny !== undefined || ran.isError === true || !WRITE_TOOLS.has(name)) return ran
+    if (ran.deny !== undefined || ran.isError === true || !REFRESH_TOOLS.has(name)) return ran
+    if (!WRITE_TOOLS.has(name)) {
+      await refresh($)
+
+      return ran
+    }
 
     // A new task, or closing the named one, moves the pin; logging to
     // another task does not.

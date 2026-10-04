@@ -9,6 +9,8 @@ import {
   sectionText,
   statusText,
   transcriptExcerpt,
+  REFRESH_TOOLS,
+  WRITE_TOOLS,
   type JournalState,
 } from './journal'
 
@@ -120,6 +122,14 @@ describe('chronicle', () => {
   test('no gaps, or only unknown ones, is no nudge', () => {
     expect(chronicleNudge(withGaps([]))).toBe(null)
     expect(chronicleNudge(withGaps([{ kind: 'from_the_future' }]))).toBe(null)
+  })
+})
+
+describe('REFRESH_TOOLS', () => {
+  test('linking or saving a module refreshes the status line; only journal writes get a session id', () => {
+    for (const t of ['module_link', 'module_save', 'task_create', 'task_close']) expect(REFRESH_TOOLS.has(t)).toBe(true)
+    expect(WRITE_TOOLS.has('module_link')).toBe(false)
+    expect(REFRESH_TOOLS.has('module_page')).toBe(false)
   })
 })
 
