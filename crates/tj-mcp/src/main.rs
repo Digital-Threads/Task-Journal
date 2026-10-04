@@ -344,12 +344,16 @@ fn resolve_project_paths(
     Ok((project_hash, events, state))
 }
 
-fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
-    let dir = match PROJECT_DIR_OVERRIDE.get() {
+/// The project directory every tool works on: `--project-dir`, else the cwd.
+fn project_dir() -> anyhow::Result<PathBuf> {
+    Ok(match PROJECT_DIR_OVERRIDE.get() {
         Some(p) => p.clone(),
         None => std::env::current_dir()?,
-    };
-    resolve_project_paths(&dir)
+    })
+}
+
+fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
+    resolve_project_paths(&project_dir()?)
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -439,10 +443,7 @@ impl TaskJournalServer {
                     &p.task_id,
                     tj_core::completeness::pending_count(),
                 )?;
-                let dir = match PROJECT_DIR_OVERRIDE.get() {
-                    Some(d) => d.clone(),
-                    None => std::env::current_dir()?,
-                };
+                let dir = project_dir()?;
                 let arts = tj_core::db::task_artifacts(&conn, &p.task_id)?;
                 report
                     .gaps
@@ -813,10 +814,11 @@ impl TaskJournalServer {
                     if !tj_core::db::task_exists(&conn, &p.task_id)? {
                         anyhow::bail!("task not found: {}", p.task_id);
                     }
-                    // v0.6.0: validate outcome_tag enum and persist
-                    // outcome+tag to the task row before writing the
-                    // close event. Same enum + same ordering as the
-                    // CLI close handler — keep them lockstep.
+                    // v0.6.0: validate the outcome_tag enum before writing
+                    // the close event (same enum as the CLI close handler).
+                    // outcome+tag ride in the close event's meta and reach
+                    // the task row only when that event is ingested, so a
+                    // failed append never leaves an open task with an outcome.
                     if let Some(tag) = p.outcome_tag.as_deref() {
                         match tag {
                             "done" | "abandoned" | "superseded" => {}
@@ -824,9 +826,6 @@ impl TaskJournalServer {
                                 "invalid outcome_tag `{other}` (expected: done | abandoned | superseded)"
                             ),
                         }
-                    }
-                    if let Some(o) = p.outcome.as_deref() {
-                        tj_core::db::set_task_outcome(&conn, &p.task_id, o, p.outcome_tag.as_deref())?;
                     }
                     open_kids = tj_core::db::count_open_children(&conn, &p.task_id)?;
                 } // release the connection lock before doing the JSONL append
@@ -850,7 +849,7 @@ impl TaskJournalServer {
                 // (commit, branch, PR) into the close event so the resume pack
                 // reads as a clickable ledger of what shipped. Best-effort and
                 // structured (merged in db::index_event) — never fails close.
-                if let Ok(dir) = std::env::current_dir() {
+                if let Ok(dir) = project_dir() {
                     let arts = tj_core::harvest::harvest(&dir);
                     if !arts.is_empty() {
                         if let Ok(v) = serde_json::to_value(&arts) {
@@ -1658,6 +1657,90 @@ mod tests {
         assert!(search(&server, "", None, Some("relative/dir"), None)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn task_close_harvests_the_project_dir_not_the_cwd() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        // The test binary runs inside this repo's checkout, while the project
+        // dir is a temp dir. A close must never stamp the cwd repo's commit.
+        let cwd_commit = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let Some(cwd_commit) = cwd_commit else {
+            return; // not run from a git checkout: nothing to tell apart
+        };
+
+        let task = create_task(&server, "Harvest dir").await;
+        server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: task.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+            }))
+            .await
+            .unwrap();
+
+        let (_, events_path, _) = project_paths().unwrap();
+        let jsonl = std::fs::read_to_string(&events_path).unwrap();
+        let close = jsonl
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["task_id"] == task.as_str() && v["type"] == "close")
+            .expect("close event in jsonl");
+        assert!(
+            !close["meta"].to_string().contains(&cwd_commit),
+            "close harvested the cwd repo ({cwd_commit}): {}",
+            close["meta"]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_close_records_outcome_only_through_the_close_event() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        let task = create_task(&server, "Append fails").await;
+        let close = |outcome: &str| TaskCloseParams {
+            task_id: task.clone(),
+            reason: "done".into(),
+            outcome: Some(outcome.into()),
+            outcome_tag: Some("done".into()),
+        };
+
+        // Make the close append fail: the journal is read-only.
+        let (_, events_path, state_path) = project_paths().unwrap();
+        let writable = std::fs::metadata(&events_path).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&events_path, read_only).unwrap();
+        let res = server.task_close(Parameters(close("must not stick"))).await;
+        std::fs::set_permissions(&events_path, writable).unwrap();
+        assert!(res.is_err(), "append to a read-only journal must fail");
+
+        let conn_arc = cached_open(&state_path).unwrap();
+        {
+            let conn = conn_arc.lock().unwrap();
+            let meta = tj_core::db::task_metadata(&conn, &task).unwrap().unwrap();
+            assert_eq!(meta.outcome, None, "failed close left an outcome behind");
+            let status = tj_core::db::task_status(&conn, &task).unwrap();
+            assert_eq!(status.as_deref(), Some("open"));
+        }
+
+        server
+            .task_close(Parameters(close("shipped")))
+            .await
+            .unwrap();
+        let conn = conn_arc.lock().unwrap();
+        let meta = tj_core::db::task_metadata(&conn, &task).unwrap().unwrap();
+        assert_eq!(meta.outcome.as_deref(), Some("shipped"));
+        assert_eq!(meta.outcome_tag.as_deref(), Some("done"));
     }
 
     #[test]
