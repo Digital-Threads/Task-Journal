@@ -157,15 +157,19 @@ mod tests {
     fn list_sessions_sorted_by_mtime_newest_first() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Create files with different modification times.
-        let older = dir.path().join("older.jsonl");
-        std::fs::write(&older, "{}").unwrap();
-
-        // Sleep briefly to ensure different mtime.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let newer = dir.path().join("newer.jsonl");
-        std::fs::write(&newer, "{}").unwrap();
+        // Set the mtimes explicitly: a sleep between two writes is not enough
+        // when the wall clock steps back (seen on WSL), and it slows the test.
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for (name, secs) in [("older.jsonl", 0), ("newer.jsonl", 60)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
 
         let sessions = list_sessions(dir.path()).unwrap();
         assert_eq!(sessions.len(), 2);
