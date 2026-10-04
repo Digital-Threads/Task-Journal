@@ -94,8 +94,13 @@ fn active_task(conn: &Connection, task_id: &str) -> anyhow::Result<ActiveTask> {
     )?;
 
     let mut counts = BTreeMap::new();
-    let mut stmt =
-        conn.prepare("SELECT type, COUNT(*) FROM events_index WHERE task_id = ?1 GROUP BY type")?;
+    // Corrected entries and bookkeeping (compaction markers, model switches)
+    // are not part of what the task holds.
+    let mut stmt = conn.prepare(
+        "SELECT type, COUNT(*) FROM events_index
+         WHERE task_id = ?1 AND corrected_by IS NULL AND bookkeeping = 0
+         GROUP BY type",
+    )?;
     for row in stmt.query_map([task_id], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })? {
@@ -107,6 +112,7 @@ fn active_task(conn: &Connection, task_id: &str) -> anyhow::Result<ActiveTask> {
         "SELECT e.type, f.text FROM events_index e
          JOIN search_fts f ON f.event_id = e.event_id
          WHERE e.task_id = ?1 AND e.type NOT IN ('open', 'amend')
+           AND e.corrected_by IS NULL AND e.bookkeeping = 0
          ORDER BY e.timestamp DESC, e.event_id DESC LIMIT ?2",
     )?;
     let mut recent = stmt
@@ -192,6 +198,44 @@ mod tests {
         assert_eq!(closed.active.unwrap().task_id, "tj-sub");
         let unknown = session_state(&conn, "p", Some("s1"), Some("tj-nope")).unwrap();
         assert_eq!(unknown.active.unwrap().task_id, "tj-sub");
+    }
+
+    #[test]
+    fn corrected_entries_are_left_out_of_counts_and_recent() {
+        let (_dir, conn) = conn();
+        write(&conn, "tj-a", EventType::Open, "a", Some("s1"));
+        let mut wrong = Event::new(
+            "tj-a",
+            EventType::Decision,
+            Author::Agent,
+            Source::Chat,
+            "Use X".into(),
+        );
+        crate::session_id::stamp_session_id(&mut wrong.meta, Some("s1"));
+        crate::db::upsert_task_from_event(&conn, &wrong, "p").unwrap();
+        crate::db::index_event(&conn, &wrong).unwrap();
+        let mut fix = Event::new(
+            "tj-a",
+            EventType::Correction,
+            Author::Agent,
+            Source::Chat,
+            "Not X, Y".into(),
+        );
+        fix.corrects = Some(wrong.event_id.clone());
+        crate::db::upsert_task_from_event(&conn, &fix, "p").unwrap();
+        crate::db::index_event(&conn, &fix).unwrap();
+
+        let active = session_state(&conn, "p", Some("s1"), None)
+            .unwrap()
+            .active
+            .unwrap();
+        assert_eq!(
+            active.counts.get("decision"),
+            None,
+            "the corrected decision is not counted"
+        );
+        assert!(active.recent.iter().all(|r| r.text != "Use X"));
+        assert!(active.recent.iter().any(|r| r.text == "Not X, Y"));
     }
 
     #[test]
