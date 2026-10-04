@@ -2524,7 +2524,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
- "libc",
+ "fd-lock",
  "mockito",
  "predicates",
  "ratatui",

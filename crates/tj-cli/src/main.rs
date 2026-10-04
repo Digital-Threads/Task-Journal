@@ -187,6 +187,10 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             state_dir.join(format!("{to_hash}.sqlite-shm")),
         ),
         (
+            state_dir.join(format!("{from_hash}.recall-shown")),
+            state_dir.join(format!("{to_hash}.recall-shown")),
+        ),
+        (
             metrics_dir.join(format!("{from_hash}.jsonl")),
             metrics_dir.join(format!("{to_hash}.jsonl")),
         ),
@@ -214,6 +218,29 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             .with_context(|| format!("checkpoint WAL of {src_state_path:?}"))?;
     }
 
+    // --force: the JSONL is the source of truth, so keep the journal being
+    // replaced. A copy, so a failed move still leaves the destination intact.
+    let (src_jsonl, dst_jsonl) = &pairs[0];
+    let mut backup = None;
+    if src_jsonl.exists() && dst_jsonl.metadata().is_ok_and(|m| m.len() > 0) {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let bak = dst_jsonl.with_file_name(format!("{to_hash}.jsonl.bak-{stamp}"));
+        std::fs::copy(dst_jsonl, &bak).with_context(|| format!("back up {dst_jsonl:?}"))?;
+        backup = Some(bak);
+    }
+
+    // --force: a destination `-wal` / `-shm` belongs to the database being
+    // replaced. Left next to the one moving in, SQLite would replay it into
+    // it; the source's own sidecars, if any, are moved in below.
+    if src_state_path.exists() {
+        for suffix in ["-wal", "-shm"] {
+            let stale = state_dir.join(format!("{to_hash}.sqlite{suffix}"));
+            if stale.exists() {
+                std::fs::remove_file(&stale).with_context(|| format!("remove {stale:?}"))?;
+            }
+        }
+    }
+
     let mut moved: Vec<String> = Vec::new();
     for (src, dst) in &pairs {
         if !src.exists() {
@@ -227,6 +254,34 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         // a failed move under --force leaves the destination intact.
         std::fs::rename(src, dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
         moved.push(dst.display().to_string());
+    }
+
+    // Queued chunks carry the hash in their name and, for the worker's
+    // ownership check, in their `project_hash`.
+    let pending_dir = events_dir.with_file_name("pending");
+    if pending_dir.exists() {
+        let prefix = format!("{from_hash}.");
+        for src in std::fs::read_dir(&pending_dir)?.flatten().map(|e| e.path()) {
+            let Some(rest) = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(&prefix))
+            else {
+                continue;
+            };
+            let dst = pending_dir.join(format!("{to_hash}.{rest}"));
+
+            let body = std::fs::read_to_string(&src)?;
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if v["project_hash"] == from_hash.as_str() {
+                    v["project_hash"] = to_hash.clone().into();
+                    std::fs::write(&src, serde_json::to_string_pretty(&v)?)?;
+                }
+            }
+
+            std::fs::rename(&src, &dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
+            moved.push(dst.display().to_string());
+        }
     }
 
     // Re-key the project_hash columns inside the (now renamed) SQLite.
@@ -258,6 +313,9 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             println!("  {path}");
         }
         println!("  project_hash {from_hash} -> {to_hash}");
+    }
+    if let Some(bak) = backup {
+        println!("kept the replaced journal as {}", bak.display());
     }
     Ok(())
 }
@@ -2447,14 +2505,13 @@ fn real_main() -> Result<()> {
             };
 
             // The Claude Code mod captures in-process and marks the hooks it
-            // starts; the classic capture stands down instead of doing the
-            // same work twice. Resume packs and model switches stay ours.
-            if mod_active()
-                && matches!(
-                    kind.as_str(),
-                    "UserPromptSubmit" | "PostToolUse" | "Stop" | "PreCompact" | "SessionEnd"
-                )
-            {
+            // starts; the classic capture stands down where the mod does the
+            // same work: the Stop / PreCompact / SessionEnd transcript
+            // catch-up (and the compaction marker) here, per-message queueing
+            // and auto-open further down. Push-recall, the `/rewind`
+            // correction, resume packs and model switches stay ours.
+            let mod_on = mod_active();
+            if mod_on && matches!(kind.as_str(), "Stop" | "PreCompact" | "SessionEnd") {
                 return Ok(());
             }
 
@@ -3010,6 +3067,11 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 writer.append(&event)?;
                 writer.flush_durable()?;
                 println!("{}", event.event_id);
+                return Ok(());
+            }
+
+            // The mod classifies prompts and tool calls itself (see above).
+            if mod_on && matches!(kind.as_str(), "UserPromptSubmit" | "PostToolUse") {
                 return Ok(());
             }
 
@@ -5791,100 +5853,33 @@ fn spawn_classify_worker(backend: &str) -> anyhow::Result<()> {
 /// Characters of a PostToolUse chunk (tool input + response) that get queued.
 const POST_TOOL_USE_TEXT_MAX: usize = 2000;
 
-/// How long an empty (pid not yet written) worker lockfile counts as held.
-const LOCK_PID_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// File-lock guard for the classify-worker. Holds the lockfile until
-/// dropped; ensures cleanup on panic. One worker per project_hash.
-struct WorkerLock {
-    path: std::path::PathBuf,
-}
-
-impl WorkerLock {
-    /// Try to acquire the lock. Returns Ok(Some(_)) on success, Ok(None)
-    /// if another live worker holds it, Err on filesystem failure.
-    fn try_acquire(project_hash: &str) -> anyhow::Result<Option<Self>> {
-        let dir = tj_core::paths::state_dir()?;
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("classifier-{project_hash}.lock"));
-
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", std::process::id());
-                    return Ok(Some(Self { path }));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Inspect existing lockfile. If PID is alive → another
-                    // worker is running; back off. If dead → remove stale
-                    // file and retry.
-                    let body = std::fs::read_to_string(&path).unwrap_or_default();
-                    match body.trim().parse::<u32>() {
-                        Ok(pid) if pid_is_alive(pid) => return Ok(None),
-                        Ok(_) => {}
-                        Err(_) => {
-                            // No PID yet: the holder may sit between
-                            // `create_new` and the pid write. Only a lock
-                            // that stayed empty past the grace is stale.
-                            let fresh = std::fs::metadata(&path)
-                                .and_then(|m| m.modified())
-                                .map(|t| t.elapsed().unwrap_or_default() < LOCK_PID_GRACE)
-                                .unwrap_or(false);
-                            if fresh {
-                                return Ok(None);
-                            }
-                        }
-                    }
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-}
-
-impl Drop for WorkerLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
-    // kill(pid, 0) probes existence without sending a signal.
-    // SAFETY: libc::kill is a thin syscall wrapper, no aliasing concerns.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-
-    // EPERM: the process exists but belongs to another user.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    // Conservative on non-Unix: assume alive so we don't double-spawn.
-    // The lockfile gets cleaned up on Drop in the normal exit path.
-    true
-}
-
 /// classify-worker: drain pending v2 entries by running the real
 /// classifier. v1 entries (legacy text+error shape) are left for
-/// `pending retry`. Holds a project-scoped file lock so only one
+/// `pending retry`. Holds a project-scoped OS lock so only one
 /// worker per project runs at a time.
 fn run_classify_worker(backend: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
 
-    let lock = match WorkerLock::try_acquire(&project_hash)? {
-        Some(l) => l,
-        None => return Ok(()), // another worker is running
+    // An advisory lock held for the worker's lifetime. The OS releases it
+    // when the process exits or dies, so a leftover file never blocks the
+    // next worker and needs no stale-pid check. The file is never deleted:
+    // a worker could lock the unlinked file while another creates and
+    // locks a fresh one.
+    let state_dir = tj_core::paths::state_dir()?;
+    std::fs::create_dir_all(&state_dir)?;
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_dir.join(format!("classifier-{project_hash}.lock")))?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _held = match lock.try_write() {
+        Ok(guard) => guard,
+        // Another worker of this project is running.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        Err(e) => return Err(e.into()),
     };
 
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
@@ -5894,8 +5889,26 @@ fn run_classify_worker(backend: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("events_dir has no grandparent"))?
         .join("pending");
     if !pending.exists() {
-        drop(lock);
         return Ok(());
+    }
+
+    // A worker that died mid-entry left it claimed. We hold the lock, so no
+    // other worker of this project is on it: put it back in the queue.
+    for claimed in std::fs::read_dir(&pending)?.flatten().map(|e| e.path()) {
+        let Some(name) = claimed
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".processing"))
+        else {
+            continue;
+        };
+        let ours = std::fs::read_to_string(&claimed)
+            .ok()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v["project_hash"] == project_hash.as_str());
+        if ours {
+            let _ = std::fs::rename(&claimed, pending.join(name));
+        }
     }
 
     // Snapshot entries up front so concurrent re-queues don't loop us.
@@ -5912,7 +5925,6 @@ fn run_classify_worker(backend: &str) -> Result<()> {
         }
     }
 
-    drop(lock);
     Ok(())
 }
 
@@ -5951,22 +5963,37 @@ fn process_pending_entry(
     // Inherit the session id queued on the v2 chunk (additive; absent → None).
     let chunk_session_id = tj_core::session_id::session_id_from_payload(&v);
 
-    let classifier = build_classifier(backend)?;
-    let outcome = classify_chunk(
-        classifier.as_ref(),
-        events_path,
-        project_hash,
-        &kind,
-        &text,
-        chunk_session_id.as_deref(),
-    )?;
-    if let ChunkOutcome::Unplaced(err) = outcome {
-        // Persist as legacy v1 pending entry so `pending retry`
-        // surfaces it; remove the v2 source.
-        persist_pending(events_path, project_hash, &kind, &text, &err)?;
+    // Claim the entry before the classifier call: a rename succeeds for one
+    // process only, so an entry is never classified (and recorded) twice.
+    let claimed = path.with_extension("json.processing");
+    if std::fs::rename(path, &claimed).is_err() {
+        return Ok(()); // someone else took it
     }
 
-    std::fs::remove_file(path)?;
+    let classified = (|| -> anyhow::Result<()> {
+        let classifier = build_classifier(backend)?;
+        let outcome = classify_chunk(
+            classifier.as_ref(),
+            events_path,
+            project_hash,
+            &kind,
+            &text,
+            chunk_session_id.as_deref(),
+        )?;
+        if let ChunkOutcome::Unplaced(err) = outcome {
+            // Persist as legacy v1 pending entry so `pending retry`
+            // surfaces it; remove the v2 source.
+            persist_pending(events_path, project_hash, &kind, &text, &err)?;
+        }
+        Ok(())
+    })();
+    if classified.is_err() {
+        // Back in the queue under its own name for the next worker.
+        let _ = std::fs::rename(&claimed, path);
+        return classified;
+    }
+
+    std::fs::remove_file(&claimed)?;
     Ok(())
 }
 
@@ -6835,14 +6862,6 @@ mod inline_tests {
             tj_core::session_id::session_id_from_payload(&v).as_deref(),
             Some("sess-9")
         );
-    }
-
-    /// PID 1 always exists; for a non-root user `kill(1, 0)` fails with EPERM,
-    /// which means "alive, not ours" — never "dead".
-    #[cfg(unix)]
-    #[test]
-    fn pid_is_alive_treats_eperm_as_alive() {
-        assert!(pid_is_alive(1));
     }
 
     #[test]

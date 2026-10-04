@@ -1124,10 +1124,12 @@ fn migrate_project_force_keeps_destination_when_the_move_fails() {
     );
 }
 
+/// The JSONL is the source of truth: `--force` keeps the journal it replaces
+/// as `<dst>.jsonl.bak-<timestamp>` and says where it went.
 #[test]
 fn migrate_project_force_replaces_existing_destination() {
     let xdg = assert_fs::TempDir::new().unwrap();
-    let (proj_a, proj_b, _, _) = two_projects();
+    let (proj_a, proj_b, _, to_hash) = two_projects();
 
     for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
         Command::cargo_bin("task-journal")
@@ -1139,7 +1141,23 @@ fn migrate_project_force_replaces_existing_destination() {
             .success();
     }
 
-    migrate(xdg.path(), proj_a.path(), proj_b.path(), true);
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+            "--force",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
 
     Command::cargo_bin("task-journal")
         .unwrap()
@@ -1149,6 +1167,119 @@ fn migrate_project_force_replaces_existing_destination() {
         .assert()
         .success()
         .stdout(contains("Source task").and(contains("Overwritten task").not()));
+
+    let events = xdg.path().join("task-journal").join("events");
+    let backup = std::fs::read_dir(&events)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("{to_hash}.jsonl.bak-"))
+        })
+        .unwrap_or_else(|| panic!("no backup of the replaced journal; stdout: {out}"));
+    assert!(std::fs::read_to_string(&backup)
+        .unwrap()
+        .contains("Overwritten task"));
+    assert!(out.contains(&backup.display().to_string()), "{out}");
+}
+
+/// A destination WAL left behind by the database `--force` replaces must not
+/// be replayed into the one moving in.
+#[test]
+fn migrate_project_force_drops_the_replaced_databases_wal() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", title])
+            .assert()
+            .success();
+    }
+    drop(tj_core::db::open(state.join(format!("{from_hash}.sqlite"))).unwrap());
+
+    // A crash leftover: the destination's WAL with a write never folded in.
+    let dst_db = state.join(format!("{to_hash}.sqlite"));
+    let dst_wal = state.join(format!("{to_hash}.sqlite-wal"));
+    {
+        let conn = tj_core::db::open(&dst_db).unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        conn.execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES ('stale-wal', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let wal = std::fs::read(&dst_wal).unwrap();
+        drop(conn);
+        std::fs::write(&dst_wal, wal).unwrap();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), true);
+
+    let conn = rusqlite::Connection::open(&dst_db).unwrap();
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dream_state WHERE project_hash = 'stale-wal'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "the replaced database's WAL was replayed");
+}
+
+/// Queued chunks and the push-recall log are keyed by the project hash too.
+/// After a move the new project's worker classifies what the old one queued.
+#[test]
+fn migrate_project_rekeys_pending_entries_and_the_recall_log() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let pending = xdg.path().join("task-journal").join("pending");
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Queue host"])
+        .assert()
+        .success();
+    let queued = write_pending_entry(
+        &pending,
+        &format!("{from_hash}.01JD0000000000000000000000.json"),
+        Some(&from_hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use store-moved for the cache",
+    );
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join(format!("{from_hash}.recall-shown")), "s1 e1\n").unwrap();
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    assert!(!queued.exists(), "entry left under the old hash");
+    assert_eq!(
+        std::fs::read_to_string(state.join(format!("{to_hash}.recall-shown"))).unwrap(),
+        "s1 e1\n"
+    );
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+    let journal = project_events(xdg.path(), &to_hash);
+    assert!(journal.contains("store-moved"), "{journal}");
 }
 
 #[test]
@@ -2249,7 +2380,8 @@ fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
 }
 
 /// The Claude Code mod captures in-process and sets TJ_MOD_ACTIVE for the
-/// hooks it starts; the classic capture must then stand down.
+/// hooks it starts; the classic capture must then stand down. (Nothing here
+/// echoes a prior entry, so push-recall stays quiet too.)
 #[test]
 fn mod_active_silences_the_classic_capture_hooks() {
     for kind in [
@@ -2271,6 +2403,77 @@ fn mod_active_keeps_session_start_and_model_switch() {
     for kind in ["SessionStart", "PostModelSwitch"] {
         assert!(hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
     }
+}
+
+/// The mod takes over capture, not push-recall: a tool call that echoes a
+/// prior rejection still gets the recall on both paths, and nothing is queued.
+#[test]
+fn mod_active_keeps_push_recall() {
+    let (dir, _task_id) = seed_axum_rejection();
+
+    for tool in ["Bash", "mcp__x__do"] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": "let's switch the server to axum" },
+            "tool_response": { "output": "" }
+        });
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+            .env("TJ_MOD_ACTIVE", "1")
+            .args(["ingest-hook", "--backend", "heuristic"])
+            .write_stdin(payload.to_string())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("previously rejected"), "{tool}: {out}");
+    }
+
+    let pending = std::fs::read_dir(dir.path().join("task-journal").join("pending"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(pending, 0, "the mod queues tool calls itself");
+}
+
+/// `/rewind` is the user rolling back a path — the mod doesn't record that,
+/// so the correction event still lands.
+#[test]
+fn mod_active_keeps_the_rewind_correction() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Rewind host"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .env("TJ_MOD_ACTIVE", "1")
+        .current_dir(proj.path())
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "/rewind go back to plan A",
+            })
+            .to_string(),
+        )
+        .assert()
+        .success();
+
+    let journal = project_events(xdg.path(), &hash);
+    assert_eq!(session_ids_of(&journal, "correction").len(), 1, "{journal}");
 }
 
 #[test]
@@ -3778,28 +3981,11 @@ fn classify_worker_handles_classifier_failure_cleanly() {
         .args(["classify-worker", "--backend", "hybrid"])
         .assert()
         .success();
-
-    // Lockfile must not be left behind.
-    let state = dir.path().join("task-journal").join("state");
-    if state.exists() {
-        for e in std::fs::read_dir(&state).unwrap() {
-            let p = e.unwrap().path();
-            assert!(
-                !p.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .ends_with(".lock"),
-                "lockfile must be removed after worker exits, found: {p:?}"
-            );
-        }
-    }
 }
 
-/// Lockfile prevents concurrent workers in the same project. We can't
-/// easily race two real spawns deterministically in a unit test, so
-/// instead simulate a held lock by writing a lockfile with our own
-/// (live) PID, then run classify-worker and assert it exits cleanly
-/// without draining the queue.
+/// One worker per project, enforced by an OS lock on the lock file, not by
+/// what the file says: while another process holds the lock, a worker
+/// leaves the queue alone — even when the file names a dead pid.
 #[test]
 fn classify_worker_respects_existing_lock() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -3831,13 +4017,19 @@ fn classify_worker_respects_existing_lock() {
     )
     .unwrap();
 
-    // Hand-roll a lockfile with this process's (live) PID. The
-    // worker should see the live PID and bail without touching the
-    // pending entry.
+    // Hold the lock from this process, over a file naming a dead pid.
     let state = dir.path().join("task-journal").join("state");
     std::fs::create_dir_all(&state).unwrap();
     let lock_path = state.join(format!("classifier-{project_hash}.lock"));
-    std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+    std::fs::write(&lock_path, format!("{}\n", i32::MAX)).unwrap();
+    let mut lock = fd_lock::RwLock::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap(),
+    );
+    let _held = lock.try_write().unwrap();
 
     Command::cargo_bin("task-journal")
         .unwrap()
@@ -3860,12 +4052,12 @@ fn classify_worker_respects_existing_lock() {
     );
 }
 
-/// The lock is created empty and the pid is written a moment later. A
-/// second worker that reads it in between must treat it as held, not as a
-/// stale lock to delete and steal. An empty lock that has sat for a while
-/// is a crashed worker's leftover and is taken over.
+/// A lock file nobody holds is a finished or crashed worker's leftover —
+/// whatever it says (empty, or a pid that is alive again under another
+/// program) the next worker takes over: the OS released the lock with the
+/// process.
 #[test]
-fn classify_worker_treats_fresh_empty_lock_as_held() {
+fn classify_worker_takes_over_a_leftover_lock_file() {
     let dir = assert_fs::TempDir::new().unwrap();
     let cwd = std::env::current_dir().unwrap();
     let project_hash = tj_core::project_hash::from_path(&cwd).expect("compute project hash");
@@ -3878,54 +4070,163 @@ fn classify_worker_treats_fresh_empty_lock_as_held() {
         .join("events")
         .join(format!("{project_hash}.jsonl"));
     std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
-    let entry = pending.join("01emptylock.json");
-    std::fs::write(
-        &entry,
-        serde_json::json!({
-            "schema": "v2",
-            "kind": "PostToolUse",
-            "text": "empty lock marker",
-            "project_hash": project_hash,
-            "events_path": events_path.to_string_lossy(),
-            "backend": "heuristic",
-            "queued_at": "2026-05-08T00:00:00Z",
-        })
-        .to_string(),
-    )
-    .unwrap();
-
     let state = dir.path().join("task-journal").join("state");
     std::fs::create_dir_all(&state).unwrap();
     let lock_path = state.join(format!("classifier-{project_hash}.lock"));
-    std::fs::write(&lock_path, "").unwrap();
 
-    let worker = || {
+    for leftover in [String::new(), format!("{}\n", std::process::id())] {
+        let entry = pending.join("01leftoverlock.json");
+        std::fs::write(
+            &entry,
+            serde_json::json!({
+                "schema": "v2",
+                "kind": "PostToolUse",
+                "text": "leftover lock marker",
+                "project_hash": project_hash,
+                "events_path": events_path.to_string_lossy(),
+                "backend": "heuristic",
+                "queued_at": "2026-05-08T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(&lock_path, &leftover).unwrap();
+
         Command::cargo_bin("task-journal")
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .args(["classify-worker", "--backend", "heuristic"])
             .assert()
             .success();
+
+        assert!(!entry.exists(), "lock file {leftover:?} is taken over");
+    }
+}
+
+/// Workers started at once on one queue — over a crashed worker's leftover
+/// lock — record each entry exactly once: no duplicate classifier calls, no
+/// duplicate events.
+#[test]
+fn classify_workers_started_together_record_each_entry_once() {
+    const ENTRIES: usize = 12;
+    const WORKERS: usize = 8;
+
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Worker race host"])
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    for i in 0..ENTRIES {
+        write_pending_entry(
+            &pending,
+            &format!("{hash}.01JB{i:022}.json"),
+            Some(&hash),
+            true,
+            "UserPromptSubmit",
+            &format!("We decided to use store-{i:02} for the cache"),
+        );
+    }
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join(format!("classifier-{hash}.lock")),
+        format!("{}\n", i32::MAX),
+    )
+    .unwrap();
+
+    let start = std::sync::Barrier::new(WORKERS);
+    std::thread::scope(|s| {
+        for _ in 0..WORKERS {
+            s.spawn(|| {
+                let mut cmd = Command::cargo_bin("task-journal").unwrap();
+                cmd.env("XDG_DATA_HOME", dir.path())
+                    .current_dir(&workdir)
+                    .args(["classify-worker", "--backend", "heuristic"]);
+                start.wait();
+                cmd.assert().success();
+            });
+        }
+    });
+
+    // The race can leave an entry to the next worker, never record it twice.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    let journal = project_events(dir.path(), &hash);
+    for i in 0..ENTRIES {
+        let marker = format!("store-{i:02}");
+        let n = journal.lines().filter(|l| l.contains(&marker)).count();
+        assert_eq!(n, 1, "{marker} recorded {n} times:\n{journal}");
+    }
+}
+
+/// A worker claims an entry (`<name>.processing`) before classifying it. A
+/// failed entry goes back under its own name; one a crashed worker left
+/// claimed is put back in the queue by the next worker and recorded.
+#[test]
+fn classify_worker_requeues_failed_and_orphaned_claims() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Claim host"])
+        .assert()
+        .success();
+    let pending = dir.path().join("task-journal").join("pending");
+    let worker = |backend: &str| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["classify-worker", "--backend", backend])
+            .assert()
+            .success();
     };
 
-    worker();
-    assert!(
-        entry.exists(),
-        "a fresh empty lock is held — entry must stay"
+    let queued = write_pending_entry(
+        &pending,
+        &format!("{hash}.01JC0000000000000000000000.json"),
+        Some(&hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use store-failed for the cache",
     );
-    assert!(lock_path.exists(), "a fresh empty lock must not be deleted");
+    worker("no-such-backend");
+    assert!(queued.exists(), "a failed entry is back under its own name");
 
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-    std::fs::File::options()
-        .write(true)
-        .open(&lock_path)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    let orphan = write_pending_entry(
+        &pending,
+        &format!("{hash}.01JC0000000000000000000001.json.processing"),
+        Some(&hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use store-orphan for the cache",
+    );
+    worker("heuristic");
 
-    worker();
-    assert!(!entry.exists(), "a stale empty lock is taken over");
-    assert!(!lock_path.exists(), "the new holder releases the lock");
+    assert!(!queued.exists() && !orphan.exists());
+    let journal = project_events(dir.path(), &hash);
+    for marker in ["store-failed", "store-orphan"] {
+        let n = journal.lines().filter(|l| l.contains(marker)).count();
+        assert_eq!(n, 1, "{marker} recorded {n} times:\n{journal}");
+    }
 }
 
 // ---------------- pending/ is global: every consumer is project-scoped ----------------
