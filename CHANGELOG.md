@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-10-04
+
+### Fixed
+- The session start now names the chronicle's most important gap (for
+  example "no module map yet") also when the project has no open task. Before,
+  the hook returned before reaching that line, so a project whose tasks were
+  all closed never got the invitation to map it.
+
 ## [0.31.0] - 2026-10-04
 
 The journal becomes a map of the system. A project splits into modules — parts

@@ -8873,3 +8873,29 @@ fn a_worktree_shares_the_main_checkouts_module_map() {
         .success()
         .stdout(contains(id.as_str()).not());
 }
+
+#[test]
+fn session_start_names_the_chronicle_gap_with_no_open_task() {
+    // A project whose tasks are all closed has no resume pack to show, yet
+    // the chronicle still has something to say.
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+    let mut create = tj();
+    create.args(["create", "Done work"]);
+    let id = stdout_of(create);
+    tj().args(["close", &id, "--outcome", "Shipped"])
+        .assert()
+        .success();
+
+    let mut hook = tj();
+    hook.args(["ingest-hook", "--kind", "SessionStart", "--text", ""]);
+    let out: serde_json::Value = serde_json::from_str(&stdout_of(hook)).unwrap();
+    let ctx = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+
+    assert!(ctx.contains("📚 Chronicle: no module map yet"), "{out}");
+}
