@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Gap {
     /// Tasks exist, but no module does.

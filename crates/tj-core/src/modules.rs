@@ -35,7 +35,7 @@ pub struct ModuleFields {
     pub merged_into: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Module {
     pub module_id: String,
     pub name: String,
@@ -417,7 +417,7 @@ const RU_STOPWORDS: &[&str] = &[
 ];
 
 /// A module the journal thinks a task belongs to. Only a hint: the AI decides.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Suggestion {
     pub module_id: String,
     pub name: String,
@@ -542,7 +542,7 @@ pub fn suggest(
 }
 
 /// A task with no module, with what the AI needs to place it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Candidate {
     pub task_id: String,
     pub title: String,
