@@ -600,8 +600,14 @@ pub fn backfill_candidates(
 /// A module page is read like a full task pack: same budget.
 const PAGE_BUDGET: usize = 32 * 1024;
 
-/// Entries each of decisions, rejections and constraints lists in full.
-const SECTION_ITEMS: usize = 40;
+/// Entries the decisions section lists; rejections and constraints list fewer.
+/// With one-line entries the three stay well inside the budget, so the
+/// history below them always shows.
+const DECISION_ITEMS: usize = 20;
+const OTHER_ITEMS: usize = 15;
+
+/// Longest entry on a page: the start of what was recorded, on one line.
+const ENTRY_CHARS: usize = 200;
 
 /// Closed tasks listed in full before older history shrinks to one line each.
 const FULL_HISTORY: usize = 30;
@@ -683,13 +689,25 @@ fn short(text: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-fn push_section(out: &mut String, title: &str, items: &[String]) {
+/// `text` as one line of at most `max` chars: line breaks and Markdown
+/// heading marks folded away, so an entry never breaks the page's structure.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text
+        .split_whitespace()
+        .filter(|w| !w.chars().all(|c| c == '#'))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    short(&flat, max)
+}
+
+fn push_section(out: &mut String, title: &str, items: &[String], limit: usize) {
     out.push_str(&format!("\n## {title}\n"));
     if items.is_empty() {
         out.push_str("- (none)\n");
     }
 
-    let shown = items.len().min(SECTION_ITEMS);
+    let shown = items.len().min(limit);
     for item in &items[..shown] {
         out.push_str(item);
         out.push('\n');
@@ -760,26 +778,33 @@ pub fn page(conn: &Connection, project_hash: &str, module_id: &str) -> anyhow::R
     }
 
     let (mut decisions, mut rejected, mut constraints) = (Vec::new(), Vec::new(), Vec::new());
+    let entry = |text: &str, marker: &str, task: &str| {
+        format!("- {}{marker} ({task})", one_line(text, ENTRY_CHARS))
+    };
     for r in &rows {
         for d in crate::pack::active_decisions(conn, &r.task_id)? {
-            decisions.push(format!("- {}{} ({})", d.text, d.marker(), r.task_id));
+            if !crate::pack::is_noise(&d.text) {
+                decisions.push(entry(&d.text, d.marker(), &r.task_id));
+            }
         }
         for x in crate::pack::rejections(conn, &r.task_id)? {
-            rejected.push(format!("- {}{} ({})", x.text, x.marker(), r.task_id));
+            if !crate::pack::is_noise(&x.text) {
+                rejected.push(entry(&x.text, x.marker(), &r.task_id));
+            }
         }
         for c in texts_of(conn, &r.task_id, "constraint")? {
-            constraints.push(format!("- {c} ({})", r.task_id));
+            constraints.push(entry(&c, "", &r.task_id));
         }
     }
-    push_section(&mut out, "Active decisions", &decisions);
-    push_section(&mut out, "Rejected", &rejected);
-    push_section(&mut out, "Constraints", &constraints);
+    push_section(&mut out, "Active decisions", &decisions, DECISION_ITEMS);
+    push_section(&mut out, "Rejected", &rejected, OTHER_ITEMS);
+    push_section(&mut out, "Constraints", &constraints, OTHER_ITEMS);
 
     let open: Vec<String> = open
         .iter()
-        .map(|r| format!("- {} {}", r.task_id, r.title))
+        .map(|r| format!("- {} {}", r.task_id, one_line(&r.title, ENTRY_CHARS)))
         .collect();
-    push_section(&mut out, "Open tasks", &open);
+    push_section(&mut out, "Open tasks", &open, OTHER_ITEMS);
 
     out.push_str("\n## History\n");
     if closed.is_empty() {
@@ -789,20 +814,21 @@ pub fn page(conn: &Connection, project_hash: &str, module_id: &str) -> anyhow::R
         let outcome = r.outcome.as_deref().unwrap_or("(no outcome)");
         if i < FULL_HISTORY {
             out.push_str(&format!(
-                "- {} · {} · {} — {outcome}\n",
+                "- {} · {} · {} — {}\n",
                 day(&r.at),
                 r.task_id,
-                r.title
+                one_line(&r.title, ENTRY_CHARS),
+                one_line(outcome, ENTRY_CHARS)
             ));
             if let Some(note) = &r.note {
-                out.push_str(&format!("  ↳ {note}\n"));
+                out.push_str(&format!("  ↳ {}\n", one_line(note, ENTRY_CHARS)));
             }
         } else {
             out.push_str(&format!(
                 "- {} · {} · {}\n",
                 day(&r.at),
                 r.task_id,
-                short(outcome, SHORT_OUTCOME)
+                one_line(outcome, SHORT_OUTCOME)
             ));
         }
     }
@@ -1306,6 +1332,57 @@ mod tests {
         assert!(p.len() <= PAGE_BUDGET, "{}", p.len());
         assert!(p.contains("## History"), "history cut away");
         assert!(p.contains("more"), "no sign that entries were left out");
+    }
+
+    #[test]
+    fn page_of_real_sized_entries_keeps_every_section() {
+        // Sizes from the real journal: ~600 B decisions, 2 KB multi-line
+        // rejections with their own Markdown headings, a few constraints.
+        let mut events = vec![named("real", "Real")];
+        for i in 0..10 {
+            let id = format!("tj-{i:02}");
+            events.push(open_task(&id, &["real"]));
+            for d in 0..6 {
+                events.push(said(
+                    &id,
+                    EventType::Decision,
+                    &format!("decision {d}: {}", "x".repeat(600)),
+                ));
+            }
+            let rejection = format!(
+                "## Summary\n{}\n## 1. Details\n{}",
+                "r".repeat(900),
+                "q".repeat(900)
+            );
+            events.push(said(&id, EventType::Rejection, &rejection));
+            events.push(said(&id, EventType::Constraint, &"c".repeat(400)));
+            if i > 0 {
+                events.push(close_task(
+                    &id,
+                    serde_json::json!({"outcome": "o".repeat(300)}),
+                ));
+            }
+        }
+        let (_d, conn) = journal(&events);
+
+        let p = page(&conn, "p", "real").unwrap();
+
+        assert!(p.len() <= PAGE_BUDGET, "{}", p.len());
+        for section in [
+            "## Constraints",
+            "## Open tasks",
+            "## History",
+            "tj-00",
+            "tj-09",
+        ] {
+            assert!(p.contains(section), "missing {section}");
+        }
+        // Each entry is one line: no heading smuggled in from an event's text.
+        assert_eq!(p.matches("## Summary").count(), 0, "{p}");
+        assert!(
+            p.lines().all(|l| l.chars().count() <= 400),
+            "a line runs too long"
+        );
     }
 
     #[test]
