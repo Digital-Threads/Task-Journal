@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-10-04
+
+Claude Code 2.1.287 added mods: plugins that run inside Claude Code and can
+shape the system prompt, the compaction and the status line. This release ships
+a Task Journal mod, makes every session (Claude Code and Codex alike) keep its
+own active task, and fixes what a full audit of the journal turned up.
+
+### Added
+- **Task Journal mod for Claude Code 2.1.287+**, bundled with the plugin
+  (`plugin/hooks/`). It keeps the session's active task in the system prompt, so
+  a compaction can no longer lose it, and asks the compaction summary to keep
+  the task id. Right before a compaction it asks the model what was decided but
+  never logged and records those as `suggested` events. It shows the task in
+  the status line, toasts each entry, and reminds the agent to log only after
+  several prompts without an entry. Options: `nudge_after_turns`,
+  `distill_on_compact`. While it runs, the classic hooks skip what it replaces
+  (the reminder, per-message classification, the transcript catch-ups) and keep
+  the rest (resume packs, push-recall, `/rewind`). On Claude Code older than
+  2.1.287 the mod doesn't load and everything else works as before.
+- **Per-session active task.** Events carry their session id and the index
+  keeps it, so two sessions in one project each resume their own task instead
+  of whichever task was touched last. Codex sessions bind the same way: the MCP
+  server reads the session id Codex sends with each tool call. Only deliberate
+  writes bind a session — a hook's model-switch note or a classifier's guess
+  landing on another task no longer pulls a fresh session onto it.
+- `task-journal state [--session] [--prefer]`: the session's active task,
+  counts and latest entries as JSON (schema `tj-state/1`).
+- `task-journal event --suggested --session --origin` for integrations, and an
+  optional `session_id` on the MCP write tools.
+- `task_search` honours `status` and `project`; with an empty query it lists the
+  project's tasks, and its result gains a `tasks` field (title, status, goal).
+- `doctor` reports whether `codex` is on PATH.
+
+### Fixed
+- **Re-indexing is linear and resumable.** Rebuilding the index cost time
+  quadratic in the journal's size (a 7,000-event journal: ~30 s); it is now
+  linear (~1.5 s for the same journal), commits in chunks, and a run that is
+  cut off picks up where it stopped instead of starting over.
+- **An older binary next to this one can't corrupt the index.** A 0.29 server
+  still running in an open session would rebuild the index without the new
+  columns; the next 0.30 call now notices and repairs it.
+- **Goals and external links survive a rebuild.** They lived only in SQLite; a
+  rebuild from the log dropped them, Loom links included. They are now in the
+  journal (on the open event, or an `amend` event for later changes).
+- **Corrections take effect.** A `correction` now hides the event it corrects
+  from every pack section and from `export-pr`.
+- **Packs say what is unconfirmed.** Suggested decisions and rejections are
+  marked; compaction markers and model-switch records no longer appear as
+  decisions, in `export-pr`, in recall or in global memory; a compact pack keeps
+  its gap summary; a cached pack no longer shows stale linked-task status.
+- **Auto-capture stays in its project.** The shared `pending/` queue was
+  processed by whichever project's worker ran first, so one project's chunks
+  could land in another's journal. Entries are now scoped to their project,
+  processed oldest first, and the classify worker holds an OS file lock, so two
+  workers can no longer pick up the same chunk.
+- A crash mid-write no longer costs the next event too; schema migrations are
+  atomic and safe when two processes open a fresh database.
+- `PostToolUse` chunks are capped and no longer turn tool output into bogus
+  `constraint` events; push-recall shows each hit once per session.
+- `pending retry` really retries, and `ingest-hook` no longer deletes failed
+  chunks before they can be retried.
+- The `codex` backend no longer triggers your own Codex hooks from inside a
+  `dream` or `complete` run.
+- `dream` no longer skips sessions forever after a scoped or partly failed run,
+  drops events for task ids the model made up, and survives an unreadable
+  transcript. `backfill` detects imported sessions reliably and indexes them.
+- FTS search no longer fails on punctuation or words like `AND`.
+- An empty `.git` directory (as Codex's sandbox briefly mounts in `/tmp`) is no
+  longer taken for a repository root; like git, a `.git` directory needs `HEAD`.
+- `task_close` harvests artifacts from the project dir; `event_add` and
+  `artifact_add` reject unknown task ids instead of writing orphan events.
+- `migrate-project` carries the WAL, the pending queue and the push-recall log
+  along, and keeps a backup of a destination journal it replaces.
+- `export`, `events list`, `rejected`, the TUI and the extractor got smaller
+  fixes (malformed lines, char-safe ids, key repeats, char counts).
+
+### Changed
+- The removed `ClaudeBinaryRunner`, the unused dream backends and the
+  `FileChanged` / `watchPaths` / `TJ_ASYNC_REWAKE` paths are gone; they were never
+  reachable.
+- `task-journal-core` is pinned once in the workspace; publishing waits for fmt,
+  clippy and tests to pass.
+- An `amend` line is skipped (with a warning) by binaries older than 0.30.0.
+- After upgrading, restart open Claude Code and Codex sessions; the first
+  command re-indexes the project once.
+
 ## [0.29.0] - 2026-09-25
 
 Three months of Claude Code releases (2.1.196 → 2.1.281) changed how hooks are
