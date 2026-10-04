@@ -38,14 +38,27 @@ pub fn project_root(start: &Path) -> PathBuf {
 /// where the project chronicle (the module map) lives. `None` when `dir` is
 /// not in a linked worktree: the project is its own home. A worktree's root
 /// holds a `.git` file naming its gitdir, whose `commondir` leads to the
-/// main repository's `.git`; a submodule's gitdir has no `commondir`.
+/// main repository's `.git`, which lists the worktree in turn; a submodule's
+/// gitdir has no `commondir`.
 pub fn chronicle_home(dir: &Path) -> Option<PathBuf> {
     let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let root = project_root(&dir);
-    let pointer = std::fs::read_to_string(root.join(".git")).ok()?;
-    let gitdir = root.join(pointer.trim().strip_prefix("gitdir:")?.trim());
+    let dot_git = dunce::canonicalize(root.join(".git")).ok()?;
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir =
+        dunce::canonicalize(root.join(pointer.trim().strip_prefix("gitdir:")?.trim())).ok()?;
     let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
     let common = dunce::canonicalize(gitdir.join(common.trim())).ok()?;
+
+    // Git's own check, both ways: the gitdir sits in the repository's
+    // `worktrees/` and names this worktree back. Without it, any folder
+    // with a forged `.git` file could join another repository's chronicle.
+    let back = std::fs::read_to_string(gitdir.join("gitdir")).ok()?;
+    let points_back = dunce::canonicalize(gitdir.join(back.trim())).ok()? == dot_git;
+    let is_listed = gitdir.parent() == Some(common.join("worktrees").as_path());
+    if !points_back || !is_listed || !common.join("HEAD").exists() {
+        return None;
+    }
 
     match common.file_name() {
         Some(name) if name == ".git" => common.parent().map(Path::to_path_buf),
@@ -190,6 +203,33 @@ mod tests {
         let main_root = dunce::canonicalize(&main).unwrap();
         assert_eq!(chronicle_home(&wt.join("deep/dir")), Some(main_root));
         assert_eq!(chronicle_home(&main.join("src")), None);
+    }
+
+    #[test]
+    fn a_forged_git_file_cannot_join_another_repository() {
+        // A downloaded folder whose `.git` file points, through a gitdir it
+        // ships itself, at someone else's repository: git would refuse it,
+        // because that repository lists no such worktree. So do we.
+        let d = tempfile::TempDir::new().unwrap();
+        let victim = d.path().join("victim");
+        std::fs::create_dir_all(victim.join(".git")).unwrap();
+        std::fs::write(victim.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let forged = d.path().join("forged");
+        let fake = forged.join("fake-gitdir");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(
+            fake.join("commondir"),
+            victim.join(".git").display().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            fake.join("gitdir"),
+            forged.join(".git").display().to_string(),
+        )
+        .unwrap();
+        std::fs::write(forged.join(".git"), format!("gitdir: {}\n", fake.display())).unwrap();
+
+        assert_eq!(chronicle_home(&forged), None);
     }
 
     #[test]
