@@ -2971,11 +2971,25 @@ fn real_main() -> Result<()> {
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                // The chronicle's most important gap, for every client that
+                // reads this hook (Claude Code with or without the mod, Codex),
+                // also when no task is open. Advice only: it never fails the
+                // session start.
+                let chronicle_line = tj_core::chronicle::Chronicle::open(&cwd)
+                    .and_then(|chr| tj_core::archive::gaps(&chr, &conn, &project_hash, None))
+                    .ok()
+                    .and_then(|gaps| tj_core::archive::headline(&gaps));
                 let recent =
                     recent_task_contexts(&conn, &project_hash, 3, live_session_id.as_deref())?;
                 if recent.is_empty() {
-                    if !prefs_block.is_empty() {
-                        emit_session_context(&prefs_block);
+                    let context = [Some(prefs_block.as_str()), chronicle_line.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if !context.is_empty() {
+                        emit_session_context(&context);
                     }
                     return Ok(());
                 }
@@ -3038,15 +3052,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                         ));
                     }
                 }
-                // The chronicle's most important gap, for every client that
-                // reads this hook (Claude Code with or without the mod, Codex).
-                // Advice only: it never fails the session start.
-                if let Some(line) = tj_core::chronicle::Chronicle::open(&cwd)
-                    .and_then(|chr| tj_core::archive::gaps(&chr, &conn, &project_hash, None))
-                    .ok()
-                    .and_then(|gaps| tj_core::archive::headline(&gaps))
-                {
-                    bundle.push_str(&line);
+                if let Some(line) = &chronicle_line {
+                    bundle.push_str(line);
                     bundle.push_str("\n\n");
                 }
                 for tc in &recent {
