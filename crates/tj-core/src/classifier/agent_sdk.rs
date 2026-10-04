@@ -50,10 +50,10 @@ pub trait CommandRunner: Send + Sync {
     }
 }
 
-/// Build the base `claude` invocation shared by both runners: print mode, the
-/// pinned model, the JSON envelope, an isolated MCP config, and — critically —
-/// the [`IN_CLASSIFIER_ENV`] recursion marker. The argv runner appends the
-/// prompt as a positional arg; the stdin runner feeds it on stdin. Extracted so
+/// Build the base `claude` invocation: print mode, the pinned model, the JSON
+/// envelope, an isolated MCP config, and — critically — the
+/// [`IN_CLASSIFIER_ENV`] recursion marker. The prompt goes on stdin (see
+/// [`ClaudeBinaryStdinRunner`]), never as a positional arg. Extracted so
 /// a unit test can assert the marker is present without spawning `claude` (the
 /// missing marker is exactly what let the fork bomb through before).
 fn base_claude_command(model: &str) -> Command {
@@ -78,12 +78,6 @@ fn base_claude_command(model: &str) -> Command {
 /// completion, never tool use). Listed explicitly because there is no wildcard.
 const DISABLED_TOOLS: &str = "Bash Read Edit Write Glob Grep Task WebFetch \
 WebSearch NotebookEdit TodoWrite BashOutput KillBash";
-
-/// Production runner: invokes the local `claude` binary in print mode, pinned
-/// to the given model, asking for the JSON envelope and an isolated MCP config
-/// (`--strict-mcp-config` keeps the project's own MCP servers — including this
-/// very journal — out of the classification subprocess).
-pub struct ClaudeBinaryRunner;
 
 /// Build the error for a non-zero `claude -p` exit. With `--output-format
 /// json` claude reports the real cause (invalid model, usage limit, auth) as
@@ -170,31 +164,15 @@ pub(crate) fn wait_with_timeout(
     })
 }
 
-impl CommandRunner for ClaudeBinaryRunner {
-    fn run(&self, model: &str, prompt: &str) -> anyhow::Result<String> {
-        let child = base_claude_command(model)
-            .arg(prompt)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to spawn `claude` (is Claude Code installed and on PATH?)")?;
-        let output = wait_with_timeout(child, claude_timeout())?;
-        if !output.status.success() {
-            return Err(claude_exit_error(
-                output.status,
-                &output.stdout,
-                &output.stderr,
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-}
-
-/// Like [`ClaudeBinaryRunner`] but feeds the prompt on **stdin** instead of as
-/// an argv argument. Use for large prompts (e.g. a whole session transcript in
-/// dream backfill) that would otherwise blow the per-argument size limit
-/// (`E2BIG`, ~128 KiB on Linux). `claude -p` with no positional prompt reads
-/// the prompt from stdin.
+/// Production runner: invokes the local `claude` binary in print mode, pinned
+/// to the given model, asking for the JSON envelope and an isolated MCP config
+/// (`--strict-mcp-config` keeps the project's own MCP servers — including this
+/// very journal — out of the classification subprocess). The prompt goes on
+/// **stdin**, not as an argv argument: that sidesteps the `--disallowed-tools`
+/// collision (see [`CommandRunner::feeds_prompt_on_stdin`]) and the
+/// per-argument size limit (`E2BIG`, ~128 KiB on Linux) that a whole session
+/// transcript in dream backfill would blow. `claude -p` with no positional
+/// prompt reads the prompt from stdin.
 pub struct ClaudeBinaryStdinRunner;
 
 impl CommandRunner for ClaudeBinaryStdinRunner {
@@ -511,9 +489,9 @@ mod tests {
         assert!(format!("{err}").contains("error"), "got: {err}");
     }
 
-    /// Regression: the production classifier MUST feed the prompt on stdin. With
-    /// the argv runner the prompt lands right after `--disallowed-tools` and the
-    /// current `claude` CLI swallows it as bogus deny-rules, failing every
+    /// Regression: the production classifier MUST feed the prompt on stdin. As
+    /// an argv positional the prompt lands right after `--disallowed-tools` and
+    /// the current `claude` CLI swallows it as bogus deny-rules, failing every
     /// classification (the "139 pending" backlog). Lock the choice here.
     #[test]
     fn production_runner_feeds_prompt_on_stdin() {
@@ -521,8 +499,6 @@ mod tests {
             default_runner().feeds_prompt_on_stdin(),
             "classifier prompt must go on stdin, not as an argv positional"
         );
-        // the argv runner is the one that collides — keep the contrast explicit
-        assert!(!ClaudeBinaryRunner.feeds_prompt_on_stdin());
         assert!(ClaudeBinaryStdinRunner.feeds_prompt_on_stdin());
     }
 }
