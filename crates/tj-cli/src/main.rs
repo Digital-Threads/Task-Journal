@@ -4246,6 +4246,12 @@ fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usiz
 /// substantial work but logged little — escalate. All signals are cheap (a file
 /// size + a tail scan); no model, never blocks the prompt.
 fn run_nudge() -> anyhow::Result<()> {
+    // Recursion guard, same as recall-hook: never inject into our own
+    // classifier child (`claude -p` / `codex exec` re-run the user's hooks).
+    if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
+        return Ok(());
+    }
+
     let mut ctx = NUDGE_BASE.to_string();
     let escalation = (|| -> Option<String> {
         use std::io::{IsTerminal, Read};

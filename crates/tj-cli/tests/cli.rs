@@ -1967,6 +1967,22 @@ fn ingest_hook_short_circuits_when_in_classifier_env_set() {
 }
 
 #[test]
+fn nudge_is_silent_inside_a_classifier_child() {
+    // A `claude -p` / `codex exec` spawned by the classifier re-runs the
+    // user's UserPromptSubmit hooks; the nudge must not inject into it.
+    let dir = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_IN_CLASSIFIER", "1")
+        .args(["nudge"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
 fn ingest_hook_reads_user_prompt_submit_payload_from_stdin() {
     // Real Claude Code passes hook input as JSON over stdin, NOT via env
     // vars. Without this, every captured event has empty text and the
