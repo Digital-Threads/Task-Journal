@@ -1173,6 +1173,54 @@ fn all_projects_search_and_rejected_warn_about_unreadable_projects() {
 }
 
 #[test]
+fn rejected_warns_about_a_row_it_cannot_read_and_keeps_the_rest() {
+    use tj_core::event::{Author, Event, EventType, Source};
+    let dir = assert_fs::TempDir::new().unwrap();
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let hash = "aaaa1111aaaa1111";
+    let conn = tj_core::db::open(state.join(format!("{hash}.sqlite"))).unwrap();
+
+    for task_id in ["tj-good1", "tj-bad1"] {
+        let mut open = Event::new(
+            task_id,
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "t".into(),
+        );
+        open.meta = serde_json::json!({"title": task_id});
+        let rejection = Event::new(
+            task_id,
+            EventType::Rejection,
+            Author::User,
+            Source::Cli,
+            format!("Marker rejected in {task_id}"),
+        );
+        for e in [&open, &rejection] {
+            tj_core::db::upsert_task_from_event(&conn, e, hash).unwrap();
+            tj_core::db::index_event(&conn, e).unwrap();
+        }
+    }
+    // A BLOB title cannot be read as text, so this task's row fails to map.
+    conn.execute(
+        "UPDATE tasks SET title = x'00' WHERE task_id = 'tj-bad1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["rejected", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stdout(contains("tj-good1"))
+        .stderr(contains("warning:").and(contains(hash)));
+}
+
+#[test]
 fn search_command_finds_task_by_event_text() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(

@@ -3863,8 +3863,18 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
                 continue;
             }
         };
-        for row in rows.flatten() {
-            hits.push(row);
+        // Keep going past a row that fails to map, but say so once.
+        let mut first_err = None;
+        for row in rows {
+            match row {
+                Ok(row) => hits.push(row),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            eprintln!("warning: skipped unreadable rejection row(s) in project {hash}: {e}");
         }
     }
 
