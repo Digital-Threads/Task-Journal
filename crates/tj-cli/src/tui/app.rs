@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -158,18 +158,7 @@ impl App {
 
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        self.should_quit = true;
-                    }
-
-                    match &self.screen {
-                        Screen::TaskList => self.handle_task_list_input(key.code),
-                        Screen::TaskDetail => self.handle_task_detail_input(key.code),
-                        Screen::SessionList => self.handle_session_list_input(key.code),
-                        Screen::Chat => self.handle_chat_input(key.code),
-                    }
+                    self.handle_key(key);
                 }
             }
 
@@ -178,6 +167,25 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        // Terminals that report key releases (Windows) would otherwise fire
+        // every key twice.
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+        }
+
+        match &self.screen {
+            Screen::TaskList => self.handle_task_list_input(key.code),
+            Screen::TaskDetail => self.handle_task_detail_input(key.code),
+            Screen::SessionList => self.handle_session_list_input(key.code),
+            Screen::Chat => self.handle_chat_input(key.code),
+        }
     }
 
     fn handle_task_list_input(&mut self, key: KeyCode) {
@@ -360,5 +368,25 @@ mod tests {
         let app = App::new(proj.path()).unwrap();
         let pack = app.assemble_pack("tj-ui1").unwrap();
         assert!(pack.contains("Picked via --project"), "{pack}");
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let mut app = App {
+            screen: Screen::TaskList,
+            task_list: Some(TaskList::new(vec![], "proj".into())),
+            task_detail: None,
+            session_list: None,
+            chat_view: None,
+            should_quit: false,
+            project_path: PathBuf::from("proj"),
+        };
+        let q = |kind| KeyEvent::new_with_kind(KeyCode::Char('q'), KeyModifiers::NONE, kind);
+
+        app.handle_key(q(KeyEventKind::Release));
+        assert!(!app.should_quit, "a key release must not act as a press");
+
+        app.handle_key(q(KeyEventKind::Press));
+        assert!(app.should_quit);
     }
 }
