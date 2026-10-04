@@ -122,9 +122,6 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     r
 }
 
-/// Read a project's JSONL event log. Malformed lines are skipped with a
-/// warning on stderr, the same policy as `rebuild_state`, so one bad line
-/// cannot abort a read-only command.
 /// Run `f` on the current project's state, with the journal ingested first.
 fn with_chronicle<T>(f: impl FnOnce(&rusqlite::Connection, &str) -> Result<T>) -> Result<T> {
     let cwd = std::env::current_dir()?;
@@ -290,6 +287,9 @@ fn run_module(action: ModuleCmd) -> Result<()> {
     Ok(())
 }
 
+/// Read a project's JSONL event log. Malformed lines are skipped with a
+/// warning on stderr, the same policy as `rebuild_state`, so one bad line
+/// cannot abort a read-only command.
 fn read_events_lenient(
     path: &std::path::Path,
     command: &str,

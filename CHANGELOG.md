@@ -38,22 +38,27 @@ itself: the journal says what is missing and what to do about it.
   mid-session. The mod's status line shows the task's modules.
 - **Mapping and sorting old work.** `/task-journal:map` and the skill's steps:
   propose modules, confirm with the user, save them, sort past tasks with
-  `module_backfill_candidates`, confirm, link, write each module's first state.
+  `module_backfill_candidates` (paged with `limit` / `offset`), confirm, link —
+  leftovers to a catch-all module — and write each module's first state.
 - CLI: `module list|show|save|link|candidates`, `create --modules`,
   `close --module-note module=text`; `task_search` / MCP gain a `module` filter.
 
 ### Changed
 - `migrate-project` re-keys the module tables too.
-- Task views (`events list`, `export --format md|html|sqlite`, backfill) skip
-  `module` lines; `export --format json` keeps the full journal.
+- Task views (`events list`, every `export` format, backfill) skip `module`
+  lines, so hosts that group an export by task id see no phantom tasks. The
+  JSONL log itself remains the full record.
 
 ### Upgrading
 - Restart open Claude Code and Codex sessions after `cargo install --force`.
   The first command re-indexes the project once.
 - A 0.30 binary next to 0.31 skips `module` lines with a warning and keeps all
   tasks; 0.31 re-indexes once afterwards, so no module is lost.
-- Nothing changes until you create a module: existing tools, packs and replies
-  look as before.
+- Existing tools, commands and packs work as before. What is new before you
+  create a module: the session start shows a `📚 Chronicle:` line inviting you
+  to map the project (not in a git worktree), `task_create` replies may carry
+  `chronicle` and `suggested_modules`, and `task-journal state` gains
+  `archive` and `active.modules`.
 
 ## [0.30.0] - 2026-10-04
 
