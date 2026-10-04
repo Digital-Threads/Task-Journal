@@ -235,6 +235,8 @@ pub struct TaskCreateParams {
     /// Parent task id — makes this a subtask of the given id. Validated: the
     /// parent must exist and the link must not introduce a cycle.
     pub parent: Option<String>,
+    /// Filled in by the client or the Task Journal Claude Code mod; leave it out.
+    pub session_id: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskCreateResult {
@@ -254,6 +256,8 @@ pub struct EventAddParams {
     /// options and the final choice explicit. Stamped onto
     /// `meta.alternatives`. Rejected with an error on any non-decision type.
     pub alternatives: Option<serde_json::Value>,
+    /// Filled in by the client or the Task Journal Claude Code mod; leave it out.
+    pub session_id: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct EventAddResult {
@@ -271,6 +275,8 @@ pub struct ArtifactAddParams {
     pub url: String,
     /// Human label shown on the card.
     pub label: String,
+    /// Filled in by the client or the Task Journal Claude Code mod; leave it out.
+    pub session_id: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ArtifactAddResult {
@@ -286,6 +292,8 @@ pub struct TaskCloseParams {
     /// v0.4.0+: structured outcome tag — `done`, `abandoned`, or
     /// `superseded`. Filterable; the free-form text lives in `outcome`.
     pub outcome_tag: Option<String>,
+    /// Filled in by the client or the Task Journal Claude Code mod; leave it out.
+    pub session_id: Option<String>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TaskCloseResult {
@@ -355,6 +363,15 @@ fn project_dir() -> anyhow::Result<PathBuf> {
 
 fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
     resolve_project_paths(&project_dir()?)
+}
+
+/// The session id to stamp on an event: the caller's `session_id` param when
+/// given (empty counts as absent), else the live one from the environment.
+fn session_id_or_env(explicit: Option<&str>) -> Option<String> {
+    explicit
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(tj_core::session_id::session_id_from_env)
 }
 
 /// Ingest the journal tail, then fail on an unknown `task_id` so a typo never
@@ -683,7 +700,7 @@ impl TaskJournalServer {
                 }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
-                    tj_core::session_id::session_id_from_env().as_deref(),
+                    session_id_or_env(p.session_id.as_deref()).as_deref(),
                 );
 
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
@@ -742,7 +759,7 @@ impl TaskJournalServer {
                 }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
-                    tj_core::session_id::session_id_from_env().as_deref(),
+                    session_id_or_env(p.session_id.as_deref()).as_deref(),
                 );
 
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
@@ -785,7 +802,7 @@ impl TaskJournalServer {
                 event.meta = tj_core::artifacts::link_event_meta(&p.kind, &p.url, &p.label);
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
-                    tj_core::session_id::session_id_from_env().as_deref(),
+                    session_id_or_env(p.session_id.as_deref()).as_deref(),
                 );
 
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
@@ -874,7 +891,7 @@ impl TaskJournalServer {
                 event.meta = serde_json::Value::Object(meta);
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
-                    tj_core::session_id::session_id_from_env().as_deref(),
+                    session_id_or_env(p.session_id.as_deref()).as_deref(),
                 );
 
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
@@ -1261,6 +1278,7 @@ mod tests {
                 initial_context: None,
                 goal: None,
                 parent: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1279,6 +1297,7 @@ mod tests {
                 corrects: None,
                 supersedes: None,
                 alternatives: Some(alts.clone()),
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1305,6 +1324,7 @@ mod tests {
                 initial_context: None,
                 goal: None,
                 parent: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1319,6 +1339,7 @@ mod tests {
                 corrects: None,
                 supersedes: None,
                 alternatives: Some(serde_json::json!([{"option": "x", "chosen": true}])),
+                session_id: None,
             }))
             .await;
         let err = match res {
@@ -1347,6 +1368,7 @@ mod tests {
                 initial_context: None,
                 goal: None,
                 parent: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1359,6 +1381,7 @@ mod tests {
                 initial_context: None,
                 goal: None,
                 parent: Some(parent.clone()),
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1389,6 +1412,7 @@ mod tests {
                 initial_context: None,
                 goal: None,
                 parent: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1402,6 +1426,7 @@ mod tests {
                 initial_context: None,
                 goal: None,
                 parent: Some(parent.clone()),
+                session_id: None,
             }))
             .await
             .unwrap();
@@ -1412,6 +1437,7 @@ mod tests {
                 reason: "done".into(),
                 outcome: None,
                 outcome_tag: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1431,6 +1457,7 @@ mod tests {
                 initial_context: None,
                 goal: Some("ship it".into()),
                 parent: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1444,6 +1471,7 @@ mod tests {
                 reason: "done".into(),
                 outcome: None,
                 outcome_tag: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1470,6 +1498,7 @@ mod tests {
                 initial_context: None,
                 goal: Some("ship it".into()),
                 parent: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1485,6 +1514,7 @@ mod tests {
                 corrects: None,
                 supersedes: None,
                 alternatives: None,
+                session_id: None,
             }))
             .await
             .unwrap();
@@ -1514,6 +1544,7 @@ mod tests {
                 initial_context: None,
                 goal: Some(format!("goal of {title}")),
                 parent: None,
+                session_id: None,
             }))
             .await
             .unwrap()
@@ -1559,6 +1590,7 @@ mod tests {
                 reason: "done".into(),
                 outcome: None,
                 outcome_tag: None,
+                session_id: None,
             }))
             .await
             .unwrap();
@@ -1608,6 +1640,7 @@ mod tests {
                 reason: "done".into(),
                 outcome: None,
                 outcome_tag: None,
+                session_id: None,
             }))
             .await
             .unwrap();
@@ -1697,6 +1730,7 @@ mod tests {
                 reason: "done".into(),
                 outcome: None,
                 outcome_tag: None,
+                session_id: None,
             }))
             .await
             .unwrap();
@@ -1726,6 +1760,7 @@ mod tests {
             reason: "done".into(),
             outcome: Some(outcome.into()),
             outcome_tag: Some("done".into()),
+            session_id: None,
         };
 
         // Make the close append fail: the journal is read-only.
@@ -1774,6 +1809,7 @@ mod tests {
                 corrects: None,
                 supersedes: None,
                 alternatives: None,
+                session_id: None,
             }))
             .await;
         let err = match res {
@@ -1792,6 +1828,7 @@ mod tests {
                 kind: "doc".into(),
                 url: "https://example.com/spec".into(),
                 label: "Spec".into(),
+                session_id: None,
             }))
             .await;
         let err = match res {
@@ -1806,6 +1843,92 @@ mod tests {
 
         let after = std::fs::read_to_string(&events_path).unwrap();
         assert_eq!(after, before, "no orphan event may reach the journal");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_session_id_is_stamped_instead_of_the_env_one() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+        let prev = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+        std::env::set_var("CLAUDE_CODE_SESSION_ID", "from-env");
+
+        let task = server
+            .task_create(Parameters(TaskCreateParams {
+                title: "Session task".into(),
+                initial_context: None,
+                goal: None,
+                parent: None,
+                session_id: Some("s-create".into()),
+            }))
+            .await
+            .unwrap()
+            .0
+            .task_id;
+        let event = |session_id: Option<&str>| EventAddParams {
+            task_id: task.clone(),
+            event_type: "finding".into(),
+            text: "seen".into(),
+            corrects: None,
+            supersedes: None,
+            alternatives: None,
+            session_id: session_id.map(Into::into),
+        };
+        let explicit = server.event_add(Parameters(event(Some("s-event")))).await;
+        let from_env = server.event_add(Parameters(event(None))).await;
+        let artifact = server
+            .artifact_add(Parameters(ArtifactAddParams {
+                task_id: task.clone(),
+                kind: "doc".into(),
+                url: "https://example.com/doc".into(),
+                label: "Doc".into(),
+                session_id: Some("s-artifact".into()),
+            }))
+            .await;
+        let closed = server
+            .task_close(Parameters(TaskCloseParams {
+                task_id: task.clone(),
+                reason: "done".into(),
+                outcome: None,
+                outcome_tag: None,
+                session_id: Some("s-close".into()),
+            }))
+            .await;
+        match prev {
+            Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
+            None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
+        }
+        let (explicit, from_env, artifact) = (
+            explicit.unwrap().0.event_id,
+            from_env.unwrap().0.event_id,
+            artifact.unwrap().0.event_id,
+        );
+        closed.unwrap();
+
+        let (_, events_path, _) = project_paths().unwrap();
+        let session_of = |pick: &dyn Fn(&serde_json::Value) -> bool| {
+            std::fs::read_to_string(&events_path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|v| pick(v))
+                .and_then(|v| v["meta"]["session_id"].as_str().map(str::to_string))
+        };
+        let by_id = |id: &str| session_of(&|v| v["event_id"] == id);
+        let by_type = |ty: &str| session_of(&|v| v["task_id"] == task.as_str() && v["type"] == ty);
+        assert_eq!(by_type("open").as_deref(), Some("s-create"));
+        assert_eq!(by_id(&explicit).as_deref(), Some("s-event"));
+        assert_eq!(by_id(&from_env).as_deref(), Some("from-env"));
+        assert_eq!(by_id(&artifact).as_deref(), Some("s-artifact"));
+        assert_eq!(by_type("close").as_deref(), Some("s-close"));
+    }
+
+    #[test]
+    fn session_id_params_are_optional() {
+        let p: EventAddParams = serde_json::from_value(serde_json::json!({
+            "task_id": "tj-x", "event_type": "finding", "text": "t"
+        }))
+        .unwrap();
+        assert_eq!(p.session_id, None);
     }
 
     #[tokio::test]
@@ -1840,6 +1963,7 @@ mod tests {
                 initial_context: None,
                 goal: Some("Wire the board".into()),
                 parent: None,
+                session_id: None,
             }))
             .await;
         std::env::remove_var("LOOM_TASK_ID");
@@ -1871,6 +1995,7 @@ mod tests {
                 corrects: None,
                 supersedes: None,
                 alternatives: None,
+                session_id: None,
             }))
             .await;
         let err = match res {
