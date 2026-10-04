@@ -14,14 +14,17 @@ use std::path::{Path, PathBuf};
 /// 2. `.git` (file or directory) — covers normal checkouts and
 ///    worktrees alike (a worktree's root holds a `.git` *file*
 ///    pointing at the real gitdir, but its presence still marks the
-///    boundary).
+///    boundary). Like git itself, a `.git` directory counts only when it
+///    holds `HEAD`: Codex's sandbox (bubblewrap) briefly mounts an empty
+///    `.git` into a writable root such as `/tmp` while a command runs.
 ///
 /// Falls back to `start` if no marker is found, preserving prior
 /// behaviour for non-git scratch directories.
 pub fn project_root(start: &Path) -> PathBuf {
     let mut cur = start;
     loop {
-        if cur.join(".task-journal").is_dir() || cur.join(".git").exists() {
+        let git = cur.join(".git");
+        if cur.join(".task-journal").is_dir() || git.is_file() || git.join("HEAD").exists() {
             return cur.to_path_buf();
         }
         match cur.parent() {
@@ -103,6 +106,7 @@ mod tests {
         // repo/ with .git inside; repo/src/foo/ should normalise to repo/.
         let repo = TempDir::new().unwrap();
         std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let sub = repo.path().join("src").join("foo");
         std::fs::create_dir_all(&sub).unwrap();
 
@@ -120,6 +124,7 @@ mod tests {
         // (explicit opt-out of the parent's journal).
         let repo = TempDir::new().unwrap();
         std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let sub = repo.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::create_dir(sub.join(".task-journal")).unwrap();
@@ -147,5 +152,19 @@ mod tests {
             wt_hash, sub_hash,
             "worktree subdir must normalise to worktree root via .git file"
         );
+    }
+
+    #[test]
+    fn empty_dot_git_dir_is_not_a_boundary() {
+        // Codex's bubblewrap sandbox briefly mounts an empty `.git` into a
+        // writable root such as `/tmp` while a command runs. Git does not take
+        // it for a repository, and the project hash must not flip meanwhile.
+        let base = TempDir::new().unwrap();
+        let proj = base.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let before = from_path(&proj).unwrap();
+
+        std::fs::create_dir(base.path().join(".git")).unwrap();
+        assert_eq!(from_path(&proj).unwrap(), before);
     }
 }
