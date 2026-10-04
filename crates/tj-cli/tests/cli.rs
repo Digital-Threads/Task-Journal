@@ -855,6 +855,65 @@ fn migrate_project_carries_uncheckpointed_wal_writes() {
 }
 
 #[test]
+fn migrate_project_force_keeps_destination_when_the_move_fails() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let events = xdg.path().join("task-journal").join("events");
+
+    // A directory cannot be renamed over a file, so the move must fail.
+    std::fs::create_dir_all(events.join(format!("{from_hash}.jsonl"))).unwrap();
+    let dst = events.join(format!("{to_hash}.jsonl"));
+    std::fs::write(&dst, "destination data\n").unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+            "--force",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        "destination data\n",
+        "a failed --force move must leave the destination intact"
+    );
+}
+
+#[test]
+fn migrate_project_force_replaces_existing_destination() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, _, _) = two_projects();
+
+    for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", title])
+            .assert()
+            .success();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), true);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Source task").and(contains("Overwritten task").not()));
+}
+
+#[test]
 fn close_unknown_task_id_returns_error() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")

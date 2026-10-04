@@ -212,9 +212,9 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if dst.exists() && force {
-            std::fs::remove_file(dst).with_context(|| format!("remove existing {dst:?}"))?;
-        }
+        // No remove-then-rename: rename replaces an existing destination
+        // atomically (POSIX rename, MOVEFILE_REPLACE_EXISTING on Windows), so
+        // a failed move under --force leaves the destination intact.
         std::fs::rename(src, dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
         moved.push(dst.display().to_string());
     }
