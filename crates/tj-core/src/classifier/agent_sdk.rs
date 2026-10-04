@@ -123,10 +123,12 @@ fn claude_timeout() -> std::time::Duration {
 
 /// Wait for `child` up to `timeout`, draining stdout/stderr concurrently so a
 /// full pipe can't deadlock the wait. On timeout the child is killed and an
-/// error returned; otherwise the captured output is handed back.
+/// error naming `what` (e.g. "claude -p") is returned; otherwise the captured
+/// output is handed back.
 pub(crate) fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: std::time::Duration,
+    what: &str,
 ) -> anyhow::Result<std::process::Output> {
     use std::io::Read;
     let mut out_pipe = child.stdout.take();
@@ -153,7 +155,7 @@ pub(crate) fn wait_with_timeout(
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("`claude -p` timed out after {}s", timeout.as_secs());
+            anyhow::bail!("`{what}` timed out after {}s", timeout.as_secs());
         }
         std::thread::sleep(std::time::Duration::from_millis(150));
     };
@@ -197,7 +199,7 @@ impl CommandRunner for ClaudeBinaryStdinRunner {
             .context("claude stdin was not captured")?
             .write_all(prompt.as_bytes())
             .context("failed to write prompt to claude stdin")?;
-        let output = wait_with_timeout(child, claude_timeout())?;
+        let output = wait_with_timeout(child, claude_timeout(), "claude -p")?;
         if !output.status.success() {
             return Err(claude_exit_error(
                 output.status,
