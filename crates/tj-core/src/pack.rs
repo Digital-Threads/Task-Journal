@@ -104,48 +104,40 @@ fn render_evidence(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// A classifier's guess (`status = suggested`) must not read like a choice
-/// the agent made: such decisions and rejections stay listed but marked.
-fn unconfirmed_marker(status: &str) -> &'static str {
-    if status == "suggested" {
-        " _(unconfirmed)_"
-    } else {
-        ""
-    }
+/// A decision or rejection as the pack lists it.
+pub struct Choice {
+    pub text: String,
+    /// A decision's `meta.alternatives` JSON; always `None` for a rejection.
+    pub alternatives: Option<String>,
+    /// A classifier's guess (`status = suggested`).
+    pub unconfirmed: bool,
 }
 
-fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
-    let mut out = String::from("## Rejected\n");
-    // v0.10.3: newest-first so end-of-pack truncation drops the
-    // OLDEST rejections, not the latest decision the agent recorded.
-    let mut id_stmt = conn.prepare(
-        "SELECT event_id, status FROM events_index
-         WHERE task_id=?1 AND type='rejection' AND corrected_by IS NULL
-         ORDER BY timestamp DESC",
-    )?;
-    let mut text_stmt = conn.prepare("SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1")?;
-    let event_ids: Vec<(String, String)> = id_stmt
-        .query_map(rusqlite::params![task_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    let mut count = 0;
-    let mut seen: HashSet<String> = HashSet::new();
-    for (eid, status) in event_ids {
-        let text: String = text_stmt.query_row(rusqlite::params![eid], |r| r.get(0))?;
-        if is_noise(&text) || !seen.insert(text.trim().to_string()) {
-            continue;
+impl Choice {
+    /// A guess must not read like a choice the agent made: it stays listed
+    /// but carries this trailing marker.
+    pub fn marker(&self) -> &'static str {
+        if self.unconfirmed {
+            " _(unconfirmed)_"
+        } else {
+            ""
         }
-        out.push_str(&format!("- {text}{}\n", unconfirmed_marker(&status)));
-        count += 1;
     }
-    if count == 0 {
-        out.push_str("- (none)\n");
-    }
-    out.push('\n');
-    Ok(out)
 }
 
-fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
-    let mut out = String::from("## Active decisions\n");
+/// Keep the first of each text, minus machine noise (compaction markers), so
+/// a section reads as crisp choices, not repeated essays.
+fn dedupe(choices: impl IntoIterator<Item = Choice>) -> Vec<Choice> {
+    let mut seen: HashSet<String> = HashSet::new();
+    choices
+        .into_iter()
+        .filter(|c| !is_noise(&c.text) && seen.insert(c.text.trim().to_string()))
+        .collect()
+}
+
+/// The pack's Active decisions, newest first: neither superseded, corrected
+/// nor bookkeeping. export-pr lists the same ones.
+pub fn active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<Choice>> {
     // v0.10.3: newest decision first. `decision_id` is a ULID so DESC
     // gives reverse-chronological order. The summary/final-decision
     // event the agent records just before close is now the FIRST line
@@ -157,32 +149,69 @@ fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<S
            AND ei.bookkeeping = 0
          ORDER BY d.decision_id DESC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![task_id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<String>>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-    let mut count = 0;
-    let mut seen: HashSet<String> = HashSet::new();
-    for row in rows {
-        let (text, alternatives, status) = row?;
-        // Skip machine noise (compaction markers) and exact duplicates so the
-        // section reads as crisp decisions, not repeated essays.
-        if is_noise(&text) || !seen.insert(text.trim().to_string()) {
-            continue;
-        }
-        out.push_str(&format!("- {text}{}\n", unconfirmed_marker(&status)));
+    let rows = stmt
+        .query_map(rusqlite::params![task_id], |r| {
+            Ok(Choice {
+                text: r.get(0)?,
+                alternatives: r.get(1)?,
+                unconfirmed: r.get::<_, String>(2)? == "suggested",
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(dedupe(rows))
+}
+
+/// The pack's Rejected list, newest first, without corrected rejections.
+/// export-pr lists the same ones.
+pub fn rejections(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<Choice>> {
+    // v0.10.3: newest-first so end-of-pack truncation drops the
+    // OLDEST rejections, not the latest decision the agent recorded.
+    let mut id_stmt = conn.prepare(
+        "SELECT event_id, status FROM events_index
+         WHERE task_id=?1 AND type='rejection' AND corrected_by IS NULL
+         ORDER BY timestamp DESC",
+    )?;
+    let mut text_stmt = conn.prepare("SELECT text FROM search_fts WHERE event_id=?1 LIMIT 1")?;
+    let event_ids: Vec<(String, String)> = id_stmt
+        .query_map(rusqlite::params![task_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut rows = Vec::new();
+    for (eid, status) in event_ids {
+        rows.push(Choice {
+            text: text_stmt.query_row(rusqlite::params![eid], |r| r.get(0))?,
+            alternatives: None,
+            unconfirmed: status == "suggested",
+        });
+    }
+    Ok(dedupe(rows))
+}
+
+fn render_rejected(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
+    let mut out = String::from("## Rejected\n");
+    let rejected = rejections(conn, task_id)?;
+    for r in &rejected {
+        out.push_str(&format!("- {}{}\n", r.text, r.marker()));
+    }
+    if rejected.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+fn render_active_decisions(conn: &Connection, task_id: &str) -> anyhow::Result<String> {
+    let mut out = String::from("## Active decisions\n");
+    let decisions = active_decisions(conn, task_id)?;
+    for d in &decisions {
+        out.push_str(&format!("- {}{}\n", d.text, d.marker()));
         // v0.12.0: structured alternatives render under the decision so the
         // pack shows "considered A/B/C, chose X" without reconstructing it
         // from the hypothesis+rejection chain.
-        if let Some(block) = render_alternatives(alternatives.as_deref()) {
+        if let Some(block) = render_alternatives(d.alternatives.as_deref()) {
             out.push_str(&block);
         }
-        count += 1;
     }
-    if count == 0 {
+    if decisions.is_empty() {
         out.push_str("- (none)\n");
     }
     out.push('\n');

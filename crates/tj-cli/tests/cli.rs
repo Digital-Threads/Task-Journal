@@ -5071,6 +5071,65 @@ fn export_pr_leaves_out_corrected_events() {
 }
 
 #[test]
+fn export_pr_lists_the_same_decisions_and_rejections_as_the_pack() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let xdg = dir.path();
+
+    let task = tj_stdout(xdg, &workdir, &["create", "Same selection", "--goal", "g"]);
+    let event = |ty: &str, text: &str| {
+        tj_stdout(
+            xdg,
+            &workdir,
+            &["event", &task, "--type", ty, "--text", text],
+        )
+    };
+    let ts = event("decision", "Adopt TypeScript");
+    tj_stdout(
+        xdg,
+        &workdir,
+        &[
+            "event",
+            &task,
+            "--type",
+            "supersede",
+            "--text",
+            "TS replaced",
+            "--supersedes",
+            &ts,
+        ],
+    );
+    event("decision", "Adopt Rust");
+    event("decision", "Adopt Rust");
+    // Classifier guesses, not yet confirmed.
+    for (ty, text) in [
+        (tj_core::event::EventType::Decision, "Maybe cache packs"),
+        (tj_core::event::EventType::Rejection, "Maybe drop Postgres"),
+    ] {
+        let mut e = tj_core::event::Event::new(
+            task.clone(),
+            ty,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text.to_string(),
+        );
+        e.status = tj_core::event::EventStatus::Suggested;
+        append_jsonl_line(xdg, &serde_json::to_string(&e).unwrap());
+    }
+
+    let pr = tj_stdout(xdg, &workdir, &["export-pr", &task]);
+    let changes = pr.split("## ").find(|s| s.starts_with("Changes")).unwrap();
+    assert!(!changes.contains("Adopt TypeScript"), "{pr}");
+    assert_eq!(changes.matches("Adopt Rust").count(), 1, "{pr}");
+    assert!(
+        changes.contains("- Maybe cache packs _(unconfirmed)_\n"),
+        "{pr}"
+    );
+    assert!(pr.contains("- Maybe drop Postgres _(unconfirmed)_"), "{pr}");
+}
+
+#[test]
 fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
