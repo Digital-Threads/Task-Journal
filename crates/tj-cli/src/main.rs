@@ -6145,7 +6145,17 @@ fn build_dream_inputs(
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let parsed = parse_session(path)?;
+        // One unreadable transcript must not abort mining the rest.
+        let parsed = match parse_session(path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "dream: skipping unreadable session {}: {e:#}",
+                    path.display()
+                );
+                continue;
+            }
+        };
 
         let candidates = candidate_tasks_for_session(
             events_path,
@@ -6314,6 +6324,36 @@ mod inline_tests {
             Some("2026-02-01T00:00:00Z"),
             Some("2026-02-01T00:01:00Z"),
         ));
+    }
+
+    #[test]
+    fn build_dream_inputs_skips_an_unreadable_session() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("h.jsonl");
+        let mut ev = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task".into(),
+        );
+        ev.meta = serde_json::json!({"session_id": "good"});
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        writer.append(&ev).unwrap();
+        writer.flush_durable().unwrap();
+
+        // Invalid UTF-8 makes parse_session fail for this one file.
+        let bad = dir.path().join("bad.jsonl");
+        std::fs::write(&bad, [0xff, 0xfe, b'\n']).unwrap();
+        let good = dir.path().join("good.jsonl");
+        std::fs::write(&good,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+
+        let inputs = build_dream_inputs(&events_path, &[bad, good], None).unwrap();
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0, "good");
     }
 
     #[test]
