@@ -1645,8 +1645,8 @@ fn ingest_hook_session_start_emits_resume_pack_json() {
 
 #[test]
 fn session_start_emits_neither_session_title_nor_initial_message() {
-    // 0.14.3: the SessionStart envelope carries ONLY additionalContext
-    // (+ optional watchPaths). It must never set sessionTitle (which
+    // 0.14.3: the SessionStart envelope carries ONLY additionalContext.
+    // It must never set sessionTitle (which
     // overrode Claude Code's own session name with our task id) nor
     // initialUserMessage (which seeded garbage "[Task Journal resumed: …]"
     // task titles).
@@ -3639,12 +3639,9 @@ fn export_pr_unknown_task_id_exits_one_with_stderr_message() {
         .stderr(contains("task not found: tj-zzzz"));
 }
 
-// v0.10.0: asyncRewake backlog signal. PostToolUse hook configured with
-// asyncRewake:true in hooks.json sets TJ_ASYNC_REWAKE=1; when pending/
-// has more than PENDING_OVERFLOW_THRESHOLD (25) entries already queued,
-// ingest-hook exits 2 with a wake-message on stdout. Sync hooks (or
-// CLI invocations without the env var) must NEVER exit 2 — that would
-// block the operation in Claude Code's hook contract.
+// The PostToolUse hook used to exit 2 on a large pending backlog to wake the
+// model (TJ_ASYNC_REWAKE). Nothing installs that env var, so the signal was
+// dead code; a backlog must never turn the hook into a non-zero exit.
 fn seed_pending_chunks(pending_dir: &std::path::Path, count: usize) {
     std::fs::create_dir_all(pending_dir).unwrap();
     for i in 0..count {
@@ -3676,82 +3673,19 @@ fn posttooluse_payload() -> String {
 }
 
 #[test]
-fn session_start_emits_watch_paths_for_existing_marker_files() {
-    // v0.10.2 X4: SessionStart envelope must include `watchPaths` with
-    // existing marker files (CLAUDE.md, README.md, .docs/plans). Files
-    // that don't exist are skipped — Claude Code's watcher logs an
-    // error and gives up on missing paths, so we don't emit them.
+fn session_start_does_not_emit_watch_paths() {
+    // install-hooks never registers FileChanged, so asking Claude Code to
+    // watch marker files only made it watch them for nothing.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(workdir.join(".docs").join("plans")).unwrap();
-    std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
-    // README.md intentionally absent — must NOT appear in watchPaths.
-
-    let task_id = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .current_dir(&workdir)
-            .args(["create", "Watch paths test"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-    let _ = task_id;
-
-    let body = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .current_dir(&workdir)
-            .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap();
-    let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
-    let watches = v["hookSpecificOutput"]["watchPaths"]
-        .as_array()
-        .expect("watchPaths must be present when at least one marker exists");
-    let joined: String = watches
-        .iter()
-        .filter_map(|x| x.as_str())
-        .collect::<Vec<_>>()
-        .join("|");
-    assert!(
-        joined.contains("CLAUDE.md"),
-        "CLAUDE.md must be watched: {joined}"
-    );
-    assert!(
-        joined.contains("plans"),
-        ".docs/plans must be watched: {joined}"
-    );
-    assert!(
-        !joined.contains("README.md"),
-        "README.md does not exist, must NOT be watched: {joined}"
-    );
-}
-
-#[test]
-fn session_start_omits_watch_paths_when_disabled_via_env() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    let workdir = dir.path().join("proj");
-    std::fs::create_dir_all(&workdir).unwrap();
     std::fs::write(workdir.join("CLAUDE.md"), "# Project rules").unwrap();
 
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Watch paths env-disabled"])
+        .args(["create", "Watch paths test"])
         .assert()
         .success();
 
@@ -3759,7 +3693,6 @@ fn session_start_omits_watch_paths_when_disabled_via_env() {
         Command::cargo_bin("task-journal")
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
-            .env("TJ_WATCH_PATHS", "0")
             .current_dir(&workdir)
             .args(["ingest-hook", "--kind", "SessionStart", "--text", ""])
             .assert()
@@ -3772,19 +3705,18 @@ fn session_start_omits_watch_paths_when_disabled_via_env() {
     let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
     assert!(
         v["hookSpecificOutput"]["watchPaths"].is_null(),
-        "TJ_WATCH_PATHS=0 must suppress watchPaths emission"
+        "SessionStart must not emit watchPaths: {body}"
     );
     assert!(
         v["hookSpecificOutput"]["additionalContext"].is_string(),
-        "additionalContext still emitted independently of watchPaths"
+        "resume context is still emitted: {body}"
     );
 }
 
 #[test]
-fn file_changed_hook_appends_evidence_to_active_task() {
-    // v0.10.2 X4: FileChanged hook handler should append an evidence
-    // event to the most-recent open task with the changed path
-    // (trimmed project-relative) and the change kind.
+fn file_changed_payload_is_ignored() {
+    // No FileChanged handler any more: the payload carries no text, so the
+    // hook writes nothing even with an open task.
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3794,7 +3726,7 @@ fn file_changed_hook_appends_evidence_to_active_task() {
             .unwrap()
             .env("XDG_DATA_HOME", dir.path())
             .current_dir(&workdir)
-            .args(["create", "FileChanged evidence test"])
+            .args(["create", "Watched file ignored"])
             .assert()
             .success()
             .get_output()
@@ -3807,7 +3739,6 @@ fn file_changed_hook_appends_evidence_to_active_task() {
 
     let touched = workdir.join("CLAUDE.md");
     std::fs::write(&touched, "# rules v2").unwrap();
-
     let stdin_payload = serde_json::json!({
         "hook_event_name": "FileChanged",
         "file_path": touched.to_str().unwrap(),
@@ -3818,8 +3749,9 @@ fn file_changed_hook_appends_evidence_to_active_task() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
+        .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(stdin_payload)
         .assert()
         .success();
@@ -3831,8 +3763,7 @@ fn file_changed_hook_appends_evidence_to_active_task() {
         .args(["pack", &task_id, "--mode", "full"])
         .assert()
         .success()
-        .stdout(contains("FileChanged (change)"))
-        .stdout(contains("CLAUDE.md"));
+        .stdout(contains("FileChanged").not());
 }
 
 #[test]
@@ -3872,7 +3803,7 @@ fn file_changed_hook_with_no_open_task_is_no_op() {
 }
 
 #[test]
-fn asyncrewake_below_threshold_exits_zero() {
+fn post_tool_use_backlog_never_exits_two() {
     let dir = assert_fs::TempDir::new().unwrap();
     let workdir = dir.path().join("proj");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3881,41 +3812,11 @@ fn asyncrewake_below_threshold_exits_zero() {
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .current_dir(&workdir)
-        .args(["create", "Async wake test below threshold"])
+        .args(["create", "Backlog test"])
         .assert()
         .success();
 
-    // Seed 5 entries — well under the 25 threshold.
-    let pending = dir.path().join("task-journal").join("pending");
-    seed_pending_chunks(&pending, 5);
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .env("TJ_ASYNC_REWAKE", "1")
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
-        .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
-        .write_stdin(posttooluse_payload())
-        .assert()
-        .success(); // exit 0, no wake
-}
-
-#[test]
-fn asyncrewake_overflow_exits_two_with_drain_hint() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    let workdir = dir.path().join("proj");
-    std::fs::create_dir_all(&workdir).unwrap();
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .current_dir(&workdir)
-        .args(["create", "Async wake overflow test"])
-        .assert()
-        .success();
-
-    // Seed 30 entries — over the 25 threshold.
+    // Seed 30 entries — over the old 25-entry wake threshold.
     let pending = dir.path().join("task-journal").join("pending");
     seed_pending_chunks(&pending, 30);
 
@@ -3925,46 +3826,11 @@ fn asyncrewake_overflow_exits_two_with_drain_hint() {
         .env("TJ_ASYNC_REWAKE", "1")
         .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
+        .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(posttooluse_payload())
         .assert()
-        .failure()
-        .code(2)
-        .stdout(contains("Task Journal pending queue"))
-        .stdout(contains("pending-gc"));
-}
-
-#[test]
-fn asyncrewake_overflow_without_env_does_not_exit_two() {
-    // Sync hook safety: without TJ_ASYNC_REWAKE=1 we must NEVER exit 2
-    // even on overflow, because exit 2 from a sync hook blocks the
-    // operation in Claude Code. CLI invocations and the PreCompact/Stop
-    // hooks (which stay sync) rely on this guarantee.
-    let dir = assert_fs::TempDir::new().unwrap();
-    let workdir = dir.path().join("proj");
-    std::fs::create_dir_all(&workdir).unwrap();
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .current_dir(&workdir)
-        .args(["create", "Sync hook safety test"])
-        .assert()
-        .success();
-
-    let pending = dir.path().join("task-journal").join("pending");
-    seed_pending_chunks(&pending, 30);
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .env_remove("TJ_ASYNC_REWAKE")
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
-        .current_dir(&workdir)
-        .args(["ingest-hook", "--backend", "hybrid"])
-        .write_stdin(posttooluse_payload())
-        .assert()
-        .success(); // exit 0, no wake — must not block sync hooks
+        .success()
+        .stdout(contains("pending queue").not());
 }
 
 // ---------------------------------------------------------------------------

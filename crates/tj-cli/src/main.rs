@@ -376,9 +376,7 @@ fn run_pending_list() -> Result<()> {
             .take(72)
             .collect();
         let attempts = v.get("attempts").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-        let dead_marker = if id.ends_with(".dead") { " [DEAD]" } else { "" };
         entries.push((id, queued_at, text_preview, attempts));
-        let _ = dead_marker;
     }
     if entries.is_empty() {
         println!("(no pending entries)");
@@ -2370,33 +2368,6 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     bundle.push_str("\n\n");
                 }
 
-                // v0.10.2 X4: emit `watchPaths` so Claude Code starts
-                // monitoring our marker files (CLAUDE.md, README.md,
-                // .docs/plans). When any of them changes, Claude Code
-                // fires a FileChanged hook event — our ingest-hook
-                // handler below treats those as `evidence` entries on
-                // the active task so the journal captures
-                // "instructions were updated mid-session" without the
-                // user manually logging it. Only paths that exist at
-                // SessionStart time are emitted (no point watching a
-                // non-existent file — Claude Code logs `watcher error`
-                // and gives up on it). Gated by TJ_WATCH_PATHS=0.
-                let allow_watch_paths = std::env::var("TJ_WATCH_PATHS").as_deref() != Ok("0");
-                let watch_candidates = [
-                    cwd.join("CLAUDE.md"),
-                    cwd.join("README.md"),
-                    cwd.join(".docs").join("plans"),
-                ];
-                let watch_paths: Vec<String> = if allow_watch_paths {
-                    watch_candidates
-                        .iter()
-                        .filter(|p| p.exists())
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
                 // We deliberately DO NOT emit `sessionTitle` or
                 // `initialUserMessage` here. The v0.10.1 X2 experiment set
                 // `sessionTitle` to "TJ — <task_id> (<n> open)", which
@@ -2408,81 +2379,14 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // title. The resume context the model actually needs already
                 // rides in `additionalContext`; the tab label belongs to
                 // Claude Code, not to us. (0.14.3)
-                let mut hook_specific = serde_json::json!({
+                let hook_specific = serde_json::json!({
                     "hookEventName": "SessionStart",
                     "additionalContext": bundle.trim_end(),
                 });
-                if !watch_paths.is_empty() {
-                    hook_specific["watchPaths"] = serde_json::Value::Array(
-                        watch_paths
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    );
-                }
                 let envelope = serde_json::json!({
                     "hookSpecificOutput": hook_specific,
                 });
                 println!("{}", serde_json::to_string(&envelope)?);
-                return Ok(());
-            }
-
-            // v0.10.2 X4: FileChanged. Claude Code 2.1.x fires this
-            // event whenever a path in `watchPaths` (emitted on
-            // SessionStart) changes. Payload: { file_path, event:
-            // "change"|"add"|"unlink" }. We translate it into an
-            // `evidence` event on the active task — captures
-            // "the user/agent edited CLAUDE.md mid-session" without
-            // anyone typing anything. Schema verified in 2.1.160:
-            // `literal("FileChanged"), file_path: y.string(), event:
-            // y.enum(["change","add","unlink"])`.
-            //
-            // No active task → drop silently (we're not opening a
-            // task just because a watched file moved). No events_path
-            // → ditto, fresh project.
-            if kind == "FileChanged" {
-                if !events_path.exists() {
-                    return Ok(());
-                }
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
-                let Some(tc) = recent.into_iter().next() else {
-                    return Ok(());
-                };
-                let file_path = payload
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown)");
-                let change = payload
-                    .get("event")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("change");
-                // Trim noisy absolute paths to project-relative when
-                // possible — the journal is per-project so the prefix
-                // is redundant and just steals tokens from the pack.
-                let display_path = cwd
-                    .to_str()
-                    .and_then(|c| file_path.strip_prefix(c))
-                    .map(|s| s.trim_start_matches('/').to_string())
-                    .unwrap_or_else(|| file_path.to_string());
-                let evidence_text = format!("FileChanged ({change}): {display_path}");
-                let mut event = tj_core::event::Event::new(
-                    &tc.task_id,
-                    tj_core::event::EventType::Evidence,
-                    tj_core::event::Author::Classifier,
-                    tj_core::event::Source::Hook,
-                    evidence_text,
-                );
-                event.confidence = Some(0.9);
-                event.status = tj_core::event::EventStatus::Confirmed;
-                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
-                let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
-                writer.append(&event)?;
-                writer.flush_durable()?;
-                println!("{}", event.event_id);
                 return Ok(());
             }
 
@@ -2493,7 +2397,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             // "why did this stretch come out shallow" is usually answered by
             // "it ran on a fallback model". Recorded as a `constraint`: it's an
             // external condition the work happened under, not a decision.
-            // No active task → drop silently, same rule as FileChanged.
+            // No active task → drop silently.
             if kind == "PostModelSwitch" {
                 if !events_path.exists() {
                     return Ok(());
@@ -2829,25 +2733,6 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
                 let _ = spawn_classify_worker(&backend);
-
-                // v0.10.0 asyncRewake backlog signal. Only the PostToolUse
-                // hook runs as asyncRewake (hooks.json sets TJ_ASYNC_REWAKE=1
-                // there), so other kinds — and direct CLI invocations —
-                // never exit 2 even on overflow. Exit code 2 from a sync
-                // hook would BLOCK the operation; only asyncRewake hooks
-                // treat code 2 as "wake the model with rewakeMessage". stdout
-                // is appended to the wake message, so the user sees the
-                // drain command without us reaching into stderr.
-                let allow_wake = std::env::var("TJ_ASYNC_REWAKE").as_deref() == Ok("1");
-                if allow_wake && kind == "PostToolUse" {
-                    let pending_count = count_pending_entries(&events_path).unwrap_or(0);
-                    if pending_count > PENDING_OVERFLOW_THRESHOLD {
-                        println!(
-                            "Task Journal pending queue: {pending_count} entries. Classifier behind — run `task-journal pending-gc --days 0` to drain.",
-                        );
-                        std::process::exit(2);
-                    }
-                }
                 return Ok(());
             }
 
@@ -5346,41 +5231,6 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
 /// v0.6.2: queue an ingest event for the detached classify-worker. The
 /// hook returns immediately after writing this entry so it does not
 /// block Claude Code's hook timeout (was 5-30s, now <100ms). Schema "v2"
-/// Threshold for the v0.10.0 asyncRewake backlog signal. When the
-/// PostToolUse hook (configured with `asyncRewake: true` in
-/// `hooks.json`) finds more than this many entries already queued
-/// in `pending/`, it exits with code 2 to wake the model with a
-/// system reminder pointing at `task-journal pending-gc`. Tuned so
-/// that normal load (<5 in-flight at any moment) never trips, but
-/// a stuck classifier surfaces visibly before the queue grows into
-/// the hundreds (the v0.6.2 fork-bomb era saw 515 entries before a
-/// user noticed).
-const PENDING_OVERFLOW_THRESHOLD: usize = 25;
-
-/// Count `.json` (and `.json.dead`) entries currently sitting in
-/// `pending/` next to `events_path`. Best-effort: any IO error
-/// returns 0 so a borked filesystem never wakes the model with
-/// noise. Used by the asyncRewake backlog signal.
-fn count_pending_entries(events_path: &std::path::Path) -> anyhow::Result<usize> {
-    let dir = events_path
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("events_path has no grandparent"))?
-        .join("pending");
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut count = 0usize;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some("json") = path.extension().and_then(|e| e.to_str()) {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// distinguishes async-ingest entries from legacy v1 (text+error) ones
 /// the `pending retry` path knows how to handle.
 fn persist_pending_v2(
