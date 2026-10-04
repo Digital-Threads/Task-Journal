@@ -43,7 +43,15 @@ pub fn project_root(start: &Path) -> PathBuf {
 pub fn chronicle_home(dir: &Path) -> Option<PathBuf> {
     let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let root = project_root(&dir);
-    let dot_git = dunce::canonicalize(root.join(".git")).ok()?;
+    // A plain file only: a symlinked `.git` could borrow another worktree.
+    let dot_git = root.join(".git");
+    if !std::fs::symlink_metadata(&dot_git)
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
     let pointer = std::fs::read_to_string(&dot_git).ok()?;
     let gitdir =
         dunce::canonicalize(root.join(pointer.trim().strip_prefix("gitdir:")?.trim())).ok()?;
@@ -229,6 +237,46 @@ mod tests {
         .unwrap();
         std::fs::write(forged.join(".git"), format!("gitdir: {}\n", fake.display())).unwrap();
 
+        assert_eq!(chronicle_home(&forged), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_git_file_cannot_borrow_a_real_worktree() {
+        // A folder whose `.git` is a symlink to a real worktree's `.git`
+        // file would pass the two-way check by borrowing that worktree.
+        let d = tempfile::TempDir::new().unwrap();
+        let main = d.path().join("repo");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        let wt = d.path().join("wt");
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let forged = d.path().join("forged");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::os::unix::fs::symlink(wt.join(".git"), forged.join(".git")).unwrap();
+
+        assert!(chronicle_home(&wt).is_some());
         assert_eq!(chronicle_home(&forged), None);
     }
 
