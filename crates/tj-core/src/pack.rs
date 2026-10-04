@@ -269,6 +269,29 @@ fn render_subtasks(conn: &Connection, task_id: &str) -> anyhow::Result<Option<St
     Ok(Some(s))
 }
 
+/// Compact-mode Completeness: the heading plus ONE line with the score and
+/// every gap, capped so it always fits the 2 KB budget beside the reasoning.
+fn render_gap_line(report: &crate::completeness::CompletenessReport) -> Option<String> {
+    const GAP_LINE_MAX: usize = 400;
+
+    if report.gaps.is_empty() {
+        return None;
+    }
+    let details = report
+        .gaps
+        .iter()
+        .map(|g| g.detail.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut line = format!("- ⚠ honesty score: {}/100 — {details}", report.score());
+    truncate_to_budget(&mut line, GAP_LINE_MAX, "…");
+
+    Some(format!(
+        "\n## Completeness ({})\n{line}\n",
+        report.gaps.len()
+    ))
+}
+
 fn truncate_to_budget(text: &mut String, budget: usize, marker: &str) {
     if text.len() <= budget {
         return;
@@ -448,6 +471,13 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     };
     text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
 
+    // One-level roll-up of direct children (parents only). Appended before
+    // truncation so it shares the pack budget. Task 5 busts the parent cache
+    // when a child changes, so the next assemble regenerates fresh.
+    if let Some(subtasks) = render_subtasks(conn, task_id)? {
+        text.push_str(&subtasks);
+    }
+
     let mut report =
         crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
     // Honesty drift: flag artifacts (files/commits/local links) that no longer
@@ -455,16 +485,13 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     report
         .gaps
         .extend(crate::completeness::artifact_gaps_for_cwd(&arts));
-    if let Some(section) = crate::completeness::render_section(&report) {
-        text.push_str(&section);
+    // The gaps tell the next agent what is missing, so they go last with
+    // their room reserved: truncation cuts the reasoning above, never them.
+    let gaps = match mode {
+        PackMode::Full => crate::completeness::render_section(&report),
+        PackMode::Compact => render_gap_line(&report),
     }
-
-    // One-level roll-up of direct children (parents only). Appended before
-    // truncation so it shares the pack budget. Task 5 busts the parent cache
-    // when a child changes, so the next assemble regenerates fresh.
-    if let Some(subtasks) = render_subtasks(conn, task_id)? {
-        text.push_str(&subtasks);
-    }
+    .unwrap_or_default();
 
     // Token-budget truncation: cap pack size so it always fits an LLM context window.
     // v0.10.3: full bumped 10K → 24K → 32K. Real tasks accumulate 50-100 events
@@ -478,10 +505,11 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         PackMode::Full => FULL_BUDGET,
         PackMode::Compact => COMPACT_BUDGET,
     };
-    let truncated = text.len() > budget;
+    let truncated = text.len() + gaps.len() > budget;
     if truncated {
-        truncate_to_budget(&mut text, budget, TRUNC_MARKER);
+        truncate_to_budget(&mut text, budget.saturating_sub(gaps.len()), TRUNC_MARKER);
     }
+    text.push_str(&gaps);
 
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
@@ -1375,5 +1403,56 @@ mod tests {
         let active = section(&pack.text, "Active decisions");
         assert!(!active.contains("Context boundary"), "{active}");
         assert!(active.contains("Use SQLite"), "{active}");
+    }
+
+    #[test]
+    fn truncated_packs_keep_the_gap_summary() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-gap", "Gaps"); // no goal → a gap
+        for i in 0..60 {
+            let long = format!("Decision #{i}: {}", "lorem ipsum ".repeat(60));
+            put(&conn, &ev("tj-gap", EventType::Decision, &long));
+        }
+
+        for mode in [PackMode::Compact, PackMode::Full] {
+            let pack = assemble(&conn, "tj-gap", mode).unwrap();
+            assert!(pack.metadata.truncated, "{mode:?}");
+            let gaps = section(&pack.text, "Completeness");
+            assert!(gaps.contains("no goal recorded"), "{mode:?}: {gaps}");
+        }
+
+        let compact = assemble(&conn, "tj-gap", PackMode::Compact).unwrap();
+        assert!(
+            compact.text.len() <= 2 * 1024 + 64,
+            "{}",
+            compact.text.len()
+        );
+        let gaps = section(&compact.text, "Completeness");
+        assert_eq!(
+            gaps.trim_end().lines().count(),
+            2,
+            "one summary line: {gaps}"
+        );
+    }
+
+    #[test]
+    fn compact_gap_line_stays_short_with_many_gaps() {
+        use crate::completeness::{CompletenessReport, Gap, GapKind};
+
+        let report = CompletenessReport {
+            gaps: (0..50)
+                .map(|i| Gap {
+                    kind: GapKind::MissingFile,
+                    detail: format!("referenced file no longer exists: src/deep/path/file_{i}.rs"),
+                })
+                .collect(),
+        };
+        let line = render_gap_line(&report).unwrap();
+        assert!(line.len() <= 512, "{} bytes: {line}", line.len());
+        assert!(line.contains("## Completeness (50)"), "{line}");
+        assert!(line.contains("honesty score: 0/100"), "{line}");
     }
 }
