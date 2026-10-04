@@ -3319,7 +3319,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 Some(d) => d,
                 None => {
                     eprintln!(
-                        "No Claude Code sessions found for: {}",
+                        "No Claude Code sessions found for: {} — backfill reads Claude Code \
+transcripts only (Codex sessions are not read yet)",
                         project_path.display()
                     );
                     eprintln!(
@@ -4509,7 +4510,10 @@ fn run_dream_op(
     // 1. Resolve session files in scope.
     let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
     let Some(project_dir) = project_dir else {
-        println!("dream: no Claude Code sessions found for this project");
+        println!(
+            "dream: no Claude Code session directory for this project — dream mines \
+Claude Code transcripts only (Codex sessions are not read yet)"
+        );
         return Ok(());
     };
     let session_paths = tj_core::session::discovery::list_sessions(&project_dir)?;

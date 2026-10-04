@@ -216,3 +216,23 @@ fn backfill_indexes_imported_tasks_into_sqlite() {
         .unwrap();
     assert_eq!(tasks, 1);
 }
+
+#[test]
+fn mining_without_claude_code_sessions_says_codex_is_not_read() {
+    // A Codex-only project has no `~/.claude/projects/<path>` dir: say why
+    // nothing was mined instead of a bare zero.
+    let fx = fixture();
+    std::fs::remove_dir(&fx.sessions_dir).unwrap();
+
+    let out = dream(&fx, "http://127.0.0.1:9", &[]);
+    assert!(
+        out.contains("Claude Code") && out.contains("Codex"),
+        "{out}"
+    );
+
+    let err = backfill(&fx);
+    assert!(
+        err.contains("Claude Code") && err.contains("Codex"),
+        "{err}"
+    );
+}
