@@ -109,9 +109,11 @@ pub fn assess(
     let mut evidence = 0usize;
     let mut suggested = 0usize;
     {
-        // Bookkeeping (compaction markers) is not a decision to verify.
+        // Bookkeeping (compaction markers) is not a decision to verify, and a
+        // corrected event no longer needs confirming.
         let mut stmt = conn.prepare(
-            "SELECT type, status FROM events_index WHERE task_id = ?1 AND bookkeeping = 0",
+            "SELECT type, status FROM events_index
+             WHERE task_id = ?1 AND bookkeeping = 0 AND corrected_by IS NULL",
         )?;
         let rows = stmt.query_map(rusqlite::params![task_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -477,6 +479,37 @@ mod tests {
             .find(|g| g.kind == GapKind::SuggestedUnconfirmed)
             .unwrap();
         assert!(g.detail.contains('2'));
+    }
+
+    #[test]
+    fn corrected_suggested_event_is_not_unconfirmed() {
+        use crate::event::EventStatus;
+        let (_d, c) = conn();
+        open_task(&c, "t4c");
+        c.execute("UPDATE tasks SET goal='g' WHERE task_id='t4c'", [])
+            .unwrap();
+        let mut wrong = Event::new(
+            "t4c",
+            EventType::Finding,
+            Author::Agent,
+            Source::Hook,
+            "x".into(),
+        );
+        wrong.status = EventStatus::Suggested;
+        let mut corr = Event::new(
+            "t4c",
+            EventType::Correction,
+            Author::User,
+            Source::Cli,
+            "y".into(),
+        );
+        corr.status = EventStatus::Confirmed;
+        corr.corrects = Some(wrong.event_id.clone());
+        crate::db::index_event(&c, &wrong).unwrap();
+        crate::db::index_event(&c, &corr).unwrap();
+
+        let r = assess(&c, "t4c", 0).unwrap();
+        assert!(r.is_complete(), "{:?}", r.gaps);
     }
 
     #[test]
