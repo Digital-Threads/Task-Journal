@@ -1,4 +1,4 @@
-//! Live Claude Code session id helpers.
+//! Live agent session id helpers (Claude Code and Codex).
 //!
 //! task-journal already *parses* session ids out of Claude Code
 //! transcripts (`session::parser`) — that is a passive, read-only
@@ -9,8 +9,9 @@
 //! without time-window heuristics.
 //!
 //! Source order: hook payload field `session_id` → `CLAUDE_CODE_SESSION_ID`
-//! env var → `None`. `None` means standalone behaviour is unchanged —
-//! nothing is added to `meta`.
+//! env var → `CODEX_THREAD_ID` → `CODEX_SESSION_ID` (Codex exports both,
+//! with the same value, to the processes it starts) → `None`. `None` means
+//! standalone behaviour is unchanged — nothing is added to `meta`.
 
 use serde_json::Value;
 
@@ -24,11 +25,17 @@ pub fn session_id_from_payload(payload: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Read `CLAUDE_CODE_SESSION_ID` from the environment. Empty counts as absent.
+/// Read the live session id from the environment: `CLAUDE_CODE_SESSION_ID`,
+/// then Codex's `CODEX_THREAD_ID`, then `CODEX_SESSION_ID`. Empty counts as
+/// absent.
 pub fn session_id_from_env() -> Option<String> {
-    std::env::var("CLAUDE_CODE_SESSION_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
+    [
+        "CLAUDE_CODE_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+    ]
+    .into_iter()
+    .find_map(|var| std::env::var(var).ok().filter(|s| !s.is_empty()))
 }
 
 /// Resolve the live session id: hook payload first, env var as fallback.
@@ -52,11 +59,8 @@ pub fn stamp_session_id(meta: &mut Value, sid: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env_lock;
     use serde_json::json;
-    use std::sync::Mutex;
-
-    // Serialises the env-touching tests — std env is process-global.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn payload_session_id_extracted() {
@@ -95,7 +99,7 @@ mod tests {
 
     #[test]
     fn live_payload_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = test_env_lock();
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "from-env");
         let p = json!({"session_id": "from-payload"});
         assert_eq!(live_session_id(Some(&p)).as_deref(), Some("from-payload"));
@@ -104,7 +108,7 @@ mod tests {
 
     #[test]
     fn live_falls_back_to_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = test_env_lock();
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "from-env");
         let p = json!({"hook_event_name": "Stop"});
         assert_eq!(live_session_id(Some(&p)).as_deref(), Some("from-env"));
@@ -114,9 +118,63 @@ mod tests {
 
     #[test]
     fn live_none_when_no_source() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+        let _g = test_env_lock();
+        for var in SESSION_ENV_VARS {
+            std::env::remove_var(var);
+        }
         assert_eq!(live_session_id(None), None);
         assert_eq!(live_session_id(Some(&json!({}))), None);
+    }
+
+    const SESSION_ENV_VARS: [&str; 3] = [
+        "CLAUDE_CODE_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+    ];
+
+    /// Run `f` with exactly the given session env vars set (the rest unset).
+    fn with_session_env(set: &[(&str, &str)], f: impl FnOnce()) {
+        let _g = test_env_lock();
+        for var in SESSION_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        for (k, v) in set {
+            std::env::set_var(k, v);
+        }
+
+        f();
+
+        for var in SESSION_ENV_VARS {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn env_falls_back_to_codex_thread_then_session_id() {
+        with_session_env(
+            &[
+                ("CODEX_THREAD_ID", "thread"),
+                ("CODEX_SESSION_ID", "session"),
+            ],
+            || assert_eq!(session_id_from_env().as_deref(), Some("thread")),
+        );
+        with_session_env(&[("CODEX_SESSION_ID", "session")], || {
+            assert_eq!(session_id_from_env().as_deref(), Some("session"))
+        });
+        with_session_env(
+            &[("CODEX_THREAD_ID", ""), ("CODEX_SESSION_ID", "session")],
+            || assert_eq!(session_id_from_env().as_deref(), Some("session")),
+        );
+    }
+
+    #[test]
+    fn env_prefers_claude_code_over_codex() {
+        with_session_env(
+            &[
+                ("CLAUDE_CODE_SESSION_ID", "claude"),
+                ("CODEX_THREAD_ID", "thread"),
+            ],
+            || assert_eq!(session_id_from_env().as_deref(), Some("claude")),
+        );
     }
 }

@@ -2610,6 +2610,70 @@ fn close_with_outcome_renders_outcome_block() {
 }
 
 #[test]
+fn close_records_the_outcome_only_through_the_close_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let out = tj()
+        .args(["create", "Close me", "--goal", "g"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+    let close = |outcome: &str| {
+        let mut cmd = tj();
+        cmd.args([
+            "close",
+            &task_id,
+            "--outcome",
+            outcome,
+            "--outcome-tag",
+            "done",
+        ]);
+        cmd
+    };
+
+    // The close append fails: the journal is read-only.
+    let journal = std::fs::read_dir(dir.path().join("task-journal").join("events"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let writable = std::fs::metadata(&journal).unwrap().permissions();
+    let mut read_only = writable.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(&journal, read_only).unwrap();
+    close("must not stick").assert().failure();
+    std::fs::set_permissions(&journal, writable).unwrap();
+
+    let state = std::fs::read_dir(dir.path().join("task-journal").join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "sqlite"))
+        .unwrap();
+    let conn = tj_core::db::open(&state).unwrap();
+    let meta = tj_core::db::task_metadata(&conn, &task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.outcome, None, "failed close left an outcome behind");
+    drop(conn);
+
+    // A real close keeps its outcome through a rebuild from the journal.
+    close("shipped").assert().success();
+    std::fs::remove_dir_all(dir.path().join("task-journal").join("state")).unwrap();
+    tj().args(["pack", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("**Outcome** [done]: shipped"));
+}
+
+#[test]
 fn close_rejects_invalid_outcome_tag() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
@@ -2708,6 +2772,56 @@ fn external_add_appends_references() {
         .assert()
         .success()
         .stdout(contains("**External**: beads:claude-memory-rsw,github:#42"));
+}
+
+#[test]
+fn goal_and_external_survive_deleting_the_state_db() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let wipe_state = || {
+        let _ = std::fs::remove_dir_all(dir.path().join("task-journal").join("state"));
+    };
+    let out = tj()
+        .args(["create", "Rebuildable", "--goal", "first goal"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+
+    wipe_state();
+    tj().args(["pack", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: first goal"));
+
+    tj().args(["goal", &task_id, "second goal"])
+        .assert()
+        .success();
+    tj().args(["external", &task_id, "--add", "beads:rb-1"])
+        .assert()
+        .success();
+    wipe_state();
+
+    tj().args(["pack", &task_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: second goal"))
+        .stdout(contains("**External**: beads:rb-1"))
+        .stdout(contains("amend").not());
+    tj().args(["pack", "--external", "beads:rb-1"])
+        .assert()
+        .success()
+        .stdout(contains("Rebuildable"));
+    tj().args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("goal: second goal"));
 }
 
 #[test]
@@ -3407,6 +3521,17 @@ fn auto_open_links_to_prior_task_referencing_same_issue() {
         // instead of mashed into External, with the prior task's
         // current status annotated next to the id.
         .stdout(contains("**Linked**:"))
+        .stdout(contains(format!("- {} [closed]", prior)));
+
+    // Goal and link ride in the journal: a state rebuilt from it keeps both.
+    std::fs::remove_dir_all(dir.path().join("task-journal").join("state")).unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["pack", &new_id, "--mode", "full"])
+        .assert()
+        .success()
+        .stdout(contains("**Goal**: (not set)").not())
         .stdout(contains(format!("- {} [closed]", prior)));
 }
 
@@ -5217,6 +5342,68 @@ fn search_does_not_crash_on_hyphenated_identifier() {
         .assert()
         .success()
         .stdout(contains("tj-"));
+}
+
+#[test]
+fn search_with_an_empty_query_lists_tasks_newest_first() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path()).current_dir(&workdir);
+        cmd
+    };
+    let create = |title: &str| {
+        let out = tj().args(["create", title]).assert().success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let search = |args: &[&str]| {
+        let out = tj().arg("search").args(args).assert().success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    let older = create("Older task");
+    let newer = create("Newer task");
+    assert_eq!(search(&[""]), [newer.clone(), older.clone()]);
+
+    tj().args(["event", &older, "--type", "decision", "--text", "Pick X"])
+        .assert()
+        .success();
+    assert_eq!(search(&["   "]), [older.clone(), newer.clone()]);
+    assert_eq!(search(&["", "--type", "decision"]), [older.as_str()]);
+    assert_eq!(search(&["", "--limit", "1"]), [older]);
+}
+
+#[test]
+fn search_in_a_project_without_a_journal_creates_no_state_db() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    for query in ["", "anything"] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["search", query])
+            .assert()
+            .success()
+            .stdout("");
+    }
+
+    let state = dir.path().join("task-journal").join("state");
+    let created: Vec<_> = std::fs::read_dir(&state)
+        .map(|rd| rd.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(created.is_empty(), "{created:?}");
 }
 
 #[test]

@@ -592,6 +592,7 @@ mod tests {
         // pending_count() resolves `<data_dir>/pending`. Point the data dir at
         // the isolated tempdir (no pending/ child) so the PendingLeak rule
         // stays silent regardless of the real dev environment.
+        let _env = crate::test_env_lock();
         std::env::set_var("TASK_JOURNAL_DATA_DIR", d.path());
 
         let pack = assemble(&conn, "g2", PackMode::Compact).unwrap();

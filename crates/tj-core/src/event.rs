@@ -17,6 +17,11 @@ pub enum EventType {
     Close,
     Redirect,
     Rename,
+    /// Changes task metadata after creation: `meta.goal` replaces the goal,
+    /// `meta.external_add` (array of strings) adds external references.
+    /// Not reasoning — kept out of packs, search and recall. Written by the
+    /// `goal` / `external` commands, never accepted as a user event type.
+    Amend,
 }
 
 impl EventType {
@@ -34,6 +39,7 @@ impl EventType {
         Self::Close,
         Self::Redirect,
         Self::Rename,
+        Self::Amend,
     ];
 }
 

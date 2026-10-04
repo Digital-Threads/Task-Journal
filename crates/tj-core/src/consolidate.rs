@@ -202,6 +202,7 @@ mod tests {
 
     #[test]
     fn summarize_skips_when_backend_forced_none() {
+        let _env = crate::test_env_lock();
         std::env::set_var("TJ_CONSOLIDATE_BACKEND", "none");
         let r = summarize(&["chose ledger".into()], 5, None).unwrap();
         std::env::remove_var("TJ_CONSOLIDATE_BACKEND");
