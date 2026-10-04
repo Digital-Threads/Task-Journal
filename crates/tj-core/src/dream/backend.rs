@@ -39,10 +39,12 @@ pub trait DreamBackend {
 }
 
 /// Test backend that returns a canned list, ignoring the input.
+#[cfg(test)]
 pub struct MockDreamBackend {
     pub events: Vec<BackfillEvent>,
 }
 
+#[cfg(test)]
 impl DreamBackend for MockDreamBackend {
     fn backfill(&self, _input: &BackfillInput) -> anyhow::Result<Vec<BackfillEvent>> {
         Ok(self.events.clone())
