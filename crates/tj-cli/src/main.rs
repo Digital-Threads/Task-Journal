@@ -2576,7 +2576,8 @@ fn real_main() -> Result<()> {
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 3)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 3, live_session_id.as_deref())?;
                 if recent.is_empty() {
                     if !prefs_block.is_empty() {
                         emit_session_context(&prefs_block);
@@ -2690,7 +2691,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -2751,7 +2753,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -2888,7 +2891,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -2975,7 +2979,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                let recent = recent_task_contexts(&conn, 1)?;
+                let recent =
+                    recent_task_contexts(&conn, &project_hash, 1, live_session_id.as_deref())?;
                 let Some(tc) = recent.into_iter().next() else {
                     return Ok(());
                 };
@@ -3063,7 +3068,8 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     if events_path.exists() {
                         tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     }
-                    let mut recent = recent_task_contexts(&conn, 5)?;
+                    let mut recent =
+                        recent_task_contexts(&conn, &project_hash, 5, live_session_id.as_deref())?;
                     if recent.is_empty() {
                         // No open tasks. v0.5.0 Phase A: auto-open a new
                         // task from the user's prompt so subsequent
@@ -4326,15 +4332,26 @@ fn run_export_memory(task: Option<&str>, _all_closed: bool, dry_run: bool) -> Re
 /// the classifier prompt. Kept small so the prompt stays bounded.
 const CONSTRAINT_CONTEXT_LIMIT: i64 = 5;
 
+/// The open tasks a hook works with, newest first — except that the task
+/// this session last wrote to comes first, so two sessions in one project
+/// each see (and classify into) their own task, not just the newest one.
 fn recent_task_contexts(
     conn: &rusqlite::Connection,
+    project_hash: &str,
     limit: usize,
+    session: Option<&str>,
 ) -> anyhow::Result<Vec<tj_core::classifier::TaskContext>> {
+    let own = match session {
+        Some(sid) => tj_core::db::active_task_for_session(conn, project_hash, sid)?,
+        None => None,
+    };
+
     let mut stmt = conn.prepare(
-        "SELECT task_id, title FROM tasks WHERE status='open' ORDER BY last_event_at DESC LIMIT ?1",
+        "SELECT task_id, title FROM tasks WHERE status='open'
+         ORDER BY (task_id = ?2) DESC, last_event_at DESC LIMIT ?1",
     )?;
     let task_rows: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![limit as i64], |r| {
+        .query_map(rusqlite::params![limit as i64, own], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .collect::<Result<_, _>>()?;
@@ -4536,7 +4553,10 @@ fn run_session_end_catchup(
     let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
     let conn = tj_core::db::open(&state_path)?;
     tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
-    let Some(tc) = recent_task_contexts(&conn, 1)?.into_iter().next() else {
+    let Some(tc) = recent_task_contexts(&conn, project_hash, 1, live_session_id)?
+        .into_iter()
+        .next()
+    else {
         return Ok(());
     };
     let last_event_ts: Option<String> = conn
@@ -6001,7 +6021,7 @@ fn classify_chunk(
         tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
     }
 
-    let mut recent = recent_task_contexts(&conn, 5)?;
+    let mut recent = recent_task_contexts(&conn, project_hash, 5, session_id)?;
     if recent.is_empty() {
         let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
             .ok()
@@ -6896,6 +6916,51 @@ mod inline_tests {
     }
 
     #[test]
+    fn recent_task_contexts_puts_the_sessions_own_task_first() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+
+        // s1 works on the older task; another session touched tj-2 later.
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        for (task, at, session) in [
+            ("tj-1", "2026-01-01T00:00:00Z", Some("s1")),
+            ("tj-2", "2026-01-01T00:00:05Z", Some("s2")),
+        ] {
+            let mut open = Event::new(
+                task,
+                EventType::Open,
+                Author::Agent,
+                Source::Chat,
+                task.into(),
+            );
+            open.timestamp = at.into();
+            tj_core::session_id::stamp_session_id(&mut open.meta, session);
+            writer.append(&open).unwrap();
+        }
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, "h").unwrap();
+
+        let first = |session| {
+            recent_task_contexts(&conn, "h", 2, session).unwrap()[0]
+                .task_id
+                .clone()
+        };
+        assert_eq!(first(Some("s1")), "tj-1", "s1 sees its own task first");
+        assert_eq!(first(Some("s2")), "tj-2");
+        assert_eq!(
+            first(Some("s9")),
+            "tj-2",
+            "an unknown session falls back to the newest"
+        );
+        assert_eq!(first(None), "tj-2");
+    }
+
+    #[test]
     fn recent_task_contexts_gathers_constraints() {
         use tj_core::event::{Author, Event, EventType, Source};
         let dir = tempfile::tempdir().unwrap();
@@ -6938,7 +7003,7 @@ mod inline_tests {
         let conn = tj_core::db::open(&state_path).unwrap();
         tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
 
-        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctxs = recent_task_contexts(&conn, "h", 5, None).unwrap();
         let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
         assert!(
             ctx.constraints
@@ -6991,7 +7056,7 @@ mod inline_tests {
         let conn = tj_core::db::open(&state_path).unwrap();
         tj_core::db::ingest_new_events(&conn, &events_path, project_hash).unwrap();
 
-        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctxs = recent_task_contexts(&conn, "h", 5, None).unwrap();
         let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
         assert_eq!(
             ctx.constraints.len(),
@@ -7054,7 +7119,7 @@ mod inline_tests {
         let conn = tj_core::db::open(&state_path).unwrap();
         tj_core::db::ingest_new_events(&conn, &events_path, "h").unwrap();
 
-        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctxs = recent_task_contexts(&conn, "h", 5, None).unwrap();
         let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
         assert_eq!(ctx.constraints.len(), 5, "{:?}", ctx.constraints);
         assert!(
