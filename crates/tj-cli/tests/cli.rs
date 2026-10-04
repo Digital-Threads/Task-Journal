@@ -531,6 +531,46 @@ fn export_html_emits_self_contained_document() {
     assert!(!html.contains("https://"), "external https url leaked");
 }
 
+/// Append a line that is not a valid event to the only JSONL log under `xdg`.
+fn append_malformed_jsonl_line(xdg: &std::path::Path) {
+    use std::io::Write;
+
+    let events = xdg.join("task-journal").join("events");
+    let log = std::fs::read_dir(&events)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .expect("events log present");
+    let mut f = std::fs::OpenOptions::new().append(true).open(log).unwrap();
+    writeln!(f, "{{not json").unwrap();
+}
+
+#[test]
+fn export_skips_malformed_jsonl_lines_with_a_warning() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Survives a bad line"])
+        .assert()
+        .success();
+    append_malformed_jsonl_line(xdg.path());
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["export", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(contains("Survives a bad line"))
+        .stderr(contains("skipping malformed JSONL line 2"));
+}
+
 #[test]
 fn migrate_project_round_trips_data_to_new_path() {
     let xdg = assert_fs::TempDir::new().unwrap();
@@ -2222,6 +2262,31 @@ fn events_list_shows_recent_events() {
         .assert()
         .success()
         .stdout(contains("First task").and(contains("Second task")));
+}
+
+#[test]
+fn events_list_skips_malformed_jsonl_lines_with_a_warning() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Listed despite a bad line"])
+        .assert()
+        .success();
+    append_malformed_jsonl_line(xdg.path());
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Listed despite a bad line"))
+        .stderr(contains("skipping malformed JSONL line 2"));
 }
 
 #[test]

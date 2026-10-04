@@ -112,6 +112,32 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     r
 }
 
+/// Read a project's JSONL event log. Malformed lines are skipped with a
+/// warning on stderr, the same policy as `rebuild_state`, so one bad line
+/// cannot abort a read-only command.
+fn read_events_lenient(
+    path: &std::path::Path,
+    command: &str,
+) -> Result<Vec<tj_core::event::Event>> {
+    let body = std::fs::read_to_string(path)?;
+    let mut events = Vec::new();
+
+    for (i, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(e) => events.push(e),
+            Err(err) => eprintln!(
+                "warning: skipping malformed JSONL line {} in {command}: {err}",
+                i + 1
+            ),
+        }
+    }
+
+    Ok(events)
+}
+
 /// Move all on-disk data for one project_hash to another. Used by the
 /// `migrate-project` subcommand when a project's directory has been
 /// moved on disk and the canonical-path hash no longer matches.
@@ -1234,12 +1260,7 @@ fn real_main() -> Result<()> {
                     println!("(no events yet)");
                     return Ok(());
                 }
-                let body = std::fs::read_to_string(&events_path)?;
-                let mut events: Vec<tj_core::event::Event> = body
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(serde_json::from_str)
-                    .collect::<Result<_, _>>()?;
+                let mut events = read_events_lenient(&events_path, "events list")?;
                 events.reverse();
                 for e in events.into_iter().take(limit) {
                     let title = e
@@ -3095,12 +3116,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 anyhow::bail!("no events file at {events_path:?}");
             }
 
-            let body = std::fs::read_to_string(&events_path)?;
-            let all_events: Vec<tj_core::event::Event> = body
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(serde_json::from_str)
-                .collect::<Result<_, _>>()?;
+            let all_events = read_events_lenient(&events_path, "export")?;
 
             // Filter to specific task if requested.
             let events: Vec<&tj_core::event::Event> = if let Some(ref tid) = task {
