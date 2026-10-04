@@ -6985,6 +6985,48 @@ fn complete_command_runs_and_skips_cleanly_without_sessions() {
 }
 
 #[test]
+fn complete_enrich_without_claude_code_sessions_says_codex_is_not_read() {
+    // A Codex-only project has no `~/.claude/projects/<path>` dir: --enrich
+    // must say why it read nothing. `anthropic` without a key = no backend,
+    // so no model is ever called.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let claude = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Enrich me", "--goal", "g"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    for args in [
+        vec!["complete", task_id.as_str(), "--enrich"],
+        vec!["complete", "--enrich", "--yes"],
+    ] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .current_dir(proj.path())
+            .env("XDG_DATA_HOME", dir.path())
+            .env("CLAUDE_CONFIG_DIR", claude.path())
+            .env_remove("ANTHROPIC_API_KEY")
+            .args(args)
+            .args(["--backend", "anthropic"])
+            .assert()
+            .success()
+            .stderr(contains("Claude Code").and(contains("Codex")));
+    }
+}
+
+#[test]
 fn complete_unknown_task_errors() {
     // A non-existent id is a hard error, not a silent no-op.
     let dir = assert_fs::TempDir::new().unwrap();

@@ -5092,6 +5092,23 @@ PATH; or pick one via --backend / TJ_BACKEND: anthropic, openai, ollama (free, l
     );
 }
 
+/// The Claude Code session dir that `--enrich` reads. With `--enrich` and no
+/// such dir, say why nothing gets enriched instead of staying silent.
+fn complete_project_dir(
+    cwd: &std::path::Path,
+    enrich: bool,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let dir = tj_core::session::discovery::find_project_dir(cwd)?;
+    if enrich && dir.is_none() {
+        eprintln!(
+            "complete: no Claude Code session directory for this project — --enrich reads \
+Claude Code transcripts only (Codex sessions are not read yet)"
+        );
+    }
+
+    Ok(dir)
+}
+
 /// `complete <id>` — finalize a single task.
 fn run_complete_single(
     task_id: &str,
@@ -5110,7 +5127,7 @@ fn run_complete_single(
     if !tj_core::db::task_exists(&conn, task_id)? {
         anyhow::bail!("task not found: {task_id}");
     }
-    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+    let project_dir = complete_project_dir(&cwd, enrich)?;
     let ctx = ProjectCtx {
         conn: &conn,
         events_path: &events_path,
@@ -5156,7 +5173,7 @@ fn run_complete_batch(
         return Ok(());
     }
 
-    let project_dir = tj_core::session::discovery::find_project_dir(&cwd)?;
+    let project_dir = complete_project_dir(&cwd, enrich)?;
 
     // Show the numbered list with event/session counts so the user can judge
     // what to keep before anything is touched.
