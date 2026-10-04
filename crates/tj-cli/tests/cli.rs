@@ -1124,10 +1124,12 @@ fn migrate_project_force_keeps_destination_when_the_move_fails() {
     );
 }
 
+/// The JSONL is the source of truth: `--force` keeps the journal it replaces
+/// as `<dst>.jsonl.bak-<timestamp>` and says where it went.
 #[test]
 fn migrate_project_force_replaces_existing_destination() {
     let xdg = assert_fs::TempDir::new().unwrap();
-    let (proj_a, proj_b, _, _) = two_projects();
+    let (proj_a, proj_b, _, to_hash) = two_projects();
 
     for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
         Command::cargo_bin("task-journal")
@@ -1139,7 +1141,23 @@ fn migrate_project_force_replaces_existing_destination() {
             .success();
     }
 
-    migrate(xdg.path(), proj_a.path(), proj_b.path(), true);
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+            "--force",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
 
     Command::cargo_bin("task-journal")
         .unwrap()
@@ -1149,6 +1167,119 @@ fn migrate_project_force_replaces_existing_destination() {
         .assert()
         .success()
         .stdout(contains("Source task").and(contains("Overwritten task").not()));
+
+    let events = xdg.path().join("task-journal").join("events");
+    let backup = std::fs::read_dir(&events)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("{to_hash}.jsonl.bak-"))
+        })
+        .unwrap_or_else(|| panic!("no backup of the replaced journal; stdout: {out}"));
+    assert!(std::fs::read_to_string(&backup)
+        .unwrap()
+        .contains("Overwritten task"));
+    assert!(out.contains(&backup.display().to_string()), "{out}");
+}
+
+/// A destination WAL left behind by the database `--force` replaces must not
+/// be replayed into the one moving in.
+#[test]
+fn migrate_project_force_drops_the_replaced_databases_wal() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", title])
+            .assert()
+            .success();
+    }
+    drop(tj_core::db::open(state.join(format!("{from_hash}.sqlite"))).unwrap());
+
+    // A crash leftover: the destination's WAL with a write never folded in.
+    let dst_db = state.join(format!("{to_hash}.sqlite"));
+    let dst_wal = state.join(format!("{to_hash}.sqlite-wal"));
+    {
+        let conn = tj_core::db::open(&dst_db).unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        conn.execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES ('stale-wal', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let wal = std::fs::read(&dst_wal).unwrap();
+        drop(conn);
+        std::fs::write(&dst_wal, wal).unwrap();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), true);
+
+    let conn = rusqlite::Connection::open(&dst_db).unwrap();
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dream_state WHERE project_hash = 'stale-wal'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "the replaced database's WAL was replayed");
+}
+
+/// Queued chunks and the push-recall log are keyed by the project hash too.
+/// After a move the new project's worker classifies what the old one queued.
+#[test]
+fn migrate_project_rekeys_pending_entries_and_the_recall_log() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let pending = xdg.path().join("task-journal").join("pending");
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Queue host"])
+        .assert()
+        .success();
+    let queued = write_pending_entry(
+        &pending,
+        &format!("{from_hash}.01JD0000000000000000000000.json"),
+        Some(&from_hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use store-moved for the cache",
+    );
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join(format!("{from_hash}.recall-shown")), "s1 e1\n").unwrap();
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    assert!(!queued.exists(), "entry left under the old hash");
+    assert_eq!(
+        std::fs::read_to_string(state.join(format!("{to_hash}.recall-shown"))).unwrap(),
+        "s1 e1\n"
+    );
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+    let journal = project_events(xdg.path(), &to_hash);
+    assert!(journal.contains("store-moved"), "{journal}");
 }
 
 #[test]

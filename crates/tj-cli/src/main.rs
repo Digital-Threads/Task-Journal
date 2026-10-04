@@ -187,6 +187,10 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             state_dir.join(format!("{to_hash}.sqlite-shm")),
         ),
         (
+            state_dir.join(format!("{from_hash}.recall-shown")),
+            state_dir.join(format!("{to_hash}.recall-shown")),
+        ),
+        (
             metrics_dir.join(format!("{from_hash}.jsonl")),
             metrics_dir.join(format!("{to_hash}.jsonl")),
         ),
@@ -214,6 +218,29 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             .with_context(|| format!("checkpoint WAL of {src_state_path:?}"))?;
     }
 
+    // --force: the JSONL is the source of truth, so keep the journal being
+    // replaced. A copy, so a failed move still leaves the destination intact.
+    let (src_jsonl, dst_jsonl) = &pairs[0];
+    let mut backup = None;
+    if src_jsonl.exists() && dst_jsonl.metadata().is_ok_and(|m| m.len() > 0) {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let bak = dst_jsonl.with_file_name(format!("{to_hash}.jsonl.bak-{stamp}"));
+        std::fs::copy(dst_jsonl, &bak).with_context(|| format!("back up {dst_jsonl:?}"))?;
+        backup = Some(bak);
+    }
+
+    // --force: a destination `-wal` / `-shm` belongs to the database being
+    // replaced. Left next to the one moving in, SQLite would replay it into
+    // it; the source's own sidecars, if any, are moved in below.
+    if src_state_path.exists() {
+        for suffix in ["-wal", "-shm"] {
+            let stale = state_dir.join(format!("{to_hash}.sqlite{suffix}"));
+            if stale.exists() {
+                std::fs::remove_file(&stale).with_context(|| format!("remove {stale:?}"))?;
+            }
+        }
+    }
+
     let mut moved: Vec<String> = Vec::new();
     for (src, dst) in &pairs {
         if !src.exists() {
@@ -227,6 +254,34 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         // a failed move under --force leaves the destination intact.
         std::fs::rename(src, dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
         moved.push(dst.display().to_string());
+    }
+
+    // Queued chunks carry the hash in their name and, for the worker's
+    // ownership check, in their `project_hash`.
+    let pending_dir = events_dir.with_file_name("pending");
+    if pending_dir.exists() {
+        let prefix = format!("{from_hash}.");
+        for src in std::fs::read_dir(&pending_dir)?.flatten().map(|e| e.path()) {
+            let Some(rest) = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(&prefix))
+            else {
+                continue;
+            };
+            let dst = pending_dir.join(format!("{to_hash}.{rest}"));
+
+            let body = std::fs::read_to_string(&src)?;
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if v["project_hash"] == from_hash.as_str() {
+                    v["project_hash"] = to_hash.clone().into();
+                    std::fs::write(&src, serde_json::to_string_pretty(&v)?)?;
+                }
+            }
+
+            std::fs::rename(&src, &dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
+            moved.push(dst.display().to_string());
+        }
     }
 
     // Re-key the project_hash columns inside the (now renamed) SQLite.
@@ -258,6 +313,9 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
             println!("  {path}");
         }
         println!("  project_hash {from_hash} -> {to_hash}");
+    }
+    if let Some(bak) = backup {
+        println!("kept the replaced journal as {}", bak.display());
     }
     Ok(())
 }
