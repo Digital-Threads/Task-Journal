@@ -432,7 +432,8 @@ pub struct ModulePageResult {
 pub struct BackfillParams {
     /// Tasks per page, newest first (default 20, at most 100).
     pub limit: Option<usize>,
-    /// Tasks to skip: page on past the ones you left for later.
+    /// Tasks to skip: the ones you left unlinked on earlier pages. Linked
+    /// tasks drop out of the list, so do not count them.
     pub offset: Option<usize>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -1424,7 +1425,7 @@ impl TaskJournalServer {
 
     #[tool(
         name = "module_backfill_candidates",
-        description = "Tasks that belong to no module, newest first: id, title, status, goal, outcome, files, and the modules the journal suggests for each. Sort them, confirm with the user, then module_link. `total_unlinked` counts them all; page with `limit` and `offset`."
+        description = "Tasks that belong to no module, newest first: id, title, status, goal, outcome, files, and the modules the journal suggests for each. Sort them, confirm with the user, then module_link. `total_unlinked` counts them all; page with `limit`, and `offset` = the tasks you left unlinked so far."
     )]
     async fn module_backfill_candidates(
         &self,

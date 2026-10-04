@@ -480,6 +480,39 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         }
     }
 
+    // The chronicle registry: a moved home keeps the worktree journals its
+    // module history comes from, and a moved member stays listed under its home.
+    let chronicle_dir = tj_core::paths::data_dir()?.join("chronicle");
+    if chronicle_dir.is_dir() {
+        let from_registry = chronicle_dir.join(format!("{from_hash}.members"));
+        if from_registry.exists() {
+            let to_registry = chronicle_dir.join(format!("{to_hash}.members"));
+            let mut members = std::fs::read_to_string(&to_registry).unwrap_or_default();
+            members.push_str(&std::fs::read_to_string(&from_registry)?);
+            std::fs::write(&to_registry, members)?;
+            std::fs::remove_file(&from_registry)?;
+            moved.push(to_registry.display().to_string());
+        }
+        for entry in std::fs::read_dir(&chronicle_dir)? {
+            let path = entry?.path();
+            let text = std::fs::read_to_string(&path)?;
+            if text.lines().any(|l| l.trim() == from_hash) {
+                let renamed: String = text
+                    .lines()
+                    .map(|l| {
+                        if l.trim() == from_hash {
+                            to_hash.as_str()
+                        } else {
+                            l
+                        }
+                    })
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                std::fs::write(&path, renamed)?;
+            }
+        }
+    }
+
     // The global cross-project index keys its rows by project_hash too.
     let memory_path = tj_core::paths::memory_db()?;
     if memory_path.exists() {
@@ -2027,7 +2060,7 @@ fn real_main() -> Result<()> {
                     &project_hash,
                     session.as_deref(),
                     prefer.as_deref(),
-                    &tj_core::chronicle::Chronicle::open(&cwd)?,
+                    tj_core::chronicle::Chronicle::open(&cwd).ok().as_ref(),
                 )?
             } else {
                 tj_core::session_state::SessionState {

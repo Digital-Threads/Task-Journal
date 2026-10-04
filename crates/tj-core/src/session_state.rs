@@ -58,7 +58,7 @@ pub fn session_state(
     project_hash: &str,
     session_id: Option<&str>,
     prefer: Option<&str>,
-    chr: &crate::chronicle::Chronicle,
+    chr: Option<&crate::chronicle::Chronicle>,
 ) -> anyhow::Result<SessionState> {
     let open_tasks = conn.query_row(
         "SELECT COUNT(*) FROM tasks WHERE project_hash = ?1 AND status = 'open'",
@@ -84,12 +84,18 @@ pub fn session_state(
     let active = active_id
         .map(|id| active_task(conn, &id, chr))
         .transpose()?;
-    let archive = crate::archive::gaps(
-        chr,
-        conn,
-        project_hash,
-        active.as_ref().map(|a| a.task_id.as_str()),
-    )?;
+    // The chronicle is advice: a map that cannot be read leaves it empty.
+    let archive = chr
+        .and_then(|chr| {
+            crate::archive::gaps(
+                chr,
+                conn,
+                project_hash,
+                active.as_ref().map(|a| a.task_id.as_str()),
+            )
+            .ok()
+        })
+        .unwrap_or_default();
 
     Ok(SessionState {
         schema: SCHEMA,
@@ -103,7 +109,7 @@ pub fn session_state(
 fn active_task(
     conn: &Connection,
     task_id: &str,
-    chr: &crate::chronicle::Chronicle,
+    chr: Option<&crate::chronicle::Chronicle>,
 ) -> anyhow::Result<ActiveTask> {
     let (title, goal) = conn.query_row(
         "SELECT title, goal FROM tasks WHERE task_id = ?1",
@@ -153,10 +159,12 @@ fn active_task(
             .into_iter()
             .map(|(id, name)| {
                 // A worktree's own state has no modules: names live in the home.
-                crate::modules::get(&chr.home, &chr.home_hash, &id)
-                    .ok()
-                    .flatten()
-                    .map_or(name, |m| m.name)
+                chr.and_then(|chr| {
+                    crate::modules::get(&chr.home, &chr.home_hash, &id)
+                        .ok()
+                        .flatten()
+                })
+                .map_or(name, |m| m.name)
             })
             .collect(),
     })
@@ -208,7 +216,7 @@ mod tests {
         crate::session_id::stamp_session_id(&mut mine.meta, Some("s1"));
         let (_d, conn) = journal(&[stars, mine, open_task("tj-b", &[])]);
 
-        let state = session_state(&conn, "p", Some("s1"), None, &chronicle(&_d)).unwrap();
+        let state = session_state(&conn, "p", Some("s1"), None, Some(&chronicle(&_d))).unwrap();
 
         assert_eq!(
             state.active.as_ref().unwrap().modules,
@@ -220,13 +228,26 @@ mod tests {
     }
 
     #[test]
+    fn without_a_chronicle_the_state_still_names_the_task() {
+        // The chronicle is advice: a map that cannot be read must not take
+        // the status line down with it.
+        let (_dir, conn) = conn();
+        write(&conn, "tj-a", EventType::Open, "a", Some("s1"));
+
+        let state = session_state(&conn, "p", Some("s1"), None, None).unwrap();
+
+        assert_eq!(state.active.unwrap().task_id, "tj-a");
+        assert!(state.archive.is_empty());
+    }
+
+    #[test]
     fn active_task_is_the_sessions_own_not_the_newest() {
         let (_dir, conn) = conn();
         write(&conn, "tj-a", EventType::Open, "a", Some("s1"));
         write(&conn, "tj-a", EventType::Decision, "Use <=", Some("s1"));
         write(&conn, "tj-b", EventType::Open, "b", Some("s2"));
 
-        let s1 = session_state(&conn, "p", Some("s1"), None, &chronicle(&_dir)).unwrap();
+        let s1 = session_state(&conn, "p", Some("s1"), None, Some(&chronicle(&_dir))).unwrap();
         let active = s1.active.expect("s1 has a task");
         assert_eq!(active.task_id, "tj-a");
         assert_eq!(active.title, "Title of tj-a");
@@ -236,7 +257,7 @@ mod tests {
         assert_eq!(active.recent[0].kind, "decision");
         assert_eq!(s1.open_tasks, 2);
 
-        let other = session_state(&conn, "p", Some("s3"), None, &chronicle(&_dir)).unwrap();
+        let other = session_state(&conn, "p", Some("s3"), None, Some(&chronicle(&_dir))).unwrap();
         assert!(other.active.is_none());
         assert_eq!(other.open_tasks, 2);
     }
@@ -248,19 +269,37 @@ mod tests {
         write(&conn, "tj-sub", EventType::Open, "s", Some("s1"));
 
         // Without a preference the newest write wins; with one, the pin holds.
-        let plain = session_state(&conn, "p", Some("s1"), None, &chronicle(&_dir)).unwrap();
+        let plain = session_state(&conn, "p", Some("s1"), None, Some(&chronicle(&_dir))).unwrap();
         assert_eq!(plain.active.unwrap().task_id, "tj-sub");
-        let pinned =
-            session_state(&conn, "p", Some("s1"), Some("tj-parent"), &chronicle(&_dir)).unwrap();
+        let pinned = session_state(
+            &conn,
+            "p",
+            Some("s1"),
+            Some("tj-parent"),
+            Some(&chronicle(&_dir)),
+        )
+        .unwrap();
         assert_eq!(pinned.active.unwrap().task_id, "tj-parent");
 
         // A closed or unknown preference falls back to the session's own task.
         write(&conn, "tj-parent", EventType::Close, "done", Some("s1"));
-        let closed =
-            session_state(&conn, "p", Some("s1"), Some("tj-parent"), &chronicle(&_dir)).unwrap();
+        let closed = session_state(
+            &conn,
+            "p",
+            Some("s1"),
+            Some("tj-parent"),
+            Some(&chronicle(&_dir)),
+        )
+        .unwrap();
         assert_eq!(closed.active.unwrap().task_id, "tj-sub");
-        let unknown =
-            session_state(&conn, "p", Some("s1"), Some("tj-nope"), &chronicle(&_dir)).unwrap();
+        let unknown = session_state(
+            &conn,
+            "p",
+            Some("s1"),
+            Some("tj-nope"),
+            Some(&chronicle(&_dir)),
+        )
+        .unwrap();
         assert_eq!(unknown.active.unwrap().task_id, "tj-sub");
     }
 
@@ -289,7 +328,7 @@ mod tests {
         crate::db::upsert_task_from_event(&conn, &fix, "p").unwrap();
         crate::db::index_event(&conn, &fix).unwrap();
 
-        let active = session_state(&conn, "p", Some("s1"), None, &chronicle(&_dir))
+        let active = session_state(&conn, "p", Some("s1"), None, Some(&chronicle(&_dir)))
             .unwrap()
             .active
             .unwrap();
@@ -308,7 +347,7 @@ mod tests {
         write(&conn, "tj-a", EventType::Open, "a", Some("s1"));
         write(&conn, "tj-a", EventType::Close, "done", Some("s1"));
 
-        let s = session_state(&conn, "p", Some("s1"), None, &chronicle(&_dir)).unwrap();
+        let s = session_state(&conn, "p", Some("s1"), None, Some(&chronicle(&_dir))).unwrap();
         assert!(s.active.is_none());
         assert_eq!(s.open_tasks, 0);
     }
@@ -319,7 +358,7 @@ mod tests {
         write(&conn, "tj-a", EventType::Open, "a", Some("s1"));
 
         let v = serde_json::to_value(
-            session_state(&conn, "p", Some("s1"), None, &chronicle(&_dir)).unwrap(),
+            session_state(&conn, "p", Some("s1"), None, Some(&chronicle(&_dir))).unwrap(),
         )
         .unwrap();
         assert_eq!(v["schema"], "tj-state/1");
@@ -327,9 +366,10 @@ mod tests {
         assert_eq!(v["active"]["task_id"], "tj-a");
         assert!(v["active"]["recent"].as_array().unwrap().is_empty());
 
-        let none =
-            serde_json::to_value(session_state(&conn, "p", None, None, &chronicle(&_dir)).unwrap())
-                .unwrap();
+        let none = serde_json::to_value(
+            session_state(&conn, "p", None, None, Some(&chronicle(&_dir))).unwrap(),
+        )
+        .unwrap();
         assert!(none["active"].is_null());
         assert!(none["session_id"].is_null());
     }

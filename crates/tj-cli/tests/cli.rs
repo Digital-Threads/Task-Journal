@@ -1026,6 +1026,45 @@ fn migrate_project_rekeys_embeddings_and_dream_state() {
 }
 
 #[test]
+fn migrate_project_carries_the_chronicle_registry() {
+    // The registry lists the worktree journals a home's module history comes
+    // from; a moved home must keep it, and a moved member must stay listed.
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let chronicle = xdg.path().join("task-journal").join("chronicle");
+    std::fs::create_dir_all(&chronicle).unwrap();
+    std::fs::write(
+        chronicle.join(format!("{from_hash}.members")),
+        "aaaaaaaaaaaaaaaa\n",
+    )
+    .unwrap();
+    std::fs::write(
+        chronicle.join("bbbbbbbbbbbbbbbb.members"),
+        format!("{from_hash}\n"),
+    )
+    .unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Move me"])
+        .assert()
+        .success();
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    assert!(!chronicle.join(format!("{from_hash}.members")).exists());
+    assert_eq!(
+        std::fs::read_to_string(chronicle.join(format!("{to_hash}.members"))).unwrap(),
+        "aaaaaaaaaaaaaaaa\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(chronicle.join("bbbbbbbbbbbbbbbb.members")).unwrap(),
+        format!("{to_hash}\n")
+    );
+}
+
+#[test]
 fn migrate_project_rekeys_only_its_rows_in_global_memory() {
     let xdg = assert_fs::TempDir::new().unwrap();
     let (proj_a, proj_b, from_hash, to_hash) = two_projects();

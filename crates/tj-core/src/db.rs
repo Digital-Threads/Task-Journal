@@ -1140,7 +1140,7 @@ fn clear_search_fts(conn: &Connection, project_hash: &str) -> anyhow::Result<()>
 /// table; by rowid, re-indexing an event replaces its row in O(log n).
 // ponytail: two ids hashing alike (odds ~n²/2^64) would share one search row;
 // a mapping table removes that if it ever matters.
-fn fts_rowid(event_id: &str) -> i64 {
+pub(crate) fn fts_rowid(event_id: &str) -> i64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in event_id.bytes() {
         hash ^= u64::from(byte);

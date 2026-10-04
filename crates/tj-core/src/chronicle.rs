@@ -17,15 +17,16 @@ pub struct Chronicle {
     pub home_hash: String,
     /// The home's state: the modules, and the home's own tasks.
     pub home: Connection,
-    /// The states of the other journals that may hold linked tasks.
-    pub members: Vec<Connection>,
     /// The current project's hash when it is a member (a worktree).
     pub member_hash: Option<String>,
+    /// The other journals known to link tasks to the home's modules. Opened
+    /// one at a time, and only by the views that gather the whole history.
+    members: Vec<String>,
     data: PathBuf,
 }
 
 impl Chronicle {
-    /// The chronicle of the project at `dir`, every journal ingested.
+    /// The chronicle of the project at `dir`: its home's state, caught up.
     pub fn open(dir: &Path) -> anyhow::Result<Self> {
         Self::open_in(&crate::paths::data_dir()?, dir)
     }
@@ -38,23 +39,17 @@ impl Chronicle {
             None => current.clone(),
         };
         let member_hash = (home_hash != current).then_some(current);
-        if let Some(member) = &member_hash {
-            register(data, &home_hash, member)?;
-        }
-
         let home = open_journal(data, &home_hash)?;
-        let mut members = Vec::new();
-        for hash in member_hashes(data, &home_hash)? {
-            if hash != home_hash && data.join("events").join(format!("{hash}.jsonl")).exists() {
-                members.push(open_journal(data, &hash)?);
-            }
-        }
+        let members = member_hashes(data, &home_hash)?
+            .into_iter()
+            .filter(|h| *h != home_hash)
+            .collect();
 
         Ok(Self {
             home_hash,
             home,
-            members,
             member_hash,
+            members,
             data: data.to_path_buf(),
         })
     }
@@ -64,15 +59,35 @@ impl Chronicle {
         Self {
             home_hash: hash.to_string(),
             home: conn,
-            members: Vec::new(),
             member_hash: None,
+            members: Vec::new(),
             data: PathBuf::new(),
         }
     }
 
-    /// Every state that holds tasks, the home first.
-    pub fn journals(&self) -> impl Iterator<Item = &Connection> {
-        std::iter::once(&self.home).chain(self.members.iter())
+    pub fn member_hashes(&self) -> &[String] {
+        &self.members
+    }
+
+    /// Visit each member journal's state in turn: opened, caught up with its
+    /// journal and closed again, so a repository with hundreds of worktrees
+    /// holds one at a time. A member that fails is skipped, never fatal.
+    pub fn for_each_member(&self, mut visit: impl FnMut(&Connection) -> anyhow::Result<()>) {
+        for hash in &self.members {
+            if !self
+                .data
+                .join("events")
+                .join(format!("{hash}.jsonl"))
+                .exists()
+            {
+                continue;
+            }
+
+            let result = open_journal(&self.data, hash).and_then(|conn| visit(&conn));
+            if let Err(e) = result {
+                tracing::warn!(member = hash.as_str(), "skipping a chronicle member: {e:#}");
+            }
+        }
     }
 
     /// The home's journal file: where module events go.
@@ -82,19 +97,21 @@ impl Chronicle {
             .join(format!("{}.jsonl", self.home_hash))
     }
 
-    /// Mark an event a member writes about modules with its home, so the
-    /// home finds the member again even without the registry.
+    /// Mark an event a member writes about modules with its home, and list
+    /// the member under its home: from now on its tasks join the history.
     pub fn stamp(&self, meta: &mut serde_json::Value) {
-        if self.member_hash.is_some() {
-            meta[HOME_KEY] = serde_json::Value::String(self.home_hash.clone());
+        let Some(member) = &self.member_hash else {
+            return;
+        };
+
+        meta[HOME_KEY] = serde_json::Value::String(self.home_hash.clone());
+        // The mark is in the journal, so a lost registration is rebuilt.
+        if let Err(e) = register(&self.data, &self.home_hash, member) {
+            tracing::warn!(
+                member = member.as_str(),
+                "could not register a chronicle member: {e:#}"
+            );
         }
-    }
-
-    /// Re-read the home's journal after writing to it.
-    pub fn refresh_home(&self) -> anyhow::Result<()> {
-        crate::db::ingest_new_events(&self.home, self.home_events(), &self.home_hash)?;
-
-        Ok(())
     }
 }
 
@@ -167,7 +184,18 @@ fn scan(data: &Path, home: &str) -> anyhow::Result<Vec<String>> {
     for entry in entries {
         let path = entry?.path();
         let is_journal = path.extension().is_some_and(|x| x == "jsonl");
-        if is_journal && std::fs::read_to_string(&path).is_ok_and(|t| t.contains(&needle)) {
+        let is_member = is_journal
+            && std::fs::read_to_string(&path).is_ok_and(|text| {
+                // Only the mark a member writes counts: `meta.chronicle_home`
+                // of an event, not the same text inside any other value.
+                text.lines()
+                    .filter(|line| line.contains(&needle))
+                    .any(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .is_ok_and(|e| e["meta"][HOME_KEY] == home)
+                    })
+            });
+        if is_member {
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 out.push(stem.to_string());
             }
@@ -350,7 +378,79 @@ mod tests {
 
         assert_eq!(chr.home_hash, home);
         assert!(chr.member_hash.is_none());
-        assert!(chr.members.is_empty());
+        assert!(chr.member_hashes().is_empty());
+    }
+
+    fn registry_of(r: &Repo) -> String {
+        let home = crate::project_hash::from_path(&r.main).unwrap();
+
+        std::fs::read_to_string(r.data.join("chronicle").join(format!("{home}.members")))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_worktree_registers_only_once_it_links_a_task() {
+        // Every Loom task gets a worktree; most never link anything. Only a
+        // worktree whose tasks join the history is worth visiting.
+        let r = repo();
+        write(&r.data, &r.main, &[stars()]);
+        let member = crate::project_hash::from_path(&r.worktree).unwrap();
+
+        let chr = Chronicle::open_in(&r.data, &r.worktree).unwrap();
+        assert!(
+            !registry_of(&r).contains(&member),
+            "registered on a mere open"
+        );
+
+        chr.stamp(&mut serde_json::json!({}));
+        assert!(registry_of(&r).contains(&member));
+    }
+
+    #[test]
+    fn a_broken_member_is_skipped_not_fatal() {
+        let r = populated();
+        Chronicle::open_in(&r.data, &r.worktree)
+            .unwrap()
+            .stamp(&mut serde_json::json!({}));
+        let bogus = "deadbeefdeadbeef";
+        std::fs::write(r.data.join("events").join(format!("{bogus}.jsonl")), "{}\n").unwrap();
+        std::fs::write(
+            r.data.join("state").join(format!("{bogus}.sqlite")),
+            "not a database",
+        )
+        .unwrap();
+        let home = crate::project_hash::from_path(&r.main).unwrap();
+        let registry = r.data.join("chronicle").join(format!("{home}.members"));
+        std::fs::write(
+            &registry,
+            format!("{}{bogus}\n", std::fs::read_to_string(&registry).unwrap()),
+        )
+        .unwrap();
+
+        let chr = Chronicle::open_in(&r.data, &r.main).unwrap();
+
+        assert!(crate::modules::page(&chr, "stars")
+            .unwrap()
+            .contains("tj-wt"));
+        assert_eq!(crate::modules::map(&chr).unwrap()[0].task_count, 2);
+    }
+
+    #[test]
+    fn a_mark_inside_free_text_does_not_join_a_chronicle() {
+        // An agent can put any JSON in a decision's alternatives; only the
+        // top-level mark a member writes counts.
+        let r = repo();
+        let home = write(&r.data, &r.main, &[stars()]);
+        let mut open = open_task("tj-stranger", &["stars"]);
+        open.meta["alternatives"] = serde_json::json!([{ HOME_KEY: home }]);
+        let stranger = tempfile::TempDir::new().unwrap();
+        write(&r.data, stranger.path(), &[open]);
+
+        let chr = Chronicle::open_in(&r.data, &r.main).unwrap();
+
+        assert!(!crate::modules::page(&chr, "stars")
+            .unwrap()
+            .contains("tj-stranger"));
     }
 
     #[test]

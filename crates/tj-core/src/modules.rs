@@ -350,7 +350,7 @@ pub fn list(conn: &Connection, project_hash: &str) -> anyhow::Result<Vec<Module>
 pub fn map(chr: &crate::chronicle::Chronicle) -> anyhow::Result<Vec<Module>> {
     let mut modules = list(&chr.home, &chr.home_hash)?;
 
-    for conn in &chr.members {
+    chr.for_each_member(|conn| {
         let mut stmt = conn.prepare(
             "SELECT tm.module_id, COUNT(*), MAX(t.last_event_at)
              FROM task_modules tm JOIN tasks t ON t.task_id = tm.task_id
@@ -372,7 +372,9 @@ pub fn map(chr: &crate::chronicle::Chronicle) -> anyhow::Result<Vec<Module>> {
                 }
             }
         }
-    }
+
+        Ok(())
+    });
 
     Ok(modules)
 }
@@ -692,17 +694,20 @@ const FULL_HISTORY: usize = 30;
 const SHORT_OUTCOME: usize = 80;
 
 struct HistoryRow {
-    /// Which of the chronicle's journals holds the task.
-    journal: usize,
     task_id: String,
     title: String,
     status: String,
     at: String,
     outcome: Option<String>,
     note: Option<String>,
+    /// The task's live decisions, rejections and constraints, one line each,
+    /// read while its journal is open.
+    decisions: Vec<String>,
+    rejected: Vec<String>,
+    constraints: Vec<String>,
 }
 
-fn history(conn: &Connection, journal: usize, ids: &[String]) -> anyhow::Result<Vec<HistoryRow>> {
+fn history(conn: &Connection, ids: &[String]) -> anyhow::Result<Vec<HistoryRow>> {
     let mut stmt = conn.prepare(
         "SELECT t.task_id, t.title, t.status, COALESCE(t.closed_at, t.last_event_at), t.outcome,
                 (SELECT group_concat(n.text, ' / ') FROM module_notes n
@@ -716,13 +721,15 @@ fn history(conn: &Connection, journal: usize, ids: &[String]) -> anyhow::Result<
     for id in ids {
         let part = stmt.query_map([id], |r| {
             Ok(HistoryRow {
-                journal,
                 task_id: r.get(0)?,
                 title: r.get(1)?,
                 status: r.get(2)?,
                 at: r.get(3)?,
                 outcome: r.get(4)?,
                 note: r.get(5)?,
+                decisions: Vec::new(),
+                rejected: Vec::new(),
+                constraints: Vec::new(),
             })
         })?;
         for row in part {
@@ -733,21 +740,47 @@ fn history(conn: &Connection, journal: usize, ids: &[String]) -> anyhow::Result<
         }
     }
 
+    let entry = |text: &str, marker: &str, task: &str| {
+        format!("- {}{marker} ({task})", one_line(text, ENTRY_CHARS))
+    };
+    for r in &mut rows {
+        for d in crate::pack::active_decisions(conn, &r.task_id)? {
+            if !crate::pack::is_noise(&d.text) {
+                r.decisions.push(entry(&d.text, d.marker(), &r.task_id));
+            }
+        }
+        for x in crate::pack::rejections(conn, &r.task_id)? {
+            if !crate::pack::is_noise(&x.text) {
+                r.rejected.push(entry(&x.text, x.marker(), &r.task_id));
+            }
+        }
+        for c in texts_of(conn, &r.task_id, "constraint")? {
+            r.constraints.push(entry(&c, "", &r.task_id));
+        }
+    }
+
     Ok(rows)
 }
 
 /// The task's live entries of one type, newest first: not corrected, not bookkeeping.
 fn texts_of(conn: &Connection, task_id: &str, kind: &str) -> anyhow::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.text FROM events_index ei JOIN search_fts f ON f.event_id = ei.event_id
-         WHERE ei.task_id = ?1 AND ei.type = ?2 AND ei.corrected_by IS NULL AND ei.bookkeeping = 0
-         ORDER BY ei.timestamp DESC",
+    let mut ids = conn.prepare(
+        "SELECT event_id FROM events_index
+         WHERE task_id = ?1 AND type = ?2 AND corrected_by IS NULL AND bookkeeping = 0
+         ORDER BY timestamp DESC",
     )?;
-    let rows = stmt
-        .query_map(rusqlite::params![task_id, kind], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
+    // By rowid: `event_id` is not indexed in the FTS table, so a join scans it.
+    let mut text = conn.prepare("SELECT text FROM search_fts WHERE rowid = ?1")?;
 
-    Ok(rows)
+    let mut out = Vec::new();
+    for event_id in ids.query_map(rusqlite::params![task_id, kind], |r| r.get::<_, String>(0))? {
+        let rowid = crate::db::fts_rowid(&event_id?);
+        if let Some(t) = text.query_row([rowid], |r| r.get(0)).optional()? {
+            out.push(t);
+        }
+    }
+
+    Ok(out)
 }
 
 fn day(at: &str) -> &str {
@@ -808,12 +841,13 @@ pub fn page(chr: &crate::chronicle::Chronicle, module_id: &str) -> anyhow::Resul
     })? {
         ids.push(id?);
     }
-    // The module's tasks from every journal of the repository.
-    let journals: Vec<&Connection> = chr.journals().collect();
-    let mut rows = Vec::new();
-    for (i, journal) in journals.iter().enumerate() {
-        rows.extend(history(journal, i, &ids)?);
-    }
+    // The module's tasks from every journal of the repository: the home's,
+    // then each member's while it is open.
+    let mut rows = history(conn, &ids)?;
+    chr.for_each_member(|member| {
+        rows.extend(history(member, &ids)?);
+        Ok(())
+    });
     let mut seen = std::collections::HashSet::new();
     rows.retain(|r| seen.insert(r.task_id.clone()));
     rows.sort_by(|a, b| b.at.cmp(&a.at));
@@ -861,24 +895,10 @@ pub fn page(chr: &crate::chronicle::Chronicle, module_id: &str) -> anyhow::Resul
     }
 
     let (mut decisions, mut rejected, mut constraints) = (Vec::new(), Vec::new(), Vec::new());
-    let entry = |text: &str, marker: &str, task: &str| {
-        format!("- {}{marker} ({task})", one_line(text, ENTRY_CHARS))
-    };
     for r in &rows {
-        let conn = journals[r.journal];
-        for d in crate::pack::active_decisions(conn, &r.task_id)? {
-            if !crate::pack::is_noise(&d.text) {
-                decisions.push(entry(&d.text, d.marker(), &r.task_id));
-            }
-        }
-        for x in crate::pack::rejections(conn, &r.task_id)? {
-            if !crate::pack::is_noise(&x.text) {
-                rejected.push(entry(&x.text, x.marker(), &r.task_id));
-            }
-        }
-        for c in texts_of(conn, &r.task_id, "constraint")? {
-            constraints.push(entry(&c, "", &r.task_id));
-        }
+        decisions.extend(r.decisions.iter().cloned());
+        rejected.extend(r.rejected.iter().cloned());
+        constraints.extend(r.constraints.iter().cloned());
     }
     push_section(&mut out, "Active decisions", &decisions, DECISION_ITEMS);
     push_section(&mut out, "Rejected", &rejected, OTHER_ITEMS);

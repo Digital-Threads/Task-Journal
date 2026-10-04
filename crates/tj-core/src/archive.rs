@@ -62,7 +62,7 @@ pub fn headline(gaps: &[Gap]) -> Option<String> {
 
 /// What the chronicle is missing, most important first, as seen from the
 /// journal `conn` (`project_hash`): the map comes from the chronicle's home,
-/// tasks from this journal, and a module's lag from every journal.
+/// tasks from this journal, and a module's lag from the home and this journal.
 /// `active_task` is the session's task, checked for a module of its own.
 pub fn gaps(
     chr: &crate::chronicle::Chronicle,
@@ -97,8 +97,14 @@ pub fn gaps(
 
     let mut stale = Vec::new();
     for m in modules.iter().filter(|m| m.status == "active") {
+        // The home and this journal only: a session's gaps stay cheap however
+        // many worktrees the repository had. Module pages count them all.
+        let mut journals = vec![&chr.home];
+        if chr.member_hash.is_some() {
+            journals.push(conn);
+        }
         let mut closed_since = 0;
-        for journal in chr.journals() {
+        for journal in journals {
             closed_since += journal.query_row(
                 "SELECT COUNT(*) FROM task_modules tm
                    JOIN tasks t ON t.task_id = tm.task_id AND t.status = 'closed'
