@@ -92,8 +92,17 @@ fn map_command_exists_and_asks_the_user_first() {
         .unwrap_or_else(|e| panic!("map command missing at {}: {e}", path.display()))
         .replace("\r\n", "\n");
 
-    assert!(s.starts_with("---\n") && s.contains("\ndescription:"), "frontmatter");
-    for needle in ["module_list", "module_save", "module_backfill_candidates", "module_link", "confirm"] {
+    assert!(
+        s.starts_with("---\n") && s.contains("\ndescription:"),
+        "frontmatter"
+    );
+    for needle in [
+        "module_list",
+        "module_save",
+        "module_backfill_candidates",
+        "module_link",
+        "confirm",
+    ] {
         assert!(s.contains(needle), "map command must mention {needle}");
     }
     // Saving comes only after the user's answer.

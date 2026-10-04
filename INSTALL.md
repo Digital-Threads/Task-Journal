@@ -157,6 +157,10 @@ keeps writing next to the new one. The first command after the upgrade
 re-indexes the project once (a few seconds for a large journal); later calls
 are incremental.
 
+0.31 adds `module` lines to the journal (the project chronicle). A 0.30 binary
+still running next to it skips those lines with a warning and keeps every task;
+the next 0.31 command notices and re-indexes once, so no module is lost.
+
 ## Verify
 
 ```bash

@@ -104,6 +104,7 @@ that tie it back to the code.
 - **The mod (Claude Code 2.1.287+).** A plugin of function hooks that runs inside Claude Code and calls the `task-journal` CLI. It keeps the session's active task in the system prompt (a compaction can't drop it), gives each session its own active task, shows the task in the status line, reminds the agent to log only after several prompts without an entry, and — right before a compaction — asks the model what was never logged and records it as `suggested` events. It needs no setup. When it runs, the classic hooks skip what it replaces (the reminder, per-message classification and the transcript catch-ups) and keep the rest (resume packs, push-recall, `/rewind`). Codex and Claude Code older than 2.1.287 keep using the hooks below; there the mod simply doesn't load.
 - **Self-tagging is the primary path (recommended).** You — the agent in the live session — record reasoning directly via the five MCP tools: open a task with a `goal`, append a typed `decision` / `finding` / `rejection` / `evidence` event at the moment of commitment, and `task_close` with a written `outcome`. This is free (it rides the interactive session), language-agnostic, and higher-fidelity than any after-the-fact classifier. The bundled `task-journal` skill drives this automatically. See [MCP tools](#mcp-tools).
 - **Auto-capture is an opt-in backstop — OFF by default (v0.14.0).** A fresh `install-hooks` wires only a cheap, read-only SessionStart resume hook: no per-message classifier runs, no `claude -p` is ever spawned, nothing is charged. Self-tagging is the capture mechanism. Opt in with `install-hooks --auto-capture` and Claude Code hooks also run every prompt, tool call, and reply through a two-stage classifier that lands typed events on its own: Stage 1 is a fast in-process heuristic (obvious EN+RU phrasing, zero cost); Stage 2 falls back to an LLM only when the heuristic is uncertain (and only if you pick `--backend agent-sdk` / `api`). Even opted in it is a safety net under your explicit self-tagging, not the main mechanism, and it misses real reasoning — especially non-English prose.
+- **Project chronicle (0.31).** The journal is also a map of the system: the project splits into **modules** — parts of the system by meaning, not folders or tickets — and every task belongs to one or more. Each module has a page: how it works now, the decisions, rejections and constraints of all its tasks, and its history, one line per task. A new task can start from that page; closing it adds its line. The journal suggests a module for a new task (from its words and files, no model call) and names what the chronicle is missing — no map yet, tasks without a module, a module whose state lags behind its tasks — at session start and in tool replies, so the agent keeps it up by itself. `/task-journal:map` (or the skill's steps in any client) maps a project and sorts its past tasks, with the user confirming both.
 - **Artifact extraction.** Each event scans its text for commit hashes, PR URLs, file paths, issue IDs, and branch names. Aggregated artifacts are how Task Journal links related tasks: when you start a new task touching the same issue or file, the prior task is surfaced automatically.
 - **Resume packs.** `task_pack` (MCP tool or CLI) renders a task into a compact Markdown briefing — Goal, Outcome, decisions, rejections, evidence, artifacts — that fits in a fresh agent's context window without dumping the raw event log.
 - **Auto-capture boundaries.** Beyond per-event capture, two extra hooks mark *reasoning boundaries* automatically. On `PreCompact`, Task Journal reads the transcript JSONL tail (entries newer than the active task's last event) and enqueues anything the synchronous hooks missed before the compact — then drops a marker decision so the post-compact agent sees a clear cut. A `/rewind`-prefixed prompt appends a single correction event so pack readers see where the user rolled back. No mass-rejection of prior events — the boundary is a sentinel, not a rewrite.
@@ -169,13 +170,14 @@ task-journal pack tj-x9rz1f --mode full
 
 | Command | What it does |
 |---------|--------------|
-| `create <title> [--goal "..."]` | Open a task with optional goal |
+| `create <title> [--goal "..."] [--modules a,b]` | Open a task with optional goal and modules |
+| `module list [--json] \| show <id> \| save <id> [--name] [--description] [--path P] [--term T] [--state] [--status] [--merged-into] \| link <task> [--add M] [--remove M] \| candidates [--limit N]` | The project chronicle: module map, module pages, creating and linking modules, tasks without a module |
 | `goal <id> "..."` | Set or replace a task's goal |
 | `event <id> --type X --text Y [--suggested] [--session S] [--origin O]` | Append a typed event |
 | `state [--session S]` | The session's active task, counts and latest entries as JSON (what the mod reads) |
 | `event-correct --corrects <eid> --task <id> --text "..."` | Correct an earlier event |
 | `external <id> "..."` | Append an external reference (URL, ticket, linked task) |
-| `close <id> --outcome "..." --outcome-tag done\|abandoned\|superseded` | Close with outcome |
+| `close <id> --outcome "..." --outcome-tag done\|abandoned\|superseded [--module-note module=text]` | Close with outcome (and a line of each module's history) |
 | `reopen <id> --reason "..."` | Reopen a closed task |
 | `pack <id> --mode compact\|full` | Render a resume pack |
 | `events list [--limit N]` | List recent events |
@@ -198,7 +200,7 @@ task-journal pack tj-x9rz1f --mode full
 
 ## MCP tools
 
-The MCP server exposes seven tools to Claude Code, Codex and any MCP client:
+The MCP server exposes these tools to Claude Code, Codex and any MCP client:
 
 | Tool | Purpose |
 |------|---------|
@@ -209,6 +211,14 @@ The MCP server exposes seven tools to Claude Code, Codex and any MCP client:
 | `task_pack` | Render a resume pack |
 | `task_search` | Search tasks: full text, or `status="open"` with no query to list them |
 | `task_check` | Score a task's completeness and list its gaps |
+| `module_list` | The module map and what the chronicle is missing |
+| `module_page` | A module's page: state, decisions, rejections, constraints, history |
+| `module_save` | Create or update a module (partial) |
+| `module_link` | Link tasks to modules, many at once |
+| `module_backfill_candidates` | Tasks without a module, with suggestions, for sorting old work |
+
+`task_create` takes optional `modules` and suggests some when they're missing;
+`task_close` takes optional `module_notes`; `task_search` takes an optional `module`.
 
 The write tools take an optional `session_id`; Claude Code (through the mod) and
 Codex (through each call's metadata) fill it in, so every session keeps its own
