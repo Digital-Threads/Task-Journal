@@ -2,7 +2,7 @@ use crate::event::Event;
 use anyhow::Context;
 use fd_lock::RwLock as FdLock;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Append-only writer for the events JSONL log. Holds an advisory
@@ -45,12 +45,22 @@ impl JsonlWriter {
     }
 
     pub fn append(&mut self, event: &Event) -> anyhow::Result<()> {
-        let line = serde_json::to_string(event).context("serialize event")?;
+        let mut line = serde_json::to_string(event).context("serialize event")?;
+        line.push('\n');
         let mut guard = self.lock.write().context("acquire exclusive file lock")?;
+
+        // A crash mid-append leaves a torn last line without its newline.
+        // Terminate it first, so only that line is lost and not this event,
+        // which would otherwise glue onto it and be skipped as malformed too.
+        if ends_without_newline(&mut guard).context("check the log's last byte")? {
+            guard
+                .write_all(b"\n")
+                .context("terminate a torn last line")?;
+        }
+
         guard
             .write_all(line.as_bytes())
             .context("write event line")?;
-        guard.write_all(b"\n").context("write newline")?;
         Ok(())
     }
 
@@ -66,6 +76,21 @@ impl JsonlWriter {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// True when the file is non-empty and its last byte is not `\n`. Writes
+/// still go to the end afterwards: the file is opened in append mode.
+fn ends_without_newline(file: &mut File) -> std::io::Result<bool> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+
+    Ok(last[0] != b'\n')
 }
 
 #[cfg(test)]
@@ -122,6 +147,30 @@ mod tests {
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 2);
+    }
+
+    #[test]
+    fn append_after_a_torn_last_line_loses_only_that_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.jsonl");
+
+        // A crash mid-append left a whole event and then half of the next one.
+        let whole = serde_json::to_string(&sample_event("whole")).unwrap();
+        std::fs::write(&path, format!("{whole}\n{{\"event_id\":\"01TORN")).unwrap();
+
+        let mut w = JsonlWriter::open(&path).unwrap();
+        w.append(&sample_event("after crash")).unwrap();
+        w.flush_durable().unwrap();
+        drop(w);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let parsed: Vec<Event> = body
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let texts: Vec<&str> = parsed.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["whole", "after crash"], "file:\n{body}");
+        assert!(body.ends_with('\n'));
     }
 
     #[test]
