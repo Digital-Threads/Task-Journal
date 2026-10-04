@@ -2738,6 +2738,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(1.0);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
                 writer.flush_durable()?;
@@ -2833,8 +2834,13 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     if auto_open_disabled || !kind.contains("UserPrompt") {
                         return Ok(());
                     }
-                    let Some(new_task) =
-                        auto_open_task_from_prompt(&events_path, &project_hash, &conn, &text)?
+                    let Some(new_task) = auto_open_task_from_prompt(
+                        &events_path,
+                        &project_hash,
+                        &conn,
+                        &text,
+                        live_session_id.as_deref(),
+                    )?
                     else {
                         // Prompt was only machine noise — nothing worth a task.
                         return Ok(());
@@ -2966,6 +2972,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             event.confidence = Some(confidence);
             event.status = tj_core::classifier::decide_status(confidence);
             event.evidence_strength = evidence_strength;
+            tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
 
             let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
             writer.append(&event)?;
@@ -5199,6 +5206,7 @@ fn auto_open_task_from_prompt(
     project_hash: &str,
     conn: &rusqlite::Connection,
     prompt: &str,
+    session_id: Option<&str>,
 ) -> anyhow::Result<Option<tj_core::classifier::TaskContext>> {
     // Title/goal must read like a human wrote them on purpose. When the
     // prompt is only machine noise — session-start scrollback
@@ -5220,6 +5228,7 @@ fn auto_open_task_from_prompt(
         title.clone(),
     );
     event.meta = serde_json::json!({ "title": title, "auto_opened": true });
+    tj_core::session_id::stamp_session_id(&mut event.meta, session_id);
 
     let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
     writer.append(&event)?;
@@ -5592,7 +5601,13 @@ fn process_pending_entry(
             std::fs::remove_file(path)?;
             return Ok(());
         }
-        let Some(new_task) = auto_open_task_from_prompt(events_path, project_hash, &conn, &text)?
+        let Some(new_task) = auto_open_task_from_prompt(
+            events_path,
+            project_hash,
+            &conn,
+            &text,
+            chunk_session_id.as_deref(),
+        )?
         else {
             // Prompt was only machine noise — drop the entry silently.
             std::fs::remove_file(path)?;

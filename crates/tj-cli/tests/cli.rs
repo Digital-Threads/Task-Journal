@@ -3721,6 +3721,92 @@ fn rewind_prompt_appends_correction_event() {
         .stdout(contains("[correction]").and(contains("/rewind")));
 }
 
+/// `meta.session_id` of the journal's events of `etype`.
+fn session_ids_of(journal: &str, etype: &str) -> Vec<Option<String>> {
+    journal
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["type"] == etype)
+        .map(|e| e["meta"]["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn hook_written_events_carry_the_session_id() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+    let hook = |prompt: &str| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .env("TJ_INGEST_SYNC", "1")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .current_dir(&workdir)
+            .args(["ingest-hook", "--backend", "heuristic"])
+            .write_stdin(
+                serde_json::json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "sess-hook",
+                    "prompt": prompt,
+                })
+                .to_string(),
+            )
+            .assert()
+            .success();
+    };
+
+    // No open task: the prompt auto-opens one and is classified inline.
+    hook("We decided to use postgres for the journal store going forward");
+    hook("/rewind go back to plan A");
+
+    let journal = project_events(dir.path(), &hash);
+    let want = vec![Some("sess-hook".to_string())];
+    assert_eq!(session_ids_of(&journal, "open"), want, "auto-open event");
+    assert_eq!(
+        session_ids_of(&journal, "decision"),
+        want,
+        "sync-classified"
+    );
+    assert_eq!(session_ids_of(&journal, "correction"), want, "/rewind");
+}
+
+#[test]
+fn worker_auto_open_carries_the_chunk_session_id() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let entry = write_pending_entry(
+        &pending,
+        &format!("{hash}.01JA0000000000000000000000.json"),
+        Some(&hash),
+        true,
+        "UserPromptSubmit",
+        "We decided to use postgres for the journal store going forward",
+    );
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&entry).unwrap()).unwrap();
+    v["session_id"] = serde_json::json!("sess-chunk");
+    std::fs::write(&entry, v.to_string()).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    let journal = project_events(dir.path(), &hash);
+    let want = vec![Some("sess-chunk".to_string())];
+    assert_eq!(session_ids_of(&journal, "open"), want, "auto-open event");
+    assert_eq!(session_ids_of(&journal, "decision"), want, "classified");
+}
+
 #[test]
 fn install_hooks_wires_precompact_event() {
     let dir = assert_fs::TempDir::new().unwrap();
