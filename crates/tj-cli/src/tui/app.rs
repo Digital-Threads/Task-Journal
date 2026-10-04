@@ -124,9 +124,14 @@ impl App {
 
         let result = self.main_loop(&mut terminal);
 
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
+        run_restore_steps(
+            &mut terminal,
+            &[
+                |_| disable_raw_mode(),
+                |t| execute!(t.backend_mut(), LeaveAlternateScreen),
+                |t| t.show_cursor(),
+            ],
+        )?;
 
         result
     }
@@ -337,9 +342,51 @@ impl App {
     }
 }
 
+/// Terminal restore sequence on exit. Every step runs even when an earlier
+/// one fails — a half-restored terminal (raw mode, alternate screen, hidden
+/// cursor) is worse than a late error — and the first error is reported.
+fn run_restore_steps<T>(target: &mut T, steps: &[fn(&mut T) -> io::Result<()>]) -> io::Result<()> {
+    let mut first = Ok(());
+
+    for step in steps {
+        let result = step(target);
+        if first.is_ok() {
+            first = result;
+        }
+    }
+
+    first
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_runs_every_step_and_reports_the_first_error() {
+        let mut log: Vec<&str> = Vec::new();
+        let err = run_restore_steps(
+            &mut log,
+            &[
+                |log| {
+                    log.push("raw mode");
+                    Err(io::Error::other("raw mode failed"))
+                },
+                |log| {
+                    log.push("alt screen");
+                    Err(io::Error::other("alt screen failed"))
+                },
+                |log| {
+                    log.push("cursor");
+                    Ok(())
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(log, ["raw mode", "alt screen", "cursor"]);
+        assert_eq!(err.to_string(), "raw mode failed");
+    }
 
     #[test]
     fn task_detail_reads_the_project_passed_to_ui_not_cwd() {
