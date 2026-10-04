@@ -19,6 +19,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 import {
+  chronicleKeys,
   chronicleNudge,
   compactInstruction,
   distillPrompt,
@@ -66,9 +67,9 @@ const mod = {
   pinned: null as string | null,
   turnsSinceEntry: 0,
   workSinceEntry: 0,
-  // The chronicle gap last brought up. Seeded at the session's start with
-  // the gap the SessionStart hook shows, so it is not repeated.
-  chronicleKey: null as string | null,
+  // Chronicle gaps this session has been told about. Seeded at its start
+  // with every gap the SessionStart hook showed, so none is repeated.
+  chronicleSeen: new Set<string>(),
 }
 
 type CliResult =
@@ -131,7 +132,7 @@ async function refresh($: EngineInterface): Promise<void> {
 
   if (mod.session !== session) {
     mod.pinned = null
-    mod.chronicleKey = chronicleNudge(state)?.key ?? null
+    mod.chronicleSeen = new Set(chronicleKeys(state))
   }
   mod.session = session
   mod.state = state
@@ -229,7 +230,7 @@ export const register: Register = (on, options) => {
     mod.retryAt = 0
     mod.turnsSinceEntry = 0
     mod.workSinceEntry = 0
-    mod.chronicleKey = null
+    mod.chronicleSeen = new Set()
 
     return next(e)
   })
@@ -258,9 +259,9 @@ export const register: Register = (on, options) => {
     // Both reminders ride in the prompt's context, never in the system
     // prompt: a change there would re-send the conversation uncached.
     const added: string[] = []
-    const chronicle = chronicleNudge(state)
-    if (chronicle !== null && chronicle.key !== mod.chronicleKey) {
-      mod.chronicleKey = chronicle.key
+    const chronicle = chronicleNudge(state, mod.chronicleSeen)
+    if (chronicle !== null) {
+      mod.chronicleSeen.add(chronicle.key)
       added.push(chronicle.text)
     }
 

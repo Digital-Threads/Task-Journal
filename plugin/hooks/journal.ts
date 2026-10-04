@@ -116,21 +116,32 @@ const GAP_TEXT: Record<string, (g: ArchiveGap) => string> = {
 // so a gap whose count moved is not new.
 const GAP_SUBJECT: Record<string, string> = { stale_module: 'module_id', task_without_module: 'task_id' }
 
+function gapKey(gap: ArchiveGap): string {
+  const subject = GAP_SUBJECT[gap.kind]
+
+  return subject === undefined ? gap.kind : `${gap.kind}:${String(gap[subject])}`
+}
+
+/** Keys of the gaps a state names: what the session start already showed. */
+export function chronicleKeys(state: JournalState): string[] {
+  return state.archive.filter(g => GAP_TEXT[g.kind] !== undefined).map(gapKey)
+}
+
 /**
- * The chronicle gap to bring up, keyed so the same gap is not brought up
- * twice. The session's own task without a module comes first: it is the
- * one gap the agent can close right now.
+ * The chronicle gap to bring up, if one is new to this session (`seen`
+ * holds the keys already shown). The session's own task without a module
+ * comes first: it is the one gap the agent can close right now.
  */
-export function chronicleNudge(state: JournalState): { key: string; text: string } | null {
-  const own = state.archive.find(g => g.kind === 'task_without_module')
-  const gap = own ?? state.archive.find(g => GAP_TEXT[g.kind] !== undefined)
+export function chronicleNudge(
+  state: JournalState,
+  seen: ReadonlySet<string> = new Set(),
+): { key: string; text: string } | null {
+  const fresh = state.archive.filter(g => GAP_TEXT[g.kind] !== undefined && !seen.has(gapKey(g)))
+  const gap = fresh.find(g => g.kind === 'task_without_module') ?? fresh[0]
   const describe = gap === undefined ? undefined : GAP_TEXT[gap.kind]
   if (gap === undefined || describe === undefined) return null
 
-  const subject = GAP_SUBJECT[gap.kind]
-  const key = subject === undefined ? gap.kind : `${gap.kind}:${String(gap[subject])}`
-
-  return { key, text: `📚 Chronicle: ${describe(gap)}. Close this gap once the current work is done.` }
+  return { key: gapKey(gap), text: `📚 Chronicle: ${describe(gap)}. Close this gap once the current work is done.` }
 }
 
 /**

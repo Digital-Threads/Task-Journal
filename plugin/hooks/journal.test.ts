@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
+  chronicleKeys,
   chronicleNudge,
   journalTool,
   nudgeText,
@@ -117,6 +118,33 @@ describe('chronicle', () => {
     expect(chronicleNudge(withGaps([{ kind: 'stale_module', module_id: 'stars', closed_since: 2 }]))?.key).toBe(
       'stale_module:stars',
     )
+  })
+
+  test('a gap seen once in a session is not brought up again', () => {
+    // The session starts with unlinked tasks; the new task has no module;
+    // once it is linked, the start gap must not come back.
+    const start = withGaps([{ kind: 'unlinked_tasks', count: 4 }])
+    const seen = new Set(chronicleKeys(start))
+    expect(chronicleNudge(start, seen)).toBe(null)
+
+    const created = withGaps([
+      { kind: 'task_without_module', task_id: 'tj-a' },
+      { kind: 'unlinked_tasks', count: 5 },
+    ])
+    const n = chronicleNudge(created, seen)
+    expect(n?.key).toBe('task_without_module:tj-a')
+    seen.add(n!.key)
+
+    const linked = withGaps([{ kind: 'unlinked_tasks', count: 4 }])
+    expect(chronicleNudge(linked, seen)).toBe(null)
+  })
+
+  test('the first unseen gap is brought up even behind a seen one', () => {
+    const s = withGaps([
+      { kind: 'stale_module', module_id: 'stars', closed_since: 1 },
+      { kind: 'stale_module', module_id: 'auth', closed_since: 1 },
+    ])
+    expect(chronicleNudge(s, new Set(['stale_module:stars']))?.key).toBe('stale_module:auth')
   })
 
   test('no gaps, or only unknown ones, is no nudge', () => {
