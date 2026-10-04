@@ -2284,6 +2284,70 @@ fn close_with_outcome_renders_outcome_block() {
 }
 
 #[test]
+fn close_records_the_outcome_only_through_the_close_event() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", dir.path());
+        cmd
+    };
+    let out = tj()
+        .args(["create", "Close me", "--goal", "g"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task_id = String::from_utf8(out).unwrap().trim().to_string();
+    let close = |outcome: &str| {
+        let mut cmd = tj();
+        cmd.args([
+            "close",
+            &task_id,
+            "--outcome",
+            outcome,
+            "--outcome-tag",
+            "done",
+        ]);
+        cmd
+    };
+
+    // The close append fails: the journal is read-only.
+    let journal = std::fs::read_dir(dir.path().join("task-journal").join("events"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let writable = std::fs::metadata(&journal).unwrap().permissions();
+    let mut read_only = writable.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(&journal, read_only).unwrap();
+    close("must not stick").assert().failure();
+    std::fs::set_permissions(&journal, writable).unwrap();
+
+    let state = std::fs::read_dir(dir.path().join("task-journal").join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "sqlite"))
+        .unwrap();
+    let conn = tj_core::db::open(&state).unwrap();
+    let meta = tj_core::db::task_metadata(&conn, &task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.outcome, None, "failed close left an outcome behind");
+    drop(conn);
+
+    // A real close keeps its outcome through a rebuild from the journal.
+    close("shipped").assert().success();
+    std::fs::remove_dir_all(dir.path().join("task-journal").join("state")).unwrap();
+    tj().args(["pack", &task_id])
+        .assert()
+        .success()
+        .stdout(contains("**Outcome** [done]: shipped"));
+}
+
+#[test]
 fn close_rejects_invalid_outcome_tag() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(

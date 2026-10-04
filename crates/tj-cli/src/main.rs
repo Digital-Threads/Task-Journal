@@ -1699,13 +1699,6 @@ fn real_main() -> Result<()> {
             if !tj_core::db::task_exists(&conn, &task_id)? {
                 anyhow::bail!("task not found: {task_id}");
             }
-            // Persist outcome BEFORE the close event so the cache wipe
-            // inside set_task_outcome doesn't compete with subsequent
-            // assemble calls. Both columns optional — caller can pass
-            // neither and just get the close event.
-            if let Some(o) = outcome.as_deref() {
-                tj_core::db::set_task_outcome(&conn, &task_id, o, outcome_tag.as_deref())?;
-            }
             let open_kids = tj_core::db::count_open_children(&conn, &task_id)?;
             drop(conn);
 
@@ -1719,6 +1712,15 @@ fn real_main() -> Result<()> {
             let mut meta = serde_json::Map::new();
             if let Some(r) = reason {
                 meta.insert("reason".into(), serde_json::Value::String(r));
+            }
+            // outcome + tag ride in the close event's meta and reach the task
+            // row only when that event is ingested, so a failed append never
+            // leaves an open task with an outcome and a rebuild keeps it.
+            if let Some(o) = outcome {
+                meta.insert("outcome".into(), serde_json::Value::String(o));
+            }
+            if let Some(t) = outcome_tag {
+                meta.insert("outcome_tag".into(), serde_json::Value::String(t));
             }
             // Layer-2 close harvest: stamp deterministic git/gh refs (commit,
             // branch, PR) so the closed pack reads as a clickable ledger of
