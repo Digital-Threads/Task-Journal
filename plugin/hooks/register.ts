@@ -7,6 +7,8 @@
 //   its own active task;
 // - shows the task in the status line and a toast on every entry;
 // - reminds the agent to log only after N turns without an entry;
+// - brings up a project-chronicle gap that opened during the session (the
+//   session start already showed the one it began with);
 // - before a compaction, asks the model (from its own prompt cache) what
 //   was not logged and records it as suggested events.
 //
@@ -17,6 +19,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 import {
+  chronicleNudge,
   compactInstruction,
   distillPrompt,
   journalTool,
@@ -62,6 +65,9 @@ const mod = {
   pinned: null as string | null,
   turnsSinceEntry: 0,
   workSinceEntry: 0,
+  // The chronicle gap last brought up. Seeded at the session's start with
+  // the gap the SessionStart hook shows, so it is not repeated.
+  chronicleKey: null as string | null,
 }
 
 type CliResult =
@@ -122,7 +128,10 @@ async function refresh($: EngineInterface): Promise<void> {
     return
   }
 
-  if (mod.session !== session) mod.pinned = null
+  if (mod.session !== session) {
+    mod.pinned = null
+    mod.chronicleKey = chronicleNudge(state)?.key ?? null
+  }
   mod.session = session
   mod.state = state
   mod.pinned = state.active?.task_id ?? null
@@ -219,6 +228,7 @@ export const register: Register = (on, options) => {
     mod.retryAt = 0
     mod.turnsSinceEntry = 0
     mod.workSinceEntry = 0
+    mod.chronicleKey = null
 
     return next(e)
   })
@@ -244,14 +254,25 @@ export const register: Register = (on, options) => {
     const state = await current($)
     if (state === null) return next(e)
 
+    // Both reminders ride in the prompt's context, never in the system
+    // prompt: a change there would re-send the conversation uncached.
+    const added: string[] = []
+    const chronicle = chronicleNudge(state)
+    if (chronicle !== null && chronicle.key !== mod.chronicleKey) {
+      mod.chronicleKey = chronicle.key
+      added.push(chronicle.text)
+    }
+
     mod.turnsSinceEntry += 1
     const isDue =
       nudgeAfter > 0 && mod.turnsSinceEntry > nudgeAfter && (state.active !== null || mod.workSinceEntry > 0)
-    if (!isDue) return next(e)
+    if (isDue) {
+      mod.turnsSinceEntry = 0
+      added.push(nudgeText(state, nudgeAfter))
+    }
+    if (added.length === 0) return next(e)
 
-    mod.turnsSinceEntry = 0
-
-    return next({ ...e, context: [...(e.context ?? []), nudgeText(state, nudgeAfter)] })
+    return next({ ...e, context: [...(e.context ?? []), ...added] })
   })
 
   on('tool.call', async ($, e, next) => {
