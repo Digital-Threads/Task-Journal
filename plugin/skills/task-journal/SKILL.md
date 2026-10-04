@@ -23,8 +23,9 @@ treat it as if it does nothing and record explicitly.
 
 ## Session-start ritual (do this before real work)
 
-1. `task_search(query=<a few words about the work>, status="open")` — is there an open
-   task for this? If yes, `task_pack(task_id)` and continue it. **Do not** open a duplicate.
+1. `task_search(status="open")` (add `query=<a few words about the work>` to narrow) — is
+   there an open task for this? Each entry in `tasks` shows its title and goal. If yes,
+   `task_pack(task_id)` and continue it. **Do not** open a duplicate.
 2. If nothing fits, `task_create(title=<short>, goal=<one sentence: what the user is trying to accomplish>)`. **Always pass `goal`** — it is the first line of every pack and
    the anchor for "why was this done?".
 3. Hold the returned `task_id` for the whole task. One task = one logical objective.
@@ -100,7 +101,11 @@ task_close(
 | Resuming an existing project | `task_search(status="open")` → `task_pack` on the match |
 
 `task_pack` mode: `compact` (~2KB, default for resume) or `full` (~10KB, full trail).
-`task_search` filters: `status`, `project`, `event_type` (decision/finding/evidence/…).
+`task_search` filters: `status` (`open` | `closed` | `any`, default `any`), `project`
+(absolute path of another project directory), `event_type` (decision/finding/evidence/…).
+An empty or absent `query` lists the tasks, newest activity first. The result has
+`results` (task ids) and `tasks` — the same ids in the same order, each with `title`,
+`status`, `last_event_at` and `goal`.
 
 ## The 5 MCP tools (exact params)
 
@@ -110,7 +115,8 @@ task_close(
   correction | reopen | supersede | redirect. `alternatives` is decision-only.
 - `task_close(task_id, reason, outcome?, outcome_tag?)` — **always pass `outcome` + `outcome_tag`.**
 - `task_pack(task_id, mode?)` — `compact` | `full`.
-- `task_search(query, status?, project?, event_type?)` — FTS5 over this project's events.
+- `task_search(query?, status?, project?, event_type?)` — full-text search over the project's
+  events; no `query` lists its tasks. Returns `results` (ids) and `tasks` (id, title, status, goal).
 
 ## Invariants
 

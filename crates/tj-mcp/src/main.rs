@@ -131,9 +131,10 @@ tools — so call them, every session, without being asked.
 
 THE RITUAL — do this on EVERY coding session, not optional:
 
-1. START. task_search(status="open") for related work → task_pack to resume it;
-   if nothing fits, task_create(title, goal=<one sentence: what the user is
-   trying to accomplish>). Hold the returned task_id for the whole session.
+1. START. task_search(status="open") lists open tasks, newest first (add a
+   `query` to narrow; each entry in `tasks` has title + goal) → task_pack to
+   resume one; if nothing fits, task_create(title, goal=<one sentence: what the
+   user is trying to accomplish>). Hold the returned task_id for the whole session.
 2. AT THE MOMENT you commit to an approach → event_add(event_type="decision",
    ...) and pass `alternatives` (the options you weighed). Right then — not at
    the end, or you will forget.
