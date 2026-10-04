@@ -211,9 +211,27 @@ fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
         if applied.contains(&migration.version) {
             continue;
         }
-        conn.execute_batch(migration.sql)
+
+        // One IMMEDIATE transaction per migration: it takes the write lock up
+        // front, so a second process opening the same fresh DB waits here and
+        // then sees the version as applied instead of re-running its ALTERs.
+        // The migration and its row commit together — a failure halfway rolls
+        // the whole migration back instead of leaving a partial schema.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .with_context(|| format!("begin schema migration v{:03}", migration.version))?;
+        let already_applied: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            rusqlite::params![migration.version],
+            |r| r.get(0),
+        )?;
+        if already_applied {
+            continue;
+        }
+
+        tx.execute_batch(migration.sql)
             .with_context(|| format!("apply schema migration v{:03}", migration.version))?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![
                 migration.version,
@@ -226,6 +244,8 @@ fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
                 migration.version
             )
         })?;
+        tx.commit()
+            .with_context(|| format!("commit schema migration v{:03}", migration.version))?;
     }
     Ok(())
 }
@@ -962,13 +982,33 @@ pub fn index_event(conn: &Connection, event: &Event) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Switch the DB to WAL. On a fresh file that needs an exclusive lock, and
+/// SQLite answers SQLITE_BUSY at once — no busy handler, to avoid a deadlock —
+/// when another connection is switching the same file: two processes opening
+/// a fresh DB together. Retry briefly; once the file is in WAL it is a no-op.
+fn enable_wal(conn: &Connection) -> anyhow::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 100 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            res => return res.context("set WAL journal mode"),
+        }
+    }
+}
+
 pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Connection> {
     if let Some(parent) = path.as_ref().parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create dir {parent:?}"))?;
     }
     let conn =
         Connection::open(&path).with_context(|| format!("open SQLite at {:?}", path.as_ref()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    enable_wal(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     apply_migrations(&conn).context("apply schema migrations")?;
     Ok(conn)
 }
@@ -1487,6 +1527,65 @@ mod tests {
             MIGRATIONS.len() as i64,
             "schema_migrations must contain exactly one row per declared migration after repeated opens"
         );
+    }
+
+    #[test]
+    fn a_migration_failing_halfway_leaves_no_partial_schema() {
+        let d = TempDir::new().unwrap();
+        let conn = Connection::open(d.path().join("state.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+             INSERT INTO schema_migrations VALUES (1, 'x'), (2, 'x');",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_001).unwrap();
+        conn.execute_batch(MIGRATION_002).unwrap();
+        // v003 adds goal, then outcome: make its second ALTER fail.
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN outcome TEXT;")
+            .unwrap();
+
+        assert!(apply_migrations(&conn).is_err());
+
+        let goal_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'goal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(goal_cols, 0, "v003's first ALTER must roll back");
+        let v3: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v3, 0);
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_fresh_db_both_succeed() {
+        let d = TempDir::new().unwrap();
+
+        for round in 0..20 {
+            let path = d.path().join(format!("state-{round}.sqlite"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        open(&path).map(|_| ())
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                let res = h.join().unwrap();
+                assert!(res.is_ok(), "round {round}: {:#}", res.unwrap_err());
+            }
+        }
     }
 
     fn make_text_event(text: &str) -> crate::event::Event {
