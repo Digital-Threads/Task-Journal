@@ -69,7 +69,9 @@ Then install the Rust binaries that the plugin calls into:
 cargo install task-journal-cli task-journal-mcp
 ```
 
-That's it. Restart Claude Code, start working, and the journal fills itself.
+That's it. Restart Claude Code, start working, and the journal fills itself. On
+Claude Code 2.1.287+ the plugin also brings the **Task Journal mod** (see
+[How it works](#how-it-works)).
 
 **Alternative installs:** [pre-built binaries](https://github.com/Digital-Threads/Task-Journal/releases), `cargo install` only (manual MCP wiring), or build from source — see [Manual Setup](#manual-setup).
 
@@ -79,6 +81,11 @@ That's it. Restart Claude Code, start working, and the journal fills itself.
 codex mcp add task-journal -- task-journal-mcp
 task-journal install-hooks --scope user --client codex
 ```
+
+Codex asks before every MCP tool call; add `default_tools_approval_mode = "approve"`
+under `[mcp_servers.task-journal]` in `~/.codex/config.toml` so the agent can journal
+without a prompt each time (in `codex exec` it is required). Any other MCP client
+works with the server alone — see [INSTALL.md](INSTALL.md) for every client.
 
 ## Why not just use the agent's own memory?
 
@@ -94,6 +101,7 @@ that tie it back to the code.
 
 ## How it works
 
+- **The mod (Claude Code 2.1.287+).** A plugin of function hooks that runs inside Claude Code and calls the `task-journal` CLI. It keeps the session's active task in the system prompt (a compaction can't drop it), gives each session its own active task, shows the task in the status line, reminds the agent to log only after several prompts without an entry, and — right before a compaction — asks the model what was never logged and records it as `suggested` events. It needs no setup; when it runs, the classic capture hooks stand down so nothing is recorded twice. Codex and older Claude Code keep using the hooks below.
 - **Self-tagging is the primary path (recommended).** You — the agent in the live session — record reasoning directly via the five MCP tools: open a task with a `goal`, append a typed `decision` / `finding` / `rejection` / `evidence` event at the moment of commitment, and `task_close` with a written `outcome`. This is free (it rides the interactive session), language-agnostic, and higher-fidelity than any after-the-fact classifier. The bundled `task-journal` skill drives this automatically. See [MCP tools](#mcp-tools).
 - **Auto-capture is an opt-in backstop — OFF by default (v0.14.0).** A fresh `install-hooks` wires only a cheap, read-only SessionStart resume hook: no per-message classifier runs, no `claude -p` is ever spawned, nothing is charged. Self-tagging is the capture mechanism. Opt in with `install-hooks --auto-capture` and Claude Code hooks also run every prompt, tool call, and reply through a two-stage classifier that lands typed events on its own: Stage 1 is a fast in-process heuristic (obvious EN+RU phrasing, zero cost); Stage 2 falls back to an LLM only when the heuristic is uncertain (and only if you pick `--backend agent-sdk` / `api`). Even opted in it is a safety net under your explicit self-tagging, not the main mechanism, and it misses real reasoning — especially non-English prose.
 - **Artifact extraction.** Each event scans its text for commit hashes, PR URLs, file paths, issue IDs, and branch names. Aggregated artifacts are how Task Journal links related tasks: when you start a new task touching the same issue or file, the prior task is surfaced automatically.
@@ -163,14 +171,15 @@ task-journal pack tj-x9rz1f --mode full
 |---------|--------------|
 | `create <title> [--goal "..."]` | Open a task with optional goal |
 | `goal <id> "..."` | Set or replace a task's goal |
-| `event <id> --type X --text Y` | Append a typed event |
+| `event <id> --type X --text Y [--suggested] [--session S] [--origin O]` | Append a typed event |
+| `state [--session S]` | The session's active task, counts and latest entries as JSON (what the mod reads) |
 | `event-correct --corrects <eid> --task <id> --text "..."` | Correct an earlier event |
 | `external <id> "..."` | Append an external reference (URL, ticket, linked task) |
 | `close <id> --outcome "..." --outcome-tag done\|abandoned\|superseded` | Close with outcome |
 | `reopen <id> --reason "..."` | Reopen a closed task |
 | `pack <id> --mode compact\|full` | Render a resume pack |
 | `events list [--limit N]` | List recent events |
-| `search <query> [--all-projects]` | Full-text search (FTS5) |
+| `search <query> [--all-projects]` | Full-text search (FTS5); an empty query lists tasks |
 | `rejected <topic> [--all-projects] [--limit N] [--since DAYS]` | Cross-task rejection lookup — surfaces approaches already turned down |
 | `export-pr <id>` | Render a task as PR-description Markdown |
 | `statusline` | One-liner for `~/.claude/settings.json` `statusLine` (sub-100ms) |
@@ -189,15 +198,21 @@ task-journal pack tj-x9rz1f --mode full
 
 ## MCP tools
 
-The MCP server exposes five tools to Claude Code (and any MCP client):
+The MCP server exposes seven tools to Claude Code, Codex and any MCP client:
 
 | Tool | Purpose |
 |------|---------|
-| `task_create` | Open a task with optional goal |
+| `task_create` | Open a task with a goal (and optional parent) |
 | `event_add` | Append a typed reasoning event |
-| `task_pack` | Render a resume pack |
-| `task_search` | Full-text search across events |
+| `artifact_add` | Attach a typed link (doc, deploy, dashboard, …) |
 | `task_close` | Close with outcome and outcome tag |
+| `task_pack` | Render a resume pack |
+| `task_search` | Search tasks: full text, or `status="open"` with no query to list them |
+| `task_check` | Score a task's completeness and list its gaps |
+
+The write tools take an optional `session_id`; Claude Code (through the mod) and
+Codex (through each call's metadata) fill it in, so every session keeps its own
+active task.
 
 ## Configuration
 
@@ -261,6 +276,8 @@ PATH), `dream` says so and stops. Model overrides per backend are in the table b
 | `supersede` | Replaces an earlier event |
 | `close` | Task completed with outcome and outcome tag |
 | `redirect` | Task re-routed to a different task |
+| `rename` | Task title changed |
+| `amend` | Goal or external references changed (bookkeeping, kept out of packs and search) |
 
 ## Manual Setup
 
@@ -311,8 +328,8 @@ cargo install task-journal-cli task-journal-mcp --force
 Restart Claude Code and verify:
 
 ```bash
-task-journal --version       # 0.6.3
-task-journal-mcp --version   # 0.6.3
+task-journal --version       # both print the same version as the plugin
+task-journal-mcp --version
 ```
 
 If you installed from source:
