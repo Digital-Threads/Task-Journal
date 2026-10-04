@@ -426,20 +426,48 @@ pub struct Suggestion {
     pub why: String,
 }
 
+/// Shorter words ("api", "dev", "log") are too generic to tie a task to a
+/// module; a module term may still name them.
+const MIN_WORD: usize = 4;
+
 // ponytail: a 5-char prefix stands in for stemming (EN/RU inflections);
 // swap in a real stemmer if suggestions turn noisy.
-fn stems(text: &str) -> std::collections::BTreeSet<String> {
-    crate::recall::keywords(text)
-        .into_iter()
-        .filter(|w| !RU_STOPWORDS.contains(&w.as_str()))
-        .map(|w| w.chars().take(5).collect())
-        .collect()
+/// The meaningful words of `text` by stem, each with the first word seen.
+fn stems(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for word in crate::recall::keywords(text) {
+        let is_generic = word.chars().count() < MIN_WORD
+            || RU_STOPWORDS.contains(&word.as_str())
+            || word.chars().all(|c| c.is_ascii_digit());
+        if is_generic {
+            continue;
+        }
+
+        let stem: String = word.replace('ё', "е").chars().take(5).collect();
+        out.entry(stem).or_insert(word);
+    }
+
+    out
 }
 
+/// Whether `file` lies in the folder (or is the file) `prefix` names.
 fn is_under(file: &str, prefix: &str) -> bool {
-    let prefix = prefix.trim_start_matches("./");
+    let file = file.trim_start_matches("./");
+    let prefix = prefix.trim_start_matches("./").trim_end_matches('/');
 
-    !prefix.is_empty() && file.trim_start_matches("./").starts_with(prefix)
+    !prefix.is_empty()
+        && file.starts_with(prefix)
+        && (file.len() == prefix.len() || file[prefix.len()..].starts_with('/'))
+}
+
+/// Whether `phrase` stands in `text` as whole words.
+fn has_phrase(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + phrase.len()..].chars().next();
+
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 fn task_titles(
@@ -471,7 +499,7 @@ pub fn suggest(
     files: &[String],
 ) -> anyhow::Result<Vec<Suggestion>> {
     let words = stems(text);
-    let lower = text.to_lowercase();
+    let lower = text.to_lowercase().replace('ё', "е");
     let mut out = Vec::new();
 
     for m in list(conn, project_hash)?
@@ -497,27 +525,39 @@ pub fn suggest(
             .terms
             .iter()
             .map(String::as_str)
-            .filter(|t| t.chars().count() >= 3 && lower.contains(&t.to_lowercase()))
+            .filter(|t| {
+                t.chars().count() >= 3 && has_phrase(&lower, &t.to_lowercase().replace('ё', "е"))
+            })
             .collect();
         if !terms.is_empty() {
             score += 2 * terms.len() as u32;
             why.push(format!("terms: {}", terms.join(", ")));
         }
 
-        let vocabulary = format!(
-            "{} {} {} {}",
+        // The module's own words count one each. Words shared only with its
+        // past task titles back a match up, but never make one alone.
+        let own = stems(&format!(
+            "{} {} {}",
             m.name,
             m.description.as_deref().unwrap_or(""),
-            m.hints.terms.join(" "),
-            task_titles(conn, project_hash, &m.module_id)?.join(" ")
-        );
-        let shared: Vec<String> = words
-            .intersection(&stems(&vocabulary))
+            m.hints.terms.join(" ")
+        ));
+        let titles = stems(&task_titles(conn, project_hash, &m.module_id)?.join(" "));
+        let shared_own: Vec<&str> = words
+            .iter()
+            .filter(|(stem, _)| own.contains_key(*stem))
+            .map(|(_, word)| word.as_str())
             .take(5)
-            .cloned()
             .collect();
+        let shared_titles: Vec<&str> = words
+            .iter()
+            .filter(|(stem, _)| !own.contains_key(*stem) && titles.contains_key(*stem))
+            .map(|(_, word)| word.as_str())
+            .take(5)
+            .collect();
+        score += shared_own.len() as u32 + u32::from(!shared_titles.is_empty());
+        let shared: Vec<&str> = shared_own.into_iter().chain(shared_titles).collect();
         if !shared.is_empty() {
-            score += shared.len() as u32;
             why.push(format!("words: {}", shared.join(", ")));
         }
 
@@ -1131,15 +1171,101 @@ mod tests {
             .is_empty());
     }
 
-    #[test]
-    fn titles_of_a_modules_tasks_join_its_vocabulary() {
-        let mut t = open_task("tj-a", &["auth"]);
-        t.meta["title"] = serde_json::json!("Rotate signing keys");
-        let (_d, conn) = journal(&[named("auth", "Auth"), t]);
+    fn described(id: &str, description: &str, terms: &[&str], paths: &[&str]) -> Event {
+        module_event(
+            id,
+            &ModuleFields {
+                name: Some(id.into()),
+                description: Some(description.into()),
+                hints: Some(Hints {
+                    paths: paths.iter().map(|p| p.to_string()).collect(),
+                    terms: terms.iter().map(|t| t.to_string()).collect(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
 
-        let s = suggest(&conn, "p", "signing keys expire too early", &[]).unwrap();
+    fn titled(id: &str, title: &str, module: &str) -> Event {
+        let mut t = open_task(id, &[module]);
+        t.meta["title"] = serde_json::json!(title);
+
+        t
+    }
+
+    #[test]
+    fn past_task_titles_alone_never_suggest_a_module() {
+        // A module's past titles share generic words with half the backlog;
+        // they may back a match up, never make one.
+        let (_d, conn) = journal(&[
+            described("auth", "Login", &[], &[]),
+            titled("tj-a", "Rotate webhook signing keys", "auth"),
+        ]);
+
+        assert!(suggest(&conn, "p", "rotate webhook signing keys", &[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn past_task_titles_back_up_a_word_of_the_module() {
+        let (_d, conn) = journal(&[
+            described("auth", "Login and signing", &[], &[]),
+            titled("tj-a", "Rotate webhook keys", "auth"),
+        ]);
+
+        let s = suggest(&conn, "p", "webhook signing", &[]).unwrap();
 
         assert_eq!(s.first().map(|s| s.module_id.as_str()), Some("auth"));
+    }
+
+    #[test]
+    fn a_term_matches_whole_words_only() {
+        let (_d, conn) = journal(&[described("logs", "Shipping", &["log"], &[])]);
+
+        assert!(suggest(&conn, "p", "the catalog page is slow", &[])
+            .unwrap()
+            .is_empty());
+        assert_eq!(suggest(&conn, "p", "log rotation", &[]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_hint_path_matches_a_folder_not_a_name_prefix() {
+        let (_d, conn) = journal(&[described("stars", "Ratings", &[], &["src/stars"])]);
+
+        assert!(suggest(&conn, "p", "x", &["src/starship/a.rs".into()])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            suggest(&conn, "p", "x", &["src/stars/a.rs".into()])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn yo_and_ye_are_the_same_letter() {
+        let (_d, conn) = journal(&[described("stars", "Рейтинг звёзд", &[], &[])]);
+
+        assert_eq!(suggest(&conn, "p", "рейтинг звезд", &[]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn why_names_the_tasks_words_not_their_stems() {
+        let (_d, conn) = mapped();
+
+        let s = suggest(&conn, "p", "Пересчитать рейтинга звёзды", &[]).unwrap();
+
+        assert!(s[0].why.contains("рейтинга"), "{}", s[0].why);
+    }
+
+    #[test]
+    fn three_letter_words_are_too_generic_to_suggest() {
+        let (_d, conn) = journal(&[described("tools", "dev api log ops", &[], &[])]);
+
+        assert!(suggest(&conn, "p", "dev api log", &[]).unwrap().is_empty());
     }
 
     #[test]
