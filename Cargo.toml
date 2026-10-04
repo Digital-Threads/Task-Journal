@@ -18,6 +18,9 @@ keywords = ["task-journal", "ai-coding", "mcp", "memory", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
+# `version` must equal workspace.package.version: `cargo publish` uploads it as
+# the requirement on core. Cargo can't inherit it; plugin_metadata.rs checks it.
+tj-core = { package = "task-journal-core", version = "0.29.0", path = "crates/tj-core", default-features = false }
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
