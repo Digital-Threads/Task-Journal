@@ -20,3 +20,4 @@
 
 # Types Claude Code lays beside a mod it loads from this folder
 plugin/.claude-plugin/types/
+plugin/tsconfig.json
