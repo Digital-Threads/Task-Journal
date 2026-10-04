@@ -59,6 +59,7 @@ mod task_id_tests {
 
 pub mod archive;
 pub mod artifacts;
+pub mod chronicle;
 pub mod classifier;
 pub mod completeness;
 pub mod consolidate;

@@ -40,6 +40,12 @@ itself: the journal says what is missing and what to do about it.
   propose modules, confirm with the user, save them, sort past tasks with
   `module_backfill_candidates` (paged with `limit` / `offset`), confirm, link —
   leftovers to a catch-all module — and write each module's first state.
+- **One map per repository, worktrees included.** A git worktree reads and
+  writes the module map of its main checkout, while its tasks stay in its own
+  journal. A module's page, task counts and staleness gather the tasks of the
+  main checkout and of every worktree, removed ones too. Worktrees register
+  next to the journals, and their module links carry the main checkout's id,
+  so the registry can be rebuilt from the journals.
 - CLI: `module list|show|save|link|candidates`, `create --modules`,
   `close --module-note module=text`; `task_search` / MCP gain a `module` filter.
 
@@ -56,7 +62,7 @@ itself: the journal says what is missing and what to do about it.
   tasks; 0.31 re-indexes once afterwards, so no module is lost.
 - Existing tools, commands and packs work as before. What is new before you
   create a module: the session start shows a `📚 Chronicle:` line inviting you
-  to map the project (not in a git worktree), `task_create` replies may carry
+  to map the project, `task_create` replies may carry
   `chronicle` and `suggested_modules`, and `task-journal state` gains
   `archive` and `active.modules`.
 

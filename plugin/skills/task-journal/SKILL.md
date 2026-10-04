@@ -115,7 +115,8 @@ The project is a map of **modules**: parts of the system by meaning — not fold
 tickets. Every task belongs to one or more modules, and each module keeps a page: how it
 works now (`state`), what is decided, rejected and constrained there across all its tasks,
 and every task in order. Six months later, `module_page` is how you learn a part of the
-system before touching it.
+system before touching it. A repository has one map: in a git worktree the same modules
+apply, and its tasks join their history.
 
 - **Start:** `task_create(..., modules=["stars"])`. Not sure which? The reply carries
   `suggested_modules` — link with `module_link`, or create a module with `module_save`.

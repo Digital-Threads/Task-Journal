@@ -122,23 +122,32 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     r
 }
 
-/// Run `f` on the current project's state, with the journal ingested first.
-fn with_chronicle<T>(f: impl FnOnce(&rusqlite::Connection, &str) -> Result<T>) -> Result<T> {
+/// Run `f` on the project's chronicle (the module map of its repository, a
+/// worktree sharing the main checkout's) and on the current project's state.
+fn with_chronicle<T>(
+    f: impl FnOnce(&tj_core::chronicle::Chronicle, &rusqlite::Connection, &str) -> Result<T>,
+) -> Result<T> {
     let cwd = std::env::current_dir()?;
+    let chr = tj_core::chronicle::Chronicle::open(&cwd)?;
     let project_hash = tj_core::project_hash::from_path(&cwd)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
     let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
     let conn = tj_core::db::open(&state_path)?;
     tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
 
-    f(&conn, &project_hash)
+    f(&chr, &conn, &project_hash)
 }
 
 /// Append `events` to the current project's journal, durably.
 fn append_to_journal(events: &[tj_core::event::Event]) -> Result<()> {
     let project_hash = tj_core::project_hash::from_path(&std::env::current_dir()?)?;
     let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
-    let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+    append_to(&events_path, events)
+}
+
+/// Append `events` to the journal at `path`, durably.
+fn append_to(path: &std::path::Path, events: &[tj_core::event::Event]) -> Result<()> {
+    let mut writer = tj_core::storage::JsonlWriter::open(path)?;
     for event in events {
         writer.append(event)?;
     }
@@ -158,13 +167,10 @@ fn by_user(mut event: tj_core::event::Event) -> tj_core::event::Event {
 fn run_module(action: ModuleCmd) -> Result<()> {
     match action {
         ModuleCmd::List { json } => {
-            let (modules, gaps) = with_chronicle(|conn, hash| {
+            let (modules, gaps) = with_chronicle(|chr, conn, hash| {
                 Ok((
-                    tj_core::modules::list(conn, hash)?,
-                    tj_core::archive::for_dir(
-                        tj_core::archive::gaps(conn, hash, None)?,
-                        &std::env::current_dir()?,
-                    ),
+                    tj_core::modules::map(chr)?,
+                    tj_core::archive::gaps(chr, conn, hash, None)?,
                 ))
             })?;
             if json {
@@ -200,7 +206,7 @@ fn run_module(action: ModuleCmd) -> Result<()> {
             }
         }
         ModuleCmd::Show { module_id } => {
-            let page = with_chronicle(|conn, hash| tj_core::modules::page(conn, hash, &module_id))?;
+            let page = with_chronicle(|chr, _, _| tj_core::modules::page(chr, &module_id))?;
             println!("{page}");
         }
         ModuleCmd::Save {
@@ -225,7 +231,10 @@ fn run_module(action: ModuleCmd) -> Result<()> {
             };
             let event = tj_core::modules::module_event(&module_id, &fields)?;
 
-            let created = with_chronicle(|conn, hash| {
+            // Modules live in the repository's home journal, also when saved
+            // from a worktree.
+            let (created, home_events) = with_chronicle(|chr, _, _| {
+                let (conn, hash) = (&chr.home, chr.home_hash.as_str());
                 let exists = tj_core::modules::get(conn, hash, &module_id)?.is_some();
                 if !exists && fields.name.is_none() {
                     anyhow::bail!("module {module_id} is new: pass --name too");
@@ -239,9 +248,9 @@ fn run_module(action: ModuleCmd) -> Result<()> {
                     }
                 }
 
-                Ok(!exists)
+                Ok((!exists, chr.home_events()))
             })?;
-            append_to_journal(&[by_user(event)])?;
+            append_to(&home_events, &[by_user(event)])?;
             println!(
                 "{} {module_id}",
                 if created { "created" } else { "updated" }
@@ -252,7 +261,7 @@ fn run_module(action: ModuleCmd) -> Result<()> {
             add,
             remove,
         } => {
-            let resolved = with_chronicle(|conn, hash| {
+            let event = with_chronicle(|chr, conn, _| {
                 if !tj_core::db::task_exists(conn, &task_id)? {
                     anyhow::bail!("task not found: {task_id}");
                 }
@@ -260,24 +269,24 @@ fn run_module(action: ModuleCmd) -> Result<()> {
                     tj_core::modules::validate_id(id)?;
                 }
 
-                tj_core::modules::resolve(conn, hash, &add)
+                let resolved = tj_core::modules::resolve(&chr.home, &chr.home_hash, &add)?;
+                for w in &resolved.warnings {
+                    eprintln!("warning: {w}");
+                }
+                if resolved.ids.is_empty() && remove.is_empty() {
+                    anyhow::bail!("nothing to do: pass --add or --remove");
+                }
+                let mut event = tj_core::modules::link_event(&task_id, &resolved.ids, &remove);
+                chr.stamp(&mut event.meta);
+
+                Ok(event)
             })?;
-            for w in &resolved.warnings {
-                eprintln!("warning: {w}");
-            }
-            if resolved.ids.is_empty() && remove.is_empty() {
-                anyhow::bail!("nothing to do: pass --add or --remove");
-            }
-            append_to_journal(&[by_user(tj_core::modules::link_event(
-                &task_id,
-                &resolved.ids,
-                &remove,
-            ))])?;
+            append_to_journal(&[by_user(event)])?;
             println!("linked {task_id}");
         }
         ModuleCmd::Candidates { limit, offset } => {
-            let (total, candidates) = with_chronicle(|conn, hash| {
-                tj_core::modules::backfill_candidates(conn, hash, limit, offset)
+            let (total, candidates) = with_chronicle(|chr, conn, hash| {
+                tj_core::modules::backfill_candidates(chr, conn, hash, limit, offset)
             })?;
             let out = serde_json::json!({ "total_unlinked": total, "candidates": candidates });
             println!("{}", serde_json::to_string(&out)?);
@@ -1673,12 +1682,13 @@ fn real_main() -> Result<()> {
                 meta["goal"] = serde_json::Value::String(g);
             }
             if !modules.is_empty() {
-                let resolved =
-                    with_chronicle(|conn, hash| tj_core::modules::resolve(conn, hash, &modules))?;
+                let chr = tj_core::chronicle::Chronicle::open(&cwd)?;
+                let resolved = tj_core::modules::resolve(&chr.home, &chr.home_hash, &modules)?;
                 for w in &resolved.warnings {
                     eprintln!("warning: {w}");
                 }
                 meta["modules"] = serde_json::json!(resolved.ids);
+                chr.stamp(&mut meta);
             }
             event.meta = meta;
 
@@ -2009,7 +2019,7 @@ fn real_main() -> Result<()> {
             let session = session.or_else(tj_core::session_id::session_id_from_env);
 
             // No journal yet: an empty state, and no state DB created for it.
-            let mut state = if events_path.exists() {
+            let state = if events_path.exists() {
                 let conn = tj_core::db::open(&state_path)?;
                 tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                 tj_core::session_state::session_state(
@@ -2017,6 +2027,7 @@ fn real_main() -> Result<()> {
                     &project_hash,
                     session.as_deref(),
                     prefer.as_deref(),
+                    &tj_core::chronicle::Chronicle::open(&cwd)?,
                 )?
             } else {
                 tj_core::session_state::SessionState {
@@ -2028,7 +2039,6 @@ fn real_main() -> Result<()> {
                 }
             };
 
-            state.archive = tj_core::archive::for_dir(state.archive, &cwd);
             println!("{}", serde_json::to_string(&state)?);
         }
         Commands::ArtifactAdd {
@@ -2100,9 +2110,18 @@ fn real_main() -> Result<()> {
             }
             let open_kids = tj_core::db::count_open_children(&conn, &task_id)?;
             // A note to an unknown module fails the close before it is written.
+            let chr = if notes.is_empty() {
+                None
+            } else {
+                Some(tj_core::chronicle::Chronicle::open(&cwd)?)
+            };
             for (module, _) in notes.iter_mut() {
-                let resolved =
-                    tj_core::modules::resolve(&conn, &project_hash, std::slice::from_ref(module))?;
+                let chr = chr.as_ref().expect("opened when notes are given");
+                let resolved = tj_core::modules::resolve(
+                    &chr.home,
+                    &chr.home_hash,
+                    std::slice::from_ref(module),
+                )?;
                 for w in &resolved.warnings {
                     eprintln!("warning: {w}");
                 }
@@ -2132,6 +2151,14 @@ fn real_main() -> Result<()> {
             }
             if !notes.is_empty() {
                 meta.insert("module_notes".into(), tj_core::modules::notes_meta(&notes));
+                if let Some(chr) = &chr {
+                    if chr.member_hash.is_some() {
+                        meta.insert(
+                            tj_core::chronicle::HOME_KEY.into(),
+                            chr.home_hash.clone().into(),
+                        );
+                    }
+                }
             }
             // Layer-2 close harvest: stamp deterministic git/gh refs (commit,
             // branch, PR) so the closed pack reads as a clickable ledger of
@@ -2981,9 +3008,9 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // The chronicle's most important gap, for every client that
                 // reads this hook (Claude Code with or without the mod, Codex).
                 // Advice only: it never fails the session start.
-                if let Some(line) = tj_core::archive::gaps(&conn, &project_hash, None)
+                if let Some(line) = tj_core::chronicle::Chronicle::open(&cwd)
+                    .and_then(|chr| tj_core::archive::gaps(&chr, &conn, &project_hash, None))
                     .ok()
-                    .map(|gaps| tj_core::archive::for_dir(gaps, &cwd))
                     .and_then(|gaps| tj_core::archive::headline(&gaps))
                 {
                     bundle.push_str(&line);

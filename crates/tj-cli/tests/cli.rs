@@ -8739,32 +8739,98 @@ fn state_carries_archive_gaps() {
         .stdout(contains(r#""kind":"no_map""#));
 }
 
+/// A git repository with one linked worktree: their own journals, one map.
+fn repo_with_worktree(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let main = root.join("repo");
+    std::fs::create_dir_all(&main).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&main)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    ]);
+    let worktree = root.join("wt");
+    git(&["worktree", "add", "-q", worktree.to_str().unwrap()]);
+
+    (main, worktree)
+}
+
 #[test]
-fn a_worktree_session_is_not_asked_to_map_the_project() {
-    let (xdg, proj) = (
-        assert_fs::TempDir::new().unwrap(),
-        assert_fs::TempDir::new().unwrap(),
-    );
-    std::fs::write(
-        proj.path().join(".git"),
-        "gitdir: /elsewhere/.git/worktrees/x\n",
-    )
-    .unwrap();
-    let tj = chronicle_cli(&xdg, &proj);
-    tj().args(["create", "Work in a worktree"])
+fn a_worktree_shares_the_main_checkouts_module_map() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let root = assert_fs::TempDir::new().unwrap();
+    let (main, worktree) = repo_with_worktree(root.path());
+    let tj = |dir: &std::path::Path| {
+        let mut c = Command::cargo_bin("task-journal").unwrap();
+        c.env("XDG_DATA_HOME", xdg.path()).current_dir(dir);
+        c
+    };
+
+    tj(&main)
+        .args(["module", "save", "stars", "--name", "Stars"])
         .assert()
         .success();
 
-    let mut hook = tj();
-    hook.args(["ingest-hook", "--kind", "SessionStart", "--text", ""]);
-    let out: serde_json::Value = serde_json::from_str(&stdout_of(hook)).unwrap();
-    let ctx = out["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-
-    assert!(!ctx.contains("no module map"), "{ctx}");
-    tj().args(["state"])
+    // In the worktree: the same map, a task of its own linked to it.
+    tj(&worktree)
+        .args(["module", "list"])
+        .assert()
+        .success()
+        .stdout(contains("stars"));
+    let mut create = tj(&worktree);
+    create.args(["create", "Rank in the worktree", "--modules", "stars"]);
+    let id = stdout_of(create);
+    tj(&worktree)
+        .args([
+            "close",
+            &id,
+            "--outcome",
+            "Ranked",
+            "--module-note",
+            "stars=Ranked from the worktree",
+        ])
+        .assert()
+        .success();
+    tj(&worktree)
+        .args(["module", "save", "auth", "--name", "Auth"])
+        .assert()
+        .success();
+    tj(&worktree)
+        .args(["state"])
         .assert()
         .success()
         .stdout(contains("no_map").not());
+
+    // In the main checkout: the worktree's task is in the module's history,
+    // and the module saved from the worktree is on the map.
+    tj(&main)
+        .args(["module", "show", "stars"])
+        .assert()
+        .success()
+        .stdout(contains(id.as_str()).and(contains("Ranked from the worktree")));
+    tj(&main)
+        .args(["module", "list"])
+        .assert()
+        .success()
+        .stdout(contains("auth").and(contains("1 task(s)")));
+    // The task itself stays in the worktree's journal.
+    tj(&main)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(contains(id.as_str()).not());
 }

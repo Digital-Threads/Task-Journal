@@ -536,9 +536,45 @@ fn append_events(events: &[tj_core::event::Event]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether this project has a journal yet; read-only tools create nothing without one.
+/// Append `events` to the journal at `path`, durably.
+fn append_to(path: &Path, events: &[tj_core::event::Event]) -> anyhow::Result<()> {
+    let mut writer = tj_core::storage::JsonlWriter::open(path)?;
+    for event in events {
+        writer.append(event)?;
+    }
+    writer.flush_durable()?;
+
+    Ok(())
+}
+
+/// The project's chronicle: the module map of its repository (a worktree
+/// shares the main checkout's) and every journal that links tasks to it.
+fn chronicle() -> anyhow::Result<tj_core::chronicle::Chronicle> {
+    tj_core::chronicle::Chronicle::open(&project_dir()?)
+}
+
+/// Run `f` on the chronicle and on this project's own state.
+fn with_chronicle<T>(
+    f: impl FnOnce(&tj_core::chronicle::Chronicle, &Connection, &str) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let chr = chronicle()?;
+
+    with_state(|conn, project_hash| f(&chr, conn, project_hash))
+}
+
+/// Whether this project, or the main checkout whose module map it shares, has
+/// a journal yet; read-only tools create nothing without one.
 fn has_journal() -> anyhow::Result<bool> {
-    Ok(project_paths()?.1.exists())
+    if project_paths()?.1.exists() {
+        return Ok(true);
+    }
+
+    Ok(
+        match tj_core::project_hash::chronicle_home(&project_dir()?) {
+            Some(home) => resolve_project_paths(&home)?.1.exists(),
+            None => false,
+        },
+    )
 }
 
 /// What a new task's reply says about the chronicle: its modules with their
@@ -552,10 +588,10 @@ fn new_task_chronicle(
     Vec<tj_core::modules::Suggestion>,
     Option<String>,
 )> {
-    with_state(|conn, project_hash| {
+    with_chronicle(|chr, conn, project_hash| {
         let mut modules = Vec::new();
         for id in linked {
-            if let Some(m) = tj_core::modules::get(conn, project_hash, id)? {
+            if let Some(m) = tj_core::modules::get(&chr.home, &chr.home_hash, id)? {
                 modules.push(ModuleBrief {
                     module_id: m.module_id,
                     name: m.name,
@@ -564,14 +600,11 @@ fn new_task_chronicle(
             }
         }
         let suggested = if linked.is_empty() {
-            tj_core::modules::suggest(conn, project_hash, text, &[])?
+            tj_core::modules::suggest(&chr.home, &chr.home_hash, text, &[])?
         } else {
             Vec::new()
         };
-        let gaps = tj_core::archive::for_dir(
-            tj_core::archive::gaps(conn, project_hash, Some(task_id))?,
-            &project_dir()?,
-        );
+        let gaps = tj_core::archive::gaps(chr, conn, project_hash, Some(task_id))?;
 
         Ok((modules, suggested, tj_core::archive::headline(&gaps)))
     })
@@ -579,13 +612,13 @@ fn new_task_chronicle(
 
 /// What a closed task's modules still need: a link, or a fresh state.
 fn module_reminder(
+    chr: &tj_core::chronicle::Chronicle,
     conn: &Connection,
-    project_hash: &str,
     task_id: &str,
     has_notes: bool,
 ) -> anyhow::Result<Option<String>> {
     // No map yet: the session start and module_list already say so.
-    if tj_core::modules::list(conn, project_hash)?.is_empty() {
+    if tj_core::modules::list(&chr.home, &chr.home_hash)?.is_empty() {
         return Ok(None);
     }
 
@@ -911,9 +944,11 @@ impl TaskJournalServer {
                 // Modules are checked before the open event is written: an
                 // unknown id fails the call and leaves no task behind.
                 let resolved = match p.modules.as_deref() {
-                    Some(ids) if !ids.is_empty() => Some(with_state(|conn, hash| {
-                        tj_core::modules::resolve(conn, hash, ids)
-                    })?),
+                    Some(ids) if !ids.is_empty() => {
+                        let chr = chronicle()?;
+                        let r = tj_core::modules::resolve(&chr.home, &chr.home_hash, ids)?;
+                        Some((r, chr))
+                    }
                     _ => None,
                 };
 
@@ -937,8 +972,9 @@ impl TaskJournalServer {
                 if let Some(ref r) = loom_ref {
                     event.meta["external"] = serde_json::json!([r]);
                 }
-                if let Some(r) = &resolved {
+                if let Some((r, chr)) = &resolved {
                     event.meta["modules"] = serde_json::json!(r.ids);
+                    chr.stamp(&mut event.meta);
                 }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
@@ -950,7 +986,10 @@ impl TaskJournalServer {
                 writer.flush_durable()?;
 
                 // The task is written; what follows only advises, so it never fails the call.
-                let linked = resolved.as_ref().map(|r| r.ids.clone()).unwrap_or_default();
+                let linked = resolved
+                    .as_ref()
+                    .map(|(r, _)| r.ids.clone())
+                    .unwrap_or_default();
                 let text = format!(
                     "{} {} {}",
                     p.title,
@@ -965,7 +1004,7 @@ impl TaskJournalServer {
                     title: p.title.clone(),
                     modules,
                     suggested_modules,
-                    warnings: resolved.map(|r| r.warnings).unwrap_or_default(),
+                    warnings: resolved.map(|(r, _)| r.warnings).unwrap_or_default(),
                     chronicle,
                 })
             })
@@ -1094,6 +1133,11 @@ impl TaskJournalServer {
                 let open_kids;
                 let mut notes = Vec::new();
                 let mut warnings = Vec::new();
+                // Notes go to modules of the repository's shared map.
+                let chr = match &p.module_notes {
+                    Some(n) if !n.is_empty() => Some(chronicle()?),
+                    _ => None,
+                };
                 {
                     let conn = conn_arc
                         .lock()
@@ -1121,9 +1165,10 @@ impl TaskJournalServer {
 
                     // A note to an unknown module fails the close before it is written.
                     for note in p.module_notes.iter().flatten() {
+                        let chr = chr.as_ref().expect("opened when notes are given");
                         let r = tj_core::modules::resolve(
-                            &conn,
-                            &project_hash,
+                            &chr.home,
+                            &chr.home_hash,
                             std::slice::from_ref(&note.module),
                         )?;
                         warnings.extend(r.warnings);
@@ -1165,6 +1210,9 @@ impl TaskJournalServer {
                     }
                 }
                 event.meta = serde_json::Value::Object(meta);
+                if let Some(chr) = &chr {
+                    chr.stamp(&mut event.meta);
+                }
                 tj_core::session_id::stamp_session_id(
                     &mut event.meta,
                     session_id_or_env(p.session_id.as_deref()).as_deref(),
@@ -1189,10 +1237,12 @@ impl TaskJournalServer {
                     ) {
                         gaps = report.gaps.into_iter().map(|g| g.detail).collect();
                     }
-                    module_reminder =
-                        crate::module_reminder(&conn, &project_hash, &p.task_id, !notes.is_empty())
-                            .ok()
-                            .flatten();
+                    module_reminder = chronicle()
+                        .and_then(|chr| {
+                            crate::module_reminder(&chr, &conn, &p.task_id, !notes.is_empty())
+                        })
+                        .ok()
+                        .flatten();
                 }
                 Ok((open_kids, gaps, module_reminder, warnings))
             })
@@ -1229,14 +1279,11 @@ impl TaskJournalServer {
                     }));
                 }
 
-                with_state(|conn, project_hash| {
-                    let gaps = tj_core::archive::for_dir(
-                        tj_core::archive::gaps(conn, project_hash, None)?,
-                        &project_dir()?,
-                    );
+                with_chronicle(|chr, conn, project_hash| {
+                    let gaps = tj_core::archive::gaps(chr, conn, project_hash, None)?;
 
                     Ok(Json(ModuleListResult {
-                        modules: tj_core::modules::list(conn, project_hash)?,
+                        modules: tj_core::modules::map(chr)?,
                         chronicle: tj_core::archive::headline(&gaps),
                         gaps,
                     }))
@@ -1264,9 +1311,7 @@ impl TaskJournalServer {
                     );
                 }
 
-                let text = with_state(|conn, project_hash| {
-                    tj_core::modules::page(conn, project_hash, &p.module_id)
-                })?;
+                let text = tj_core::modules::page(&chronicle()?, &p.module_id)?;
 
                 Ok(Json(ModulePageResult {
                     module_id: p.module_id,
@@ -1298,7 +1343,11 @@ impl TaskJournalServer {
                 };
                 let event = tj_core::modules::module_event(&p.module_id, &fields)?;
 
-                let created = with_state(|conn, project_hash| {
+                // Modules live in the repository's home journal, also when
+                // saved from a worktree.
+                let chr = chronicle()?;
+                let (conn, project_hash) = (&chr.home, chr.home_hash.as_str());
+                let created = {
                     let exists = tj_core::modules::get(conn, project_hash, &p.module_id)?.is_some();
                     if !exists && fields.name.is_none() {
                         anyhow::bail!("module {} is new: pass `name` too", p.module_id);
@@ -1312,9 +1361,9 @@ impl TaskJournalServer {
                         }
                     }
 
-                    Ok(!exists)
-                })?;
-                append_events(&[event])?;
+                    !exists
+                };
+                append_to(&chr.home_events(), &[event])?;
 
                 Ok(Json(ModuleSaveResult {
                     module_id: p.module_id,
@@ -1337,7 +1386,7 @@ impl TaskJournalServer {
         traced_tool("module_link", async move {
             run_blocking(move || {
                 let mut warnings = Vec::new();
-                let events = with_state(|conn, project_hash| {
+                let events = with_chronicle(|chr, conn, _| {
                     let mut events = Vec::new();
                     for link in &p.links {
                         if !tj_core::db::task_exists(conn, &link.task_id)? {
@@ -1346,16 +1395,15 @@ impl TaskJournalServer {
                         for id in &link.remove {
                             tj_core::modules::validate_id(id)?;
                         }
-                        let add = tj_core::modules::resolve(conn, project_hash, &link.add)?;
+                        let add = tj_core::modules::resolve(&chr.home, &chr.home_hash, &link.add)?;
                         warnings.extend(add.warnings);
                         if add.ids.is_empty() && link.remove.is_empty() {
                             continue;
                         }
-                        events.push(tj_core::modules::link_event(
-                            &link.task_id,
-                            &add.ids,
-                            &link.remove,
-                        ));
+                        let mut event =
+                            tj_core::modules::link_event(&link.task_id, &add.ids, &link.remove);
+                        chr.stamp(&mut event.meta);
+                        events.push(event);
                     }
 
                     Ok(events)
@@ -1390,8 +1438,9 @@ impl TaskJournalServer {
                 }
 
                 let limit = p.limit.unwrap_or(20).min(100);
-                let (total_unlinked, candidates) = with_state(|conn, project_hash| {
+                let (total_unlinked, candidates) = with_chronicle(|chr, conn, project_hash| {
                     tj_core::modules::backfill_candidates(
+                        chr,
                         conn,
                         project_hash,
                         limit,

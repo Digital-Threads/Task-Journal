@@ -433,7 +433,14 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     if !modules.is_empty() {
         let names: Vec<String> = modules
             .iter()
-            .map(|(id, name)| format!("{name} ({id})"))
+            // In a worktree the names live in the home's state: show the id.
+            .map(|(id, name)| {
+                if name == id {
+                    id.clone()
+                } else {
+                    format!("{name} ({id})")
+                }
+            })
             .collect();
         text.push_str(&format!("**Modules**: {}\n", names.join(", ")));
     }

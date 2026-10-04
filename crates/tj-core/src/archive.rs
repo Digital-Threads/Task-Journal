@@ -49,20 +49,6 @@ impl Gap {
     }
 }
 
-/// `gaps` as seen from `dir`. A linked git worktree keeps a journal of its
-/// own while the map lives in the main checkout, so it is not asked to map.
-// ponytail: hides NoMap in worktrees; reading the main checkout's chronicle
-// from a worktree is the real fix.
-pub fn for_dir(gaps: Vec<Gap>, dir: &std::path::Path) -> Vec<Gap> {
-    if !crate::project_hash::is_linked_worktree(dir) {
-        return gaps;
-    }
-
-    gaps.into_iter()
-        .filter(|g| !matches!(g, Gap::NoMap { .. }))
-        .collect()
-}
-
 /// The line a session start or a tool reply shows: the most important gap.
 pub fn headline(gaps: &[Gap]) -> Option<String> {
     let first = gaps.first()?;
@@ -74,9 +60,12 @@ pub fn headline(gaps: &[Gap]) -> Option<String> {
     Some(format!("📚 Chronicle: {}{more}", first.action()))
 }
 
-/// What the chronicle of `project_hash` is missing, most important first.
+/// What the chronicle is missing, most important first, as seen from the
+/// journal `conn` (`project_hash`): the map comes from the chronicle's home,
+/// tasks from this journal, and a module's lag from every journal.
 /// `active_task` is the session's task, checked for a module of its own.
 pub fn gaps(
+    chr: &crate::chronicle::Chronicle,
     conn: &Connection,
     project_hash: &str,
     active_task: Option<&str>,
@@ -89,7 +78,8 @@ pub fn gaps(
     if tasks == 0 {
         return Ok(Vec::new());
     }
-    if count("SELECT COUNT(*) FROM modules WHERE project_hash = ?1")? == 0 {
+    let modules: Vec<crate::modules::Module> = crate::modules::list(&chr.home, &chr.home_hash)?;
+    if modules.is_empty() {
         return Ok(vec![Gap::NoMap { tasks }]);
     }
 
@@ -105,22 +95,40 @@ pub fn gaps(
         }
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT m.module_id, COUNT(t.task_id) FROM modules m
-           JOIN task_modules tm ON tm.project_hash = m.project_hash AND tm.module_id = m.module_id
-           JOIN tasks t ON t.task_id = tm.task_id AND t.status = 'closed'
-          WHERE m.project_hash = ?1 AND m.status = 'active'
-            AND (m.state_at IS NULL OR COALESCE(t.closed_at, t.last_event_at) > m.state_at)
-          GROUP BY m.module_id
-          ORDER BY COUNT(t.task_id) DESC, m.module_id",
-    )?;
-    for row in stmt.query_map([project_hash], |r| Ok((r.get(0)?, r.get(1)?)))? {
-        let (module_id, closed_since) = row?;
-        out.push(Gap::StaleModule {
-            module_id,
-            closed_since,
-        });
+    let mut stale = Vec::new();
+    for m in modules.iter().filter(|m| m.status == "active") {
+        let mut closed_since = 0;
+        for journal in chr.journals() {
+            closed_since += journal.query_row(
+                "SELECT COUNT(*) FROM task_modules tm
+                   JOIN tasks t ON t.task_id = tm.task_id AND t.status = 'closed'
+                  WHERE tm.module_id = ?1
+                    AND (?2 IS NULL OR COALESCE(t.closed_at, t.last_event_at) > ?2)",
+                rusqlite::params![m.module_id, m.state_at],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
+        if closed_since > 0 {
+            stale.push(Gap::StaleModule {
+                module_id: m.module_id.clone(),
+                closed_since,
+            });
+        }
     }
+    stale.sort_by(|a, b| match (a, b) {
+        (
+            Gap::StaleModule {
+                module_id: x,
+                closed_since: n,
+            },
+            Gap::StaleModule {
+                module_id: y,
+                closed_since: k,
+            },
+        ) => k.cmp(n).then_with(|| x.cmp(y)),
+        _ => std::cmp::Ordering::Equal,
+    });
+    out.extend(stale);
 
     let unlinked = count(
         "SELECT COUNT(*) FROM tasks t WHERE t.project_hash = ?1
@@ -136,7 +144,7 @@ pub fn gaps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::tests_support::{close_task, journal, open_task};
+    use crate::modules::tests_support::{chronicle_of, close_task, journal, open_task};
     use crate::modules::{module_event, ModuleFields};
 
     fn stars(state: Option<&str>) -> crate::event::Event {
@@ -155,7 +163,9 @@ mod tests {
     fn an_empty_journal_has_no_gaps() {
         let (_d, conn) = journal(&[]);
 
-        assert!(gaps(&conn, "p", None).unwrap().is_empty());
+        assert!(gaps(&chronicle_of(&_d), &conn, "p", None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -163,7 +173,7 @@ mod tests {
         let (_d, conn) = journal(&[open_task("tj-a", &[]), open_task("tj-b", &[])]);
 
         assert_eq!(
-            gaps(&conn, "p", None).unwrap(),
+            gaps(&chronicle_of(&_d), &conn, "p", None).unwrap(),
             vec![Gap::NoMap { tasks: 2 }]
         );
     }
@@ -180,7 +190,7 @@ mod tests {
             close,
             open_task("tj-b", &[]),
         ]);
-        let g = gaps(&conn, "p", Some("tj-b")).unwrap();
+        let g = gaps(&chronicle_of(&_d), &conn, "p", Some("tj-b")).unwrap();
 
         assert_eq!(
             g,
@@ -208,7 +218,9 @@ mod tests {
             crate::modules::link_event("tj-a", &["stars".into()], &[]),
         ]);
 
-        assert!(gaps(&conn, "p", None).unwrap().is_empty());
+        assert!(gaps(&chronicle_of(&_d), &conn, "p", None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -220,7 +232,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            gaps(&conn, "p", None).unwrap(),
+            gaps(&chronicle_of(&_d), &conn, "p", None).unwrap(),
             vec![Gap::StaleModule {
                 module_id: "stars".into(),
                 closed_since: 1
@@ -240,21 +252,6 @@ mod tests {
         );
         assert!(line.ends_with("(+1 more)"), "{line}");
         assert!(headline(&[]).is_none());
-    }
-
-    #[test]
-    fn a_linked_worktree_is_not_asked_to_map_the_project() {
-        // A worktree (its root holds a `.git` file) has its own journal; the
-        // map lives in the main checkout, so asking to map again is wrong.
-        let main = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(main.path().join(".git")).unwrap();
-        std::fs::write(main.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        let worktree = tempfile::TempDir::new().unwrap();
-        std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
-        let gaps = vec![Gap::NoMap { tasks: 2 }];
-
-        assert_eq!(for_dir(gaps.clone(), main.path()), gaps);
-        assert!(for_dir(gaps, worktree.path()).is_empty());
     }
 
     #[test]

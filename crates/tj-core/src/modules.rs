@@ -345,6 +345,38 @@ pub fn list(conn: &Connection, project_hash: &str) -> anyhow::Result<Vec<Module>
     Ok(rows)
 }
 
+/// The module map of a chronicle: [`list`] of the home, with task counts and
+/// last activity summed over every journal of the repository.
+pub fn map(chr: &crate::chronicle::Chronicle) -> anyhow::Result<Vec<Module>> {
+    let mut modules = list(&chr.home, &chr.home_hash)?;
+
+    for conn in &chr.members {
+        let mut stmt = conn.prepare(
+            "SELECT tm.module_id, COUNT(*), MAX(t.last_event_at)
+             FROM task_modules tm JOIN tasks t ON t.task_id = tm.task_id
+             GROUP BY tm.module_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, count, last) = row?;
+            if let Some(m) = modules.iter_mut().find(|m| m.module_id == id) {
+                m.task_count += count;
+                if last > m.last_activity {
+                    m.last_activity = last;
+                }
+            }
+        }
+    }
+
+    Ok(modules)
+}
+
 /// `(module_id, name)` of every module `task_id` belongs to.
 pub fn modules_of_task(conn: &Connection, task_id: &str) -> anyhow::Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
@@ -596,8 +628,10 @@ pub struct Candidate {
 const UNLINKED: &str = "FROM tasks t WHERE t.project_hash = ?1
      AND NOT EXISTS (SELECT 1 FROM task_modules tm WHERE tm.task_id = t.task_id)";
 
-/// A page of tasks without a module, newest first, and how many there are in all.
+/// A page of the tasks in `conn`'s journal without a module, newest first,
+/// and how many there are in all; suggestions come from the chronicle's map.
 pub fn backfill_candidates(
+    chr: &crate::chronicle::Chronicle,
     conn: &Connection,
     project_hash: &str,
     limit: usize,
@@ -623,7 +657,7 @@ pub fn backfill_candidates(
         let meta = crate::db::task_metadata(conn, &task_id)?.unwrap_or_default();
         let files = crate::db::task_artifacts(conn, &task_id)?.files;
         let text = format!("{title} {}", meta.goal.as_deref().unwrap_or(""));
-        let suggestions = suggest(conn, project_hash, &text, &files)?;
+        let suggestions = suggest(&chr.home, &chr.home_hash, &text, &files)?;
 
         out.push(Candidate {
             task_id,
@@ -658,6 +692,8 @@ const FULL_HISTORY: usize = 30;
 const SHORT_OUTCOME: usize = 80;
 
 struct HistoryRow {
+    /// Which of the chronicle's journals holds the task.
+    journal: usize,
     task_id: String,
     title: String,
     status: String,
@@ -666,24 +702,21 @@ struct HistoryRow {
     note: Option<String>,
 }
 
-fn history(
-    conn: &Connection,
-    project_hash: &str,
-    ids: &[String],
-) -> anyhow::Result<Vec<HistoryRow>> {
+fn history(conn: &Connection, journal: usize, ids: &[String]) -> anyhow::Result<Vec<HistoryRow>> {
     let mut stmt = conn.prepare(
         "SELECT t.task_id, t.title, t.status, COALESCE(t.closed_at, t.last_event_at), t.outcome,
                 (SELECT group_concat(n.text, ' / ') FROM module_notes n
                   WHERE n.task_id = t.task_id AND n.module_id = tm.module_id)
          FROM task_modules tm JOIN tasks t ON t.task_id = tm.task_id
-         WHERE tm.project_hash = ?1 AND tm.module_id = ?2",
+         WHERE tm.module_id = ?1",
     )?;
 
     let mut rows = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for id in ids {
-        let part = stmt.query_map(rusqlite::params![project_hash, id], |r| {
+        let part = stmt.query_map([id], |r| {
             Ok(HistoryRow {
+                journal,
                 task_id: r.get(0)?,
                 title: r.get(1)?,
                 status: r.get(2)?,
@@ -699,7 +732,6 @@ fn history(
             }
         }
     }
-    rows.sort_by(|a, b| b.at.cmp(&a.at));
 
     Ok(rows)
 }
@@ -761,7 +793,8 @@ fn push_section(out: &mut String, title: &str, items: &[String], limit: usize) {
 
 /// A module's page in Markdown: what it is, how it works now, what is
 /// decided, rejected and constrained across its tasks, and its history.
-pub fn page(conn: &Connection, project_hash: &str, module_id: &str) -> anyhow::Result<String> {
+pub fn page(chr: &crate::chronicle::Chronicle, module_id: &str) -> anyhow::Result<String> {
+    let (conn, project_hash) = (&chr.home, chr.home_hash.as_str());
     let Some(m) = get(conn, project_hash, module_id)? else {
         anyhow::bail!("module {module_id:?} does not exist — module_list shows the map");
     };
@@ -775,7 +808,15 @@ pub fn page(conn: &Connection, project_hash: &str, module_id: &str) -> anyhow::R
     })? {
         ids.push(id?);
     }
-    let rows = history(conn, project_hash, &ids)?;
+    // The module's tasks from every journal of the repository.
+    let journals: Vec<&Connection> = chr.journals().collect();
+    let mut rows = Vec::new();
+    for (i, journal) in journals.iter().enumerate() {
+        rows.extend(history(journal, i, &ids)?);
+    }
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|r| seen.insert(r.task_id.clone()));
+    rows.sort_by(|a, b| b.at.cmp(&a.at));
     let (open, closed): (Vec<&HistoryRow>, Vec<&HistoryRow>) =
         rows.iter().partition(|r| r.status == "open");
 
@@ -824,6 +865,7 @@ pub fn page(conn: &Connection, project_hash: &str, module_id: &str) -> anyhow::R
         format!("- {}{marker} ({task})", one_line(text, ENTRY_CHARS))
     };
     for r in &rows {
+        let conn = journals[r.journal];
         for d in crate::pack::active_decisions(conn, &r.task_id)? {
             if !crate::pack::is_noise(&d.text) {
                 decisions.push(entry(&d.text, d.marker(), &r.task_id));
@@ -918,6 +960,13 @@ pub(crate) mod tests_support {
         (d, conn)
     }
 
+    /// A chronicle of the one journal [`journal`] built in `d`.
+    pub(crate) fn chronicle_of(d: &TempDir) -> crate::chronicle::Chronicle {
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+
+        crate::chronicle::Chronicle::single(conn, "p")
+    }
+
     pub(crate) fn open_task(id: &str, modules: &[&str]) -> Event {
         let mut e = Event::new(id, EventType::Open, Author::Agent, Source::Chat, id.into());
         e.meta = serde_json::json!({"title": id, "modules": modules});
@@ -944,7 +993,7 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::TempDir;
 
-    use super::tests_support::{close_task, journal, open_task};
+    use super::tests_support::{chronicle_of, close_task, journal, open_task};
     use super::*;
     use crate::event::{Author, Event, EventType, Source};
 
@@ -1308,7 +1357,7 @@ mod tests {
         old.meta["goal"] = serde_json::json!("Speed up the star feed");
 
         let (_d, conn) = journal(&[stars, old, open_task("tj-linked", &["stars"])]);
-        let (total, page) = backfill_candidates(&conn, "p", 10, 0).unwrap();
+        let (total, page) = backfill_candidates(&chronicle_of(&_d), &conn, "p", 10, 0).unwrap();
 
         assert_eq!(total, 1);
         assert_eq!(page.len(), 1);
@@ -1325,8 +1374,8 @@ mod tests {
             open_task("tj-3", &[]),
         ]);
 
-        let (total, first) = backfill_candidates(&conn, "p", 2, 0).unwrap();
-        let (_, rest) = backfill_candidates(&conn, "p", 2, 2).unwrap();
+        let (total, first) = backfill_candidates(&chronicle_of(&_d), &conn, "p", 2, 0).unwrap();
+        let (_, rest) = backfill_candidates(&chronicle_of(&_d), &conn, "p", 2, 2).unwrap();
 
         assert_eq!((total, first.len(), rest.len()), (3, 2, 1));
         assert!(first.iter().all(|c| c.task_id != rest[0].task_id));
@@ -1356,7 +1405,7 @@ mod tests {
             }),
         );
 
-        let (_d, conn) = journal(&[
+        let (_d, _conn) = journal(&[
             stars,
             open_task("tj-a", &["stars"]),
             said("tj-a", EventType::Decision, "Use Wilson score"),
@@ -1365,7 +1414,7 @@ mod tests {
             close,
             open_task("tj-b", &["stars"]),
         ]);
-        let p = page(&conn, "p", "stars").unwrap();
+        let p = page(&chronicle_of(&_d), "stars").unwrap();
 
         for needle in [
             "# Stars (stars)",
@@ -1395,25 +1444,25 @@ mod tests {
         let mut fix = said("tj-a", EventType::Correction, "No: Wilson score");
         fix.corrects = Some(wrong.event_id.clone());
 
-        let (_d, conn) = journal(&[
+        let (_d, _conn) = journal(&[
             named("stars", "Stars"),
             open_task("tj-a", &["stars"]),
             wrong,
             fix,
         ]);
-        let p = page(&conn, "p", "stars").unwrap();
+        let p = page(&chronicle_of(&_d), "stars").unwrap();
 
         assert!(!p.contains("Use plain average"), "{p}");
     }
 
     #[test]
     fn page_names_the_gaps_of_a_module() {
-        let (_d, conn) = journal(&[
+        let (_d, _conn) = journal(&[
             named("stars", "Stars"),
             open_task("tj-a", &["stars"]),
             close_task("tj-a", serde_json::json!({})),
         ]);
-        let p = page(&conn, "p", "stars").unwrap();
+        let p = page(&chronicle_of(&_d), "stars").unwrap();
 
         assert!(p.contains("## Gaps"), "{p}");
         assert!(p.contains("no state"), "{p}");
@@ -1432,13 +1481,13 @@ mod tests {
             },
         )
         .unwrap();
-        let (_d, conn) = journal(&[
+        let (_d, _conn) = journal(&[
             named("stars", "Stars"),
             named("old", "Old"),
             open_task("tj-old", &["old"]),
             old,
         ]);
-        let p = page(&conn, "p", "stars").unwrap();
+        let p = page(&chronicle_of(&_d), "stars").unwrap();
 
         assert!(p.contains("tj-old"), "{p}");
     }
@@ -1455,9 +1504,9 @@ mod tests {
                 serde_json::json!({"outcome": "o".repeat(150)}),
             ));
         }
-        let (_d, conn) = journal(&events);
+        let (_d, _conn) = journal(&events);
 
-        let p = page(&conn, "p", "big").unwrap();
+        let p = page(&chronicle_of(&_d), "big").unwrap();
 
         assert!(p.len() <= PAGE_BUDGET, "{}", p.len());
         assert!(p.contains("## History"), "history cut away");
@@ -1493,9 +1542,9 @@ mod tests {
                 ));
             }
         }
-        let (_d, conn) = journal(&events);
+        let (_d, _conn) = journal(&events);
 
-        let p = page(&conn, "p", "real").unwrap();
+        let p = page(&chronicle_of(&_d), "real").unwrap();
 
         assert!(p.len() <= PAGE_BUDGET, "{}", p.len());
         for section in [
@@ -1517,9 +1566,9 @@ mod tests {
 
     #[test]
     fn unknown_module_page_is_an_error() {
-        let (_d, conn) = mapped();
+        let (_d, _conn) = mapped();
 
-        let err = page(&conn, "p", "nope").unwrap_err().to_string();
+        let err = page(&chronicle_of(&_d), "nope").unwrap_err().to_string();
 
         assert!(err.contains("module_list"), "{err}");
     }
