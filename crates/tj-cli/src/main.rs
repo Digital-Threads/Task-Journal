@@ -3610,11 +3610,9 @@ runs in the background and won't block you; it only fills gaps and never closes 
             }
 
             let mut all_events = read_events_lenient(&events_path, "export")?;
-            // Module lines are the project's map, not a task: only the full
-            // JSON dump carries them.
-            if format != "json" {
-                all_events.retain(|e| !e.is_module());
-            }
+            // Module lines are the project's map, not a task: hosts group an
+            // export by task id, so they stay out of every format.
+            all_events.retain(|e| !e.is_module());
 
             // Filter to specific task if requested.
             let events: Vec<&tj_core::event::Event> = if let Some(ref tid) = task {

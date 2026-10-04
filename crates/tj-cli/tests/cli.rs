@@ -8506,9 +8506,9 @@ fn event_on_an_unknown_task_fails_and_writes_nothing() {
 }
 
 /// A `module` line (the project chronicle) describes the project's map, not a
-/// task: task views skip it, the full JSON dump keeps it.
+/// task: task views and every export format skip it.
 #[test]
-fn module_lines_stay_out_of_task_views_but_not_json_export() {
+fn module_lines_stay_out_of_task_views_and_exports() {
     let xdg = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
     let tj = || {
@@ -8546,10 +8546,12 @@ fn module_lines_stay_out_of_task_views_but_not_json_export() {
             .success()
             .stdout(contains("mod:stars").not());
     }
+    // JSON export too: hosts such as the Loom board group it by task id, and
+    // a module line would turn into a phantom task. The JSONL is the full copy.
     tj().args(["export", "--format", "json"])
         .assert()
         .success()
-        .stdout(contains("mod:stars"));
+        .stdout(contains("mod:stars").not());
 }
 
 /// A `task-journal` command run in its own data home and project dir.
