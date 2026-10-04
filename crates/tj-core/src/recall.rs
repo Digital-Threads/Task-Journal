@@ -8,6 +8,7 @@ use crate::event::EventType;
 /// One recalled high-signal event that matched the current context.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallHit {
+    pub event_id: String,
     pub task_id: String,
     pub event_type: EventType, // Rejection | Decision
     pub text: String,
@@ -164,6 +165,7 @@ pub fn relevant_recall(
         .filter_map(|(eid, score)| {
             meta.remove(&eid)
                 .map(|(task_id, event_type, text)| RecallHit {
+                    event_id: eid,
                     task_id,
                     event_type,
                     text,

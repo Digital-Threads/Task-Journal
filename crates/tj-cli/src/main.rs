@@ -2393,6 +2393,12 @@ fn real_main() -> Result<()> {
                         &text,
                         tj_core::recall::DEFAULT_MAX_HITS,
                     ) {
+                        let hits = fresh_recall_hits(
+                            hits,
+                            live_session_id.as_deref(),
+                            &events_path,
+                            &project_hash,
+                        );
                         if !hits.is_empty() {
                             let mut ctx = String::new();
                             for h in &hits {
@@ -2425,8 +2431,12 @@ fn real_main() -> Result<()> {
             // mcp__ tools) — gated MCP-only, falls through to the queue path so
             // event capture is unaffected. Disabled by TJ_PUSH_RECALL=0.
             if kind == "PostToolUse" && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0") {
-                if let Some(envelope) = push_recall_envelope(&payload, &events_path, &project_hash)
-                {
+                if let Some(envelope) = push_recall_envelope(
+                    &payload,
+                    &events_path,
+                    &project_hash,
+                    live_session_id.as_deref(),
+                ) {
                     println!("{}", serde_json::to_string(&envelope)?);
                 }
             }
@@ -5998,6 +6008,7 @@ fn push_recall_envelope(
     payload: &serde_json::Value,
     events_path: &std::path::Path,
     project_hash: &str,
+    session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     // MCP-only gate: Claude Code prefixes MCP tools `mcp__<server>__<tool>`.
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str())?;
@@ -6028,6 +6039,7 @@ fn push_recall_envelope(
     let hits =
         tj_core::recall::relevant_recall(&conn, &query_text, tj_core::recall::DEFAULT_MAX_HITS)
             .ok()?;
+    let hits = fresh_recall_hits(hits, session_id, events_path, project_hash);
     if hits.is_empty() {
         return None;
     }
@@ -6038,6 +6050,83 @@ fn push_recall_envelope(
             "updatedMCPToolOutput": updated,
         }
     }))
+}
+
+/// Most `<session> <event_id>` lines the shown-recall log keeps.
+const RECALL_SHOWN_CAP: usize = 2000;
+
+/// The recall hits still worth pushing to `session_id`: each one at most once
+/// per session (remembered in `<state_dir>/<project>.recall-shown`, newest
+/// [`RECALL_SHOWN_CAP`] lines), and never an event the session wrote on its
+/// current task — the agent just wrote it. Without a session id every hit
+/// passes, as before. Best-effort: an unreadable log never hides a hit.
+fn fresh_recall_hits(
+    hits: Vec<tj_core::recall::RecallHit>,
+    session_id: Option<&str>,
+    events_path: &std::path::Path,
+    project_hash: &str,
+) -> Vec<tj_core::recall::RecallHit> {
+    let Some(sid) = session_id else {
+        return hits;
+    };
+    if hits.is_empty() {
+        return hits;
+    }
+    let Ok(log) =
+        tj_core::paths::state_dir().map(|d| d.join(format!("{project_hash}.recall-shown")))
+    else {
+        return hits;
+    };
+
+    let own = session_task_event_ids(events_path, sid);
+    let body = std::fs::read_to_string(&log).unwrap_or_default();
+    let shown: std::collections::HashSet<&str> = body.lines().collect();
+    let fresh: Vec<_> = hits
+        .into_iter()
+        .filter(|h| !own.contains(&h.event_id))
+        .filter(|h| !shown.contains(format!("{sid} {}", h.event_id).as_str()))
+        .collect();
+    if fresh.is_empty() {
+        return fresh;
+    }
+
+    // ponytail: read-modify-write without a lock; two parallel hooks can
+    // re-show a hit once. Add a file lock if that ever shows up in practice.
+    let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+    lines.extend(fresh.iter().map(|h| format!("{sid} {}", h.event_id)));
+    let keep = &lines[lines.len().saturating_sub(RECALL_SHOWN_CAP)..];
+    let _ = std::fs::write(&log, keep.join("\n") + "\n");
+
+    fresh
+}
+
+/// Ids of the events session `sid` wrote on its current task — the task of
+/// its latest event — read from the journal by `meta.session_id`.
+fn session_task_event_ids(
+    events_path: &std::path::Path,
+    sid: &str,
+) -> std::collections::HashSet<String> {
+    let body = std::fs::read_to_string(events_path).unwrap_or_default();
+    let mine: Vec<(String, String)> = body
+        .lines()
+        .filter(|l| l.contains(sid))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["meta"]["session_id"].as_str() == Some(sid))
+        .filter_map(|e| {
+            Some((
+                e["event_id"].as_str()?.into(),
+                e["task_id"].as_str()?.into(),
+            ))
+        })
+        .collect();
+
+    let Some((_, current)) = mine.last() else {
+        return Default::default();
+    };
+    mine.iter()
+        .filter(|(_, task)| task == current)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// One ⚠ line per recall hit (mirrors the close-gate / SessionStart convention).

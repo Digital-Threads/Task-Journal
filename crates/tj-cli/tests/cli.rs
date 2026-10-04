@@ -5543,6 +5543,109 @@ fn post_tool_use_emits_recall_additional_context() {
     );
 }
 
+/// One real (non-mock) PostToolUse hook run; `session: None` sends no
+/// session id at all. Returns stdout.
+fn post_tool_use(dir: &std::path::Path, session: Option<&str>, tool: &str, input: &str) -> String {
+    let mut payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": tool,
+        "tool_input": { "command": input },
+        "tool_response": { "output": "" }
+    });
+    if let Some(sid) = session {
+        payload["session_id"] = sid.into();
+    }
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir)
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+/// After every tool call the same hits used to come back, flooding the
+/// agent's context. A session sees each hit once, on either recall path.
+#[test]
+fn push_recall_shows_each_hit_once_per_session() {
+    let (dir, _task_id) = seed_axum_rejection();
+    let axum = "let's switch the server to axum";
+
+    let first = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
+    assert!(first.contains("⚠ recall"), "{first}");
+
+    let again = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
+    assert!(!again.contains("recall"), "{again}");
+    let via_mcp = post_tool_use(dir.path(), Some("s-a"), "mcp__x__do", axum);
+    assert!(!via_mcp.contains("recall"), "{via_mcp}");
+
+    let other = post_tool_use(dir.path(), Some("s-b"), "Bash", axum);
+    assert!(other.contains("⚠ recall"), "{other}");
+}
+
+#[test]
+fn push_recall_without_a_session_id_repeats_as_before() {
+    let (dir, _task_id) = seed_axum_rejection();
+    let axum = "let's switch the server to axum";
+
+    for _ in 0..2 {
+        let out = post_tool_use(dir.path(), None, "Bash", axum);
+        assert!(out.contains("⚠ recall"), "{out}");
+    }
+}
+
+/// The agent just wrote that rejection on its own task in this session —
+/// echoing it back is noise. Another session still gets it.
+#[test]
+fn push_recall_skips_what_this_session_wrote_on_its_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Own session host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-own",
+        "prompt": "Tried switching the server to axum but it broke rmcp stdio."
+    });
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--mock-event-type",
+            "rejection",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success();
+    let axum = "let's switch the server to axum";
+
+    let own = post_tool_use(dir.path(), Some("s-own"), "Bash", axum);
+    assert!(!own.contains("recall"), "{own}");
+
+    let other = post_tool_use(dir.path(), Some("s-other"), "Bash", axum);
+    assert!(other.contains("⚠ recall"), "{other}");
+}
+
 #[test]
 fn post_tool_use_no_recall_when_no_match() {
     let (dir, task_id) = seed_axum_rejection();
