@@ -268,7 +268,7 @@ impl SessionList {
                     s.assistant_message_count()
                 );
                 let duration = format_duration(&s.first_timestamp, &s.last_timestamp);
-                let id_short = &s.session_id[..8.min(s.session_id.len())];
+                let id_short = super::short_session_id(&s.session_id);
 
                 let line = Line::from(vec![
                     Span::styled(format!("{date} "), Style::default().fg(Color::DarkGray)),
@@ -355,8 +355,7 @@ fn session_title(s: &ParsedSession) -> String {
             .unwrap_or(&clean);
         truncate_with_ellipsis(line.trim(), 80)
     } else {
-        let head: String = s.session_id.chars().take(8).collect();
-        format!("Session {head}")
+        format!("Session {}", super::short_session_id(&s.session_id))
     }
 }
 
@@ -431,7 +430,25 @@ fn shorten_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_with_ellipsis;
+    use super::{truncate_with_ellipsis, SessionList};
+    use ratatui::{backend::TestBackend, Terminal};
+    use tj_core::session::parser::ParsedSession;
+
+    #[test]
+    fn render_list_cuts_non_ascii_session_id_on_char_boundary() {
+        // Byte 8 falls inside the fourth 'é'.
+        let session = ParsedSession {
+            session_id: "aééééé".into(),
+            file_path: String::new(),
+            entries: vec![],
+            first_timestamp: None,
+            last_timestamp: None,
+        };
+        let list = SessionList::new(vec![session], String::new());
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        terminal.draw(|frame| list.render(frame)).unwrap();
+    }
 
     #[test]
     fn truncate_ascii_under_limit_returns_input_as_is() {

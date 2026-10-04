@@ -118,8 +118,7 @@ impl ChatView {
                 .unwrap_or(&clean);
             truncate(line.trim(), 60)
         } else {
-            let head: String = session.session_id.chars().take(8).collect();
-            format!("Session {head}")
+            format!("Session {}", super::short_session_id(&session.session_id))
         };
 
         ChatView {
