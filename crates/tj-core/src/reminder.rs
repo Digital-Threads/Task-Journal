@@ -5,6 +5,12 @@ use rusqlite::Connection;
 
 pub const MAX_CONSTRAINTS: usize = 3;
 
+/// Text prefix of the `constraint` events ingest-hook writes on a model
+/// switch (they also carry `meta.kind = "model_switch"`). SQLite does not
+/// index `meta`, so constraint lists filter on this prefix to keep a run of
+/// switches from crowding out the task's real constraints.
+pub const MODEL_SWITCH_TEXT_PREFIX: &str = "Model switched (";
+
 /// Most-recent OPEN task → "title + goal + up to MAX_CONSTRAINTS newest
 /// constraint texts". `None` when there is no open task. Read-only.
 pub fn active_task_reminder(conn: &Connection, label: &str) -> anyhow::Result<Option<String>> {
@@ -30,12 +36,15 @@ pub fn active_task_reminder(conn: &Connection, label: &str) -> anyhow::Result<Op
         "SELECT sf.text FROM events_index ei \
          LEFT JOIN search_fts sf ON sf.event_id = ei.event_id \
          WHERE ei.task_id = ?1 AND ei.type = 'constraint' \
+         AND COALESCE(sf.text, '') NOT LIKE ?3 \
          ORDER BY ei.timestamp DESC LIMIT ?2",
     )?;
+    let model_switch = format!("{MODEL_SWITCH_TEXT_PREFIX}%");
     let constraints: Vec<String> = stmt
-        .query_map(rusqlite::params![task_id, MAX_CONSTRAINTS as i64], |r| {
-            r.get::<_, Option<String>>(0)
-        })?
+        .query_map(
+            rusqlite::params![task_id, MAX_CONSTRAINTS as i64, model_switch],
+            |r| r.get::<_, Option<String>>(0),
+        )?
         .filter_map(|r| r.ok().flatten())
         .filter(|t| !t.trim().is_empty())
         .collect();
@@ -124,6 +133,35 @@ mod tests {
         assert!(r.contains("Must support offline mode"), "got: {r}");
         assert!(r.contains("API key rotates daily"), "got: {r}");
         assert!(!r.contains("OLDEST"), "oldest constraint leaked: {r}");
+    }
+
+    #[test]
+    fn reminder_skips_model_switch_constraints() {
+        // Model switches are recorded as constraints, but a run of them must
+        // not push the task's real constraints out of the 3 slots.
+        let events = vec![
+            open_event("tj-1", "Build the widget"),
+            constraint_event("tj-1", "API key rotates daily", "2026-06-01T00:00:00Z"),
+            constraint_event("tj-1", "Must support offline mode", "2026-06-02T00:00:00Z"),
+            constraint_event("tj-1", "Ship before Friday", "2026-06-03T00:00:00Z"),
+            constraint_event(
+                "tj-1",
+                "Model switched (auto): opus → haiku",
+                "2026-06-04T00:00:00Z",
+            ),
+            constraint_event(
+                "tj-1",
+                "Model switched (user): haiku → opus",
+                "2026-06-05T00:00:00Z",
+            ),
+        ];
+        let (_d, conn) = seed(&events);
+
+        let r = active_task_reminder(&conn, "Active task").unwrap().unwrap();
+        assert!(r.contains("API key rotates daily"), "got: {r}");
+        assert!(r.contains("Must support offline mode"), "got: {r}");
+        assert!(r.contains("Ship before Friday"), "got: {r}");
+        assert!(!r.contains("Model switched"), "got: {r}");
     }
 
     #[test]

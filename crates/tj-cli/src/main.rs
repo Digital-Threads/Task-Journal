@@ -2466,7 +2466,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     .get("source")
                     .and_then(|v| v.as_str())
                     .unwrap_or("user");
-                let text = format!("Model switched ({switch_source}): {from_model} → {to_model}");
+                let text = format!(
+                    "{}{switch_source}): {from_model} → {to_model}",
+                    tj_core::reminder::MODEL_SWITCH_TEXT_PREFIX
+                );
                 let mut event = tj_core::event::Event::new(
                     &tc.task_id,
                     tj_core::event::EventType::Constraint,
@@ -2476,6 +2479,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
                 event.confidence = Some(0.9);
                 event.status = tj_core::event::EventStatus::Confirmed;
+                // Kept in the journal, but left out of the constraint lists
+                // (resume reminder, classifier context) — see
+                // MODEL_SWITCH_TEXT_PREFIX.
+                event.meta = serde_json::json!({ "kind": "model_switch" });
                 tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
                 writer.append(&event)?;
@@ -4099,17 +4106,22 @@ fn recent_task_contexts(
             "SELECT sf.text FROM events_index ei
              LEFT JOIN search_fts sf ON sf.event_id = ei.event_id
              WHERE ei.task_id = ?1 AND ei.type = 'constraint'
+             AND COALESCE(sf.text, '') NOT LIKE ?3
              ORDER BY ei.timestamp DESC LIMIT ?2",
         )?;
+        let model_switch = format!("{}%", tj_core::reminder::MODEL_SWITCH_TEXT_PREFIX);
         let constraints: Vec<String> = c_stmt
-            .query_map(rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT], |r| {
-                let txt: Option<String> = r.get(0)?;
-                Ok(txt
-                    .unwrap_or_default()
-                    .chars()
-                    .take(120)
-                    .collect::<String>())
-            })?
+            .query_map(
+                rusqlite::params![task_id, CONSTRAINT_CONTEXT_LIMIT, model_switch],
+                |r| {
+                    let txt: Option<String> = r.get(0)?;
+                    Ok(txt
+                        .unwrap_or_default()
+                        .chars()
+                        .take(120)
+                        .collect::<String>())
+                },
+            )?
             .collect::<Result<Vec<String>, _>>()?
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -6491,6 +6503,59 @@ mod inline_tests {
             .constraints
             .iter()
             .any(|s| s.contains("constraint number 1")));
+    }
+
+    #[test]
+    fn recent_task_contexts_skips_model_switch_constraints() {
+        use tj_core::event::{Author, Event, EventType, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let state_path = dir.path().join("h.sqlite");
+
+        let mut writer = tj_core::storage::JsonlWriter::open(&events_path).unwrap();
+        let mut open = Event::new(
+            "tj-1",
+            EventType::Open,
+            Author::User,
+            Source::Cli,
+            "task one".into(),
+        );
+        open.meta = serde_json::json!({ "title": "task one" });
+        open.timestamp = "2026-01-01T00:00:00Z".into();
+        writer.append(&open).unwrap();
+        for i in 0..8 {
+            // Five real constraints, then three newer model switches.
+            let text = if i < 5 {
+                format!("constraint number {i}")
+            } else {
+                format!("Model switched (auto): opus → haiku {i}")
+            };
+            let mut cons = Event::new(
+                "tj-1",
+                EventType::Constraint,
+                Author::Agent,
+                Source::Hook,
+                text,
+            );
+            cons.timestamp = format!("2026-01-01T00:00:1{i}Z");
+            writer.append(&cons).unwrap();
+        }
+        writer.flush_durable().unwrap();
+
+        let conn = tj_core::db::open(&state_path).unwrap();
+        tj_core::db::ingest_new_events(&conn, &events_path, "h").unwrap();
+
+        let ctxs = recent_task_contexts(&conn, 5).unwrap();
+        let ctx = ctxs.iter().find(|c| c.task_id == "tj-1").unwrap();
+        assert_eq!(ctx.constraints.len(), 5, "{:?}", ctx.constraints);
+        assert!(
+            ctx.constraints
+                .iter()
+                .all(|s| s.starts_with("constraint number")),
+            "{:?}",
+            ctx.constraints
+        );
     }
 
     #[test]

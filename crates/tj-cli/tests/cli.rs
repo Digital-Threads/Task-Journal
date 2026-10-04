@@ -1109,6 +1109,17 @@ fn post_model_switch_records_a_constraint_on_the_active_task() {
         .stdout(contains(
             "Model switched (auto): claude-opus-5 → claude-haiku-4-5",
         ));
+
+    // Marked so readers of the journal can tell it from a real constraint.
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    let journal = project_events(dir.path(), &hash);
+    let switch: serde_json::Value = journal
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["type"] == "constraint")
+        .expect("model switch recorded");
+    assert_eq!(switch["meta"]["kind"], "model_switch", "{switch}");
+    assert_eq!(switch["meta"]["session_id"], "s-switch", "{switch}");
 }
 
 /// No open task → a model switch is not a reason to start one.
