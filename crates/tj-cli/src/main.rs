@@ -351,11 +351,11 @@ fn project_pending_entries(
     dir: &std::path::Path,
     project_hash: &str,
 ) -> Result<Vec<std::path::PathBuf>> {
-    let mut out = Vec::new();
     if !dir.exists() {
-        return Ok(out);
+        return Ok(Vec::new());
     }
 
+    let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         let Some(stem) = path
@@ -366,16 +366,19 @@ fn project_pending_entries(
             continue;
         };
         let stem = stem.strip_suffix(".dead").unwrap_or(stem);
-        let ours = match stem.split_once('.') {
-            Some((prefix, _)) => prefix == project_hash,
-            None => !legacy_pending_is_foreign(&path, project_hash),
+        let (ulid, ours) = match stem.split_once('.') {
+            Some((prefix, ulid)) => (ulid, prefix == project_hash),
+            None => (stem, !legacy_pending_is_foreign(&path, project_hash)),
         };
         if ours {
-            out.push(path);
+            out.push((ulid.to_string(), path));
         }
     }
 
-    Ok(out)
+    // ULIDs sort by creation time: oldest first, so a user prompt is
+    // classified before the assistant turn that answered it.
+    out.sort();
+    Ok(out.into_iter().map(|(_, path)| path).collect())
 }
 
 /// A legacy (un-prefixed) entry belongs to another project only when its
@@ -6293,6 +6296,33 @@ mod inline_tests {
         assert!(project_pending_entries(&pending, "other")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn pending_entries_come_back_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // ULID order == queue order; legacy un-prefixed names interleave by
+        // their ULID, not by the hash prefix of the new names.
+        let mut expected = Vec::new();
+        for i in 0..20u32 {
+            let ulid = format!("01JA{i:022}");
+            let name = if i % 5 == 0 {
+                format!("{ulid}.json")
+            } else {
+                format!("h.{ulid}.json")
+            };
+            expected.push(name);
+        }
+        for name in expected.iter().rev() {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+
+        let got: Vec<String> = project_pending_entries(dir.path(), "h")
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
