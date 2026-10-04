@@ -310,32 +310,7 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         PackMode::Compact => "compact",
         PackMode::Full => "full",
     };
-
-    // Read-through cache: if we have a stored pack with the same mode, return it.
-    let cached: Option<(String, String, i64)> = conn
-        .query_row(
-            "SELECT text, generated_at, source_event_count FROM task_pack_cache
-         WHERE task_id=?1 AND mode=?2",
-            rusqlite::params![task_id, mode_str],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
-    if let Some((cached_text, cached_at, cached_count)) = cached {
-        // Detect truncation by re-checking for the marker.
-        let was_truncated = cached_text.contains("_(truncated to fit pack budget)_");
-        return Ok(TaskPack {
-            task_id: task_id.to_string(),
-            mode,
-            schema_version: crate::SCHEMA_VERSION.into(),
-            text: cached_text,
-            metadata: PackMetadata {
-                generated_at: cached_at,
-                source_event_count: cached_count as usize,
-                cache_hit: true,
-                truncated: was_truncated,
-            },
-        });
-    }
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let (title, status, goal, outcome, outcome_tag, external): (
         String,
@@ -360,12 +335,6 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
             },
         )
         .with_context(|| format!("task not found: {task_id}"))?;
-
-    let event_count: usize = conn.query_row(
-        "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
-        rusqlite::params![task_id],
-        |r| r.get::<_, i64>(0).map(|n| n as usize),
-    )?;
 
     let mut text = format!("# {title}  [status: {status}]\n\n");
 
@@ -457,26 +426,36 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     }
     text.push('\n');
 
-    if matches!(mode, PackMode::Full) {
-        text.push_str(&render_lifecycle(conn, task_id)?);
-    }
-    text.push_str(&render_active_decisions(conn, task_id)?);
-    if matches!(mode, PackMode::Full) {
-        text.push_str(&render_rejected(conn, task_id)?);
-        text.push_str(&render_evidence(conn, task_id)?);
-    }
-    let recent_limit = match mode {
-        PackMode::Compact => 3,
-        PackMode::Full => 10,
+    // Read-through cache of the body. It changes only with this task's own
+    // events (or a child's), and index_event clears it then. The header above
+    // (live status of linked tasks) and the gaps below (pending queue, cwd git
+    // state) change without such an event, so they are rendered every call.
+    let cached: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT text, source_event_count FROM task_pack_cache WHERE task_id=?1 AND mode=?2",
+            rusqlite::params![task_id, mode_str],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let cache_hit = cached.is_some();
+    let (body, event_count) = match cached {
+        Some((body, count)) => (body, count as usize),
+        None => {
+            let body = render_body(conn, task_id, mode)?;
+            let event_count: usize = conn.query_row(
+                "SELECT COUNT(*) FROM events_index WHERE task_id=?1",
+                rusqlite::params![task_id],
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![task_id, mode_str, body, generated_at, event_count as i64],
+            )?;
+            (body, event_count)
+        }
     };
-    text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
-
-    // One-level roll-up of direct children (parents only). Appended before
-    // truncation so it shares the pack budget. Task 5 busts the parent cache
-    // when a child changes, so the next assemble regenerates fresh.
-    if let Some(subtasks) = render_subtasks(conn, task_id)? {
-        text.push_str(&subtasks);
-    }
+    text.push_str(&body);
 
     let mut report =
         crate::completeness::assess(conn, task_id, crate::completeness::pending_count())?;
@@ -511,15 +490,6 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
     }
     text.push_str(&gaps);
 
-    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-    // Write-through cache.
-    conn.execute(
-        "INSERT OR REPLACE INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![task_id, mode_str, text, generated_at, event_count as i64],
-    )?;
-
     Ok(TaskPack {
         task_id: task_id.to_string(),
         mode,
@@ -528,10 +498,38 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         metadata: PackMetadata {
             generated_at,
             source_event_count: event_count,
-            cache_hit: false,
+            cache_hit,
             truncated,
         },
     })
+}
+
+/// The cacheable part of a pack: every section built from this task's own
+/// events and its children's, in pack order.
+fn render_body(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Result<String> {
+    let mut text = String::new();
+    if matches!(mode, PackMode::Full) {
+        text.push_str(&render_lifecycle(conn, task_id)?);
+    }
+    text.push_str(&render_active_decisions(conn, task_id)?);
+    if matches!(mode, PackMode::Full) {
+        text.push_str(&render_rejected(conn, task_id)?);
+        text.push_str(&render_evidence(conn, task_id)?);
+    }
+    let recent_limit = match mode {
+        PackMode::Compact => 3,
+        PackMode::Full => 10,
+    };
+    text.push_str(&render_recent_events(conn, task_id, recent_limit)?);
+
+    // One-level roll-up of direct children (parents only). Appended before
+    // truncation so it shares the pack budget. Task 5 busts the parent cache
+    // when a child changes, so the next assemble regenerates fresh.
+    if let Some(subtasks) = render_subtasks(conn, task_id)? {
+        text.push_str(&subtasks);
+    }
+
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -1454,5 +1452,48 @@ mod tests {
         assert!(line.len() <= 512, "{} bytes: {line}", line.len());
         assert!(line.contains("## Completeness (50)"), "{line}");
         assert!(line.contains("honesty score: 0/100"), "{line}");
+    }
+
+    #[test]
+    fn cached_pack_shows_live_status_of_linked_tasks() {
+        use crate::event::EventType;
+
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-a", "A");
+        open_task(&conn, "tj-b", "B");
+        crate::db::add_task_external(&conn, "tj-a", "linked:tj-b").unwrap();
+        assert!(assemble(&conn, "tj-a", PackMode::Compact)
+            .unwrap()
+            .text
+            .contains("- tj-b [open]"));
+
+        // Closing B touches only B's events, so A's cached body stays valid.
+        put(&conn, &ev("tj-b", EventType::Close, "done"));
+
+        let pack = assemble(&conn, "tj-a", PackMode::Compact).unwrap();
+        assert!(pack.metadata.cache_hit);
+        assert!(pack.text.contains("- tj-b [closed]"), "{}", pack.text);
+    }
+
+    #[test]
+    fn cached_pack_shows_live_gaps() {
+        let d = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(d.path().join("s.sqlite")).unwrap();
+        open_task(&conn, "tj-g", "G");
+        crate::db::set_task_goal(&conn, "tj-g", "g").unwrap();
+        let _env = crate::test_env_lock();
+        std::env::set_var("TASK_JOURNAL_DATA_DIR", d.path());
+        let first = assemble(&conn, "tj-g", PackMode::Compact).unwrap();
+
+        // A pending entry appears without any new event on the task.
+        std::fs::create_dir_all(d.path().join("pending")).unwrap();
+        std::fs::write(d.path().join("pending/x.json"), "{}").unwrap();
+        let second = assemble(&conn, "tj-g", PackMode::Compact).unwrap();
+        std::env::remove_var("TASK_JOURNAL_DATA_DIR");
+
+        assert!(!first.text.contains("## Completeness"), "{}", first.text);
+        assert!(second.metadata.cache_hit);
+        assert!(second.text.contains("1 pending entry"), "{}", second.text);
     }
 }

@@ -178,6 +178,12 @@ ALTER TABLE events_index ADD COLUMN bookkeeping INTEGER NOT NULL DEFAULT 0;
 DELETE FROM index_state;
 "#;
 
+/// v0.30.0 pack cache holds only the stable body; the header and the gaps
+/// are rendered on every call. Rows cached as the whole pack text go.
+const MIGRATION_012: &str = r#"
+DELETE FROM task_pack_cache;
+"#;
+
 /// All schema migrations in version order. Append new entries here; never
 /// edit a published migration's `sql` — write a new one instead.
 const MIGRATIONS: &[Migration] = &[
@@ -224,6 +230,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 11,
         sql: MIGRATION_011,
+    },
+    Migration {
+        version: 12,
+        sql: MIGRATION_012,
     },
 ];
 
@@ -2623,6 +2633,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(corrected_by.as_deref(), Some(corr.event_id.as_str()));
+    }
+
+    #[test]
+    fn upgrading_wipes_packs_cached_as_whole_text() {
+        let d = TempDir::new().unwrap();
+        let db = d.path().join("s.sqlite");
+        let conn = open(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO task_pack_cache(task_id, mode, text, generated_at, source_event_count)
+             VALUES ('tj-x', 'compact', '# Old whole pack', '', 1);
+             DELETE FROM schema_migrations WHERE version = 12;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&db).unwrap();
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_pack_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0);
     }
 
     #[test]
