@@ -16,7 +16,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tj_core::session::{discovery, parser};
 
 use super::chat_view::ChatView;
@@ -42,6 +42,8 @@ pub struct App {
     pub session_list: Option<SessionList>,
     pub chat_view: Option<ChatView>,
     pub should_quit: bool,
+    /// The project this UI browses (`ui --project`, else cwd).
+    project_path: PathBuf,
 }
 
 impl App {
@@ -68,6 +70,7 @@ impl App {
             session_list: None,
             chat_view: None,
             should_quit: false,
+            project_path: project_path.to_path_buf(),
         })
     }
 
@@ -108,6 +111,7 @@ impl App {
             session_list: Some(SessionList::new(items, project_str)),
             chat_view: None,
             should_quit: false,
+            project_path: project_path.to_path_buf(),
         })
     }
 
@@ -226,8 +230,7 @@ impl App {
         // The state SQLite already exists (App::new opened it).
         // Re-resolve through paths to avoid storing the connection
         // on App and dealing with !Send across the render loop.
-        let cwd = std::env::current_dir()?;
-        let project_hash = tj_core::project_hash::from_path(&cwd)?;
+        let project_hash = tj_core::project_hash::from_path(&self.project_path)?;
         let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
         let conn = tj_core::db::open(&state_path)?;
         // Full mode: show the complete reasoning chain — every event,
@@ -323,5 +326,39 @@ impl App {
             KeyCode::End => cv.scroll_bottom(),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_detail_reads_the_project_passed_to_ui_not_cwd() {
+        let data = tempfile::TempDir::new().unwrap();
+        let proj = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(proj.path().join(".git")).unwrap();
+        // The only test in this binary that resolves the data dir.
+        std::env::set_var("TASK_JOURNAL_DATA_DIR", data.path());
+
+        let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+        let state = tj_core::paths::state_dir()
+            .unwrap()
+            .join(format!("{hash}.sqlite"));
+        let conn = tj_core::db::open(&state).unwrap();
+        let open = tj_core::event::Event::new(
+            "tj-ui1".to_string(),
+            tj_core::event::EventType::Open,
+            tj_core::event::Author::User,
+            tj_core::event::Source::Cli,
+            "Picked via --project".to_string(),
+        );
+        tj_core::db::upsert_task_from_event(&conn, &open, &hash).unwrap();
+        tj_core::db::index_event(&conn, &open).unwrap();
+        drop(conn);
+
+        let app = App::new(proj.path()).unwrap();
+        let pack = app.assemble_pack("tj-ui1").unwrap();
+        assert!(pack.contains("Picked via --project"), "{pack}");
     }
 }
