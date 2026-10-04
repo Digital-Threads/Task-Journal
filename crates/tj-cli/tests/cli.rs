@@ -29,19 +29,32 @@ impl Command {
     }
 }
 
-/// The test process's PATH minus any directory that holds `claude` or `codex`.
-/// Computed once: on WSL the PATH carries dozens of slow `/mnt/c` directories.
+/// The test process's PATH minus any directory that holds `claude` or `codex`,
+/// led by a directory whose `gh` always fails, so `close`'s artifact harvest
+/// never asks GitHub about this repository. Computed once: on WSL the PATH
+/// carries dozens of slow `/mnt/c` directories.
 fn path_without_llm_clis() -> &'static std::ffi::OsStr {
     static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
+        let shims = std::env::temp_dir().join(format!("tj-cli-test-shims-{}", std::process::id()));
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::write(shims.join("gh.cmd"), "@exit /b 1\r\n").unwrap();
+        std::fs::write(shims.join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(shims.join("gh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let keep = std::env::split_paths(&path).filter(|dir| {
+        let keep = std::iter::once(shims).chain(std::env::split_paths(&path).filter(|dir| {
             ["claude", "codex"].iter().all(|bin| {
                 ["", ".exe", ".cmd"]
                     .iter()
                     .all(|ext| !dir.join(format!("{bin}{ext}")).exists())
             })
-        });
+        }));
         std::env::join_paths(keep).unwrap()
     })
 }
