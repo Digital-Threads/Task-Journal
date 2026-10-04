@@ -2095,6 +2095,115 @@ fn ingest_hook_mock_drain_keeps_entries_it_cannot_record() {
     );
 }
 
+/// Run one `ingest-hook` payload of `kind` with `TJ_MOD_ACTIVE` set to
+/// `mod_value` (None = unset), in a fresh project with an open task and a
+/// transcript. True when the hook left any trace: stdout, a pending entry,
+/// or a new journal line.
+fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Mod host"])
+        .assert()
+        .success();
+    let transcript = proj.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","uuid":"u1","timestamp":"2099-01-01T00:00:00.000Z","sessionId":"s1","message":{"content":"the refund flow needs idempotency keys"}}"#,
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": kind,
+        "session_id": "s1",
+        "transcript_path": transcript.to_str().unwrap(),
+        "reason": "clear",
+        "prompt": "We decided to adopt the PKCE flow.",
+        "tool_name": "Bash",
+        "tool_input": { "command": "cargo test" },
+        "tool_response": { "output": "ok" },
+        "from_model": "claude-opus",
+        "to_model": "claude-sonnet",
+    });
+    let journal = xdg.path().join("task-journal").join("events");
+    let journal_len = || -> u64 {
+        std::fs::read_dir(&journal)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let before = journal_len();
+
+    let mut cmd = Command::cargo_bin("task-journal").unwrap();
+    cmd.env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(proj.path());
+    if let Some(v) = mod_value {
+        cmd.env("TJ_MOD_ACTIVE", v);
+    }
+    let out = cmd
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let pending = std::fs::read_dir(xdg.path().join("task-journal").join("pending"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    !out.is_empty() || pending > 0 || journal_len() != before
+}
+
+/// The Claude Code mod captures in-process and sets TJ_MOD_ACTIVE for the
+/// hooks it starts; the classic capture must then stand down.
+#[test]
+fn mod_active_silences_the_classic_capture_hooks() {
+    for kind in [
+        "UserPromptSubmit",
+        "PostToolUse",
+        "Stop",
+        "PreCompact",
+        "SessionEnd",
+    ] {
+        assert!(!hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
+        assert!(hook_leaves_a_trace(kind, Some("0")), "{kind}, mod \"0\"");
+        assert!(hook_leaves_a_trace(kind, None), "{kind}, mod unset");
+    }
+}
+
+/// Resume packs and the model-switch constraint are not the mod's job.
+#[test]
+fn mod_active_keeps_session_start_and_model_switch() {
+    for kind in ["SessionStart", "PostModelSwitch"] {
+        assert!(hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
+    }
+}
+
+#[test]
+fn mod_active_silences_the_nudge() {
+    for (mod_value, silent) in [(Some("1"), true), (Some("0"), false), (None, false)] {
+        let xdg = assert_fs::TempDir::new().unwrap();
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", xdg.path());
+        if let Some(v) = mod_value {
+            cmd.env("TJ_MOD_ACTIVE", v);
+        }
+        let out = cmd
+            .arg("nudge")
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(out.is_empty(), silent, "TJ_MOD_ACTIVE={mod_value:?}");
+    }
+}
+
 #[test]
 fn stats_command_shows_classifier_counts() {
     let dir = assert_fs::TempDir::new().unwrap();

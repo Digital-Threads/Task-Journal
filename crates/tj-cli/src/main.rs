@@ -2338,6 +2338,18 @@ fn real_main() -> Result<()> {
                 _ => parse_hook_stdin()?,
             };
 
+            // The Claude Code mod captures in-process and marks the hooks it
+            // starts; the classic capture stands down instead of doing the
+            // same work twice. Resume packs and model switches stay ours.
+            if mod_active()
+                && matches!(
+                    kind.as_str(),
+                    "UserPromptSubmit" | "PostToolUse" | "Stop" | "PreCompact" | "SessionEnd"
+                )
+            {
+                return Ok(());
+            }
+
             // Emergency capture kill-switch: a `.capture-disabled` marker in the
             // data dir no-ops realtime capture (the read-only SessionStart
             // resume still runs). Because the hook re-invokes this binary on
@@ -4306,6 +4318,12 @@ fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usiz
         .count()
 }
 
+/// True when the Claude Code mod (`plugin/hooks/register.ts`) runs in this
+/// session: it sets `TJ_MOD_ACTIVE` for every hook it starts. Codex never does.
+fn mod_active() -> bool {
+    std::env::var("TJ_MOD_ACTIVE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Adaptive UserPromptSubmit nudge (caveman pattern, non-blocking, free): always
 /// emit the base "record as you go" reminder, and — when the session has done
 /// substantial work but logged little — escalate. All signals are cheap (a file
@@ -4314,6 +4332,10 @@ fn run_nudge() -> anyhow::Result<()> {
     // Recursion guard, same as recall-hook: never inject into our own
     // classifier child (`claude -p` / `codex exec` re-run the user's hooks).
     if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
+        return Ok(());
+    }
+    // The Claude Code mod nudges by itself (after N turns without an entry).
+    if mod_active() {
         return Ok(());
     }
 
