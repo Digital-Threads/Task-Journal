@@ -246,11 +246,6 @@ fn link(
         )?;
     }
 
-    // The pack names the task's modules.
-    if !add.is_empty() || !remove.is_empty() {
-        crate::db::invalidate_pack_cascade(conn, task_id)?;
-    }
-
     Ok(())
 }
 
@@ -602,6 +597,237 @@ pub fn backfill_candidates(
     Ok((total, out))
 }
 
+/// A module page is read like a full task pack: same budget.
+const PAGE_BUDGET: usize = 32 * 1024;
+
+/// Entries each of decisions, rejections and constraints lists in full.
+const SECTION_ITEMS: usize = 40;
+
+/// Closed tasks listed in full before older history shrinks to one line each.
+const FULL_HISTORY: usize = 30;
+
+/// Longest outcome in a one-line history entry.
+const SHORT_OUTCOME: usize = 80;
+
+struct HistoryRow {
+    task_id: String,
+    title: String,
+    status: String,
+    at: String,
+    outcome: Option<String>,
+    note: Option<String>,
+}
+
+fn history(
+    conn: &Connection,
+    project_hash: &str,
+    ids: &[String],
+) -> anyhow::Result<Vec<HistoryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.task_id, t.title, t.status, COALESCE(t.closed_at, t.last_event_at), t.outcome,
+                (SELECT group_concat(n.text, ' / ') FROM module_notes n
+                  WHERE n.task_id = t.task_id AND n.module_id = tm.module_id)
+         FROM task_modules tm JOIN tasks t ON t.task_id = tm.task_id
+         WHERE tm.project_hash = ?1 AND tm.module_id = ?2",
+    )?;
+
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        let part = stmt.query_map(rusqlite::params![project_hash, id], |r| {
+            Ok(HistoryRow {
+                task_id: r.get(0)?,
+                title: r.get(1)?,
+                status: r.get(2)?,
+                at: r.get(3)?,
+                outcome: r.get(4)?,
+                note: r.get(5)?,
+            })
+        })?;
+        for row in part {
+            let row = row?;
+            if seen.insert(row.task_id.clone()) {
+                rows.push(row);
+            }
+        }
+    }
+    rows.sort_by(|a, b| b.at.cmp(&a.at));
+
+    Ok(rows)
+}
+
+/// The task's live entries of one type, newest first: not corrected, not bookkeeping.
+fn texts_of(conn: &Connection, task_id: &str, kind: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.text FROM events_index ei JOIN search_fts f ON f.event_id = ei.event_id
+         WHERE ei.task_id = ?1 AND ei.type = ?2 AND ei.corrected_by IS NULL AND ei.bookkeeping = 0
+         ORDER BY ei.timestamp DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![task_id, kind], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    Ok(rows)
+}
+
+fn day(at: &str) -> &str {
+    at.get(..10).unwrap_or(at)
+}
+
+fn short(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+
+    let cut: String = text.chars().take(max - 1).collect();
+    format!("{cut}…")
+}
+
+fn push_section(out: &mut String, title: &str, items: &[String]) {
+    out.push_str(&format!("\n## {title}\n"));
+    if items.is_empty() {
+        out.push_str("- (none)\n");
+    }
+
+    let shown = items.len().min(SECTION_ITEMS);
+    for item in &items[..shown] {
+        out.push_str(item);
+        out.push('\n');
+    }
+    if items.len() > shown {
+        out.push_str(&format!("- … and {} more\n", items.len() - shown));
+    }
+}
+
+/// A module's page in Markdown: what it is, how it works now, what is
+/// decided, rejected and constrained across its tasks, and its history.
+pub fn page(conn: &Connection, project_hash: &str, module_id: &str) -> anyhow::Result<String> {
+    let Some(m) = get(conn, project_hash, module_id)? else {
+        anyhow::bail!("module {module_id:?} does not exist — module_list shows the map");
+    };
+
+    // A merged module's history lives on in the one that took it over.
+    let mut ids = vec![m.module_id.clone()];
+    let mut merged =
+        conn.prepare("SELECT module_id FROM modules WHERE project_hash = ?1 AND merged_into = ?2")?;
+    for id in merged.query_map(rusqlite::params![project_hash, module_id], |r| {
+        r.get::<_, String>(0)
+    })? {
+        ids.push(id?);
+    }
+    let rows = history(conn, project_hash, &ids)?;
+    let (open, closed): (Vec<&HistoryRow>, Vec<&HistoryRow>) =
+        rows.iter().partition(|r| r.status == "open");
+
+    let mut out = format!("# {} ({})\n", m.name, m.module_id);
+    if let Some(d) = &m.description {
+        out.push_str(&format!("{d}\n"));
+    }
+    let merged_into = m
+        .merged_into
+        .as_deref()
+        .map(|i| format!(" → {i}"))
+        .unwrap_or_default();
+    out.push_str(&format!("**Status**: {}{merged_into}\n", m.status));
+    if ids.len() > 1 {
+        out.push_str(&format!("**Includes**: {}\n", ids[1..].join(", ")));
+    }
+
+    out.push_str("\n## Now\n");
+    match (&m.state, &m.state_at) {
+        (Some(state), Some(at)) => out.push_str(&format!("{state}\n_(as of {})_\n", day(at))),
+        _ => out.push_str("(no state yet — write one with module_save(state=...))\n"),
+    }
+
+    // Gaps come before the long sections, so trimming a big page never drops them.
+    let mut gaps = Vec::new();
+    if m.state.is_none() {
+        gaps.push("no state".to_string());
+    }
+    let newer = closed
+        .iter()
+        .filter(|r| m.state_at.as_deref().is_some_and(|s| r.at.as_str() > s))
+        .count();
+    if newer > 0 {
+        gaps.push(format!("state is older than {newer} closed task(s)"));
+    }
+    let no_outcome = closed.iter().filter(|r| r.outcome.is_none()).count();
+    if no_outcome > 0 {
+        gaps.push(format!("{no_outcome} closed task(s) without an outcome"));
+    }
+    if !gaps.is_empty() {
+        out.push_str(&format!("\n## Gaps\n- {}\n", gaps.join("\n- ")));
+    }
+
+    let (mut decisions, mut rejected, mut constraints) = (Vec::new(), Vec::new(), Vec::new());
+    for r in &rows {
+        for d in crate::pack::active_decisions(conn, &r.task_id)? {
+            decisions.push(format!("- {}{} ({})", d.text, d.marker(), r.task_id));
+        }
+        for x in crate::pack::rejections(conn, &r.task_id)? {
+            rejected.push(format!("- {}{} ({})", x.text, x.marker(), r.task_id));
+        }
+        for c in texts_of(conn, &r.task_id, "constraint")? {
+            constraints.push(format!("- {c} ({})", r.task_id));
+        }
+    }
+    push_section(&mut out, "Active decisions", &decisions);
+    push_section(&mut out, "Rejected", &rejected);
+    push_section(&mut out, "Constraints", &constraints);
+
+    let open: Vec<String> = open
+        .iter()
+        .map(|r| format!("- {} {}", r.task_id, r.title))
+        .collect();
+    push_section(&mut out, "Open tasks", &open);
+
+    out.push_str("\n## History\n");
+    if closed.is_empty() {
+        out.push_str("- (none)\n");
+    }
+    for (i, r) in closed.iter().enumerate() {
+        let outcome = r.outcome.as_deref().unwrap_or("(no outcome)");
+        if i < FULL_HISTORY {
+            out.push_str(&format!(
+                "- {} · {} · {} — {outcome}\n",
+                day(&r.at),
+                r.task_id,
+                r.title
+            ));
+            if let Some(note) = &r.note {
+                out.push_str(&format!("  ↳ {note}\n"));
+            }
+        } else {
+            out.push_str(&format!(
+                "- {} · {} · {}\n",
+                day(&r.at),
+                r.task_id,
+                short(outcome, SHORT_OUTCOME)
+            ));
+        }
+    }
+
+    Ok(fit(out))
+}
+
+/// Keep the page within budget by cutting the oldest history at a line end.
+fn fit(mut page: String) -> String {
+    if page.len() <= PAGE_BUDGET {
+        return page;
+    }
+
+    let marker = "- … older history cut to fit — task packs have the rest\n";
+    let mut cut = PAGE_BUDGET - marker.len();
+    while !page.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let cut = page[..cut].rfind('\n').map_or(cut, |i| i + 1);
+    page.truncate(cut);
+    page.push_str(marker);
+
+    page
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     use rusqlite::Connection;
@@ -948,6 +1174,147 @@ mod tests {
         let (total, page) = backfill_candidates(&conn, "p", 2).unwrap();
 
         assert_eq!((total, page.len()), (3, 2));
+    }
+
+    fn said(task: &str, kind: EventType, text: &str) -> Event {
+        Event::new(task, kind, Author::Agent, Source::Chat, text.into())
+    }
+
+    #[test]
+    fn page_shows_state_decisions_rejections_and_history() {
+        let stars = module_event(
+            "stars",
+            &ModuleFields {
+                name: Some("Stars".into()),
+                description: Some("Star ratings".into()),
+                state: Some("Ranks by score".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let close = close_task(
+            "tj-a",
+            serde_json::json!({
+                "outcome": "Shipped ranking",
+                "module_notes": notes_meta(&[("stars".into(), "Ranking added".into())])
+            }),
+        );
+
+        let (_d, conn) = journal(&[
+            stars,
+            open_task("tj-a", &["stars"]),
+            said("tj-a", EventType::Decision, "Use Wilson score"),
+            said("tj-a", EventType::Rejection, "Plain average"),
+            said("tj-a", EventType::Constraint, "Votes are public"),
+            close,
+            open_task("tj-b", &["stars"]),
+        ]);
+        let p = page(&conn, "p", "stars").unwrap();
+
+        for needle in [
+            "# Stars (stars)",
+            "Star ratings",
+            "## Now",
+            "Ranks by score",
+            "## Active decisions",
+            "Use Wilson score",
+            "## Rejected",
+            "Plain average",
+            "## Constraints",
+            "Votes are public",
+            "## Open tasks",
+            "tj-b",
+            "## History",
+            "tj-a",
+            "Shipped ranking",
+            "Ranking added",
+        ] {
+            assert!(p.contains(needle), "missing {needle}:\n{p}");
+        }
+    }
+
+    #[test]
+    fn page_leaves_out_corrected_entries() {
+        let wrong = said("tj-a", EventType::Decision, "Use plain average");
+        let mut fix = said("tj-a", EventType::Correction, "No: Wilson score");
+        fix.corrects = Some(wrong.event_id.clone());
+
+        let (_d, conn) = journal(&[
+            named("stars", "Stars"),
+            open_task("tj-a", &["stars"]),
+            wrong,
+            fix,
+        ]);
+        let p = page(&conn, "p", "stars").unwrap();
+
+        assert!(!p.contains("Use plain average"), "{p}");
+    }
+
+    #[test]
+    fn page_names_the_gaps_of_a_module() {
+        let (_d, conn) = journal(&[
+            named("stars", "Stars"),
+            open_task("tj-a", &["stars"]),
+            close_task("tj-a", serde_json::json!({})),
+        ]);
+        let p = page(&conn, "p", "stars").unwrap();
+
+        assert!(p.contains("## Gaps"), "{p}");
+        assert!(p.contains("no state"), "{p}");
+        assert!(p.contains("without an outcome"), "{p}");
+    }
+
+    #[test]
+    fn a_merged_modules_history_shows_on_the_one_that_took_it_over() {
+        let old = module_event(
+            "old",
+            &ModuleFields {
+                name: Some("Old".into()),
+                status: Some("merged".into()),
+                merged_into: Some("stars".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_d, conn) = journal(&[
+            named("stars", "Stars"),
+            named("old", "Old"),
+            open_task("tj-old", &["old"]),
+            old,
+        ]);
+        let p = page(&conn, "p", "stars").unwrap();
+
+        assert!(p.contains("tj-old"), "{p}");
+    }
+
+    #[test]
+    fn page_of_a_huge_module_fits_the_budget() {
+        let mut events = vec![named("big", "Big")];
+        for i in 0..400 {
+            let id = format!("tj-{i:04}");
+            events.push(open_task(&id, &["big"]));
+            events.push(said(&id, EventType::Decision, &"d".repeat(200)));
+            events.push(close_task(
+                &id,
+                serde_json::json!({"outcome": "o".repeat(150)}),
+            ));
+        }
+        let (_d, conn) = journal(&events);
+
+        let p = page(&conn, "p", "big").unwrap();
+
+        assert!(p.len() <= PAGE_BUDGET, "{}", p.len());
+        assert!(p.contains("## History"), "history cut away");
+        assert!(p.contains("more"), "no sign that entries were left out");
+    }
+
+    #[test]
+    fn unknown_module_page_is_an_error() {
+        let (_d, conn) = mapped();
+
+        let err = page(&conn, "p", "nope").unwrap_err().to_string();
+
+        assert!(err.contains("module_list"), "{err}");
     }
 
     #[test]

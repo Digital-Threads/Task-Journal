@@ -428,6 +428,16 @@ pub fn assemble(conn: &Connection, task_id: &str, mode: PackMode) -> anyhow::Res
         }
     }
 
+    // v0.31.0: the modules of the project chronicle this task belongs to.
+    let modules = crate::modules::modules_of_task(conn, task_id)?;
+    if !modules.is_empty() {
+        let names: Vec<String> = modules
+            .iter()
+            .map(|(id, name)| format!("{name} ({id})"))
+            .collect();
+        text.push_str(&format!("**Modules**: {}\n", names.join(", ")));
+    }
+
     // v0.5.0 Phase B: artifacts auto-extracted from event text. Render
     // only categories that have entries — empty groups are noise on a
     // 30-event task. Order is stable so packs diff cleanly.
@@ -1220,6 +1230,32 @@ mod tests {
             "rejected rationale missing: {}",
             pack.text
         );
+    }
+
+    #[test]
+    fn pack_names_the_tasks_modules() {
+        use crate::modules::tests_support::{journal, open_task};
+        use crate::modules::{module_event, ModuleFields};
+
+        let stars = module_event(
+            "stars",
+            &ModuleFields {
+                name: Some("Stars".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_d, conn) = journal(&[stars, open_task("tj-a", &["stars"]), open_task("tj-b", &[])]);
+
+        let linked = assemble(&conn, "tj-a", PackMode::Compact).unwrap();
+        let unlinked = assemble(&conn, "tj-b", PackMode::Compact).unwrap();
+
+        assert!(
+            linked.text.contains("**Modules**: Stars (stars)"),
+            "{}",
+            linked.text
+        );
+        assert!(!unlinked.text.contains("**Modules**"), "{}", unlinked.text);
     }
 
     #[test]
