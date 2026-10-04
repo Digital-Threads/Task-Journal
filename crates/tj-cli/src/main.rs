@@ -275,9 +275,9 @@ fn run_module(action: ModuleCmd) -> Result<()> {
             ))])?;
             println!("linked {task_id}");
         }
-        ModuleCmd::Candidates { limit } => {
+        ModuleCmd::Candidates { limit, offset } => {
             let (total, candidates) = with_chronicle(|conn, hash| {
-                tj_core::modules::backfill_candidates(conn, hash, limit)
+                tj_core::modules::backfill_candidates(conn, hash, limit, offset)
             })?;
             let out = serde_json::json!({ "total_unlinked": total, "candidates": candidates });
             println!("{}", serde_json::to_string(&out)?);
@@ -1569,6 +1569,8 @@ enum ModuleCmd {
     Candidates {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
 }
 

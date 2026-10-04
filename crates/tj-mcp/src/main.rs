@@ -432,6 +432,8 @@ pub struct ModulePageResult {
 pub struct BackfillParams {
     /// Tasks per page, newest first (default 20, at most 100).
     pub limit: Option<usize>,
+    /// Tasks to skip: page on past the ones you left for later.
+    pub offset: Option<usize>,
 }
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct BackfillResult {
@@ -1366,7 +1368,7 @@ impl TaskJournalServer {
 
     #[tool(
         name = "module_backfill_candidates",
-        description = "Tasks that belong to no module, newest first: id, title, status, goal, outcome, files, and the modules the journal suggests for each. Sort them, confirm with the user, then module_link. `total_unlinked` counts them all; page with `limit`."
+        description = "Tasks that belong to no module, newest first: id, title, status, goal, outcome, files, and the modules the journal suggests for each. Sort them, confirm with the user, then module_link. `total_unlinked` counts them all; page with `limit` and `offset`."
     )]
     async fn module_backfill_candidates(
         &self,
@@ -1383,7 +1385,12 @@ impl TaskJournalServer {
 
                 let limit = p.limit.unwrap_or(20).min(100);
                 let (total_unlinked, candidates) = with_state(|conn, project_hash| {
-                    tj_core::modules::backfill_candidates(conn, project_hash, limit)
+                    tj_core::modules::backfill_candidates(
+                        conn,
+                        project_hash,
+                        limit,
+                        p.offset.unwrap_or(0),
+                    )
                 })?;
 
                 Ok(Json(BackfillResult {
@@ -2748,7 +2755,10 @@ mod tests {
         assert!(created.chronicle.is_some());
 
         let candidates = server
-            .module_backfill_candidates(Parameters(BackfillParams { limit: Some(100) }))
+            .module_backfill_candidates(Parameters(BackfillParams {
+                limit: Some(100),
+                offset: None,
+            }))
             .await
             .unwrap()
             .0;

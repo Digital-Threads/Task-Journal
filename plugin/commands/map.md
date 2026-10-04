@@ -15,11 +15,12 @@ Focus (optional): $ARGUMENTS
    prefixes) and `hints.terms` (words people use for it). Ask the user to confirm or
    correct the list, and wait for the answer.
 4. After the user's yes, `module_save` each confirmed module.
-5. Call `module_backfill_candidates(limit=50)`, page by page. Assign each task to modules
-   using its title, goal, outcome, files and the suggestions; list the doubtful ones
-   separately.
+5. Call `module_backfill_candidates(limit=50)`, page by page (`offset` steps past a page).
+   Assign each task to modules using its title, goal, outcome, files and the suggestions;
+   list the doubtful ones separately.
 6. Show the assignment to the user and ask them to confirm it. After a yes, make one
-   `module_link` call per page.
+   `module_link` call per page. Tasks that fit no module go to a catch-all module
+   (`other`, "Other") once the user agrees, so no task is left without a module.
 7. For every module with tasks, read `module_page` and write its first `state` with
    `module_save(module_id, state=...)`: a few sentences on how it works now.
 

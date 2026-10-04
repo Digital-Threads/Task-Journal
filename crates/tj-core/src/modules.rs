@@ -556,11 +556,12 @@ pub struct Candidate {
 const UNLINKED: &str = "FROM tasks t WHERE t.project_hash = ?1
      AND NOT EXISTS (SELECT 1 FROM task_modules tm WHERE tm.task_id = t.task_id)";
 
-/// The newest `limit` tasks without a module, and how many there are in all.
+/// A page of tasks without a module, newest first, and how many there are in all.
 pub fn backfill_candidates(
     conn: &Connection,
     project_hash: &str,
     limit: usize,
+    offset: usize,
 ) -> anyhow::Result<(i64, Vec<Candidate>)> {
     let total: i64 = conn.query_row(
         &format!("SELECT COUNT(*) {UNLINKED}"),
@@ -568,12 +569,13 @@ pub fn backfill_candidates(
         |r| r.get(0),
     )?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT t.task_id, t.title, t.status {UNLINKED} ORDER BY t.last_event_at DESC LIMIT ?2"
+        "SELECT t.task_id, t.title, t.status {UNLINKED} ORDER BY t.last_event_at DESC, t.task_id LIMIT ?2 OFFSET ?3"
     ))?;
     let rows: Vec<(String, String, String)> = stmt
-        .query_map(rusqlite::params![project_hash, limit as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?
+        .query_map(
+            rusqlite::params![project_hash, limit as i64, offset as i64],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
         .collect::<Result<_, _>>()?;
 
     let mut out = Vec::new();
@@ -1180,7 +1182,7 @@ mod tests {
         old.meta["goal"] = serde_json::json!("Speed up the star feed");
 
         let (_d, conn) = journal(&[stars, old, open_task("tj-linked", &["stars"])]);
-        let (total, page) = backfill_candidates(&conn, "p", 10).unwrap();
+        let (total, page) = backfill_candidates(&conn, "p", 10, 0).unwrap();
 
         assert_eq!(total, 1);
         assert_eq!(page.len(), 1);
@@ -1197,9 +1199,11 @@ mod tests {
             open_task("tj-3", &[]),
         ]);
 
-        let (total, page) = backfill_candidates(&conn, "p", 2).unwrap();
+        let (total, first) = backfill_candidates(&conn, "p", 2, 0).unwrap();
+        let (_, rest) = backfill_candidates(&conn, "p", 2, 2).unwrap();
 
-        assert_eq!((total, page.len()), (3, 2));
+        assert_eq!((total, first.len(), rest.len()), (3, 2, 1));
+        assert!(first.iter().all(|c| c.task_id != rest[0].task_id));
     }
 
     fn said(task: &str, kind: EventType, text: &str) -> Event {

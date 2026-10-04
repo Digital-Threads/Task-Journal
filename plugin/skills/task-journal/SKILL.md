@@ -135,9 +135,12 @@ system before touching it.
    `hints.paths` (code path prefixes) and `hints.terms` (the words people use for it).
 4. Show the list to the user and **confirm** it; adjust from the answer.
 5. `module_save` each confirmed module.
-6. `module_backfill_candidates(limit=50)`, page by page: assign each old task to modules by
-   its title, goal, outcome, files and the suggestions; list the doubtful ones separately.
-7. Show the assignment to the user, **confirm**, then one `module_link` call per page.
+6. `module_backfill_candidates(limit=50)`, page by page (`offset` steps past a page): assign
+   each old task to modules by its title, goal, outcome, files and the suggestions; list the
+   doubtful ones separately.
+7. Show the assignment to the user, **confirm**, then one `module_link` call per page. Tasks
+   that fit no module go to a catch-all module (`other`, "Other") once the user agrees, so
+   the chronicle has no loose ends.
 8. For each module with tasks, read its `module_page` and write its first `state`.
 
 Chronicle tools:
@@ -147,8 +150,8 @@ Chronicle tools:
 - `module_save(module_id, name?, description?, hints?{paths, terms}, state?, status?, merged_into?)`
   — partial update; a new module needs `name`. `status`: active | retired | merged.
 - `module_link(links=[{task_id, add?: [...], remove?: [...]}])` — many tasks at once.
-- `module_backfill_candidates(limit?)` → `total_unlinked`, `candidates` (id, title, goal,
-  outcome, files, suggestions).
+- `module_backfill_candidates(limit?, offset?)` → `total_unlinked`, `candidates` (id, title,
+  goal, outcome, files, suggestions).
 
 ## The 5 MCP tools (exact params)
 

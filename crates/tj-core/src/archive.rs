@@ -32,7 +32,7 @@ impl Gap {
             ),
             Gap::UnlinkedTasks { count } => format!(
                 "{count} task(s) belong to no module — sort them with module_backfill_candidates, \
-                 confirm with the user, then module_link"
+                 confirm with the user, then module_link (leftovers go to a catch-all module)"
             ),
             Gap::StaleModule {
                 module_id,
@@ -79,14 +79,16 @@ pub fn gaps(
         return Ok(vec![Gap::NoMap { tasks }]);
     }
 
+    // What the agent can act on right now comes first: its own task, then a
+    // module whose state lags. Sorting old tasks needs the user, so it waits.
     let mut out = Vec::new();
 
-    let unlinked = count(
-        "SELECT COUNT(*) FROM tasks t WHERE t.project_hash = ?1
-           AND NOT EXISTS (SELECT 1 FROM task_modules tm WHERE tm.task_id = t.task_id)",
-    )?;
-    if unlinked > 0 {
-        out.push(Gap::UnlinkedTasks { count: unlinked });
+    if let Some(task_id) = active_task {
+        if crate::modules::modules_of_task(conn, task_id)?.is_empty() {
+            out.push(Gap::TaskWithoutModule {
+                task_id: task_id.to_string(),
+            });
+        }
     }
 
     let mut stmt = conn.prepare(
@@ -106,12 +108,12 @@ pub fn gaps(
         });
     }
 
-    if let Some(task_id) = active_task {
-        if crate::modules::modules_of_task(conn, task_id)?.is_empty() {
-            out.push(Gap::TaskWithoutModule {
-                task_id: task_id.to_string(),
-            });
-        }
+    let unlinked = count(
+        "SELECT COUNT(*) FROM tasks t WHERE t.project_hash = ?1
+           AND NOT EXISTS (SELECT 1 FROM task_modules tm WHERE tm.task_id = t.task_id)",
+    )?;
+    if unlinked > 0 {
+        out.push(Gap::UnlinkedTasks { count: unlinked });
     }
 
     Ok(out)
@@ -168,15 +170,17 @@ mod tests {
 
         assert_eq!(
             g,
+            // What the agent can act on now comes first; sorting old
+            // tasks waits behind it.
             vec![
-                Gap::UnlinkedTasks { count: 1 },
+                Gap::TaskWithoutModule {
+                    task_id: "tj-b".into()
+                },
                 Gap::StaleModule {
                     module_id: "stars".into(),
                     closed_since: 1
                 },
-                Gap::TaskWithoutModule {
-                    task_id: "tj-b".into()
-                },
+                Gap::UnlinkedTasks { count: 1 },
             ]
         );
     }

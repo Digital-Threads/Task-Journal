@@ -106,7 +106,7 @@ const GAP_TEXT: Record<string, (g: ArchiveGap) => string> = {
   no_map: g =>
     `no module map yet (${g.tasks} tasks) — map the project with /task-journal:map and confirm the modules with the user`,
   unlinked_tasks: g =>
-    `${g.count} task(s) belong to no module — sort them with module_backfill_candidates, confirm with the user, then module_link`,
+    `${g.count} task(s) belong to no module — sort them with module_backfill_candidates, confirm with the user, then module_link (leftovers go to a catch-all module)`,
   stale_module: g =>
     `module ${g.module_id}: ${g.closed_since} closed task(s) not reflected in its state — read module_page and rewrite it with module_save(state=...)`,
   task_without_module: g => `the active task ${g.task_id} belongs to no module — link it with module_link (module_list shows the map)`,

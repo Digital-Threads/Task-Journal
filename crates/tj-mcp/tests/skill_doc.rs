@@ -80,6 +80,8 @@ fn skill_teaches_the_chronicle() {
         "module_notes",
         "📚 Chronicle",
         "confirm",
+        "catch-all",
+        "offset",
     ] {
         assert!(s.contains(needle), "skill must mention {needle}");
     }
@@ -102,6 +104,7 @@ fn map_command_exists_and_asks_the_user_first() {
         "module_backfill_candidates",
         "module_link",
         "confirm",
+        "catch-all",
     ] {
         assert!(s.contains(needle), "map command must mention {needle}");
     }
