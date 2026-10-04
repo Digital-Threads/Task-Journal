@@ -8551,3 +8551,188 @@ fn module_lines_stay_out_of_task_views_but_not_json_export() {
         .success()
         .stdout(contains("mod:stars"));
 }
+
+/// A `task-journal` command run in its own data home and project dir.
+fn chronicle_cli<'a>(
+    xdg: &'a assert_fs::TempDir,
+    proj: &'a assert_fs::TempDir,
+) -> impl Fn() -> assert_cmd::Command + 'a {
+    move || {
+        let mut c = Command::cargo_bin("task-journal").unwrap();
+        c.env("XDG_DATA_HOME", xdg.path()).current_dir(proj.path());
+        c
+    }
+}
+
+fn stdout_of(mut cmd: assert_cmd::Command) -> String {
+    String::from_utf8(cmd.assert().success().get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn module_lifecycle_through_the_cli() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+
+    tj().args([
+        "module",
+        "save",
+        "stars",
+        "--name",
+        "Stars",
+        "--path",
+        "src/stars/",
+        "--term",
+        "star feed",
+    ])
+    .assert()
+    .success();
+    let mut create = tj();
+    create.args(["create", "Rank stars", "--modules", "stars"]);
+    let id = stdout_of(create);
+    tj().args([
+        "close",
+        &id,
+        "--outcome",
+        "Ranked",
+        "--module-note",
+        "stars=Ranking by Wilson score",
+    ])
+    .assert()
+    .success();
+
+    tj().args(["module", "show", "stars"])
+        .assert()
+        .success()
+        .stdout(
+            contains("# Stars (stars)")
+                .and(contains("Ranking by Wilson score"))
+                .and(contains(id.as_str())),
+        );
+    tj().args(["pack", &id])
+        .assert()
+        .success()
+        .stdout(contains("**Modules**: Stars (stars)"));
+    tj().args(["module", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(contains(r#""module_id":"stars""#));
+    tj().args(["module", "list"])
+        .assert()
+        .success()
+        .stdout(contains("stars").and(contains("Stars")));
+}
+
+#[test]
+fn module_link_and_candidates_through_the_cli() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+    tj().args([
+        "module",
+        "save",
+        "auth",
+        "--name",
+        "Auth",
+        "--term",
+        "token refresh",
+    ])
+    .assert()
+    .success();
+    let mut create = tj();
+    create.args(["create", "Fix token refresh race"]);
+    let id = stdout_of(create);
+
+    let mut candidates = tj();
+    candidates.args(["module", "candidates"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout_of(candidates)).unwrap();
+    assert_eq!(json["total_unlinked"], 1);
+    assert_eq!(json["candidates"][0]["suggestions"][0]["module_id"], "auth");
+
+    tj().args(["module", "link", &id, "--add", "auth"])
+        .assert()
+        .success();
+    tj().args(["pack", &id])
+        .assert()
+        .success()
+        .stdout(contains("**Modules**: Auth (auth)"));
+    tj().args(["module", "link", "tj-missing", "--add", "auth"])
+        .assert()
+        .failure()
+        .stderr(contains("tj-missing"));
+}
+
+#[test]
+fn unknown_module_and_bad_slug_fail_before_writing() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+
+    tj().args(["create", "Orphan", "--modules", "nope"])
+        .assert()
+        .failure()
+        .stderr(contains("module_save"));
+    tj().args(["module", "save", "Bad Slug", "--name", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("auth-refresh"));
+    tj().args(["module", "save", "unnamed"])
+        .assert()
+        .failure()
+        .stderr(contains("--name"));
+    tj().args(["close", "tj-x", "--module-note", "no-equals-sign"])
+        .assert()
+        .failure()
+        .stderr(contains("module=text"));
+
+    assert!(
+        !xdg.path().join("task-journal/events").exists()
+            || std::fs::read_dir(xdg.path().join("task-journal/events"))
+                .unwrap()
+                .all(|e| std::fs::metadata(e.unwrap().path()).unwrap().len() == 0),
+        "a failed command wrote to the journal"
+    );
+}
+
+#[test]
+fn session_start_names_the_top_chronicle_gap() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+    tj().args(["create", "Some work"]).assert().success();
+
+    let mut hook = tj();
+    hook.args(["ingest-hook", "--kind", "SessionStart", "--text", ""]);
+    let out: serde_json::Value = serde_json::from_str(&stdout_of(hook)).unwrap();
+    let ctx = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+
+    assert!(ctx.contains("📚 Chronicle: no module map yet"), "{ctx}");
+}
+
+#[test]
+fn state_carries_archive_gaps() {
+    let (xdg, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    let tj = chronicle_cli(&xdg, &proj);
+    tj().args(["create", "Some work"]).assert().success();
+
+    tj().args(["state"])
+        .assert()
+        .success()
+        .stdout(contains(r#""kind":"no_map""#));
+}

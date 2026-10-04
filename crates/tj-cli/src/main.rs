@@ -125,6 +125,168 @@ fn dir_writable(dir: &std::path::Path) -> bool {
 /// Read a project's JSONL event log. Malformed lines are skipped with a
 /// warning on stderr, the same policy as `rebuild_state`, so one bad line
 /// cannot abort a read-only command.
+/// Run `f` on the current project's state, with the journal ingested first.
+fn with_chronicle<T>(f: impl FnOnce(&rusqlite::Connection, &str) -> Result<T>) -> Result<T> {
+    let cwd = std::env::current_dir()?;
+    let project_hash = tj_core::project_hash::from_path(&cwd)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let state_path = tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+    let conn = tj_core::db::open(&state_path)?;
+    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+
+    f(&conn, &project_hash)
+}
+
+/// Append `events` to the current project's journal, durably.
+fn append_to_journal(events: &[tj_core::event::Event]) -> Result<()> {
+    let project_hash = tj_core::project_hash::from_path(&std::env::current_dir()?)?;
+    let events_path = tj_core::paths::events_dir()?.join(format!("{project_hash}.jsonl"));
+    let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
+    for event in events {
+        writer.append(event)?;
+    }
+    writer.flush_durable()?;
+
+    Ok(())
+}
+
+/// The CLI writes as the user, from the command line.
+fn by_user(mut event: tj_core::event::Event) -> tj_core::event::Event {
+    event.author = tj_core::event::Author::User;
+    event.source = tj_core::event::Source::Cli;
+
+    event
+}
+
+fn run_module(action: ModuleCmd) -> Result<()> {
+    match action {
+        ModuleCmd::List { json } => {
+            let (modules, gaps) = with_chronicle(|conn, hash| {
+                Ok((
+                    tj_core::modules::list(conn, hash)?,
+                    tj_core::archive::gaps(conn, hash, None)?,
+                ))
+            })?;
+            if json {
+                let out = serde_json::json!({ "modules": modules, "gaps": gaps });
+                println!("{}", serde_json::to_string(&out)?);
+                return Ok(());
+            }
+
+            if modules.is_empty() {
+                println!("(no modules yet)");
+            }
+            for m in &modules {
+                let last = m.last_activity.as_deref().map(|t| t.get(..10).unwrap_or(t));
+                let status = if m.status == "active" {
+                    String::new()
+                } else {
+                    format!(" [{}]", m.status)
+                };
+                println!(
+                    "{:<20} {}{status} — {} task(s){}{}",
+                    m.module_id,
+                    m.name,
+                    m.task_count,
+                    last.map(|d| format!(", last {d}")).unwrap_or_default(),
+                    m.description
+                        .as_deref()
+                        .map(|d| format!(" — {d}"))
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some(line) = tj_core::archive::headline(&gaps) {
+                println!("\n{line}");
+            }
+        }
+        ModuleCmd::Show { module_id } => {
+            let page = with_chronicle(|conn, hash| tj_core::modules::page(conn, hash, &module_id))?;
+            println!("{page}");
+        }
+        ModuleCmd::Save {
+            module_id,
+            name,
+            description,
+            paths,
+            terms,
+            state,
+            status,
+            merged_into,
+        } => {
+            let hints = (!paths.is_empty() || !terms.is_empty())
+                .then_some(tj_core::modules::Hints { paths, terms });
+            let fields = tj_core::modules::ModuleFields {
+                name,
+                description,
+                hints,
+                state,
+                status,
+                merged_into,
+            };
+            let event = tj_core::modules::module_event(&module_id, &fields)?;
+
+            let created = with_chronicle(|conn, hash| {
+                let exists = tj_core::modules::get(conn, hash, &module_id)?.is_some();
+                if !exists && fields.name.is_none() {
+                    anyhow::bail!("module {module_id} is new: pass --name too");
+                }
+                if let Some(into) = &fields.merged_into {
+                    if into == &module_id {
+                        anyhow::bail!("a module cannot be merged into itself");
+                    }
+                    if tj_core::modules::get(conn, hash, into)?.is_none() {
+                        anyhow::bail!("--merged-into: module {into:?} does not exist");
+                    }
+                }
+
+                Ok(!exists)
+            })?;
+            append_to_journal(&[by_user(event)])?;
+            println!(
+                "{} {module_id}",
+                if created { "created" } else { "updated" }
+            );
+        }
+        ModuleCmd::Link {
+            task_id,
+            add,
+            remove,
+        } => {
+            let resolved = with_chronicle(|conn, hash| {
+                if !tj_core::db::task_exists(conn, &task_id)? {
+                    anyhow::bail!("task not found: {task_id}");
+                }
+                for id in &remove {
+                    tj_core::modules::validate_id(id)?;
+                }
+
+                tj_core::modules::resolve(conn, hash, &add)
+            })?;
+            for w in &resolved.warnings {
+                eprintln!("warning: {w}");
+            }
+            if resolved.ids.is_empty() && remove.is_empty() {
+                anyhow::bail!("nothing to do: pass --add or --remove");
+            }
+            append_to_journal(&[by_user(tj_core::modules::link_event(
+                &task_id,
+                &resolved.ids,
+                &remove,
+            ))])?;
+            println!("linked {task_id}");
+        }
+        ModuleCmd::Candidates { limit } => {
+            let (total, candidates) = with_chronicle(|conn, hash| {
+                tj_core::modules::backfill_candidates(conn, hash, limit)
+            })?;
+            let out = serde_json::json!({ "total_unlinked": total, "candidates": candidates });
+            println!("{}", serde_json::to_string(&out)?);
+        }
+    }
+
+    Ok(())
+}
+
 fn read_events_lenient(
     path: &std::path::Path,
     command: &str,
@@ -825,6 +987,9 @@ enum Commands {
         /// Parent task id — makes this a subtask of the given id.
         #[arg(long)]
         parent: Option<String>,
+        /// Modules the task belongs to, comma-separated (see `module list`).
+        #[arg(long, value_delimiter = ',')]
+        modules: Vec<String>,
     },
     /// List tasks for the current project.
     List {
@@ -976,6 +1141,10 @@ enum Commands {
         /// primary field; the tag is for filtering / aggregation.
         #[arg(long)]
         outcome_tag: Option<String>,
+        /// A line of a module's history: `module=what this task changed there`.
+        /// Repeat for several modules.
+        #[arg(long = "module-note")]
+        module_notes: Vec<String>,
     },
     /// Attach a clickable, typed link to a task (doc, deploy, dashboard,
     /// design, …). Renders under the pack's Artifacts as `[label](url)` so a
@@ -1039,6 +1208,12 @@ enum Commands {
         /// several references over time.
         #[arg(long = "add")]
         add: String,
+    },
+    /// The project chronicle: modules (parts of the system by meaning) and
+    /// their history.
+    Module {
+        #[command(subcommand)]
+        action: ModuleCmd,
     },
     /// Re-run artifact extraction over every event of a task and
     /// refresh the pack cache. Use after upgrading from v0.4.x — older
@@ -1352,6 +1527,52 @@ enum EventsCmd {
 }
 
 #[derive(Subcommand)]
+enum ModuleCmd {
+    /// The module map and what the chronicle is missing.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// A module's page: state, decisions, rejections, constraints, history.
+    Show { module_id: String },
+    /// Create or update a module; only the fields given change.
+    Save {
+        module_id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        /// A code path prefix that marks the module (repeatable).
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// A term of the module (repeatable).
+        #[arg(long = "term")]
+        terms: Vec<String>,
+        /// How the module works now.
+        #[arg(long)]
+        state: Option<String>,
+        /// `active`, `retired` or `merged` (with `--merged-into`).
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        merged_into: Option<String>,
+    },
+    /// Link a task to modules, or unlink it.
+    Link {
+        task_id: String,
+        #[arg(long = "add")]
+        add: Vec<String>,
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
+    /// Tasks that belong to no module, with suggestions (JSON).
+    Candidates {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
 enum PendingCmd {
     /// List queued classifier failures.
     List,
@@ -1404,6 +1625,7 @@ fn real_main() -> Result<()> {
             context,
             goal,
             parent,
+            modules,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -1444,6 +1666,14 @@ fn real_main() -> Result<()> {
             // from the JSONL) restores it.
             if let Some(g) = goal {
                 meta["goal"] = serde_json::Value::String(g);
+            }
+            if !modules.is_empty() {
+                let resolved =
+                    with_chronicle(|conn, hash| tj_core::modules::resolve(conn, hash, &modules))?;
+                for w in &resolved.warnings {
+                    eprintln!("warning: {w}");
+                }
+                meta["modules"] = serde_json::json!(resolved.ids);
             }
             event.meta = meta;
 
@@ -1827,6 +2057,7 @@ fn real_main() -> Result<()> {
             reason,
             outcome,
             outcome_tag,
+            module_notes,
         } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -1844,6 +2075,13 @@ fn real_main() -> Result<()> {
                     ),
                 }
             }
+            let mut notes = Vec::new();
+            for note in &module_notes {
+                let Some((module, text)) = note.split_once('=') else {
+                    anyhow::bail!("--module-note expects module=text, got {note:?}");
+                };
+                notes.push((module.trim().to_string(), text.trim().to_string()));
+            }
 
             // Catch up the index then assert the task is real before we
             // append a close event for an id that never existed.
@@ -1855,6 +2093,15 @@ fn real_main() -> Result<()> {
                 anyhow::bail!("task not found: {task_id}");
             }
             let open_kids = tj_core::db::count_open_children(&conn, &task_id)?;
+            // A note to an unknown module fails the close before it is written.
+            for (module, _) in notes.iter_mut() {
+                let resolved =
+                    tj_core::modules::resolve(&conn, &project_hash, std::slice::from_ref(module))?;
+                for w in &resolved.warnings {
+                    eprintln!("warning: {w}");
+                }
+                *module = resolved.ids[0].clone();
+            }
             drop(conn);
 
             let mut event = tj_core::event::Event::new(
@@ -1876,6 +2123,9 @@ fn real_main() -> Result<()> {
             }
             if let Some(t) = outcome_tag {
                 meta.insert("outcome_tag".into(), serde_json::Value::String(t));
+            }
+            if !notes.is_empty() {
+                meta.insert("module_notes".into(), tj_core::modules::notes_meta(&notes));
             }
             // Layer-2 close harvest: stamp deterministic git/gh refs (commit,
             // branch, PR) so the closed pack reads as a clickable ledger of
@@ -2056,6 +2306,7 @@ fn real_main() -> Result<()> {
             tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
             println!("ok");
         }
+        Commands::Module { action } => run_module(action)?,
         Commands::External { task_id, add } => {
             let cwd = std::env::current_dir()?;
             let project_hash = tj_core::project_hash::from_path(&cwd)?;
@@ -2720,6 +2971,16 @@ the `task-journal-distiller` subagent to capture them from the transcript{transc
 runs in the background and won't block you; it only fills gaps and never closes tasks.\n\n"
                         ));
                     }
+                }
+                // The chronicle's most important gap, for every client that
+                // reads this hook (Claude Code with or without the mod, Codex).
+                // Advice only: it never fails the session start.
+                if let Some(line) = tj_core::archive::gaps(&conn, &project_hash, None)
+                    .ok()
+                    .and_then(|gaps| tj_core::archive::headline(&gaps))
+                {
+                    bundle.push_str(&line);
+                    bundle.push_str("\n\n");
                 }
                 for tc in &recent {
                     let pack = tj_core::pack::assemble(
