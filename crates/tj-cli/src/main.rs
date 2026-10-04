@@ -343,23 +343,60 @@ fn pending_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// The current project's entries in the global `pending/` dir. New entries
+/// are named `<project_hash>.<ulid>.json` (`….dead.json` once retries are
+/// exhausted); a legacy bare `<ulid>.json` counts as ours unless its JSON
+/// names another project. Callers filter schema / dead state on top.
+fn project_pending_entries(
+    dir: &std::path::Path,
+    project_hash: &str,
+) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let stem = stem.strip_suffix(".dead").unwrap_or(stem);
+        let ours = match stem.split_once('.') {
+            Some((prefix, _)) => prefix == project_hash,
+            None => !legacy_pending_is_foreign(&path, project_hash),
+        };
+        if ours {
+            out.push(path);
+        }
+    }
+
+    Ok(out)
+}
+
+/// A legacy (un-prefixed) entry belongs to another project only when its
+/// JSON says so; one without `project_hash` stays visible here.
+fn legacy_pending_is_foreign(path: &std::path::Path, project_hash: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("project_hash")?.as_str().map(|h| h != project_hash))
+        .unwrap_or(false)
+}
+
 fn run_pending_list() -> Result<()> {
     let dir = pending_dir()?;
-    if !dir.exists() {
-        println!("(no pending entries)");
-        return Ok(());
-    }
+    let project_hash = tj_core::project_hash::from_path(std::env::current_dir()?)?;
     let mut entries: Vec<(String, String, String, u32)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
+    for path in project_pending_entries(&dir, &project_hash)? {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+        let id = stem
+            .strip_prefix(&format!("{project_hash}."))
+            .unwrap_or(stem)
             .to_string();
         let body = std::fs::read_to_string(&path)?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
@@ -406,12 +443,7 @@ fn run_pending_retry(
     let mut succeeded = 0usize;
     let mut died = 0usize;
     let mut still_pending = 0usize;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    for path in project_pending_entries(&dir, &project_hash)? {
         if path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -759,14 +791,17 @@ enum Commands {
         #[arg(long, default_value_t = 7)]
         days: i64,
     },
-    /// Garbage-collect the pending classifier queue. Removes entries
-    /// older than N days OR marked dead by retry exhaustion. Run after
-    /// classifier auth was broken for a while and the queue grew
-    /// stale.
+    /// Garbage-collect the current project's pending classifier queue.
+    /// Removes entries older than N days OR marked dead by retry
+    /// exhaustion. Run after classifier auth was broken for a while and
+    /// the queue grew stale.
     PendingGc {
         /// Age threshold in days. Default 7.
         #[arg(long, default_value_t = 7)]
         days: i64,
+        /// Collect every project's entries, not just the current one's.
+        #[arg(long)]
+        all: bool,
     },
     /// Set or update the goal of an existing task.
     Goal {
@@ -1640,7 +1675,7 @@ fn real_main() -> Result<()> {
                 );
             }
         }
-        Commands::PendingGc { days } => {
+        Commands::PendingGc { days, all } => {
             let pending_dir = tj_core::paths::events_dir()?
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("events_dir has no parent"))?
@@ -1649,20 +1684,23 @@ fn real_main() -> Result<()> {
                 println!("(no pending dir — nothing to gc)");
                 return Ok(());
             }
+            let entries: Vec<std::path::PathBuf> = if all {
+                std::fs::read_dir(&pending_dir)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                    .collect()
+            } else {
+                let project_hash = tj_core::project_hash::from_path(std::env::current_dir()?)?;
+                project_pending_entries(&pending_dir, &project_hash)?
+            };
             let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
             let mut removed = 0usize;
-            for entry in std::fs::read_dir(&pending_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
+            for path in entries {
                 // Prefer the file's mtime over JSON parsing — pending
                 // payloads include their own queued_at but are not
                 // guaranteed parseable when the classifier corrupted
                 // input mid-stream.
-                let mtime = entry
-                    .metadata()
+                let mtime = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| {
@@ -2652,6 +2690,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
             // Drain any pending entries first (Task 10 fills the real-classifier branch).
             drain_pending(
                 &events_path,
+                &project_hash,
                 mock_event_type.as_deref(),
                 mock_task_id.as_deref(),
                 mock_confidence,
@@ -2732,7 +2771,9 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 // Fire-and-forget worker. Errors here are best-effort —
                 // a failure to spawn just means the entry sits in
                 // pending/ until the next hook fires another spawn.
-                let _ = spawn_classify_worker(&backend);
+                if std::env::var("TJ_DISABLE_CLASSIFY_SPAWN").is_err() {
+                    let _ = spawn_classify_worker(&backend);
+                }
                 return Ok(());
             }
 
@@ -2842,7 +2883,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 let out = match classifier.classify(&input) {
                     Ok(o) => o,
                     Err(e) => {
-                        persist_pending(&events_path, &text, &e.to_string())?;
+                        persist_pending(&events_path, &project_hash, &text, &e.to_string())?;
                         return Ok(());
                     }
                 };
@@ -2872,6 +2913,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     None => {
                         persist_pending(
                             &events_path,
+                            &project_hash,
                             &text,
                             &format!("task_id_guess `{tid}` not found"),
                         )?;
@@ -2880,6 +2922,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     Some(s) if s == "closed" => {
                         persist_pending(
                             &events_path,
+                            &project_hash,
                             &text,
                             &format!("task_id_guess `{tid}` is closed"),
                         )?;
@@ -3441,20 +3484,19 @@ fn run_statusline() -> anyhow::Result<String> {
         })
         .count();
 
-    // Pending dir is global — one entry per queued classifier failure.
-    // No project filter (matches the brief; per-project counting would
-    // need extra metadata in each pending file).
+    // Pending dir is global; this project's entries carry its hash as a
+    // filename prefix, so counting stays a cheap readdir with no JSON
+    // parsing. Legacy un-prefixed entries are not counted.
+    let prefix = format!("{project_hash}.");
     let pending_count = pending_dir()
         .ok()
         .and_then(|d| std::fs::read_dir(&d).ok())
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .map(|x| x == "json")
-                        .unwrap_or(false)
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(&prefix) && name.ends_with(".json")
                 })
                 .count()
         })
@@ -5211,7 +5253,12 @@ fn auto_open_task_from_prompt(
     }))
 }
 
-fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyhow::Result<()> {
+fn persist_pending(
+    events_path: &std::path::Path,
+    project_hash: &str,
+    text: &str,
+    err: &str,
+) -> anyhow::Result<()> {
     let pending_dir = events_path
         .parent()
         .unwrap()
@@ -5222,7 +5269,7 @@ fn persist_pending(events_path: &std::path::Path, text: &str, err: &str) -> anyh
     let id = ulid::Ulid::new().to_string();
     let payload = serde_json::json!({"text": text, "error": err, "queued_at": chrono::Utc::now().to_rfc3339()});
     std::fs::write(
-        pending_dir.join(format!("{id}.json")),
+        pending_dir.join(format!("{project_hash}.{id}.json")),
         serde_json::to_string_pretty(&payload)?,
     )?;
     Ok(())
@@ -5261,7 +5308,9 @@ fn persist_pending_v2(
     if let Some(sid) = session_id {
         payload["session_id"] = serde_json::Value::String(sid.to_string());
     }
-    let path = pending_dir.join(format!("{id}.json"));
+    // `pending/` is shared by every project: the hash prefix tells each
+    // project's worker which entries are its own.
+    let path = pending_dir.join(format!("{project_hash}.{id}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
     Ok(path)
 }
@@ -5456,14 +5505,9 @@ fn run_classify_worker(backend: &str) -> Result<()> {
     }
 
     // Snapshot entries up front so concurrent re-queues don't loop us.
-    let mut entries: Vec<std::path::PathBuf> = Vec::new();
-    for e in std::fs::read_dir(&pending)? {
-        let e = e?;
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("json") {
-            entries.push(p);
-        }
-    }
+    // Only this project's entries: the lock is per project, so a worker
+    // of another project may be draining the same directory right now.
+    let entries = project_pending_entries(&pending, &project_hash)?;
 
     for path in entries {
         if let Err(err) = process_pending_entry(&path, &events_path, &project_hash, backend) {
@@ -5492,6 +5536,11 @@ fn process_pending_entry(
     let schema = v.get("schema").and_then(|x| x.as_str()).unwrap_or("v1");
     if schema != "v2" {
         return Ok(()); // legacy entry, handled by `pending retry`
+    }
+    // A legacy un-prefixed entry is ours only when it names this project;
+    // one without `project_hash` is left for `pending retry`.
+    if v.get("project_hash").and_then(|x| x.as_str()) != Some(project_hash) {
+        return Ok(());
     }
 
     let kind = v
@@ -5584,7 +5633,7 @@ fn process_pending_entry(
         Err(e) => {
             // Persist as legacy v1 pending entry so `pending retry`
             // surfaces it; remove the v2 source.
-            persist_pending(events_path, &text, &e.to_string())?;
+            persist_pending(events_path, project_hash, &text, &e.to_string())?;
             std::fs::remove_file(path)?;
             return Ok(());
         }
@@ -5604,6 +5653,7 @@ fn process_pending_entry(
         None => {
             persist_pending(
                 events_path,
+                project_hash,
                 &text,
                 &format!("task_id_guess `{tid}` not found"),
             )?;
@@ -5613,6 +5663,7 @@ fn process_pending_entry(
         Some(s) if s == "closed" => {
             persist_pending(
                 events_path,
+                project_hash,
                 &text,
                 &format!("task_id_guess `{tid}` is closed"),
             )?;
@@ -5671,6 +5722,7 @@ fn process_pending_entry(
 
 fn drain_pending(
     events_path: &std::path::Path,
+    project_hash: &str,
     mock_etype: Option<&str>,
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
@@ -5681,17 +5733,9 @@ fn drain_pending(
         .parent()
         .unwrap()
         .join("pending");
-    if !pending_dir.exists() {
-        return Ok(());
-    }
 
-    for entry in std::fs::read_dir(&pending_dir)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-
-        let body = std::fs::read_to_string(entry.path())?;
+    for path in project_pending_entries(&pending_dir, project_hash)? {
+        let body = std::fs::read_to_string(&path)?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
         // v0.6.2: skip v2 entries — those are owned by classify-worker.
         // Removing them here would silently drop async-queued events.
@@ -5719,7 +5763,7 @@ fn drain_pending(
                 writer.flush_durable()?;
             }
         }
-        std::fs::remove_file(entry.path())?;
+        std::fs::remove_file(&path)?;
     }
     Ok(())
 }
@@ -6223,6 +6267,32 @@ mod inline_tests {
         let body = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v.get("session_id").is_none());
+    }
+
+    #[test]
+    fn pending_entries_are_named_after_their_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events").join("h.jsonl");
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+
+        persist_pending_v2(&events_path, "PostToolUse", "txt", "h", "hybrid", None).unwrap();
+        persist_pending(&events_path, "h", "txt", "err").unwrap();
+
+        let pending = dir.path().join("pending");
+        let names: Vec<String> = std::fs::read_dir(&pending)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|n| n.starts_with("h.")), "{names:?}");
+        assert_eq!(
+            project_pending_entries(&pending, "h").unwrap().len(),
+            2,
+            "both entries belong to project h"
+        );
+        assert!(project_pending_entries(&pending, "other")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

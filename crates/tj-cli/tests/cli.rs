@@ -2950,6 +2950,335 @@ fn classify_worker_treats_fresh_empty_lock_as_held() {
     assert!(!lock_path.exists(), "the new holder releases the lock");
 }
 
+// ---------------- pending/ is global: every consumer is project-scoped ----------------
+
+/// Write a pending entry. `project_hash: None` leaves the field out (an
+/// entry from before the queue knew about projects).
+fn write_pending_entry(
+    pending: &std::path::Path,
+    file_name: &str,
+    project_hash: Option<&str>,
+    schema_v2: bool,
+    kind: &str,
+    text: &str,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(pending).unwrap();
+    let mut body = serde_json::json!({
+        "kind": kind,
+        "text": text,
+        "backend": "heuristic",
+        "queued_at": "2026-05-08T00:00:00Z",
+    });
+    if schema_v2 {
+        body["schema"] = serde_json::json!("v2");
+    }
+    if let Some(h) = project_hash {
+        body["project_hash"] = serde_json::json!(h);
+        body["events_path"] = serde_json::json!(format!("/nowhere/{h}.jsonl"));
+    }
+    let path = pending.join(file_name);
+    std::fs::write(&path, body.to_string()).unwrap();
+    path
+}
+
+fn project_events(xdg: &std::path::Path, project_hash: &str) -> String {
+    std::fs::read_to_string(
+        xdg.join("task-journal")
+            .join("events")
+            .join(format!("{project_hash}.jsonl")),
+    )
+    .unwrap_or_default()
+}
+
+const OTHER_PROJECT: &str = "0123456789abcdef";
+
+#[test]
+fn classify_worker_only_processes_its_own_projects_entries() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+    let pending = dir.path().join("task-journal").join("pending");
+
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        true,
+        "UserPromptSubmit",
+        "We decided to use sqlite for the project A store",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        true,
+        "UserPromptSubmit",
+        "We decided to use postgres for the project B store",
+    );
+    let legacy_foreign = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000002.json",
+        Some(OTHER_PROJECT),
+        true,
+        "UserPromptSubmit",
+        "We decided to use mongodb for the project B cache",
+    );
+    let legacy_no_project = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000003.json",
+        None,
+        true,
+        "UserPromptSubmit",
+        "We decided to use redis for the unknown project cache",
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["classify-worker", "--backend", "heuristic"])
+        .assert()
+        .success();
+
+    assert!(!own.exists(), "the project's own entry is processed");
+    assert!(
+        foreign.exists(),
+        "another project's entry must be left alone"
+    );
+    assert!(
+        legacy_foreign.exists(),
+        "a legacy entry of another project too"
+    );
+    assert!(
+        legacy_no_project.exists(),
+        "a legacy entry without project_hash is left for `pending retry`"
+    );
+    let journal = project_events(dir.path(), &hash_a);
+    assert!(journal.contains("sqlite"), "own entry recorded: {journal}");
+    for other in ["postgres", "mongodb", "redis"] {
+        assert!(
+            !journal.contains(other),
+            "{other} belongs to another project: {journal}"
+        );
+    }
+}
+
+#[test]
+fn statusline_counts_only_this_projects_pending_entries() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["create", "Statusline scope"])
+        .assert()
+        .success();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    for i in 0..2 {
+        write_pending_entry(
+            &pending,
+            &format!("{hash_a}.01JA000000000000000000000{i}.json"),
+            Some(&hash_a),
+            true,
+            "PostToolUse",
+            "own",
+        );
+    }
+    for i in 0..3 {
+        write_pending_entry(
+            &pending,
+            &format!("{OTHER_PROJECT}.01JA000000000000000000000{i}.json"),
+            Some(OTHER_PROJECT),
+            true,
+            "PostToolUse",
+            "foreign",
+        );
+    }
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["statusline"])
+        .assert()
+        .success()
+        .stdout(contains("pending: 2"));
+}
+
+#[test]
+fn pending_list_retry_and_hook_drain_skip_other_projects() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["create", "Project A"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let pending = dir.path().join("task-journal").join("pending");
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        false,
+        "Stop",
+        "own legacy-v1 chunk alpha",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        false,
+        "Stop",
+        "foreign chunk bravo",
+    );
+    let legacy_foreign = write_pending_entry(
+        &pending,
+        "01JA0000000000000000000002.json",
+        Some(OTHER_PROJECT),
+        false,
+        "Stop",
+        "foreign legacy chunk charlie",
+    );
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args(["pending", "list"])
+        .assert()
+        .success()
+        .stdout(contains("alpha"))
+        .stdout(contains("bravo").not())
+        .stdout(contains("charlie").not());
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "pending",
+            "retry",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .assert()
+        .success()
+        .stdout(contains("1 drained"));
+    assert!(!own.exists(), "own entry drained");
+
+    // The hook's mock drain is project-scoped too.
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .current_dir(&workdir)
+        .args([
+            "ingest-hook",
+            "--kind",
+            "Stop",
+            "--text",
+            "Live chunk",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        foreign.exists(),
+        "another project's entry must be left alone"
+    );
+    assert!(
+        legacy_foreign.exists(),
+        "a legacy entry of another project too"
+    );
+    let journal = project_events(dir.path(), &hash_a);
+    assert!(journal.contains("alpha"), "own entry recorded: {journal}");
+    assert!(
+        !journal.contains("bravo") && !journal.contains("charlie"),
+        "foreign chunks leaked into project A: {journal}"
+    );
+}
+
+#[test]
+fn pending_gc_is_project_scoped_unless_all() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let workdir = dir.path().join("proj-a");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let hash_a = tj_core::project_hash::from_path(&workdir).unwrap();
+    let pending = dir.path().join("task-journal").join("pending");
+
+    let own = write_pending_entry(
+        &pending,
+        &format!("{hash_a}.01JA0000000000000000000000.json"),
+        Some(&hash_a),
+        true,
+        "PostToolUse",
+        "own",
+    );
+    let foreign = write_pending_entry(
+        &pending,
+        &format!("{OTHER_PROJECT}.01JA0000000000000000000001.json"),
+        Some(OTHER_PROJECT),
+        true,
+        "PostToolUse",
+        "foreign",
+    );
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    for p in [&own, &foreign] {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    let gc = |extra: &[&str]| {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .current_dir(&workdir)
+            .args(["pending-gc", "--days", "1"])
+            .args(extra)
+            .assert()
+            .success();
+    };
+
+    gc(&[]);
+    assert!(!own.exists(), "own stale entry collected");
+    assert!(
+        foreign.exists(),
+        "another project's entry is not ours to collect"
+    );
+
+    gc(&["--all"]);
+    assert!(!foreign.exists(), "--all collects every project");
+}
+
 // =====================================================================
 // v0.7.0: statusline / PreCompact / /rewind / rejected / export-pr
 // =====================================================================
