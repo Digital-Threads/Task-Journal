@@ -14,6 +14,8 @@ struct DoctorReport {
     task_journal_version: &'static str,
     claude_in_path: bool,
     claude_version: Option<String>,
+    /// Informational only: needed just for `--backend codex`.
+    codex_in_path: bool,
     data_dir: PathBuf,
     events_dir: PathBuf,
     state_dir: PathBuf,
@@ -46,6 +48,14 @@ impl DoctorReport {
                     .unwrap_or_else(|| "found (version unknown)".into())
             } else {
                 "NOT FOUND in PATH".into()
+            }
+        );
+        println!(
+            "  codex binary     {}",
+            if self.codex_in_path {
+                "found"
+            } else {
+                "not found in PATH (only needed for the codex backend)"
             }
         );
         println!("  data dir         {}", self.data_dir.display());
@@ -112,6 +122,32 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     r
 }
 
+/// Read a project's JSONL event log. Malformed lines are skipped with a
+/// warning on stderr, the same policy as `rebuild_state`, so one bad line
+/// cannot abort a read-only command.
+fn read_events_lenient(
+    path: &std::path::Path,
+    command: &str,
+) -> Result<Vec<tj_core::event::Event>> {
+    let body = std::fs::read_to_string(path)?;
+    let mut events = Vec::new();
+
+    for (i, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(e) => events.push(e),
+            Err(err) => eprintln!(
+                "warning: skipping malformed JSONL line {} in {command}: {err}",
+                i + 1
+            ),
+        }
+    }
+
+    Ok(events)
+}
+
 /// Move all on-disk data for one project_hash to another. Used by the
 /// `migrate-project` subcommand when a project's directory has been
 /// moved on disk and the canonical-path hash no longer matches.
@@ -131,7 +167,8 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
     let state_dir = tj_core::paths::state_dir()?;
     let metrics_dir = tj_core::paths::metrics_dir()?;
 
-    // (source, destination) tuples to attempt to rename.
+    // (source, destination) tuples to attempt to rename. The SQLite runs in
+    // WAL mode, so its `-wal` / `-shm` sidecars travel with it.
     let pairs = [
         (
             events_dir.join(format!("{from_hash}.jsonl")),
@@ -140,6 +177,14 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         (
             state_dir.join(format!("{from_hash}.sqlite")),
             state_dir.join(format!("{to_hash}.sqlite")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.sqlite-wal")),
+            state_dir.join(format!("{to_hash}.sqlite-wal")),
+        ),
+        (
+            state_dir.join(format!("{from_hash}.sqlite-shm")),
+            state_dir.join(format!("{to_hash}.sqlite-shm")),
         ),
         (
             metrics_dir.join(format!("{from_hash}.jsonl")),
@@ -159,6 +204,16 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         }
     }
 
+    // Fold uncheckpointed writes into the main file before it moves. When
+    // no one else holds the DB, closing this connection also deletes the
+    // sidecars; any that survive are moved with it below.
+    let src_state_path = state_dir.join(format!("{from_hash}.sqlite"));
+    if src_state_path.exists() {
+        let conn = rusqlite::Connection::open(&src_state_path)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .with_context(|| format!("checkpoint WAL of {src_state_path:?}"))?;
+    }
+
     let mut moved: Vec<String> = Vec::new();
     for (src, dst) in &pairs {
         if !src.exists() {
@@ -167,9 +222,9 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if dst.exists() && force {
-            std::fs::remove_file(dst).with_context(|| format!("remove existing {dst:?}"))?;
-        }
+        // No remove-then-rename: rename replaces an existing destination
+        // atomically (POSIX rename, MOVEFILE_REPLACE_EXISTING on Windows), so
+        // a failed move under --force leaves the destination intact.
         std::fs::rename(src, dst).with_context(|| format!("rename {src:?} -> {dst:?}"))?;
         moved.push(dst.display().to_string());
     }
@@ -178,14 +233,12 @@ fn run_migrate_project(from: &std::path::Path, to: &std::path::Path, force: bool
     let new_state_path = state_dir.join(format!("{to_hash}.sqlite"));
     if new_state_path.exists() {
         let conn = tj_core::db::open(&new_state_path)?;
-        conn.execute(
-            "UPDATE tasks SET project_hash = ?1 WHERE project_hash = ?2",
-            rusqlite::params![to_hash, from_hash],
-        )?;
-        conn.execute(
-            "UPDATE index_state SET project_hash = ?1 WHERE project_hash = ?2",
-            rusqlite::params![to_hash, from_hash],
-        )?;
+        for table in ["tasks", "index_state", "embeddings", "dream_state"] {
+            conn.execute(
+                &format!("UPDATE {table} SET project_hash = ?1 WHERE project_hash = ?2"),
+                rusqlite::params![to_hash, from_hash],
+            )?;
+        }
     }
 
     if moved.is_empty() {
@@ -244,6 +297,36 @@ time { font-family: ui-monospace, monospace; color: var(--muted); margin-right: 
 .suggested::after { content: " ?"; color: var(--muted); }
 "#;
 
+/// Title and status of one task for the md/html export, folded over its
+/// events with the same rules as the SQLite projection
+/// (`tj_core::db::upsert_task_from_event`): the first `open` sets the title,
+/// a later `rename` replaces it, and the last `close`/`reopen` decides status.
+fn export_title_and_status(task_events: &[&tj_core::event::Event]) -> (String, &'static str) {
+    use tj_core::event::EventType;
+
+    let mut title: Option<String> = None;
+    let mut status = "open";
+
+    for e in task_events {
+        let named = || {
+            e.meta
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&e.text)
+                .to_string()
+        };
+        match e.event_type {
+            EventType::Open if title.is_none() => title = Some(named()),
+            EventType::Rename if title.is_some() => title = Some(named()),
+            EventType::Close => status = "closed",
+            EventType::Reopen => status = "open",
+            _ => {}
+        }
+    }
+
+    (title.unwrap_or_else(|| "(untitled)".into()), status)
+}
+
 fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
     use std::collections::BTreeMap;
 
@@ -266,23 +349,7 @@ fn render_html_timeline(events: &[&tj_core::event::Event]) -> String {
     out.push_str("<main>");
 
     for (task_id, task_events) in &tasks {
-        let title = task_events
-            .iter()
-            .find(|e| e.event_type == tj_core::event::EventType::Open)
-            .and_then(|e| {
-                e.meta
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or_else(|| Some(e.text.clone()))
-            })
-            .unwrap_or_else(|| "(untitled)".into());
-
-        let closed = task_events
-            .last()
-            .map(|e| e.event_type == tj_core::event::EventType::Close)
-            .unwrap_or(false);
-        let status = if closed { "closed" } else { "open" };
+        let (title, status) = export_title_and_status(task_events);
 
         let created = task_events
             .first()
@@ -642,6 +709,7 @@ fn run_doctor() -> Result<DoctorReport> {
         task_journal_version: env!("CARGO_PKG_VERSION"),
         claude_in_path,
         claude_version,
+        codex_in_path: tj_core::llm::codex_on_path(),
         data_dir,
         events_dir,
         state_dir,
@@ -1323,12 +1391,7 @@ fn real_main() -> Result<()> {
                     println!("(no events yet)");
                     return Ok(());
                 }
-                let body = std::fs::read_to_string(&events_path)?;
-                let mut events: Vec<tj_core::event::Event> = body
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(serde_json::from_str)
-                    .collect::<Result<_, _>>()?;
+                let mut events = read_events_lenient(&events_path, "events list")?;
                 events.reverse();
                 for e in events.into_iter().take(limit) {
                     let title = e
@@ -1337,7 +1400,11 @@ fn real_main() -> Result<()> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| e.text.clone());
-                    println!("{}  [{:?}]  {}", e.timestamp, e.event_type, title);
+                    let etype = serde_json::to_value(e.event_type)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| "?".into());
+                    println!("{}  [{etype}]  {}", e.timestamp, title);
                 }
             }
         },
@@ -3106,12 +3173,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 anyhow::bail!("no events file at {events_path:?}");
             }
 
-            let body = std::fs::read_to_string(&events_path)?;
-            let all_events: Vec<tj_core::event::Event> = body
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(serde_json::from_str)
-                .collect::<Result<_, _>>()?;
+            let all_events = read_events_lenient(&events_path, "export")?;
 
             // Filter to specific task if requested.
             let events: Vec<&tj_core::event::Event> = if let Some(ref tid) = task {
@@ -3144,29 +3206,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     }
 
                     for (task_id, task_events) in &tasks {
-                        // Derive title from the first open event's meta, or text.
-                        let title = task_events
-                            .iter()
-                            .find(|e| e.event_type == tj_core::event::EventType::Open)
-                            .and_then(|e| {
-                                e.meta
-                                    .get("title")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                                    .or_else(|| Some(e.text.clone()))
-                            })
-                            .unwrap_or_else(|| "(untitled)".into());
-
-                        // Determine status: closed if last event is close, else open.
-                        let status = if task_events
-                            .last()
-                            .map(|e| e.event_type == tj_core::event::EventType::Close)
-                            .unwrap_or(false)
-                        {
-                            "closed"
-                        } else {
-                            "open"
-                        };
+                        let (title, status) = export_title_and_status(task_events);
 
                         // Created timestamp from first event.
                         let created = task_events
@@ -3242,7 +3282,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     let path = state_dir.join(format!("{hash}.sqlite"));
                     let conn = match rusqlite::Connection::open(&path) {
                         Ok(c) => c,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn_skipped_project(&hash, e);
+                            continue;
+                        }
                     };
                     let ids = match run_search(
                         &conn,
@@ -3252,7 +3295,10 @@ runs in the background and won't block you; it only fills gaps and never closes 
                         limit,
                     ) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn_skipped_project(&hash, e);
+                            continue;
+                        }
                     };
                     for id in ids {
                         println!("{hash}\t{id}");
@@ -3682,6 +3728,12 @@ fn run_search(
     Ok(ids_like)
 }
 
+/// Cross-project reads keep going past a project they cannot read, but say
+/// so on stderr instead of dropping it silently.
+fn warn_skipped_project(hash: &str, err: impl std::fmt::Display) {
+    eprintln!("warning: skipping project {hash}: {err}");
+}
+
 fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64>) -> Result<()> {
     let cutoff: Option<String> = since.map(|d| {
         (chrono::Utc::now() - chrono::Duration::days(d))
@@ -3714,11 +3766,21 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
     // attached DBs would be faster but rusqlite's bundled build doesn't
     // ship ATTACH-friendly ergonomics; per-project loop is fine here.
     let mut hits: Vec<(String, String, String, String, String)> = Vec::new();
+    // Only the --all-projects sweep reports a skipped project: the current
+    // project of a fresh clone legitimately has no tables yet.
+    let skip = |hash: &str, e: rusqlite::Error| {
+        if all_projects {
+            warn_skipped_project(hash, e);
+        }
+    };
     for hash in hashes {
         let path = state_dir.join(format!("{hash}.sqlite"));
         let conn = match rusqlite::Connection::open(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
 
         let use_fts = topic_is_fts_safe(topic);
@@ -3744,7 +3806,10 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
 
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
         let bind_q = if use_fts {
             topic.to_string()
@@ -3761,7 +3826,10 @@ fn run_rejected(topic: &str, all_projects: bool, limit: usize, since: Option<i64
             ))
         }) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                skip(&hash, e);
+                continue;
+            }
         };
         for row in rows.flatten() {
             hits.push(row);

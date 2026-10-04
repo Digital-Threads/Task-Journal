@@ -255,6 +255,57 @@ fn doctor_json_output_is_parseable_and_lists_paths() {
     assert!(v.get("issues").unwrap().is_array());
 }
 
+/// `doctor` with PATH limited to `bin`, so only what the test puts there
+/// resolves.
+fn doctor_with_path(xdg: &std::path::Path, bin: &std::path::Path, json: bool) -> String {
+    let mut args = vec!["doctor"];
+    if json {
+        args.push("--json");
+    }
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .env("PATH", bin)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn doctor_reports_missing_codex_and_claude_as_information_only() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let empty_bin = assert_fs::TempDir::new().unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&doctor_with_path(xdg.path(), empty_bin.path(), true)).unwrap();
+    assert_eq!(v["codex_in_path"], false);
+    assert_eq!(v["claude_in_path"], false);
+    assert_eq!(v["issues"].as_array().unwrap().len(), 0, "{v}");
+
+    let human = doctor_with_path(xdg.path(), empty_bin.path(), false);
+    assert!(human.contains("codex binary"), "{human}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_detects_codex_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let bin = assert_fs::TempDir::new().unwrap();
+    let codex = bin.path().join("codex");
+    std::fs::write(&codex, "#!/bin/sh\necho codex-cli 9.9.9\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&doctor_with_path(xdg.path(), bin.path(), true)).unwrap();
+    assert_eq!(v["codex_in_path"], true);
+}
+
 fn write_pending(xdg: &std::path::Path, id: &str, text: &str, attempts: u32) {
     let dir = xdg.join("task-journal").join("pending");
     std::fs::create_dir_all(&dir).unwrap();
@@ -615,6 +666,111 @@ fn export_html_emits_self_contained_document() {
     assert!(!html.contains("https://"), "external https url leaked");
 }
 
+/// Append a raw line to the only JSONL event log under `xdg`.
+fn append_jsonl_line(xdg: &std::path::Path, line: &str) {
+    use std::io::Write;
+
+    let events = xdg.join("task-journal").join("events");
+    let log = std::fs::read_dir(&events)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .expect("events log present");
+    let mut f = std::fs::OpenOptions::new().append(true).open(log).unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+#[test]
+fn export_md_and_html_follow_close_reopen_and_rename_like_the_projection() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", "Original title"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Closed, then renamed: the projection says closed + new title, while the
+    // last event alone (a rename) would read as open with the old title.
+    for (etype, text) in [
+        (tj_core::event::EventType::Close, "done"),
+        (tj_core::event::EventType::Reopen, "one more fix"),
+        (tj_core::event::EventType::Close, "done again"),
+        (tj_core::event::EventType::Rename, "Renamed title"),
+    ] {
+        let e = tj_core::event::Event::new(
+            task_id.clone(),
+            etype,
+            tj_core::event::Author::User,
+            tj_core::event::Source::Cli,
+            text.to_string(),
+        );
+        append_jsonl_line(xdg.path(), &serde_json::to_string(&e).unwrap());
+    }
+
+    let export = |format: &str| {
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["export", "--format", format])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    let md = export("md");
+    assert!(
+        md.contains(&format!("## [{task_id}] Renamed title")),
+        "md title must follow the rename: {md}"
+    );
+    assert!(md.contains("**Status**: closed"), "md status: {md}");
+
+    let html = export("html");
+    assert!(
+        html.contains(&format!("{task_id}</span>Renamed title</h2>")),
+        "html title must follow the rename: {html}"
+    );
+    assert!(html.contains("status: closed"), "html status: {html}");
+}
+
+#[test]
+fn export_skips_malformed_jsonl_lines_with_a_warning() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Survives a bad line"])
+        .assert()
+        .success();
+    append_jsonl_line(xdg.path(), "{not json");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["export", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(contains("Survives a bad line"))
+        .stderr(contains("skipping malformed JSONL line 2"));
+}
+
 #[test]
 fn migrate_project_round_trips_data_to_new_path() {
     let xdg = assert_fs::TempDir::new().unwrap();
@@ -703,6 +859,195 @@ fn migrate_project_refuses_overwrite_without_force() {
         .stderr(contains("destination already exists"));
 }
 
+/// Two project dirs that each hash to themselves, plus their hashes.
+fn two_projects() -> (assert_fs::TempDir, assert_fs::TempDir, String, String) {
+    let proj_a = assert_fs::TempDir::new().unwrap();
+    let proj_b = assert_fs::TempDir::new().unwrap();
+    std::fs::create_dir(proj_a.path().join(".git")).unwrap();
+    std::fs::create_dir(proj_b.path().join(".git")).unwrap();
+    let from_hash = tj_core::project_hash::from_path(proj_a.path()).unwrap();
+    let to_hash = tj_core::project_hash::from_path(proj_b.path()).unwrap();
+
+    (proj_a, proj_b, from_hash, to_hash)
+}
+
+fn migrate(xdg: &std::path::Path, from: &std::path::Path, to: &std::path::Path, force: bool) {
+    let mut args = vec![
+        "migrate-project",
+        "--from",
+        from.to_str().unwrap(),
+        "--to",
+        to.to_str().unwrap(),
+    ];
+    if force {
+        args.push("--force");
+    }
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg)
+        .args(args)
+        .assert()
+        .success();
+}
+
+#[test]
+fn migrate_project_rekeys_embeddings_and_dream_state() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "Re-key everything"])
+        .assert()
+        .success();
+    {
+        let conn = tj_core::db::open(state.join(format!("{from_hash}.sqlite"))).unwrap();
+        conn.execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES (?1, 't', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings(event_id, task_id, project_hash, model, dim, vec, created_at)
+             VALUES ('e1', 'tj-1', ?1, 'hash', 1, x'00000000', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
+    for table in ["dream_state", "embeddings"] {
+        let rekeyed: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE project_hash = ?1"),
+                [&to_hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rekeyed, 1,
+            "{table} row not re-keyed to the new project_hash"
+        );
+    }
+}
+
+/// A write still sitting in `<hash>.sqlite-wal` (another process holds the
+/// DB open, so nothing checkpointed it) must reach the new project, and no
+/// sidecar may stay behind under the old hash. Unix-only: Windows refuses to
+/// rename a file another handle keeps open.
+#[cfg(unix)]
+#[test]
+fn migrate_project_carries_uncheckpointed_wal_writes() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let state = xdg.path().join("task-journal").join("state");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_a.path())
+        .args(["create", "WAL survives migration"])
+        .assert()
+        .success();
+
+    let src = state.join(format!("{from_hash}.sqlite"));
+    let holder = tj_core::db::open(&src).unwrap();
+    holder
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    holder
+        .execute(
+            "INSERT INTO dream_state(project_hash, last_dream_at, updated_at) VALUES (?1, 't', 't')",
+            [&from_hash],
+        )
+        .unwrap();
+    // Keep the connection open for the rest of the test so its WAL is never
+    // checkpointed or deleted on close.
+    std::mem::forget(holder);
+    let wal = |hash: &str| state.join(format!("{hash}.sqlite-wal"));
+    assert!(wal(&from_hash).exists(), "precondition: source WAL present");
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), false);
+
+    for suffix in ["-wal", "-shm"] {
+        let left = state.join(format!("{from_hash}.sqlite{suffix}"));
+        assert!(!left.exists(), "sidecar left behind: {left:?}");
+    }
+    let conn = rusqlite::Connection::open(state.join(format!("{to_hash}.sqlite"))).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dream_state WHERE project_hash = ?1",
+            [&to_hash],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "the WAL-only write was lost in migration");
+}
+
+#[test]
+fn migrate_project_force_keeps_destination_when_the_move_fails() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, from_hash, to_hash) = two_projects();
+    let events = xdg.path().join("task-journal").join("events");
+
+    // A directory cannot be renamed over a file, so the move must fail.
+    std::fs::create_dir_all(events.join(format!("{from_hash}.jsonl"))).unwrap();
+    let dst = events.join(format!("{to_hash}.jsonl"));
+    std::fs::write(&dst, "destination data\n").unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args([
+            "migrate-project",
+            "--from",
+            proj_a.path().to_str().unwrap(),
+            "--to",
+            proj_b.path().to_str().unwrap(),
+            "--force",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        "destination data\n",
+        "a failed --force move must leave the destination intact"
+    );
+}
+
+#[test]
+fn migrate_project_force_replaces_existing_destination() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let (proj_a, proj_b, _, _) = two_projects();
+
+    for (proj, title) in [(&proj_a, "Source task"), (&proj_b, "Overwritten task")] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["create", title])
+            .assert()
+            .success();
+    }
+
+    migrate(xdg.path(), proj_a.path(), proj_b.path(), true);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj_b.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Source task").and(contains("Overwritten task").not()));
+}
+
 #[test]
 fn close_unknown_task_id_returns_error() {
     let dir = assert_fs::TempDir::new().unwrap();
@@ -744,6 +1089,45 @@ fn search_all_projects_finds_match_in_other_project_hash() {
         .assert()
         .success()
         .stdout(contains("aaaa1111").and(contains("bbbb2222")));
+}
+
+#[test]
+fn all_projects_search_and_rejected_warn_about_unreadable_projects() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let state = dir.path().join("task-journal").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let good = "aaaa1111aaaa1111";
+    let conn = tj_core::db::open(state.join(format!("{good}.sqlite"))).unwrap();
+    let mut e = tj_core::event::Event::new(
+        "tj-good1".to_string(),
+        tj_core::event::EventType::Open,
+        tj_core::event::Author::User,
+        tj_core::event::Source::Cli,
+        "Marker in a healthy project".to_string(),
+    );
+    e.meta = serde_json::json!({"title": "Healthy"});
+    tj_core::db::upsert_task_from_event(&conn, &e, good).unwrap();
+    tj_core::db::index_event(&conn, &e).unwrap();
+    drop(conn);
+    std::fs::write(state.join("cccc3333cccc3333.sqlite"), b"not a database").unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["search", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stdout(contains(good))
+        .stderr(contains("warning: skipping project cccc3333cccc3333"));
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args(["rejected", "Marker", "--all-projects"])
+        .assert()
+        .success()
+        .stderr(contains("warning: skipping project cccc3333cccc3333"));
 }
 
 #[test]
@@ -2333,6 +2717,54 @@ fn events_list_shows_recent_events() {
         .assert()
         .success()
         .stdout(contains("First task").and(contains("Second task")));
+}
+
+#[test]
+fn events_list_skips_malformed_jsonl_lines_with_a_warning() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Listed despite a bad line"])
+        .assert()
+        .success();
+    append_jsonl_line(xdg.path(), "{not json");
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Listed despite a bad line"))
+        .stderr(contains("skipping malformed JSONL line 2"));
+}
+
+#[test]
+fn events_list_prints_snake_case_event_types() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Typed listing"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["events", "list"])
+        .assert()
+        .success()
+        .stdout(contains("[open]").and(contains("[Open]").not()));
 }
 
 #[test]
