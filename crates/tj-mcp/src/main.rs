@@ -356,6 +356,28 @@ fn project_paths() -> anyhow::Result<(String, std::path::PathBuf, std::path::Pat
     resolve_project_paths(&project_dir()?)
 }
 
+/// Ingest the journal tail, then fail on an unknown `task_id` so a typo never
+/// writes an orphan event.
+fn require_task(
+    project_hash: &str,
+    events_path: &Path,
+    state_path: &Path,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let conn_arc = cached_open(state_path)?;
+    let conn = conn_arc
+        .lock()
+        .map_err(|e| anyhow::anyhow!("connection mutex poisoned: {e}"))?;
+    if events_path.exists() {
+        tj_core::db::ingest_new_events(&conn, events_path, project_hash)?;
+    }
+    if !tj_core::db::task_exists(&conn, task_id)? {
+        anyhow::bail!("task not found: {task_id}");
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskCheckParams {
     pub task_id: String,
@@ -700,7 +722,7 @@ impl TaskJournalServer {
     ) -> Result<Json<EventAddResult>, McpError> {
         traced_tool("event_add", async move {
             run_blocking(move || {
-                let (_, events_path, _) = project_paths()?;
+                let (project_hash, events_path, state_path) = project_paths()?;
                 std::fs::create_dir_all(events_path.parent().unwrap())?;
 
                 let event_type = parse_event_type(&p.event_type)?;
@@ -713,6 +735,8 @@ impl TaskJournalServer {
                         p.event_type
                     );
                 }
+                require_task(&project_hash, &events_path, &state_path, &p.task_id)?;
+
                 let mut event = tj_core::event::Event::new(
                     &p.task_id,
                     event_type,
@@ -758,8 +782,9 @@ impl TaskJournalServer {
     ) -> Result<Json<ArtifactAddResult>, McpError> {
         traced_tool("artifact_add", async move {
             run_blocking(move || {
-                let (_, events_path, _) = project_paths()?;
+                let (project_hash, events_path, state_path) = project_paths()?;
                 std::fs::create_dir_all(events_path.parent().unwrap())?;
+                require_task(&project_hash, &events_path, &state_path, &p.task_id)?;
 
                 let mut event = tj_core::event::Event::new(
                     &p.task_id,
@@ -1741,6 +1766,57 @@ mod tests {
         let meta = tj_core::db::task_metadata(&conn, &task).unwrap().unwrap();
         assert_eq!(meta.outcome.as_deref(), Some("shipped"));
         assert_eq!(meta.outcome_tag.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn event_add_and_artifact_add_reject_an_unknown_task() {
+        let _env = handler_env();
+        let server = TaskJournalServer;
+
+        create_task(&server, "Known task").await;
+        let (_, events_path, _) = project_paths().unwrap();
+        let before = std::fs::read_to_string(&events_path).unwrap();
+
+        let res = server
+            .event_add(Parameters(EventAddParams {
+                task_id: "tj-typo000000".into(),
+                event_type: "finding".into(),
+                text: "orphan".into(),
+                corrects: None,
+                supersedes: None,
+                alternatives: None,
+            }))
+            .await;
+        let err = match res {
+            Ok(_) => panic!("event_add on an unknown task must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("task not found: tj-typo000000"),
+            "{}",
+            err.message
+        );
+
+        let res = server
+            .artifact_add(Parameters(ArtifactAddParams {
+                task_id: "tj-typo000000".into(),
+                kind: "doc".into(),
+                url: "https://example.com/spec".into(),
+                label: "Spec".into(),
+            }))
+            .await;
+        let err = match res {
+            Ok(_) => panic!("artifact_add on an unknown task must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("task not found: tj-typo000000"),
+            "{}",
+            err.message
+        );
+
+        let after = std::fs::read_to_string(&events_path).unwrap();
+        assert_eq!(after, before, "no orphan event may reach the journal");
     }
 
     #[test]
