@@ -2347,6 +2347,18 @@ fn real_main() -> Result<()> {
                 _ => parse_hook_stdin()?,
             };
 
+            // The Claude Code mod captures in-process and marks the hooks it
+            // starts; the classic capture stands down instead of doing the
+            // same work twice. Resume packs and model switches stay ours.
+            if mod_active()
+                && matches!(
+                    kind.as_str(),
+                    "UserPromptSubmit" | "PostToolUse" | "Stop" | "PreCompact" | "SessionEnd"
+                )
+            {
+                return Ok(());
+            }
+
             // Emergency capture kill-switch: a `.capture-disabled` marker in the
             // data dir no-ops realtime capture (the read-only SessionStart
             // resume still runs). Because the hook re-invokes this binary on
@@ -2402,6 +2414,12 @@ fn real_main() -> Result<()> {
                         &text,
                         tj_core::recall::DEFAULT_MAX_HITS,
                     ) {
+                        let hits = fresh_recall_hits(
+                            hits,
+                            live_session_id.as_deref(),
+                            &events_path,
+                            &project_hash,
+                        );
                         if !hits.is_empty() {
                             let mut ctx = String::new();
                             for h in &hits {
@@ -2434,8 +2452,12 @@ fn real_main() -> Result<()> {
             // mcp__ tools) — gated MCP-only, falls through to the queue path so
             // event capture is unaffected. Disabled by TJ_PUSH_RECALL=0.
             if kind == "PostToolUse" && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0") {
-                if let Some(envelope) = push_recall_envelope(&payload, &events_path, &project_hash)
-                {
+                if let Some(envelope) = push_recall_envelope(
+                    &payload,
+                    &events_path,
+                    &project_hash,
+                    live_session_id.as_deref(),
+                ) {
                     println!("{}", serde_json::to_string(&envelope)?);
                 }
             }
@@ -2828,7 +2850,7 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 );
             }
 
-            // Drain any pending entries first (Task 10 fills the real-classifier branch).
+            // Mock path only: drain legacy pending entries first.
             drain_pending(
                 &events_path,
                 &project_hash,
@@ -2934,169 +2956,129 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 "assistant"
             };
 
-            let (etype, task_id, confidence, evidence_strength, suggested_text) = if let (
-                Some(t),
-                Some(tid),
-            ) =
-                (mock_event_type.as_deref(), mock_task_id.as_deref())
-            {
-                (
-                    parse_event_type(t)?,
-                    tid.to_string(),
-                    mock_confidence.unwrap_or(1.0),
-                    None,
-                    None,
-                )
-            } else {
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                if events_path.exists() {
-                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                }
-                let mut recent = recent_task_contexts(&conn, 5)?;
-                if recent.is_empty() {
-                    // No open tasks. v0.5.0 Phase A: auto-open a new
-                    // task from the user's prompt so subsequent
-                    // events have somewhere to land. Without this
-                    // every fresh session was a black hole — events
-                    // dropped silently because there was nothing to
-                    // classify against. Opt-out via
-                    // TJ_AUTO_OPEN_TASKS=0; only fires for
-                    // UserPromptSubmit (assistant tool calls
-                    // shouldn't conjure tasks).
-                    let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
-                        .ok()
-                        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-                        .unwrap_or(false);
-                    if auto_open_disabled || !kind.contains("UserPrompt") {
-                        return Ok(());
+            let (etype, task_id, confidence, evidence_strength, suggested_text) =
+                if let (Some(t), Some(tid)) = (mock_event_type.as_deref(), mock_task_id.as_deref())
+                {
+                    (
+                        parse_event_type(t)?,
+                        tid.to_string(),
+                        mock_confidence.unwrap_or(1.0),
+                        None,
+                        None,
+                    )
+                } else {
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    if events_path.exists() {
+                        tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
                     }
-                    let Some(new_task) = auto_open_task_from_prompt(
-                        &events_path,
-                        &project_hash,
-                        &conn,
-                        &text,
-                        live_session_id.as_deref(),
-                    )?
-                    else {
-                        // Prompt was only machine noise — nothing worth a task.
+                    let mut recent = recent_task_contexts(&conn, 5)?;
+                    if recent.is_empty() {
+                        // No open tasks. v0.5.0 Phase A: auto-open a new
+                        // task from the user's prompt so subsequent
+                        // events have somewhere to land. Without this
+                        // every fresh session was a black hole — events
+                        // dropped silently because there was nothing to
+                        // classify against. Opt-out via
+                        // TJ_AUTO_OPEN_TASKS=0; only fires for
+                        // UserPromptSubmit (assistant tool calls
+                        // shouldn't conjure tasks).
+                        let auto_open_disabled = std::env::var("TJ_AUTO_OPEN_TASKS")
+                            .ok()
+                            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                            .unwrap_or(false);
+                        if auto_open_disabled || !kind.contains("UserPrompt") {
+                            return Ok(());
+                        }
+                        let Some(new_task) = auto_open_task_from_prompt(
+                            &events_path,
+                            &project_hash,
+                            &conn,
+                            &text,
+                            live_session_id.as_deref(),
+                        )?
+                        else {
+                            // Prompt was only machine noise — nothing worth a task.
+                            return Ok(());
+                        };
+                        recent.push(new_task);
+                    }
+
+                    let classifier = build_classifier(&backend)?;
+                    let input = tj_core::classifier::ClassifyInput {
+                        text: text.clone(),
+                        author_hint: author_hint.into(),
+                        recent_tasks: recent,
+                        tool_output: kind == "PostToolUse",
+                    };
+                    let out = match classifier.classify(&input) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &e.to_string(),
+                            )?;
+                            return Ok(());
+                        }
+                    };
+
+                    let Some(tid) = out.task_id_guess else {
                         return Ok(());
                     };
-                    recent.push(new_task);
-                }
 
-                use tj_core::classifier::Classifier;
-                let classifier: Box<dyn Classifier> = match backend.as_str() {
-                    // v0.8.0: hybrid is the new default. Heuristic
-                    // pattern-matching first (free), Anthropic API
-                    // fallback when uncertain (requires ANTHROPIC_API_KEY).
-                    // No background spawn of `claude -p` — that subprocess
-                    // now bills tokens separately from Pro/Max.
-                    "hybrid" | "" => {
-                        Box::new(tj_core::classifier::hybrid::HybridClassifier::from_env())
+                    // Journal-integrity safeguards. The classifier sometimes
+                    // mis-attributes events to old or closed tasks (no fault
+                    // of the model — its prompt only sees recent_tasks). We
+                    // reject three patterns that produce confusing journals:
+                    //
+                    //   1. Stop-hook → Close event. The Stop hook fires at
+                    //      every Claude Code session end. Session ending
+                    //      != task done. Closes happen via explicit
+                    //      `task-journal close <id>` only.
+                    //   2. task_id_guess pointing at a non-existent task —
+                    //      route to pending so the user can decide later.
+                    //   3. task_id_guess pointing at a CLOSED task — same
+                    //      treatment; closed tasks must stay closed.
+                    use tj_core::event::EventType;
+                    if matches!(out.event_type, EventType::Close) && kind == "Stop" {
+                        return Ok(());
                     }
-                    "api" => Box::new(tj_core::classifier::http::AnthropicClassifier::from_env()?),
-                    "agent-sdk" => Box::new(
-                        tj_core::classifier::agent_sdk::ClaudeCliClassifier::from_env()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "agent-sdk backend selected but no `claude` binary on PATH — \
-                                     install Claude Code (https://claude.com/claude-code) or pick another --backend"
-                                )
-                            })?,
-                    ),
-                    "heuristic" => {
-                        // Heuristic-only: no LLM at all. Trades coverage
-                        // for absolute zero-cost / offline operation.
-                        use tj_core::classifier::heuristic::try_heuristic;
-                        use tj_core::classifier::{ClassifyInput, ClassifyOutput};
-                        struct HeuristicOnly;
-                        impl Classifier for HeuristicOnly {
-                            fn classify(
-                                &self,
-                                input: &ClassifyInput,
-                            ) -> anyhow::Result<ClassifyOutput> {
-                                try_heuristic(input).ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "heuristic uncertain (heuristic-only mode has no LLM fallback)"
-                                        )
-                                    })
-                            }
+                    match tj_core::db::task_status(&conn, &tid)? {
+                        None => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &format!("task_id_guess `{tid}` not found"),
+                            )?;
+                            return Ok(());
                         }
-                        Box::new(HeuristicOnly)
+                        Some(s) if s == "closed" => {
+                            persist_pending(
+                                &events_path,
+                                &project_hash,
+                                &kind,
+                                &text,
+                                &format!("task_id_guess `{tid}` is closed"),
+                            )?;
+                            return Ok(());
+                        }
+                        _ => {}
                     }
-                    other => anyhow::bail!(
-                        "unknown backend: {other} (expected `hybrid`, `agent-sdk`, `api`, or `heuristic`)"
-                    ),
-                };
-                let input = tj_core::classifier::ClassifyInput {
-                    text: text.clone(),
-                    author_hint: author_hint.into(),
-                    recent_tasks: recent,
-                    tool_output: kind == "PostToolUse",
-                };
-                let out = match classifier.classify(&input) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        persist_pending(&events_path, &project_hash, &kind, &text, &e.to_string())?;
-                        return Ok(());
-                    }
-                };
 
-                let Some(tid) = out.task_id_guess else {
-                    return Ok(());
+                    (
+                        out.event_type,
+                        tid,
+                        out.confidence,
+                        out.evidence_strength,
+                        Some(out.suggested_text),
+                    )
                 };
-
-                // Journal-integrity safeguards. The classifier sometimes
-                // mis-attributes events to old or closed tasks (no fault
-                // of the model — its prompt only sees recent_tasks). We
-                // reject three patterns that produce confusing journals:
-                //
-                //   1. Stop-hook → Close event. The Stop hook fires at
-                //      every Claude Code session end. Session ending
-                //      != task done. Closes happen via explicit
-                //      `task-journal close <id>` only.
-                //   2. task_id_guess pointing at a non-existent task —
-                //      route to pending so the user can decide later.
-                //   3. task_id_guess pointing at a CLOSED task — same
-                //      treatment; closed tasks must stay closed.
-                use tj_core::event::EventType;
-                if matches!(out.event_type, EventType::Close) && kind == "Stop" {
-                    return Ok(());
-                }
-                match tj_core::db::task_status(&conn, &tid)? {
-                    None => {
-                        persist_pending(
-                            &events_path,
-                            &project_hash,
-                            &kind,
-                            &text,
-                            &format!("task_id_guess `{tid}` not found"),
-                        )?;
-                        return Ok(());
-                    }
-                    Some(s) if s == "closed" => {
-                        persist_pending(
-                            &events_path,
-                            &project_hash,
-                            &kind,
-                            &text,
-                            &format!("task_id_guess `{tid}` is closed"),
-                        )?;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-
-                (
-                    out.event_type,
-                    tid,
-                    out.confidence,
-                    out.evidence_strength,
-                    Some(out.suggested_text),
-                )
-            };
 
             // Use classifier's suggested_text if available (it's more concise and specific),
             // fall back to raw hook text for mock/manual events.
@@ -4366,6 +4348,12 @@ fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usiz
         .count()
 }
 
+/// True when the Claude Code mod (`plugin/hooks/register.ts`) runs in this
+/// session: it sets `TJ_MOD_ACTIVE` for every hook it starts. Codex never does.
+fn mod_active() -> bool {
+    std::env::var("TJ_MOD_ACTIVE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Adaptive UserPromptSubmit nudge (caveman pattern, non-blocking, free): always
 /// emit the base "record as you go" reminder, and — when the session has done
 /// substantial work but logged little — escalate. All signals are cheap (a file
@@ -4374,6 +4362,10 @@ fn run_nudge() -> anyhow::Result<()> {
     // Recursion guard, same as recall-hook: never inject into our own
     // classifier child (`claude -p` / `codex exec` re-run the user's hooks).
     if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
+        return Ok(());
+    }
+    // The Claude Code mod nudges by itself (after N turns without an entry).
+    if mod_active() {
         return Ok(());
     }
 
@@ -6001,6 +5993,10 @@ fn classify_chunk(
     Ok(ChunkOutcome::Recorded)
 }
 
+/// Mock-only drain: with the mock flags, turn this project's legacy (v1)
+/// pending entries into events. Without them it does nothing — a v1 entry is
+/// a classifier failure waiting for `pending retry`, and v2 entries belong to
+/// classify-worker. An entry is removed only after its event is written.
 fn drain_pending(
     events_path: &std::path::Path,
     project_hash: &str,
@@ -6008,6 +6004,9 @@ fn drain_pending(
     mock_tid: Option<&str>,
     mock_conf: Option<f64>,
 ) -> anyhow::Result<()> {
+    let (Some(t), Some(tid)) = (mock_etype, mock_tid) else {
+        return Ok(());
+    };
     let pending_dir = events_path
         .parent()
         .unwrap()
@@ -6028,22 +6027,23 @@ fn drain_pending(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        if !text.is_empty() {
-            if let (Some(t), Some(tid)) = (mock_etype, mock_tid) {
-                let mut event = tj_core::event::Event::new(
-                    tid,
-                    parse_event_type(t)?,
-                    tj_core::event::Author::Classifier,
-                    tj_core::event::Source::Hook,
-                    text,
-                );
-                event.confidence = mock_conf;
-                event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
-                let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
-                writer.append(&event)?;
-                writer.flush_durable()?;
-            }
+        if text.is_empty() {
+            continue;
         }
+
+        let mut event = tj_core::event::Event::new(
+            tid,
+            parse_event_type(t)?,
+            tj_core::event::Author::Classifier,
+            tj_core::event::Source::Hook,
+            text,
+        );
+        event.confidence = mock_conf;
+        event.status = tj_core::classifier::decide_status(mock_conf.unwrap_or(1.0));
+        let mut writer = tj_core::storage::JsonlWriter::open(events_path)?;
+        writer.append(&event)?;
+        writer.flush_durable()?;
+
         std::fs::remove_file(&path)?;
     }
     Ok(())
@@ -6077,6 +6077,7 @@ fn push_recall_envelope(
     payload: &serde_json::Value,
     events_path: &std::path::Path,
     project_hash: &str,
+    session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     // MCP-only gate: Claude Code prefixes MCP tools `mcp__<server>__<tool>`.
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str())?;
@@ -6107,6 +6108,7 @@ fn push_recall_envelope(
     let hits =
         tj_core::recall::relevant_recall(&conn, &query_text, tj_core::recall::DEFAULT_MAX_HITS)
             .ok()?;
+    let hits = fresh_recall_hits(hits, session_id, events_path, project_hash);
     if hits.is_empty() {
         return None;
     }
@@ -6117,6 +6119,83 @@ fn push_recall_envelope(
             "updatedMCPToolOutput": updated,
         }
     }))
+}
+
+/// Most `<session> <event_id>` lines the shown-recall log keeps.
+const RECALL_SHOWN_CAP: usize = 2000;
+
+/// The recall hits still worth pushing to `session_id`: each one at most once
+/// per session (remembered in `<state_dir>/<project>.recall-shown`, newest
+/// [`RECALL_SHOWN_CAP`] lines), and never an event the session wrote on its
+/// current task — the agent just wrote it. Without a session id every hit
+/// passes, as before. Best-effort: an unreadable log never hides a hit.
+fn fresh_recall_hits(
+    hits: Vec<tj_core::recall::RecallHit>,
+    session_id: Option<&str>,
+    events_path: &std::path::Path,
+    project_hash: &str,
+) -> Vec<tj_core::recall::RecallHit> {
+    let Some(sid) = session_id else {
+        return hits;
+    };
+    if hits.is_empty() {
+        return hits;
+    }
+    let Ok(log) =
+        tj_core::paths::state_dir().map(|d| d.join(format!("{project_hash}.recall-shown")))
+    else {
+        return hits;
+    };
+
+    let own = session_task_event_ids(events_path, sid);
+    let body = std::fs::read_to_string(&log).unwrap_or_default();
+    let shown: std::collections::HashSet<&str> = body.lines().collect();
+    let fresh: Vec<_> = hits
+        .into_iter()
+        .filter(|h| !own.contains(&h.event_id))
+        .filter(|h| !shown.contains(format!("{sid} {}", h.event_id).as_str()))
+        .collect();
+    if fresh.is_empty() {
+        return fresh;
+    }
+
+    // ponytail: read-modify-write without a lock; two parallel hooks can
+    // re-show a hit once. Add a file lock if that ever shows up in practice.
+    let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+    lines.extend(fresh.iter().map(|h| format!("{sid} {}", h.event_id)));
+    let keep = &lines[lines.len().saturating_sub(RECALL_SHOWN_CAP)..];
+    let _ = std::fs::write(&log, keep.join("\n") + "\n");
+
+    fresh
+}
+
+/// Ids of the events session `sid` wrote on its current task — the task of
+/// its latest event — read from the journal by `meta.session_id`.
+fn session_task_event_ids(
+    events_path: &std::path::Path,
+    sid: &str,
+) -> std::collections::HashSet<String> {
+    let body = std::fs::read_to_string(events_path).unwrap_or_default();
+    let mine: Vec<(String, String)> = body
+        .lines()
+        .filter(|l| l.contains(sid))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["meta"]["session_id"].as_str() == Some(sid))
+        .filter_map(|e| {
+            Some((
+                e["event_id"].as_str()?.into(),
+                e["task_id"].as_str()?.into(),
+            ))
+        })
+        .collect();
+
+    let Some((_, current)) = mine.last() else {
+        return Default::default();
+    };
+    mine.iter()
+        .filter(|(_, task)| task == current)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// One ⚠ line per recall hit (mirrors the close-gate / SessionStart convention).

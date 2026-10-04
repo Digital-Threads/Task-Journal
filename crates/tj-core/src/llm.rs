@@ -243,7 +243,7 @@ impl LlmBackend for CodexCliBackend {
                 .context("codex stdin was not captured")?
                 .write_all(prompt.as_bytes())
                 .context("failed to write prompt to codex stdin")?;
-            crate::classifier::agent_sdk::wait_with_timeout(child, codex_timeout())
+            crate::classifier::agent_sdk::wait_with_timeout(child, codex_timeout(), "codex exec")
         };
         let output = run();
         let answer = std::fs::read_to_string(&out_path).unwrap_or_default();
@@ -578,6 +578,24 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
             .collect();
         assert!(left.is_empty(), "codex temp file leaked: {left:?}");
+    }
+
+    /// The timeout error names the binary that hung, not always `claude -p`.
+    #[cfg(unix)]
+    #[test]
+    fn codex_timeout_error_names_codex() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let dir = fake_codex_dir();
+        let _path = path_with(dir.path());
+        let _timeout = EnvGuard::set("TJ_CODEX_TIMEOUT_SECS", "1");
+        let _sleep = EnvGuard::set("FAKE_CODEX_SLEEP", "5");
+
+        let err = CodexCliBackend { model: None }
+            .complete_usage("classify me", 64)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("`codex exec` timed out"), "{err}");
     }
 
     #[test]

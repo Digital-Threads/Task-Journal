@@ -1,6 +1,50 @@
-use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
+
+/// Every `Command::cargo_bin` in this file goes through this wrapper, not
+/// `assert_cmd`'s, so a test can't reach a real model or the developer's live
+/// session by accident: PATH loses every directory holding a `claude` or
+/// `codex` binary, API keys and backend overrides are cleared, and the Claude
+/// Code session / mod markers of the shell running `cargo test` are dropped.
+/// A test that needs a model installs its own fake and sets PATH itself.
+struct Command;
+
+impl Command {
+    fn cargo_bin(name: &str) -> Result<assert_cmd::Command, assert_cmd::cargo::CargoError> {
+        let mut cmd = assert_cmd::Command::cargo_bin(name)?;
+        cmd.env("PATH", path_without_llm_clis());
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "TJ_BACKEND",
+            "TJ_HYBRID_LLM_ORDER",
+            "TASK_JOURNAL_DATA_DIR",
+            "CLAUDE_CODE_SESSION_ID",
+            "TJ_IN_CLASSIFIER",
+            "TJ_MOD_ACTIVE",
+        ] {
+            cmd.env_remove(var);
+        }
+        Ok(cmd)
+    }
+}
+
+/// The test process's PATH minus any directory that holds `claude` or `codex`.
+/// Computed once: on WSL the PATH carries dozens of slow `/mnt/c` directories.
+fn path_without_llm_clis() -> &'static std::ffi::OsStr {
+    static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let keep = std::env::split_paths(&path).filter(|dir| {
+            ["claude", "codex"].iter().all(|bin| {
+                ["", ".exe", ".cmd"]
+                    .iter()
+                    .all(|ext| !dir.join(format!("{bin}{ext}")).exists())
+            })
+        });
+        std::env::join_paths(keep).unwrap()
+    })
+}
 
 #[test]
 fn pack_command_prints_markdown_for_existing_task() {
@@ -288,6 +332,23 @@ fn doctor_reports_missing_codex_and_claude_as_information_only() {
 
     let human = doctor_with_path(xdg.path(), empty_bin.path(), false);
     assert!(human.contains("codex binary"), "{human}");
+}
+
+/// The suite must never reach a real model: a test command sees no `claude`
+/// or `codex` unless the test installs its own fake on PATH.
+#[test]
+fn test_commands_see_no_real_claude_or_codex() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["claude_in_path"], false, "{v}");
+    assert_eq!(v["codex_in_path"], false, "{v}");
 }
 
 #[cfg(unix)]
@@ -2056,6 +2117,181 @@ fn ingest_hook_drains_pending_queue_via_mock() {
         0,
         "pending queue must be empty after successful ingest"
     );
+}
+
+/// A legacy entry is a classifier failure waiting for `pending retry`; a
+/// live hook must not throw it away.
+#[test]
+fn ingest_hook_keeps_legacy_pending_entries_for_pending_retry() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "01failed", "We decided to adopt PKCE flow.", 1);
+
+    for kind in ["UserPromptSubmit", "PostToolUse"] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+            .current_dir(proj.path())
+            .args(["ingest-hook", "--kind", kind, "--text", "next chunk"])
+            .assert()
+            .success();
+    }
+
+    let entry = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("01failed.json");
+    assert!(
+        entry.exists(),
+        "the failed chunk must wait for pending retry"
+    );
+}
+
+/// The mock drain only removes an entry it turned into an event.
+#[test]
+fn ingest_hook_mock_drain_keeps_entries_it_cannot_record() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    write_pending(xdg.path(), "01empty", "", 0);
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "ingest-hook",
+            "--kind",
+            "Stop",
+            "--text",
+            "Live chunk",
+            "--mock-event-type",
+            "decision",
+            "--mock-task-id",
+            "tj-mock",
+        ])
+        .assert()
+        .success();
+
+    let entry = xdg
+        .path()
+        .join("task-journal")
+        .join("pending")
+        .join("01empty.json");
+    assert!(
+        entry.exists(),
+        "an entry that wrote no event must stay queued"
+    );
+}
+
+/// Run one `ingest-hook` payload of `kind` with `TJ_MOD_ACTIVE` set to
+/// `mod_value` (None = unset), in a fresh project with an open task and a
+/// transcript. True when the hook left any trace: stdout, a pending entry,
+/// or a new journal line.
+fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Mod host"])
+        .assert()
+        .success();
+    let transcript = proj.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","uuid":"u1","timestamp":"2099-01-01T00:00:00.000Z","sessionId":"s1","message":{"content":"the refund flow needs idempotency keys"}}"#,
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "hook_event_name": kind,
+        "session_id": "s1",
+        "transcript_path": transcript.to_str().unwrap(),
+        "reason": "clear",
+        "prompt": "We decided to adopt the PKCE flow.",
+        "tool_name": "Bash",
+        "tool_input": { "command": "cargo test" },
+        "tool_response": { "output": "ok" },
+        "from_model": "claude-opus",
+        "to_model": "claude-sonnet",
+    });
+    let journal = xdg.path().join("task-journal").join("events");
+    let journal_len = || -> u64 {
+        std::fs::read_dir(&journal)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let before = journal_len();
+
+    let mut cmd = Command::cargo_bin("task-journal").unwrap();
+    cmd.env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .current_dir(proj.path());
+    if let Some(v) = mod_value {
+        cmd.env("TJ_MOD_ACTIVE", v);
+    }
+    let out = cmd
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let pending = std::fs::read_dir(xdg.path().join("task-journal").join("pending"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    !out.is_empty() || pending > 0 || journal_len() != before
+}
+
+/// The Claude Code mod captures in-process and sets TJ_MOD_ACTIVE for the
+/// hooks it starts; the classic capture must then stand down.
+#[test]
+fn mod_active_silences_the_classic_capture_hooks() {
+    for kind in [
+        "UserPromptSubmit",
+        "PostToolUse",
+        "Stop",
+        "PreCompact",
+        "SessionEnd",
+    ] {
+        assert!(!hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
+        assert!(hook_leaves_a_trace(kind, Some("0")), "{kind}, mod \"0\"");
+        assert!(hook_leaves_a_trace(kind, None), "{kind}, mod unset");
+    }
+}
+
+/// Resume packs and the model-switch constraint are not the mod's job.
+#[test]
+fn mod_active_keeps_session_start_and_model_switch() {
+    for kind in ["SessionStart", "PostModelSwitch"] {
+        assert!(hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
+    }
+}
+
+#[test]
+fn mod_active_silences_the_nudge() {
+    for (mod_value, silent) in [(Some("1"), true), (Some("0"), false), (None, false)] {
+        let xdg = assert_fs::TempDir::new().unwrap();
+        let mut cmd = Command::cargo_bin("task-journal").unwrap();
+        cmd.env("XDG_DATA_HOME", xdg.path());
+        if let Some(v) = mod_value {
+            cmd.env("TJ_MOD_ACTIVE", v);
+        }
+        let out = cmd
+            .arg("nudge")
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(out.is_empty(), silent, "TJ_MOD_ACTIVE={mod_value:?}");
+    }
 }
 
 #[test]
@@ -5504,6 +5740,109 @@ fn post_tool_use_emits_recall_additional_context() {
             .and_then(|s| s.as_str()),
         Some("PostToolUse"),
     );
+}
+
+/// One real (non-mock) PostToolUse hook run; `session: None` sends no
+/// session id at all. Returns stdout.
+fn post_tool_use(dir: &std::path::Path, session: Option<&str>, tool: &str, input: &str) -> String {
+    let mut payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": tool,
+        "tool_input": { "command": input },
+        "tool_response": { "output": "" }
+    });
+    if let Some(sid) = session {
+        payload["session_id"] = sid.into();
+    }
+
+    let out = Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir)
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+/// After every tool call the same hits used to come back, flooding the
+/// agent's context. A session sees each hit once, on either recall path.
+#[test]
+fn push_recall_shows_each_hit_once_per_session() {
+    let (dir, _task_id) = seed_axum_rejection();
+    let axum = "let's switch the server to axum";
+
+    let first = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
+    assert!(first.contains("⚠ recall"), "{first}");
+
+    let again = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
+    assert!(!again.contains("recall"), "{again}");
+    let via_mcp = post_tool_use(dir.path(), Some("s-a"), "mcp__x__do", axum);
+    assert!(!via_mcp.contains("recall"), "{via_mcp}");
+
+    let other = post_tool_use(dir.path(), Some("s-b"), "Bash", axum);
+    assert!(other.contains("⚠ recall"), "{other}");
+}
+
+#[test]
+fn push_recall_without_a_session_id_repeats_as_before() {
+    let (dir, _task_id) = seed_axum_rejection();
+    let axum = "let's switch the server to axum";
+
+    for _ in 0..2 {
+        let out = post_tool_use(dir.path(), None, "Bash", axum);
+        assert!(out.contains("⚠ recall"), "{out}");
+    }
+}
+
+/// The agent just wrote that rejection on its own task in this session —
+/// echoing it back is noise. Another session still gets it.
+#[test]
+fn push_recall_skips_what_this_session_wrote_on_its_task() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let task_id = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Own session host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let payload = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s-own",
+        "prompt": "Tried switching the server to axum but it broke rmcp stdio."
+    });
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "ingest-hook",
+            "--mock-event-type",
+            "rejection",
+            "--mock-task-id",
+            &task_id,
+        ])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success();
+    let axum = "let's switch the server to axum";
+
+    let own = post_tool_use(dir.path(), Some("s-own"), "Bash", axum);
+    assert!(!own.contains("recall"), "{own}");
+
+    let other = post_tool_use(dir.path(), Some("s-other"), "Bash", axum);
+    assert!(other.contains("⚠ recall"), "{other}");
 }
 
 #[test]
