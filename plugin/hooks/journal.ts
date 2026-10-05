@@ -90,11 +90,10 @@ export function parseState(stdout: string): JournalState | null {
   }
 }
 
-export function statusText(state: JournalState): string {
+// The band above the prompt: the session's task, or nothing while it has none.
+export function statusText(state: JournalState): string | null {
   const a = state.active
-  if (a === null) {
-    return state.open_tasks > 0 ? `📓 no task in this session · ${state.open_tasks} open` : '📓 no task'
-  }
+  if (a === null) return null
 
   const n = (k: string) => a.counts[k] ?? 0
   const where = a.modules.length > 0 ? ` [${a.modules.join(', ')}]` : ''

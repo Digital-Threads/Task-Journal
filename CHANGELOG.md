@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.2] - 2026-10-05
+
+### Changed
+- The mod shows the session's task in a band above the prompt instead of the
+  status line under it. Claude Code draws a plugin's status line as one of its
+  pinned warnings, yellow with a `⚠`, so `⚠ task-journal: 📓 no task` read as an
+  error. The band shows only while the session has a task; without one the mod
+  draws nothing. It sits on top of another plugin's band rather than replacing it.
+
 ## [0.31.1] - 2026-10-04
 
 ### Fixed

@@ -5,7 +5,7 @@
 //   cannot lose it, and asks the compaction summary to keep its id;
 // - stamps the session id on the journal's MCP calls, so each session has
 //   its own active task;
-// - shows the task in the status line and a toast on every entry;
+// - shows the task in a band above the prompt and a toast on every entry;
 // - reminds the agent to log only after N turns without an entry;
 // - brings up a project-chronicle gap that opened during the session (the
 //   session start already showed the one it began with);
@@ -121,6 +121,7 @@ async function refresh($: EngineInterface): Promise<void> {
   if (state === null) {
     warnOnce($, result)
     mod.state = null
+    $.ui.invalidate('ui.render')
     if (result.kind === 'failed') {
       mod.retryAt = (await $.clock.now()) + RETRY_AFTER_MS
     } else {
@@ -137,7 +138,7 @@ async function refresh($: EngineInterface): Promise<void> {
   mod.session = session
   mod.state = state
   mod.pinned = state.active?.task_id ?? null
-  $.ui.status(statusText(state))
+  $.ui.invalidate('ui.render')
 }
 
 // The session id can change under the mod: a /clear starts a new one with
@@ -233,6 +234,25 @@ export const register: Register = (on, options) => {
     mod.chronicleSeen = new Set()
 
     return next(e)
+  })
+
+  // A band above the prompt rather than `$.ui.status`: the engine draws that
+  // line as one of its pinned warnings, yellow with a ⚠, which reads as
+  // something being wrong. The band holds one tree for every plugin, so the
+  // line goes on top of what the hooks beneath draw (another mod's band).
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const text = mod.isOff || mod.state === null ? null : statusText(mod.state)
+    if (text === null || e.props.hasSurvey) return next(e)
+
+    const { Box, Text } = $.ui.resolve(e)
+    const below = await next(e)
+
+    return (
+      <Box flexDirection="column">
+        <Text dimColor>{text}</Text>
+        {below}
+      </Box>
+    )
   })
 
   on('prompt.compose', async ($, e, next) => {
