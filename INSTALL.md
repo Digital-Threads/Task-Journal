@@ -5,7 +5,7 @@ server) plus thin integrations for each agent:
 
 | Client | What you install | What it gets |
 |--------|------------------|--------------|
-| Claude Code 2.1.287+ | the plugin (MCP server + skill + mod) | journal tools, the session's task kept in the system prompt, catch-up before compaction, status line |
+| Claude Code 2.1.287+ | the plugin (MCP server + skill + mod) | journal tools, the session's task kept in the system prompt, catch-up before compaction, the task above the prompt |
 | Claude Code, older | the plugin, optionally `install-hooks` | journal tools, resume packs on session start |
 | Codex | `codex mcp add` + `install-hooks --client codex` | journal tools, resume packs, optional auto-capture |
 | Any other MCP client | the MCP server | the seven journal tools |
@@ -52,7 +52,8 @@ The mod runs inside Claude Code and needs no setup. It:
   compaction can't lose it, and asks the compaction summary to keep its id;
 - gives every session its own active task, even with several sessions open in
   one project;
-- shows the task in the status line and a short toast when an entry is recorded;
+- shows the session's task in a band above the prompt (nothing while there is
+  none) and a short toast when an entry is recorded;
 - reminds the agent to log only after several prompts without an entry, instead
   of on every prompt;
 - right before a compaction, asks the model which decisions, rejections and

@@ -58,8 +58,11 @@ describe('texts', () => {
 
   test('status line names the task and its counts', () => {
     expect(statusText(s)).toBe('📓 tj-abc · 3 decisions · 1 rejected · 0 evidence')
-    expect(statusText(none)).toBe('📓 no task in this session · 3 open')
-    expect(statusText({ active: null, open_tasks: 0, archive: [] })).toBe('📓 no task')
+  })
+
+  test('no task in the session, no status line', () => {
+    expect(statusText(none)).toBe(null)
+    expect(statusText({ active: null, open_tasks: 0, archive: [] })).toBe(null)
   })
 
   test('the prompt section holds nothing that changes per entry', () => {
