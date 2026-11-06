@@ -9,11 +9,17 @@ const state = (active: unknown) => JSON.stringify({ schema: 'tj-state/1', open_t
 const TASK = { task_id: 'tj-abc', title: 'Fix refresh', counts: { decision: 2 }, modules: ['auth'] }
 
 // The engine beneath the mod: `task-journal state` answers `stdout`, and
-// another plugin's band sits under the mod's line.
-function session(on: On, stdout: string) {
+// another plugin's band sits under the mod's line. `env` collects what the
+// mod sets for the hooks.
+function session(on: On, stdout: string, env: Record<string, string | undefined> = {}) {
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'session-1' }))
   on('process.run', () => ({ value: ran(stdout) }))
+  on('env.set', (_$, e) => {
+    env[e.name] = e.value
+
+    return { value: undefined }
+  })
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Text({ children: 'other band' }))
   mock.env(on, {})
 }
@@ -47,5 +53,16 @@ describe('band above the prompt', () => {
     await $.session.start(START)
 
     expect(await band($)).toBe('other band')
+  })
+})
+
+describe('hooks beside the mod', () => {
+  test('tells the hooks the plugin ships its own, also before the journal answers', async ($, on) => {
+    const set: Record<string, string | undefined> = {}
+    session(on, 'error: journal unreadable', set)
+    await $.session.start(START)
+
+    expect(set.TJ_PLUGIN_HOOKS).toBe('1')
+    expect(set.TJ_MOD_ACTIVE).toBe(undefined)
   })
 })

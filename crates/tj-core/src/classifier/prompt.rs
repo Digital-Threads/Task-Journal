@@ -62,7 +62,7 @@ pub fn build(input: &ClassifyInput) -> String {
          - finding: A VERIFIED discovery backed by code reading or logs (\"found that function X does Y at line Z\", \"the config sets X=Y\").\n\
          - evidence: Test results, benchmarks, QA outcomes, reproduction steps, logs proving something works/fails. Set evidence_strength: weak (anecdotal), medium (single test), strong (comprehensive/e2e).\n\
          - decision: A chosen approach or architecture choice (\"will use strategy X because Y\"). The team commits to this.\n\
-         - rejection: An approach explicitly REJECTED (\"tried X but it won't work because Y\"). Important for avoiding repeated work.\n\
+         - rejection: An approach explicitly ruled out (\"tried X but it won't work because Y\", \"decided against X\"). Not a bug report, a failing command, a log line, a tool call or a summary. Important for avoiding repeated work.\n\
          - constraint: An external limitation discovered (\"API rate limit is 100/min\", \"must support PHP 7.4\").\n\
          - correction: The chunk CORRECTS a previous finding/hypothesis that turned out wrong. Use when the text says \"actually\", \"correction\", \"was wrong about\".\n\
          - close: Task is done — fix shipped, PR merged, verified. Use when text indicates completion.\n\

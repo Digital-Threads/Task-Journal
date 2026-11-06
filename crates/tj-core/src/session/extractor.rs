@@ -233,6 +233,24 @@ fn classify_text_heuristic(task_id: &str, text: &str, timestamp: &str) -> Option
         return None;
     }
 
+    // A rejection first, so "не будем использовать X" is not read as the
+    // decision "будем использовать"; only an approach explicitly ruled out,
+    // the same rule the classifier uses.
+    if crate::classifier::is_explicit_rejection(text) {
+        let mut ev = Event::new(
+            task_id,
+            EventType::Rejection,
+            Author::Agent,
+            Source::Cli,
+            truncate(text, 300),
+        );
+        ev.timestamp = timestamp.to_string();
+        ev.confidence = Some(0.6);
+        ev.status = EventStatus::Suggested;
+        ev.meta = serde_json::json!({"backfill": true, "heuristic": "rejection_keyword"});
+        return Some(ev);
+    }
+
     // Decision patterns.
     let decision_patterns = [
         "decided to",
@@ -257,35 +275,6 @@ fn classify_text_heuristic(task_id: &str, text: &str, timestamp: &str) -> Option
             ev.confidence = Some(0.7);
             ev.status = EventStatus::Suggested;
             ev.meta = serde_json::json!({"backfill": true, "heuristic": "decision_keyword"});
-            return Some(ev);
-        }
-    }
-
-    // Rejection patterns.
-    let rejection_patterns = [
-        "won't work",
-        "doesn't work",
-        "can't use",
-        "не работает",
-        "не подходит",
-        "отказались",
-        "tried but",
-        "rejected",
-        "abandoned",
-    ];
-    for pattern in &rejection_patterns {
-        if lower.contains(pattern) {
-            let mut ev = Event::new(
-                task_id,
-                EventType::Rejection,
-                Author::Agent,
-                Source::Cli,
-                truncate(text, 300),
-            );
-            ev.timestamp = timestamp.to_string();
-            ev.confidence = Some(0.6);
-            ev.status = EventStatus::Suggested;
-            ev.meta = serde_json::json!({"backfill": true, "heuristic": "rejection_keyword"});
             return Some(ev);
         }
     }
@@ -441,6 +430,16 @@ mod tests {
             "2026-01-01T00:00:00Z",
         );
         assert!(ev.is_some());
+        assert_eq!(ev.unwrap().event_type, EventType::Rejection);
+    }
+
+    #[test]
+    fn test_not_going_to_use_is_a_rejection_not_a_decision() {
+        let ev = classify_text_heuristic(
+            "tj-test",
+            "Мы не будем использовать Redis для очереди: лишний сервис ради пяти процентов.",
+            "2026-01-01T00:00:00Z",
+        );
         assert_eq!(ev.unwrap().event_type, EventType::Rejection);
     }
 

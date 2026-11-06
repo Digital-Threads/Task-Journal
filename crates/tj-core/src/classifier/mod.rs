@@ -59,6 +59,98 @@ pub fn decide_status(confidence: f64) -> EventStatus {
     }
 }
 
+/// The longest a rejection can be: a sentence or two on what was ruled out
+/// and why. A whole answer that happens to say "rejected" is not one.
+pub const REJECTION_MAX_CHARS: usize = 600;
+
+/// Whether `text` has the shape of a rejection: a sentence or two, not
+/// machine text, not a whole answer (paragraphs, headings, tables, code
+/// fences) and not a question. It says nothing about the words: a model or a
+/// person phrases a ruled-out approach any way they like, so this is what
+/// filters and cleans what the classifier filed as a rejection — erring on
+/// keeping it.
+pub fn reads_like_a_rejection(text: &str) -> bool {
+    let t = text.trim();
+    let is_structured = t.contains("\n\n")
+        || t.lines()
+            .map(str::trim_start)
+            .any(|l| l.starts_with('#') || l.starts_with("```") || l.starts_with('|'));
+
+    !t.is_empty()
+        && t.chars().count() <= REJECTION_MAX_CHARS
+        && crate::noise::machine_text(t).is_none()
+        && !is_structured
+        && !t.ends_with('?')
+}
+
+/// Phrases that rule an approach out on their own.
+const REJECTION_CUES: &[&str] = &[
+    "decided against",
+    "won't work because",
+    "ruled out",
+    "rule it out",
+    "won't use",
+    "will not use",
+    "not going to use",
+    "not going with",
+    "gave up on",
+    "giving up on",
+    "abandoned the",
+    "abandon the",
+    "rejected the approach",
+    "rejected the idea",
+    "rejected this approach",
+    "rejected that approach",
+    "rejected:",
+    "was rejected because",
+    "were rejected because",
+    "отказались от ",
+    "отказался от ",
+    "отказываемся от ",
+    "отказ от ",
+    "отклонил",
+    "отклонён",
+    "отклонен ",
+    "отклонена",
+    "отклонено",
+    "отклоняем",
+    "отвергли",
+    "отвергнут",
+    "не будем использовать",
+    "не стали использовать",
+];
+
+/// An attempt and its failure together: "tried X, it didn't work".
+const TRIED: &[&str] = &["tried", "attempted", "пробовал", "попробовал"];
+const FAILED: &[&str] = &[
+    "instead",
+    "doesn't work",
+    "didn't work",
+    "won't work",
+    "but it failed",
+    "but failed",
+    "вместо",
+    "не работает",
+    "не сработал",
+    "не подходит",
+];
+
+/// True when raw text rules an approach out in so many words: the shape of a
+/// rejection plus an explicit cue. What a keyword heuristic may file as a
+/// rejection on its own — a bug report ("X doesn't work"), a log line
+/// ("rejected 2 files", "the server rejected the request") or a test report
+/// ("tried it, 2 tests failed") is not.
+pub fn is_explicit_rejection(text: &str) -> bool {
+    if !reads_like_a_rejection(text) {
+        return false;
+    }
+
+    let lower = text.to_lowercase();
+    let has = |cues: &[&str]| cues.iter().any(|c| lower.contains(c));
+
+    has(REJECTION_CUES) || (has(TRIED) && has(FAILED))
+}
+
 /// Parse a model's raw text reply into a strict-JSON `ClassifyOutput`,
 /// tolerating ```json code-fence wrapping. Shared by the HTTP and agent-sdk
 /// backends so the two never diverge on how they read the verdict.
@@ -85,6 +177,32 @@ pub mod telemetry;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rejection the classifier phrased any way it liked keeps its place;
+    /// a whole answer, a question or machine text does not.
+    #[test]
+    fn a_rejection_is_a_short_statement_whatever_its_words() {
+        for text in [
+            "Windows Terminal split feature rejected: probing wt.exe closed the whole window; use tmux.",
+            "Reverted 83f53ebd: the approach conflated the two caches.",
+            "Local curl testing was insufficient to catch the null payload.",
+        ] {
+            assert!(reads_like_a_rejection(text), "{text}");
+        }
+
+        let long = "One more sentence about the release. ".repeat(20);
+        for text in [
+            "## Release notes\n\nThe PR was rejected once by CI.",
+            "First paragraph.\n\nSecond paragraph, rejected.",
+            "Should we drop the cache?",
+            r#"Bash: {"command":"git push"}"#,
+            "<task-notification> <task-id>x</task-id>",
+            long.as_str(),
+            "  ",
+        ] {
+            assert!(!reads_like_a_rejection(text), "{text}");
+        }
+    }
 
     /// The HTTP backend must honour `TJ_CLASSIFIER_MODEL`. Wraps the
     /// read-set-restore steps in one test to avoid env-var races with

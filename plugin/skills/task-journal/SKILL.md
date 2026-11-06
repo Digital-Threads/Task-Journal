@@ -124,9 +124,9 @@ apply, and its tasks join their history.
 - **Done:** `task_close(..., module_notes=[{"module": "stars", "text": "ranking by Wilson score"}])`
   — one line per module on what changed. If the module works differently now, rewrite its
   `state` with `module_save(module_id, state=...)`.
-- **Gaps:** a line starting with `📚 Chronicle:` (session start, `task_create`, `module_list`)
-  names what the chronicle is missing — no map, tasks without a module, a module whose
-  state lags behind its tasks. Close it once the current work is done.
+- **Gaps:** `module_list` (its `📚 Chronicle: …` line and `gaps`) names what the chronicle is
+  missing — no map, tasks without a module, a module whose state lags behind its tasks.
+  Check it when the user asks about the map, or once the current work is done.
 
 ### Mapping a project (no map yet, or `/task-journal:map`)
 

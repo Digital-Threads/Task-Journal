@@ -64,6 +64,44 @@ impl JsonlWriter {
         Ok(())
     }
 
+    /// Appends `event` unless `seen` finds it in the log's last 16 KiB, read
+    /// under the same exclusive lock as the write — two hooks firing for one
+    /// event cannot both miss each other. Returns whether it appended.
+    pub fn append_unless(
+        &mut self,
+        event: &Event,
+        seen: impl FnOnce(&str) -> bool,
+    ) -> anyhow::Result<bool> {
+        const TAIL: u64 = 16 * 1024;
+
+        let mut line = serde_json::to_string(event).context("serialize event")?;
+        line.push('\n');
+        let mut guard = self.lock.write().context("acquire exclusive file lock")?;
+
+        let len = guard.seek(SeekFrom::End(0)).context("seek the log's end")?;
+        guard
+            .seek(SeekFrom::Start(len.saturating_sub(TAIL)))
+            .context("seek the log's tail")?;
+        let mut tail = Vec::new();
+        guard
+            .read_to_end(&mut tail)
+            .context("read the log's tail")?;
+        if seen(&String::from_utf8_lossy(&tail)) {
+            return Ok(false);
+        }
+
+        if ends_without_newline(&mut guard).context("check the log's last byte")? {
+            guard
+                .write_all(b"\n")
+                .context("terminate a torn last line")?;
+        }
+        guard
+            .write_all(line.as_bytes())
+            .context("write event line")?;
+
+        Ok(true)
+    }
+
     /// Force the file's bytes through to durable storage. Holds the
     /// exclusive lock so no concurrent writer can sneak an append
     /// between us and the fsync.

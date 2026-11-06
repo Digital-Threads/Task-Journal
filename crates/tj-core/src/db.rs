@@ -457,6 +457,9 @@ pub fn upsert_task_from_event(
                 rusqlite::params![event.task_id, title, event.timestamp],
             )?;
         }
+        // A cleanup touches old tasks; it must not lift them to the top of
+        // every "newest first" list.
+        _ if event.meta.get("kind").and_then(|v| v.as_str()) == Some(NOISE_CLEANUP) => {}
         _ => {
             conn.execute(
                 "UPDATE tasks SET last_event_at=?2 WHERE task_id=?1",
@@ -1150,12 +1153,17 @@ pub(crate) fn fts_rowid(event_id: &str) -> i64 {
     (hash >> 1) as i64
 }
 
+/// `meta.kind` of the correction `cleanup-noise` writes over machine text the
+/// classifier once filed as reasoning.
+pub const NOISE_CLEANUP: &str = "noise_cleanup";
+
 /// Machine-written bookkeeping, not reasoning: the PreCompact boundary marker
-/// (a `decision`) and the model-switch note (a `constraint`). Known by
-/// `meta.kind`; events written before the writers set it, by text prefix.
+/// (a `decision`), the model-switch note (a `constraint`) and the
+/// `cleanup-noise` correction. Known by `meta.kind`; events written before
+/// the writers set it, by text prefix.
 pub fn is_bookkeeping(event: &Event) -> bool {
     match event.meta.get("kind").and_then(|v| v.as_str()) {
-        Some(kind) => matches!(kind, "compaction_marker" | "model_switch"),
+        Some(kind) => matches!(kind, "compaction_marker" | "model_switch" | NOISE_CLEANUP),
         None => match event.event_type {
             EventType::Decision => event.text.starts_with("Conversation compacted at"),
             EventType::Constraint => event

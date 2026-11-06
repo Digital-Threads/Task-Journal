@@ -1,9 +1,16 @@
-//! Read-only proactive-recall engine. Given the current tool context,
-//! return the most relevant prior confirmed `rejection`/`decision` events
-//! so the agent doesn't re-walk a ruled-out path. Shared by the PostToolUse
-//! push path (claude-memory-60m) and the MCP-output push path (7km).
+//! Read-only proactive recall. After a tool call, find a prior confirmed
+//! `rejection`/`decision` of the session's own task — or of a task in the
+//! same module — that the call clearly touches, so the agent doesn't re-walk
+//! a ruled-out path. Shared by the PostToolUse push path (claude-memory-60m)
+//! and the MCP-output push path (7km).
+//!
+//! It stays quiet unless the match is strong: recall that fires on one
+//! shared word, across unrelated tasks, or on machine text the classifier
+//! once filed as reasoning, buried the agent in noise (dozens of hits per
+//! session, almost none about the work at hand).
 
 use crate::event::EventType;
+use std::collections::HashSet;
 
 /// One recalled high-signal event that matched the current context.
 #[derive(Debug, Clone, PartialEq)]
@@ -15,10 +22,11 @@ pub struct RecallHit {
     pub score: f64,
 }
 
-/// Max hits surfaced per call. Autonomously-chosen default, flagged for review.
-pub const DEFAULT_MAX_HITS: usize = 2;
-/// Min blended score to surface. Autonomously-chosen default, flagged for review.
-pub const RELEVANCE_THRESHOLD: f64 = 1.0;
+/// Max hits surfaced per call.
+pub const DEFAULT_MAX_HITS: usize = 1;
+/// Shared meaningful words that make a match strong when no file, issue or
+/// commit is shared.
+pub const MIN_SHARED_WORDS: usize = 3;
 
 /// Common, low-signal words dropped from the OR-token query. Without this,
 /// a shared stopword like "the" between an unrelated tool call and a prior
@@ -32,7 +40,7 @@ const STOPWORDS: &[&str] = &[
 ];
 
 /// The meaningful words of `text`: alphanumeric runs of 3+ chars, lowercased,
-/// stopwords dropped. Shared by recall's FTS query and module suggestions.
+/// stopwords dropped. Shared by recall and module suggestions.
 pub(crate) fn keywords(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() >= 3)
@@ -41,149 +49,95 @@ pub(crate) fn keywords(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Build an FTS5 OR-of-tokens query from a free-text context string. A raw
-/// multi-word context like "let's switch to axum" parses as an implicit AND
-/// under FTS5, so it would never match a short rejection that only shares one
-/// token. We instead OR the individual word tokens (punctuation stripped,
-/// short tokens and stopwords dropped) so any shared *meaningful* keyword
-/// scores a hit — the same recall intent as `run_rejected`'s MATCH, widened
-/// for prose input. Returns `None` when no usable token survives (caller
-/// then falls back to a raw LIKE on the query).
-fn fts_or_query(query_text: &str) -> Option<String> {
-    let tokens = keywords(query_text);
-    if tokens.is_empty() {
-        return None;
-    }
-    Some(tokens.join(" OR "))
-}
-
-/// Search confirmed `rejection`/`decision` events for ones relevant to the
-/// current context, blending an FTS5/LIKE text signal with artifact overlap.
+/// Prior confirmed rejections and decisions that `query_text` (what a tool
+/// call did) clearly touches, for a session working on `task_id`.
 ///
-/// Read-only: never mutates the JSONL log or any derived table. Returns at
-/// most `max_hits` hits scoring >= [`RELEVANCE_THRESHOLD`], sorted by score
-/// descending with `Rejection` winning ties over `Decision`.
-pub fn relevant_recall(
+/// Only what the agent or the user recorded — classifier output is not
+/// trusted here — on `task_id` itself or on a task sharing a module with it,
+/// never machine text, never a corrected or bookkeeping event. A match is
+/// strong when the call and the event share a file, an issue or a commit, or
+/// at least [`MIN_SHARED_WORDS`] meaningful words. Returns at most `max_hits`,
+/// best first, a rejection ahead of a decision on a tie. Read-only.
+pub fn recall_for_task(
     conn: &rusqlite::Connection,
+    task_id: &str,
     query_text: &str,
     max_hits: usize,
 ) -> anyhow::Result<Vec<RecallHit>> {
-    use std::collections::HashMap;
-    if query_text.trim().is_empty() {
+    // A path is a file, not words: `/home/u/proj/crates/tj-core/src/db.rs`
+    // alone would share "crates", "core" and "src" with any note on the crate.
+    let (paths, prose): (Vec<&str>, Vec<&str>) = query_text
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| "\"'`,;:()[]{}<>|".contains(c)))
+        .partition(|t| t.contains('/'));
+    let words: HashSet<String> = keywords(&prose.join(" ")).into_iter().collect();
+    let arts = crate::artifacts::extract(query_text);
+    let needles: Vec<String> = arts
+        .linked_issues
+        .iter()
+        .filter(|issue| !is_a_standard(issue))
+        .chain(arts.commit_hashes.iter())
+        .map(|n| format!("\"{n}\""))
+        .collect();
+    if words.is_empty() && needles.is_empty() && paths.is_empty() {
         return Ok(Vec::new());
     }
 
-    // score keyed by event_id; carry (task_id, type, text) for output.
-    let mut scores: HashMap<String, f64> = HashMap::new();
-    let mut meta: HashMap<String, (String, EventType, String)> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT ei.event_id, ei.task_id, ei.type, sf.text, COALESCE(ei.artifacts, '')
+         FROM events_index ei
+         JOIN search_fts sf ON sf.event_id = ei.event_id
+         WHERE ei.status = 'confirmed'
+           AND ei.type IN ('rejection','decision')
+           AND ei.bookkeeping = 0
+           AND ei.corrected_by IS NULL
+           AND ei.author IN ('user','agent')
+           AND (ei.task_id = ?1 OR ei.task_id IN (
+                 SELECT other.task_id FROM task_modules mine
+                 JOIN task_modules other ON other.module_id = mine.module_id
+                 WHERE mine.task_id = ?1))",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![task_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
 
-    // 1) Text signal: FTS5 OR-of-tokens MATCH, restricted to confirmed
-    //    rejection/decision (mirrors run_rejected's join). The tokenizer
-    //    strips all punctuation, so the resulting `a OR b OR c` query is
-    //    always FTS-safe even when the raw context is noisy tool-call JSON
-    //    (`Bash: {"command":"…"}`) full of `:`/`"`/`{}` that would otherwise
-    //    trip the FTS5 parser. Falls back to a raw LIKE substring only when
-    //    no usable token survives — the same fallback shape run_search uses.
-    let fts_or = fts_or_query(query_text);
-    let use_fts = fts_or.is_some();
-    let sql = if use_fts {
-        "SELECT ei.event_id, ei.task_id, ei.type, sf.text
-         FROM events_index ei
-         JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.status = 'confirmed'
-           AND ei.type IN ('rejection','decision')
-           AND ei.bookkeeping = 0
-           AND ei.corrected_by IS NULL
-           AND search_fts MATCH ?1"
-    } else {
-        "SELECT ei.event_id, ei.task_id, ei.type, sf.text
-         FROM events_index ei
-         JOIN search_fts sf ON sf.event_id = ei.event_id
-         WHERE ei.status = 'confirmed'
-           AND ei.type IN ('rejection','decision')
-           AND ei.bookkeeping = 0
-           AND ei.corrected_by IS NULL
-           AND sf.text LIKE ?1"
-    };
-    let bind = if let Some(or_query) = fts_or {
-        or_query
-    } else {
-        crate::fts::like_pattern(query_text)
-    };
-    if let Ok(mut stmt) = conn.prepare(sql) {
-        let rows = stmt.query_map(rusqlite::params![bind], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
+    let mut hits = Vec::new();
+    for row in rows {
+        let (event_id, task_id, ty, text, artifacts) = row?;
+        if crate::noise::machine_text(&text).is_some() {
+            continue;
+        }
+
+        let shared_arts = needles
+            .iter()
+            .filter(|n| artifacts.contains(n.as_str()))
+            .count()
+            + shared_files(&paths, &artifacts);
+        let event_words = keywords(&text).into_iter().collect::<HashSet<_>>();
+        let shared_words = event_words.intersection(&words).count();
+        // The bar rises with the call's length (one word in six, at least
+        // MIN_SHARED_WORDS): a long command or script shares three words
+        // with a note by chance alone.
+        let needed = MIN_SHARED_WORDS.max(words.len().div_ceil(6));
+        if shared_arts == 0 && shared_words < needed {
+            continue;
+        }
+
+        hits.push(RecallHit {
+            event_id,
+            task_id,
+            event_type: parse_type(&ty),
+            text,
+            score: (shared_arts * 2 + shared_words) as f64,
         });
-        if let Ok(rows) = rows {
-            for row in rows.flatten() {
-                let (eid, tid, ty, text) = row;
-                let et = parse_type(&ty);
-                *scores.entry(eid.clone()).or_insert(0.0) += 1.0; // text-match weight
-                meta.entry(eid).or_insert((tid, et, text));
-            }
-        }
     }
 
-    // 2) Artifact signal: overlap of artifacts::extract(query_text) against
-    //    events_index.artifacts (mirrors find_related_tasks LIKE scan), same
-    //    confirmed rejection/decision restriction. +weight per shared artifact.
-    let arts = crate::artifacts::extract(query_text);
-    for needle in arts
-        .linked_issues
-        .iter()
-        .chain(arts.commit_hashes.iter())
-        .chain(arts.files.iter())
-    {
-        let pattern = format!("%\"{}\"%", needle.replace('%', "\\%"));
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT ei.event_id, ei.task_id, ei.type, sf.text
-             FROM events_index ei
-             JOIN search_fts sf ON sf.event_id = ei.event_id
-             WHERE ei.status = 'confirmed'
-               AND ei.type IN ('rejection','decision')
-               AND ei.bookkeeping = 0
-               AND ei.corrected_by IS NULL
-               AND ei.artifacts LIKE ?1",
-        ) {
-            let rows = stmt.query_map(rusqlite::params![pattern], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            });
-            if let Ok(rows) = rows {
-                for row in rows.flatten() {
-                    let (eid, tid, ty, text) = row;
-                    let et = parse_type(&ty);
-                    *scores.entry(eid.clone()).or_insert(0.0) += 0.5; // artifact weight
-                    meta.entry(eid).or_insert((tid, et, text));
-                }
-            }
-        }
-    }
-
-    // 3) Threshold + rank. Sort by score desc; tie → Rejection before Decision.
-    let mut hits: Vec<RecallHit> = scores
-        .into_iter()
-        .filter(|(_, s)| *s >= RELEVANCE_THRESHOLD)
-        .filter_map(|(eid, score)| {
-            meta.remove(&eid)
-                .map(|(task_id, event_type, text)| RecallHit {
-                    event_id: eid,
-                    task_id,
-                    event_type,
-                    text,
-                    score,
-                })
-        })
-        .collect();
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -191,7 +145,40 @@ pub fn relevant_recall(
             .then_with(|| rank(a.event_type).cmp(&rank(b.event_type)))
     });
     hits.truncate(max_hits);
+
     Ok(hits)
+}
+
+/// `UTF-8`, `SHA-256`, `ISO-8601`: names of standards shaped like an issue
+/// key (`DEV-4621`) that tie a tool call to nothing.
+fn is_a_standard(issue: &str) -> bool {
+    const STANDARDS: &[&str] = &[
+        "UTF", "UCS", "SHA", "MD", "ISO", "RFC", "IEEE", "ECMA", "AES", "RSA", "TLS", "SSL",
+        "HTTP", "CRC", "PEP",
+    ];
+
+    issue
+        .split_once('-')
+        .is_some_and(|(prefix, _)| STANDARDS.contains(&prefix))
+}
+
+/// Files of an event (its `artifacts` JSON) that one of `paths` names. An
+/// event keeps `src/pack.rs` while a tool call names the absolute path, so a
+/// match is the same path or one ending in the other at a `/`.
+fn shared_files(paths: &[&str], artifacts: &str) -> usize {
+    if paths.is_empty() || artifacts.is_empty() {
+        return 0;
+    }
+    let Ok(arts) = serde_json::from_str::<crate::artifacts::Artifacts>(artifacts) else {
+        return 0;
+    };
+    let same =
+        |a: &str, b: &str| a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"));
+
+    arts.files
+        .iter()
+        .filter(|f| paths.iter().any(|p| same(p, f)))
+        .count()
 }
 
 fn parse_type(s: &str) -> EventType {
@@ -215,7 +202,10 @@ mod tests {
     use crate::db;
     use crate::event::{Author, Event, EventStatus, EventType, Source};
 
-    // Open a temp db and ingest a slice of events through the same
+    const TASK: &str = "tj-1";
+    const AXUM_CALL: &str = r#"{"command":"switch the server to axum"}"#;
+
+    // Open a temp db and index a slice of events through the same
     // `index_event` path db.rs tests use (db::open + index_event).
     fn seeded(events: &[Event]) -> (tempfile::TempDir, rusqlite::Connection) {
         let d = tempfile::TempDir::new().unwrap();
@@ -232,148 +222,213 @@ mod tests {
         e
     }
 
-    #[test]
-    fn returns_matching_confirmed_rejection() {
-        let rej = ev(
-            "tj-1",
-            EventType::Rejection,
-            "Tried switching the server to axum but it broke rmcp stdio.",
-            EventStatus::Confirmed,
-        );
-        let (_d, conn) = seeded(&[rej]);
+    fn rejection(task: &str, text: &str) -> Event {
+        ev(task, EventType::Rejection, text, EventStatus::Confirmed)
+    }
 
-        let hits = relevant_recall(&conn, "let's switch to axum", DEFAULT_MAX_HITS).unwrap();
+    #[test]
+    fn returns_a_strong_match_on_the_task() {
+        let (_d, conn) = seeded(&[rejection(
+            TASK,
+            "Tried to switch the server to axum but it broke rmcp stdio.",
+        )]);
+
+        let hits = recall_for_task(&conn, TASK, AXUM_CALL, DEFAULT_MAX_HITS).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].event_type, EventType::Rejection);
         assert!(hits[0].text.contains("axum"));
     }
 
+    /// One shared word used to be enough: "server" or "test" matched
+    /// rejections from any task in the project.
+    #[test]
+    fn one_or_two_shared_words_are_not_a_match() {
+        let (_d, conn) = seeded(&[rejection(
+            TASK,
+            "Rejected the axum migration for the server: rmcp stdio broke.",
+        )]);
+
+        let hits = recall_for_task(&conn, TASK, r#"{"command":"restart the server"}"#, 2).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+        let hits = recall_for_task(&conn, TASK, r#"{"command":"axum server up"}"#, 2).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+    }
+
+    #[test]
+    fn a_shared_file_is_a_match() {
+        let (_d, conn) = seeded(&[rejection(
+            TASK,
+            "Rejected caching in src/pack.rs: it was never reused.",
+        )]);
+
+        let hits = recall_for_task(&conn, TASK, "/home/u/proj/src/pack.rs x", 2).unwrap();
+        assert_eq!(hits.len(), 1, "got: {hits:?}");
+    }
+
+    /// `UTF-8` has the shape of an issue key and used to be enough for a hit.
+    #[test]
+    fn a_standards_name_is_not_a_shared_issue() {
+        let (_d, conn) = seeded(&[ev(
+            TASK,
+            EventType::Decision,
+            "Decided to write the CSV export as UTF-8 with a BOM for Excel.",
+            EventStatus::Confirmed,
+        )]);
+
+        let query = "curl -H charset=UTF-8 localhost:3000/health";
+        let hits = recall_for_task(&conn, TASK, query, 2).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+    }
+
+    /// Three shared words are enough for a short call, not for a long one.
+    #[test]
+    fn a_long_call_needs_more_shared_words() {
+        let (_d, conn) = seeded(&[rejection(
+            TASK,
+            "Tried to switch the server to axum but it broke rmcp stdio.",
+        )]);
+        let filler = (0..30)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let long = format!("switch the server to axum {filler}");
+
+        let hits = recall_for_task(&conn, TASK, &long, 2).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+    }
+
+    /// The words of a path are not words of the work: another file of the
+    /// same crate shares "crates", "core" and "src", and that is no match.
+    #[test]
+    fn a_path_counts_as_a_file_not_as_words() {
+        let (_d, conn) = seeded(&[rejection(
+            TASK,
+            "Rejected caching in crates/tj-core/src/pack.rs: it was never reused.",
+        )]);
+
+        let other =
+            recall_for_task(&conn, TASK, "/home/u/proj/crates/tj-core/src/db.rs", 2).unwrap();
+        assert!(other.is_empty(), "got: {other:?}");
+        let same =
+            recall_for_task(&conn, TASK, "/home/u/proj/crates/tj-core/src/pack.rs", 2).unwrap();
+        assert_eq!(same.len(), 1, "got: {same:?}");
+    }
+
+    #[test]
+    fn other_tasks_are_out_unless_they_share_a_module() {
+        let text = "Tried to switch the server to axum but it broke rmcp stdio.";
+        let (_d, conn) = seeded(&[rejection("tj-other", text)]);
+
+        let hits = recall_for_task(&conn, TASK, AXUM_CALL, 2).unwrap();
+        assert!(hits.is_empty(), "another task, no module: {hits:?}");
+
+        for task in [TASK, "tj-other"] {
+            conn.execute(
+                "INSERT INTO task_modules(project_hash, task_id, module_id) VALUES ('p', ?1, 'mcp')",
+                rusqlite::params![task],
+            )
+            .unwrap();
+        }
+        let hits = recall_for_task(&conn, TASK, AXUM_CALL, 2).unwrap();
+        assert_eq!(hits.len(), 1, "same module: {hits:?}");
+    }
+
+    /// The classifier filed whole answers, tool calls and summaries as
+    /// confirmed rejections; recall trusts only what a person or the agent
+    /// recorded, and never machine text.
+    #[test]
+    fn classifier_output_and_machine_text_are_never_recalled() {
+        let mut by_classifier =
+            rejection(TASK, "Tried to switch the server to axum, it broke stdio.");
+        by_classifier.author = Author::Classifier;
+        let payload = rejection(TASK, r#"Bash: {"command":"switch the server to axum"}"#);
+        let summary = rejection(
+            TASK,
+            "This session is being continued from a previous conversation: switch the server to axum.",
+        );
+        let (_d, conn) = seeded(&[by_classifier, payload, summary]);
+
+        let hits = recall_for_task(&conn, TASK, AXUM_CALL, 3).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+    }
+
     #[test]
     fn ignores_suggested_and_wrong_type() {
         let suggested = ev(
-            "tj-1",
+            TASK,
             EventType::Rejection,
-            "Rejected the axum migration tentatively.",
+            "Rejected switching the server to axum tentatively.",
             EventStatus::Suggested,
         );
         let finding = ev(
-            "tj-1",
+            TASK,
             EventType::Finding,
-            "The axum server starts fine in isolation.",
+            "The axum server starts fine in isolation after the switch.",
             EventStatus::Confirmed,
         );
         let (_d, conn) = seeded(&[suggested, finding]);
 
-        let hits = relevant_recall(&conn, "axum", DEFAULT_MAX_HITS).unwrap();
+        let hits = recall_for_task(&conn, TASK, AXUM_CALL, 2).unwrap();
         assert!(hits.is_empty(), "got: {hits:?}");
     }
 
     #[test]
-    fn caps_at_max_hits() {
-        let events: Vec<Event> = (0..5)
-            .map(|i| {
-                ev(
-                    "tj-1",
-                    EventType::Rejection,
-                    &format!("Rejected widget approach number {i} for the dashboard"),
-                    EventStatus::Confirmed,
-                )
-            })
-            .collect();
-        let (_d, conn) = seeded(&events);
-
-        let hits = relevant_recall(&conn, "dashboard widget", 2).unwrap();
-        assert_eq!(hits.len(), 2);
-    }
-
-    #[test]
-    fn rejection_wins_tie_over_decision() {
+    fn rejection_wins_a_tie_and_hits_are_capped() {
         let decision = ev(
-            "tj-1",
+            TASK,
             EventType::Decision,
-            "Decided to use the postgres connector.",
+            "Decided to switch the server to axum.",
             EventStatus::Confirmed,
         );
-        let rejection = ev(
-            "tj-2",
-            EventType::Rejection,
-            "Rejected the postgres connector for latency.",
-            EventStatus::Confirmed,
-        );
-        let (_d, conn) = seeded(&[decision, rejection]);
+        let rej = rejection(TASK, "Rejected: switch the server to axum.");
+        let (_d, conn) = seeded(&[decision, rej]);
 
-        let hits = relevant_recall(&conn, "postgres connector", DEFAULT_MAX_HITS).unwrap();
+        let hits = recall_for_task(&conn, TASK, AXUM_CALL, 2).unwrap();
         assert_eq!(hits.len(), 2);
-        // Same text-match score (1.0 each) → rejection ranks first.
         assert_eq!(hits[0].event_type, EventType::Rejection);
-        assert_eq!(hits[1].event_type, EventType::Decision);
-    }
 
-    #[test]
-    fn below_threshold_returns_empty() {
-        // No textual or artifact overlap → score stays 0 < threshold.
-        let rej = ev(
-            "tj-1",
-            EventType::Rejection,
-            "Rejected the kafka pipeline for cost reasons.",
-            EventStatus::Confirmed,
-        );
-        let (_d, conn) = seeded(&[rej]);
-
-        let hits = relevant_recall(&conn, "frontend styling refactor", DEFAULT_MAX_HITS).unwrap();
-        assert!(hits.is_empty(), "got: {hits:?}");
+        let hits = recall_for_task(&conn, TASK, AXUM_CALL, 1).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
     fn empty_query_returns_empty() {
-        let rej = ev(
-            "tj-1",
-            EventType::Rejection,
-            "Rejected axum.",
-            EventStatus::Confirmed,
-        );
-        let (_d, conn) = seeded(&[rej]);
+        let (_d, conn) = seeded(&[rejection(TASK, "Rejected axum.")]);
 
-        assert!(relevant_recall(&conn, "", DEFAULT_MAX_HITS)
-            .unwrap()
-            .is_empty());
-        assert!(relevant_recall(&conn, "   ", DEFAULT_MAX_HITS)
-            .unwrap()
-            .is_empty());
+        assert!(recall_for_task(&conn, TASK, "", 2).unwrap().is_empty());
+        assert!(recall_for_task(&conn, TASK, "   ", 2).unwrap().is_empty());
     }
 
     #[test]
     fn compaction_markers_are_never_recalled() {
         // An old marker (recognised by its text) and a new one (by meta.kind).
         let old = ev(
-            "tj-1",
+            TASK,
             EventType::Decision,
             "Conversation compacted at 2026-01-01T00:00:00Z; preceding events should be treated as a single reasoning unit.",
             EventStatus::Confirmed,
         );
         let mut new = ev(
-            "tj-1",
+            TASK,
             EventType::Decision,
-            "Compaction boundary: reasoning unit closed.",
+            "Compaction boundary: preceding reasoning unit closed.",
             EventStatus::Confirmed,
         );
         new.meta = serde_json::json!({ "kind": "compaction_marker" });
         let (_d, conn) = seeded(&[old, new]);
 
-        let hits = relevant_recall(&conn, "reasoning unit", DEFAULT_MAX_HITS).unwrap();
+        let hits = recall_for_task(&conn, TASK, "preceding reasoning unit", 2).unwrap();
         assert!(hits.is_empty(), "got: {hits:?}");
     }
 
     #[test]
     fn corrected_events_are_never_recalled() {
-        let rej = ev(
-            "tj-1",
-            EventType::Rejection,
-            "Rejected axum for the server in src/server.rs.",
-            EventStatus::Confirmed,
+        let rej = rejection(
+            TASK,
+            "Rejected switching the server to axum in src/server.rs.",
         );
         let mut corr = ev(
-            "tj-1",
+            TASK,
             EventType::Correction,
             "That was wrong: the stdio issue was unrelated.",
             EventStatus::Confirmed,
@@ -381,8 +436,8 @@ mod tests {
         corr.corrects = Some(rej.event_id.clone());
         let (_d, conn) = seeded(&[rej, corr]);
 
-        // Both the text and the artifact path must skip the corrected event.
-        let hits = relevant_recall(&conn, "axum src/server.rs", DEFAULT_MAX_HITS).unwrap();
+        // Both the word and the file path must skip the corrected event.
+        let hits = recall_for_task(&conn, TASK, "switch server axum src/server.rs", 2).unwrap();
         assert!(hits.is_empty(), "got: {hits:?}");
     }
 }
