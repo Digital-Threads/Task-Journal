@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-11-06
+
 Less noise in the agent's context. Measured on 300 sessions: push-recall was
 added to tool results 13,696 times, almost never about the work at hand.
 
