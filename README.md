@@ -197,7 +197,7 @@ task-journal pack tj-x9rz1f --mode full
 | `rebuild-state` | Rebuild SQLite from JSONL |
 | `migrate-project` | Re-key data when a project moves on disk |
 | `install-hooks [--client claude\|codex] [--scope user\|project] [--auto-capture] [--backend hybrid\|agent-sdk\|api\|heuristic]` | Codex: wire its hooks (default: the read-only SessionStart hook; `--auto-capture` adds the per-message classifier). Claude Code: its hooks come with the plugin, so this takes the ones earlier versions wrote out of `settings.json`, after a backup. |
-| `cleanup-noise [--dry-run] [--all]` | Retire what the classifier once filed as reasoning but is not — raw tool calls, compaction summaries, notifications, "rejections" that rule no approach out — with one correction each (the journal stays append-only). |
+| `cleanup-noise [--dry-run] [--all] [--yes]` | Retire what the classifier once filed as reasoning but is not — raw tool calls, compaction summaries, notifications, "rejections" that are whole answers — with one correction each (the journal stays append-only, and a correction cannot be taken back). `--dry-run` lists every entry in a file; `--all` writes only with `--yes`. |
 
 ## MCP tools
 

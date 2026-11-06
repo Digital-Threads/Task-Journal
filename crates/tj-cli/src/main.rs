@@ -1238,17 +1238,21 @@ enum Commands {
         all: bool,
     },
     /// Retire what the classifier once filed as reasoning but is not: raw
-    /// tool calls, compaction summaries, harness notifications, and
-    /// "rejections" that rule no approach out. The journal is append-only,
-    /// so each one gets a correction, which takes it out of packs, recall and
-    /// exports. Only classifier entries are touched, never the agent's or yours.
+    /// tool calls (except as evidence), compaction summaries, harness
+    /// notifications, and "rejections" that are whole answers or questions.
+    /// The journal is append-only, so each one gets a correction, which keeps
+    /// it out of packs and recall — and cannot be taken back. Only classifier
+    /// and old backfill-keyword entries are touched, never the agent's or yours.
     CleanupNoise {
-        /// Show what would be retired; write nothing.
+        /// Write nothing; list every entry that would be retired in a file.
         #[arg(long)]
         dry_run: bool,
         /// Clean every project's journal, not just the current one.
         #[arg(long)]
         all: bool,
+        /// Confirm writing to every journal with --all.
+        #[arg(long)]
+        yes: bool,
     },
     /// Set or update the goal of an existing task.
     Goal {
@@ -2282,8 +2286,8 @@ fn real_main() -> Result<()> {
                 );
             }
         }
-        Commands::CleanupNoise { dry_run, all } => {
-            run_cleanup_noise(dry_run, all)?;
+        Commands::CleanupNoise { dry_run, all, yes } => {
+            run_cleanup_noise(dry_run, all, yes)?;
         }
         Commands::PendingGc { days, all } => {
             let pending_dir = tj_core::paths::events_dir()?
@@ -2515,6 +2519,19 @@ fn real_main() -> Result<()> {
             // settings.json entries earlier versions wrote ran next to them,
             // so for Claude Code this only takes ours out again.
             let is_claude = client == "claude";
+            // Taking ours out is only safe once the plugin's own hooks are
+            // there to take over; otherwise the session-start line, recall
+            // and model switches would just stop.
+            if is_claude && !uninstall && !plugin_ships_hooks() {
+                eprintln!(
+                    "The installed task-journal plugin ships no hooks yet (or is not installed), \
+                     so the ones in {} stay. Update the plugin (/plugin update \
+                     task-journal@task-journal), restart Claude Code, then run this again. To \
+                     remove them anyway: --uninstall.",
+                    settings_path.display()
+                );
+                return Ok(());
+            }
             if uninstall || is_claude {
                 remove_task_journal_hooks(hooks_obj);
                 if is_claude && !uninstall && (auto_capture || proactive_recall) {
@@ -2993,10 +3010,26 @@ never closes tasks."
                 // MODEL_SWITCH_TEXT_PREFIX.
                 event.meta = serde_json::json!({ "kind": "model_switch" });
                 tj_core::session_id::stamp_session_id(&mut event.meta, live_session_id.as_deref());
+                // Claude Code without the mod runs the plugin's hook and one
+                // left in settings.json side by side: one switch, one record.
                 let mut writer = tj_core::storage::JsonlWriter::open(&events_path)?;
-                writer.append(&event)?;
-                writer.flush_durable()?;
-                println!("{}", event.event_id);
+                let now = chrono::Utc::now();
+                let appended = writer.append_unless(&event, |tail| {
+                    tail.lines()
+                        .filter_map(|l| serde_json::from_str::<tj_core::event::Event>(l).ok())
+                        .any(|e| {
+                            e.task_id == event.task_id
+                                && e.text == event.text
+                                && e.meta.get("kind") == event.meta.get("kind")
+                                && chrono::DateTime::parse_from_rfc3339(&e.timestamp).is_ok_and(
+                                    |t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < 60,
+                                )
+                        })
+                })?;
+                if appended {
+                    writer.flush_durable()?;
+                    println!("{}", event.event_id);
+                }
                 return Ok(());
             }
 
@@ -3400,7 +3433,7 @@ never closes tasks."
                     let Some(tid) = out.task_id_guess else {
                         return Ok(());
                     };
-                    if !worth_recording(out.event_type, &out.suggested_text, &text) {
+                    if !worth_recording(out.event_type, &out.suggested_text) {
                         return Ok(());
                     }
 
@@ -4791,8 +4824,9 @@ fn run_nudge() -> anyhow::Result<()> {
     if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
         return Ok(());
     }
-    // The Claude Code mod nudges by itself (after N turns without an entry).
-    if mod_active() {
+    // The Claude Code mod nudges by itself (after N turns without an entry),
+    // and beside the plugin's hooks a leftover settings.json hook stands down.
+    if mod_active() || env_flag("TJ_PLUGIN_HOOKS") {
         return Ok(());
     }
 
@@ -4916,7 +4950,9 @@ fn run_session_end_catchup(
 /// or error exits silently with no output.
 fn run_recall_hook() -> anyhow::Result<()> {
     // Opt-out and recursion guard (never inject into our own classifier spawn).
-    if std::env::var("TJ_PROACTIVE_RECALL").as_deref() == Ok("0") {
+    // Beside the plugin's hooks, a recall-hook left in settings.json stands
+    // down: the plugin's push-recall is the one, scoped to the session's task.
+    if std::env::var("TJ_PROACTIVE_RECALL").as_deref() == Ok("0") || env_flag("TJ_PLUGIN_HOOKS") {
         return Ok(());
     }
     if std::env::var(tj_core::classifier::agent_sdk::IN_CLASSIFIER_ENV).is_ok() {
@@ -4963,7 +4999,10 @@ fn run_recall_hook() -> anyhow::Result<()> {
     let mut ctx = String::from(
         "📓 task-journal — relevant prior reasoning from your history (you may have decided this before):\n",
     );
-    for h in &hits {
+    for h in hits
+        .iter()
+        .filter(|h| tj_core::noise::machine_text(&h.text).is_none())
+    {
         let snippet: String = h.text.chars().take(160).collect();
         let proj: String = h.project_hash.chars().take(8).collect();
         let line = format!(
@@ -5089,37 +5128,64 @@ fn session_start_line(
 
 /// The open task the branch names: one whose events carry the branch, or
 /// carry (or whose title holds) the issue key in it — `feat/DEV-4621-x`
-/// names DEV-4621. Newest first.
+/// names DEV-4621, and DEV-46 is not DEV-4621. Newest first.
 fn task_for_branch(conn: &rusqlite::Connection, branch: &str) -> anyhow::Result<Option<String>> {
     use rusqlite::OptionalExtension;
 
-    let mut needles = vec![(branch.to_string(), false)];
-    needles.extend(
-        tj_core::artifacts::extract(branch)
-            .linked_issues
-            .into_iter()
-            .map(|issue| (issue, true)),
-    );
+    // An exact element of an event's artifacts, quotes included; `_` and
+    // `%` in a branch name are literal.
+    let escape = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    };
+    let by_artifact = |needle: &str| -> rusqlite::Result<Option<String>> {
+        conn.query_row(
+            "SELECT t.task_id FROM tasks t
+             WHERE t.status = 'open'
+               AND EXISTS (SELECT 1 FROM events_index ei
+                           WHERE ei.task_id = t.task_id AND ei.artifacts LIKE ?1 ESCAPE '\\')
+             ORDER BY t.last_event_at DESC LIMIT 1",
+            rusqlite::params![format!("%\"{}\"%", escape(needle))],
+            |r| r.get(0),
+        )
+        .optional()
+    };
+    if let Some(id) = by_artifact(branch)? {
+        return Ok(Some(id));
+    }
 
-    for (needle, by_title) in needles {
-        let id: Option<String> = conn
-            .query_row(
-                "SELECT t.task_id FROM tasks t
-                 WHERE t.status = 'open'
-                   AND ((?3 AND t.title LIKE ?2)
-                        OR EXISTS (SELECT 1 FROM events_index ei
-                                   WHERE ei.task_id = t.task_id AND ei.artifacts LIKE ?1))
-                 ORDER BY t.last_event_at DESC LIMIT 1",
-                rusqlite::params![format!("%\"{needle}\"%"), format!("%{needle}%"), by_title],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if id.is_some() {
-            return Ok(id);
+    let issues = tj_core::artifacts::extract(branch).linked_issues;
+    if issues.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT task_id, title FROM tasks WHERE status = 'open' ORDER BY last_event_at DESC",
+    )?;
+    let open: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for issue in &issues {
+        if let Some(id) = by_artifact(issue)? {
+            return Ok(Some(id));
+        }
+        if let Some((id, _)) = open.iter().find(|(_, title)| holds_key(title, issue)) {
+            return Ok(Some(id.clone()));
         }
     }
 
     Ok(None)
+}
+
+/// Whether `text` holds `key` as a whole token: no letter or digit right
+/// before or after it.
+fn holds_key(text: &str, key: &str) -> bool {
+    text.match_indices(key).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + key.len()..].chars().next();
+
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 /// The checked-out branch of the repository holding `dir`, read from its
@@ -5159,6 +5225,35 @@ fn emit_session_context(ctx: &str) {
         }
     });
     println!("{env}");
+}
+
+/// Whether an installed task-journal plugin ships the hooks that replace the
+/// settings.json ones: its `hooks/hooks.json` runs `ingest-hook --from-plugin`.
+/// Read from Claude Code's plugin registry (`$CLAUDE_CONFIG_DIR`, else
+/// `~/.claude`); false when it cannot be read.
+fn plugin_ships_hooks() -> bool {
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")));
+    let Some(registry) = config
+        .map(|c| c.join("plugins").join("installed_plugins.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+    else {
+        return false;
+    };
+
+    registry["plugins"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| name.starts_with("task-journal@"))
+        .flat_map(|(_, installs)| installs.as_array().into_iter().flatten())
+        .filter_map(|install| install["installPath"].as_str())
+        .any(|path| {
+            std::fs::read_to_string(std::path::Path::new(path).join("hooks").join("hooks.json"))
+                .is_ok_and(|hooks| hooks.contains("--from-plugin"))
+        })
 }
 
 /// Takes task-journal's hooks (`ingest-hook`, `nudge`, `recall-hook`) and its
@@ -5214,9 +5309,13 @@ fn remove_task_journal_hooks(settings: &mut serde_json::Map<String, serde_json::
     }
 }
 
-/// Why `event` is noise the classifier filed as reasoning, or `None` when it
-/// stays: only classifier entries of a reasoning type are judged — machine
-/// text of any type, and a rejection that rules no approach out.
+/// Why `event` is noise filed as reasoning, or `None` when it stays. Judged
+/// are the classifier's entries of a reasoning type and the rejections the
+/// old `backfill` keyword rule wrote; the agent's and the user's own never.
+/// Retired: a compaction summary or a notification; a raw tool call, except
+/// as evidence (a test run's record is the call); a "rejection" that is a
+/// whole answer or a question. A short rejection stays whatever its words —
+/// a correction cannot be taken back, so this errs on keeping.
 fn cleanup_reason(event: &tj_core::event::Event) -> Option<&'static str> {
     use tj_core::event::{Author, EventType};
 
@@ -5229,23 +5328,37 @@ fn cleanup_reason(event: &tj_core::event::Event) -> Option<&'static str> {
             | EventType::Hypothesis
             | EventType::Constraint
     );
+    let by_classifier = event.author == Author::Classifier;
+    let by_backfill_keyword = event.event_type == EventType::Rejection
+        && event.meta.get("heuristic").and_then(|v| v.as_str()) == Some("rejection_keyword");
     // Compaction markers and model switches are the journal's own
     // bookkeeping, already kept out of packs and recall.
-    if event.author != Author::Classifier || !reasoning || tj_core::db::is_bookkeeping(event) {
+    if !reasoning || !(by_classifier || by_backfill_keyword) || tj_core::db::is_bookkeeping(event) {
         return None;
     }
 
-    tj_core::noise::machine_text(&event.text).or_else(|| {
-        (event.event_type == EventType::Rejection
-            && !tj_core::classifier::is_explicit_rejection(&event.text))
-        .then_some("rejection that rules no approach out")
-    })
+    match tj_core::noise::machine_text(&event.text) {
+        Some("raw tool call") if event.event_type == EventType::Evidence => None,
+        Some(why) => Some(why),
+        None => (event.event_type == EventType::Rejection
+            && !tj_core::classifier::reads_like_a_rejection(&event.text))
+        .then_some("rejection that is a whole answer or a question"),
+    }
 }
 
-/// `task-journal cleanup-noise [--dry-run] [--all]`: one bookkeeping
+/// `task-journal cleanup-noise [--dry-run] [--all] [--yes]`: one bookkeeping
 /// correction per noise entry not corrected yet, so a second run finds
-/// nothing. Prints counts by reason per journal, with samples on a dry run.
-fn run_cleanup_noise(dry_run: bool, all: bool) -> Result<()> {
+/// nothing. A correction cannot be taken back, so a dry run writes the full
+/// list to a file to read first, and writing to every journal (`--all`)
+/// needs `--yes`.
+fn run_cleanup_noise(dry_run: bool, all: bool, yes: bool) -> Result<()> {
+    if all && !dry_run && !yes {
+        anyhow::bail!(
+            "--all writes a correction into every project's journal, and a correction cannot be \
+             taken back: run with --dry-run first, read the list it writes, then add --yes"
+        );
+    }
+
     let events_dir = tj_core::paths::events_dir()?;
     let journals: Vec<std::path::PathBuf> = if all {
         let mut paths: Vec<_> = std::fs::read_dir(&events_dir)?
@@ -5260,6 +5373,7 @@ fn run_cleanup_noise(dry_run: bool, all: bool) -> Result<()> {
     };
 
     let mut total = 0usize;
+    let mut listing = String::from("journal\tevent_id\ttask_id\ttype\treason\ttext\n");
     for path in journals.iter().filter(|p| p.exists()) {
         let events = read_events_lenient(path, "cleanup-noise")?;
         let corrected: std::collections::HashSet<&str> = events
@@ -5275,25 +5389,28 @@ fn run_cleanup_noise(dry_run: bool, all: bool) -> Result<()> {
             continue;
         }
 
-        let mut by_reason: std::collections::BTreeMap<&str, Vec<&tj_core::event::Event>> =
-            Default::default();
-        for (e, why) in &noise {
-            by_reason.entry(why).or_default().push(e);
-        }
         let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("?");
+        let mut by_reason: std::collections::BTreeMap<&str, usize> = Default::default();
+        for (e, why) in &noise {
+            *by_reason.entry(why).or_default() += 1;
+            let text: String = e
+                .text
+                .chars()
+                .take(300)
+                .map(|c| if c == '\t' || c == '\n' { ' ' } else { c })
+                .collect();
+            listing.push_str(&format!(
+                "{name}\t{}\t{}\t{:?}\t{why}\t{text}\n",
+                e.event_id, e.task_id, e.event_type
+            ));
+        }
         println!(
             "{name}: {} entr{}",
             noise.len(),
             if noise.len() == 1 { "y" } else { "ies" }
         );
-        for (why, list) in &by_reason {
-            println!("  {why}: {}", list.len());
-            if dry_run {
-                for e in list.iter().take(3) {
-                    let sample: String = e.text.chars().take(100).collect();
-                    println!("    {:?}: {}", e.event_type, sample.replace('\n', " "));
-                }
-            }
+        for (why, n) in &by_reason {
+            println!("  {why}: {n}");
         }
         total += noise.len();
 
@@ -5307,6 +5424,10 @@ fn run_cleanup_noise(dry_run: bool, all: bool) -> Result<()> {
                     tj_core::event::Source::Cli,
                     format!("{} not reasoning: {why}", tj_core::noise::CLEANUP_PREFIX),
                 );
+                // The entry's own time: a correction stamped "now" would
+                // crowd the newest-first views (recent events, the catch-up
+                // point, the classifier's context) out of real entries.
+                fix.timestamp = e.timestamp.clone();
                 fix.corrects = Some(e.event_id.clone());
                 fix.status = tj_core::event::EventStatus::Confirmed;
                 fix.meta = serde_json::json!({ "kind": tj_core::db::NOISE_CLEANUP });
@@ -5316,10 +5437,22 @@ fn run_cleanup_noise(dry_run: bool, all: bool) -> Result<()> {
         }
     }
 
-    match (total, dry_run) {
-        (0, _) => println!("nothing to clean"),
-        (n, true) => println!("{n} entries would be retired; run without --dry-run to retire them"),
-        (n, false) => println!("{n} entries retired"),
+    if total == 0 {
+        println!("nothing to clean");
+    } else if dry_run {
+        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let list = tj_core::paths::data_dir()?.join(format!("cleanup-noise-{stamp}.tsv"));
+        std::fs::write(&list, listing)?;
+        println!(
+            "{total} entries would be retired; every one is listed in {}",
+            list.display()
+        );
+        println!(
+            "run without --dry-run{} to retire them",
+            if all { " and with --yes" } else { "" }
+        );
+    } else {
+        println!("{total} entries retired");
     }
 
     Ok(())
@@ -6513,24 +6646,22 @@ fn process_pending_entry(
     Ok(())
 }
 
-/// Whether a classified chunk is worth an event: its text is reasoning, not
-/// a raw tool call, a summary or a notification, and a rejection rules an
-/// approach out in so many words. Whole answers, tool payloads and summaries
-/// filed as rejections were most of what recall later pushed back.
-fn worth_recording(
-    event_type: tj_core::event::EventType,
-    suggested_text: &str,
-    chunk: &str,
-) -> bool {
-    use tj_core::classifier::is_explicit_rejection;
+/// Whether a classified chunk is worth an event. Never a compaction summary
+/// or a notification; a raw tool call only as evidence (a test run is
+/// evidence by nature, and its record is the call). A rejection must read
+/// like one — a sentence or two, not a whole answer — whatever its words:
+/// the model phrases a ruled-out approach any way it likes.
+fn worth_recording(event_type: tj_core::event::EventType, suggested_text: &str) -> bool {
+    use tj_core::event::EventType;
 
-    if tj_core::noise::machine_text(suggested_text).is_some() {
-        return false;
+    match tj_core::noise::machine_text(suggested_text) {
+        Some("raw tool call") if event_type == EventType::Evidence => true,
+        Some(_) => false,
+        None => {
+            event_type != EventType::Rejection
+                || tj_core::classifier::reads_like_a_rejection(suggested_text)
+        }
     }
-
-    event_type != tj_core::event::EventType::Rejection
-        || is_explicit_rejection(suggested_text)
-        || is_explicit_rejection(chunk)
 }
 
 /// What became of one classified chunk.
@@ -6646,7 +6777,7 @@ fn classify_chunk(
     let Some(tid) = out.task_id_guess else {
         return Ok(ChunkOutcome::Dropped);
     };
-    if !worth_recording(out.event_type, &out.suggested_text, text) {
+    if !worth_recording(out.event_type, &out.suggested_text) {
         return Ok(ChunkOutcome::Dropped);
     }
 
@@ -6838,14 +6969,22 @@ fn session_recall(
 }
 
 /// What a tool call did, as text: the string values of its input, without
-/// the JSON keys (`file_path`, `old_string` say nothing about the work) and
-/// without the output (a log or a file's content is not the agent's intent).
+/// the JSON keys (`file_path` says nothing about the work), without the
+/// output (a log or a file's content is not the agent's intent), and without
+/// what an edit writes (`content`, `old_string`, `new_string`, `new_source`):
+/// a big file shares three words with nearly any note. An edit still counts
+/// by its path.
 fn tool_input_text(payload: &serde_json::Value) -> String {
+    const WRITTEN: &[&str] = &["content", "old_string", "new_string", "new_source"];
+
     fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
         match v {
             serde_json::Value::String(s) => out.push(s),
             serde_json::Value::Array(items) => items.iter().for_each(|x| strings(x, out)),
-            serde_json::Value::Object(map) => map.values().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(map) => map
+                .iter()
+                .filter(|(k, _)| !WRITTEN.contains(&k.as_str()))
+                .for_each(|(_, x)| strings(x, out)),
             _ => {}
         }
     }
@@ -6891,7 +7030,8 @@ const SESSION_COUNTER_CAP: usize = 500;
 /// `next(current)` and returns the new value. Best-effort: an unreadable file
 /// counts as empty, a failed write is ignored.
 // ponytail: read-modify-write without a lock; two parallel hooks can lose
-// one count, which only shifts the next reminder by a call.
+// one count, which only shifts the next reminder by a call. The file itself
+// is never seen half-written (see `write_whole`).
 fn session_counter(
     path: &std::path::Path,
     sid: &str,
@@ -6911,9 +7051,19 @@ fn session_counter(
     let own = format!("{sid} {value}");
     lines.push(&own);
     let keep = &lines[lines.len().saturating_sub(SESSION_COUNTER_CAP)..];
-    let _ = std::fs::write(path, keep.join("\n") + "\n");
+    write_whole(path, &(keep.join("\n") + "\n"));
 
     value
+}
+
+/// Replaces `path` with `body` through a temporary file and a rename, so a
+/// hook reading it in parallel sees the old file or the new one, never an
+/// empty one it would then write back over everyone's lines. Best-effort.
+fn write_whole(path: &std::path::Path, body: &str) {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Most `<session> <event_id>` lines the shown-recall log keeps.
@@ -6961,7 +7111,7 @@ fn fresh_recall_hits(
     let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
     lines.extend(fresh.iter().map(|h| format!("{sid} {}", h.event_id)));
     let keep = &lines[lines.len().saturating_sub(RECALL_SHOWN_CAP)..];
-    let _ = std::fs::write(&log, keep.join("\n") + "\n");
+    write_whole(&log, &(keep.join("\n") + "\n"));
 
     fresh
 }
@@ -7275,6 +7425,37 @@ mod inline_tests {
     #[test]
     fn recall_hits_json_empty_is_array() {
         assert_eq!(recall_hits_json(&[]), "[]");
+    }
+
+    /// A branch names an issue as a whole token: DEV-46 is not DEV-4621.
+    #[test]
+    fn holds_key_needs_a_whole_token() {
+        assert!(holds_key("DEV-4621: move the write path", "DEV-4621"));
+        assert!(holds_key("Fix (DEV-46) redirect", "DEV-46"));
+        assert!(!holds_key("DEV-4621: move the write path", "DEV-46"));
+        assert!(!holds_key("XDEV-46 thing", "DEV-46"));
+    }
+
+    /// What an edit writes is not the agent's intent; its path and a
+    /// command's words are.
+    #[test]
+    fn tool_input_text_skips_what_an_edit_writes() {
+        let edit = serde_json::json!({ "tool_input": {
+            "file_path": "src/pack.rs",
+            "old_string": "fn rejected_state() {}",
+            "new_string": "fn plain_state_file() {}",
+            "edits": [{ "old_string": "a", "new_string": "b" }],
+        }});
+        assert_eq!(tool_input_text(&edit), "src/pack.rs");
+
+        let bash = serde_json::json!({ "tool_input": {
+            "command": "cargo test", "description": "Run the tests",
+        }});
+        let text = tool_input_text(&bash);
+        assert!(
+            text.contains("cargo test") && text.contains("Run the tests"),
+            "{text}"
+        );
     }
 
     #[test]

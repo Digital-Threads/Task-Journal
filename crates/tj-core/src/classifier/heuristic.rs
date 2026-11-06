@@ -223,6 +223,8 @@ mod tests {
             "Decided against the Redis cache: one more service to run for a 5% gain.",
             "Отказались от chown -R в Dockerfile: веб-корень становится записываемым.",
             "Попробовал ленивую загрузку, не работает с SSR — оставляем как было.",
+            "Rejected: a second SQLite table for the counter, a plain state file is enough.",
+            "Unsplash was rejected because its licence forbids hot-linking in the demo.",
         ] {
             let out = try_heuristic(&input(text)).unwrap();
             assert_eq!(out.event_type, EventType::Rejection, "{text}");
@@ -233,6 +235,10 @@ mod tests {
             "Details follow. ".repeat(60)
         );
         for text in [
+            "The server rejected the request with a 401, checking the token next.",
+            "Стандартное отклонение задержки выросло вдвое после деплоя.",
+            "Отказ отправки письма: SMTP вернул 550, смотрю логи.",
+            "Tried running the suite again: 2 tests failed in auth.",
             "The login page doesn't work after the deploy, looking at logs now.",
             "Тест падает: страница не работает после деплоя, смотрю логи.",
             "The upload was rejected 2 files because of their size limits.",

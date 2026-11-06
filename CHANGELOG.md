@@ -14,8 +14,10 @@ added to tool results 13,696 times, almost never about the work at hand.
 - **Push-recall only on a strong match with the session's task.** A hit must be a
   rejection or decision the agent or the user recorded (classifier output is not
   trusted) on the session's active task or a task of the same module, sharing a
-  file, issue or commit with the tool call, or at least three meaningful words —
-  one shared word used to be enough. Paths count as files, not words. No session
+  file, issue or commit with the tool call, or at least three meaningful words
+  (more for a long call) — one shared word used to be enough. Paths count as
+  files, not words; what an edit writes (`content`, `old_string`, `new_string`)
+  doesn't count at all; `UTF-8` or `SHA-256` is not an issue key. No session
   task, no recall. At most one hit, at most once per ten tool calls of a session
   (`TJ_RECALL_EVERY`), never for the journal's own tools. It arrives as
   `additionalContext` for every tool: the async hook's `updatedMCPToolOutput`
@@ -33,23 +35,32 @@ added to tool results 13,696 times, almost never about the work at hand.
   push-recall and model switches (`ingest-hook --from-plugin`, never the classifier
   queue). `install-hooks` for Claude Code now only takes the hooks earlier versions
   wrote out of `settings.json`, after copying it to
-  `settings.json.task-journal-backup-<time>`; Codex is unchanged. While the mod runs,
-  a hook still left in `settings.json` stands down, so no event is handled twice.
-  `--auto-capture` and `--proactive-recall` no longer apply to Claude Code.
+  `settings.json.task-journal-backup-<time>`, and only once it finds an installed
+  plugin that ships the hooks; Codex is unchanged. Beside the plugin's hooks (the mod
+  sets `TJ_PLUGIN_HOOKS`), a hook, `nudge` or `recall-hook` still left in
+  `settings.json` stands down, and a model switch is recorded once even where both
+  run (Claude Code without the mod). `--auto-capture` and `--proactive-recall` no
+  longer apply to Claude Code, and `/rewind` in a prompt is no longer recorded there
+  (the built-in command never reached the hook).
 - **The classic nudge runs on a session's first prompt and then every sixth**
   (`TJ_NUDGE_EVERY`), not on every prompt, and no longer shouts.
-- **A rejection is an approach ruled out in so many words** ("decided against",
-  "ruled out", "отказались от", "tried X … didn't work"), at most 600 characters.
-  The classifier and `backfill` no longer file bug reports, log lines or whole
-  answers as rejections, and the classifier drops raw tool calls, compaction
-  summaries and notifications instead of recording them.
+- **Rejections.** The keyword heuristic and `backfill` file a rejection only for an
+  approach ruled out in so many words ("decided against", "ruled out",
+  "Rejected: …", "отказались от", "tried X … didn't work"), not for a bug report, a
+  log line or a test report. Whatever its words, a classified rejection must read
+  like one: at most 600 characters, no paragraphs, headings, tables or code, not a
+  question. The classifier drops compaction summaries and notifications, and a raw
+  tool call unless it is evidence.
 
 ### Added
-- `task-journal cleanup-noise [--dry-run] [--all]` retires what the classifier once
-  filed as reasoning but is not: raw tool calls, compaction summaries, harness
-  notifications, and rejections that rule no approach out. Each gets a correction
-  (the journal stays append-only), which keeps it out of packs, recall and exports
-  without moving its task up the "newest first" lists. Only classifier entries are
+- `task-journal cleanup-noise [--dry-run] [--all] [--yes]` retires what the
+  classifier once filed as reasoning but is not: raw tool calls (except as
+  evidence), compaction summaries, harness notifications, and "rejections" that are
+  whole answers or questions. Each gets a correction stamped with the entry's own
+  time (the journal stays append-only), which keeps it out of packs and recall
+  without moving anything in the "newest first" views. A correction cannot be taken
+  back: `--dry-run` lists every entry in a file, and `--all` writes only with
+  `--yes`. Only classifier entries and old `backfill` keyword rejections are
   touched.
 
 ## [0.31.2] - 2026-10-05

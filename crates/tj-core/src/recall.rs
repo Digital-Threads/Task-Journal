@@ -75,6 +75,7 @@ pub fn recall_for_task(
     let needles: Vec<String> = arts
         .linked_issues
         .iter()
+        .filter(|issue| !is_a_standard(issue))
         .chain(arts.commit_hashes.iter())
         .map(|n| format!("\"{n}\""))
         .collect();
@@ -118,12 +119,13 @@ pub fn recall_for_task(
             .filter(|n| artifacts.contains(n.as_str()))
             .count()
             + shared_files(&paths, &artifacts);
-        let shared_words = keywords(&text)
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .intersection(&words)
-            .count();
-        if shared_arts == 0 && shared_words < MIN_SHARED_WORDS {
+        let event_words = keywords(&text).into_iter().collect::<HashSet<_>>();
+        let shared_words = event_words.intersection(&words).count();
+        // The bar rises with the call's length (one word in six, at least
+        // MIN_SHARED_WORDS): a long command or script shares three words
+        // with a note by chance alone.
+        let needed = MIN_SHARED_WORDS.max(words.len().div_ceil(6));
+        if shared_arts == 0 && shared_words < needed {
             continue;
         }
 
@@ -145,6 +147,19 @@ pub fn recall_for_task(
     hits.truncate(max_hits);
 
     Ok(hits)
+}
+
+/// `UTF-8`, `SHA-256`, `ISO-8601`: names of standards shaped like an issue
+/// key (`DEV-4621`) that tie a tool call to nothing.
+fn is_a_standard(issue: &str) -> bool {
+    const STANDARDS: &[&str] = &[
+        "UTF", "UCS", "SHA", "MD", "ISO", "RFC", "IEEE", "ECMA", "AES", "RSA", "TLS", "SSL",
+        "HTTP", "CRC", "PEP",
+    ];
+
+    issue
+        .split_once('-')
+        .is_some_and(|(prefix, _)| STANDARDS.contains(&prefix))
 }
 
 /// Files of an event (its `artifacts` JSON) that one of `paths` names. An
@@ -248,6 +263,38 @@ mod tests {
 
         let hits = recall_for_task(&conn, TASK, "/home/u/proj/src/pack.rs x", 2).unwrap();
         assert_eq!(hits.len(), 1, "got: {hits:?}");
+    }
+
+    /// `UTF-8` has the shape of an issue key and used to be enough for a hit.
+    #[test]
+    fn a_standards_name_is_not_a_shared_issue() {
+        let (_d, conn) = seeded(&[ev(
+            TASK,
+            EventType::Decision,
+            "Decided to write the CSV export as UTF-8 with a BOM for Excel.",
+            EventStatus::Confirmed,
+        )]);
+
+        let query = "curl -H charset=UTF-8 localhost:3000/health";
+        let hits = recall_for_task(&conn, TASK, query, 2).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
+    }
+
+    /// Three shared words are enough for a short call, not for a long one.
+    #[test]
+    fn a_long_call_needs_more_shared_words() {
+        let (_d, conn) = seeded(&[rejection(
+            TASK,
+            "Tried to switch the server to axum but it broke rmcp stdio.",
+        )]);
+        let filler = (0..30)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let long = format!("switch the server to axum {filler}");
+
+        let hits = recall_for_task(&conn, TASK, &long, 2).unwrap();
+        assert!(hits.is_empty(), "got: {hits:?}");
     }
 
     /// The words of a path are not words of the work: another file of the

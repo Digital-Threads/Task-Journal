@@ -25,6 +25,7 @@ impl Command {
             "TJ_PLUGIN_HOOKS",
             "TJ_RECALL_EVERY",
             "TJ_NUDGE_EVERY",
+            "CLAUDE_CONFIG_DIR",
         ] {
             cmd.env_remove(var);
         }
@@ -1720,6 +1721,156 @@ fn event_correct_links_to_corrected_event() {
         .stdout(contains("Migration was NOT done").and(contains("[correction]")));
 }
 
+/// A task-journal plugin in Claude Code's registry under `home`, shipping
+/// the hooks that replace the settings.json ones.
+fn install_plugin_with_hooks(home: &std::path::Path) {
+    let install = home.join("plugin-cache").join("task-journal");
+    std::fs::create_dir_all(install.join("hooks")).unwrap();
+    std::fs::write(
+        install.join("hooks").join("hooks.json"),
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"task-journal ingest-hook --from-plugin || true"}]}]}}"#,
+    )
+    .unwrap();
+    let registry = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&registry).unwrap();
+    std::fs::write(
+        registry.join("installed_plugins.json"),
+        serde_json::json!({
+            "version": 2,
+            "plugins": { "task-journal@task-journal": [{ "installPath": install }] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// cleanup-noise retires only plain noise: a whole answer filed as a
+/// rejection and a raw tool call filed as a decision go; a short rejection
+/// in the classifier's own words and a test run's evidence stay. A dry run
+/// writes nothing but the full list; corrections keep the entries' own time,
+/// so the newest real entry still leads the pack's recent events.
+#[test]
+fn cleanup_noise_retires_only_plain_noise() {
+    use tj_core::event::{Author, Event, EventStatus, EventType, Source};
+
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    let tj = || {
+        let mut c = Command::cargo_bin("task-journal").unwrap();
+        c.env("XDG_DATA_HOME", xdg.path()).current_dir(proj.path());
+        c
+    };
+    let task = String::from_utf8(
+        tj().args(["create", "Cleanup host"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    let journal_path = xdg
+        .path()
+        .join("task-journal")
+        .join("events")
+        .join(format!("{hash}.jsonl"));
+
+    let mut writer = tj_core::storage::JsonlWriter::open(&journal_path).unwrap();
+    for (ty, text) in [
+        (
+            EventType::Rejection,
+            "## Release\n\nThe PR was rejected once by CI, then merged.",
+        ),
+        (
+            EventType::Decision,
+            r#"Bash: {"command":"git push"} → {"stdout":""}"#,
+        ),
+        (
+            EventType::Rejection,
+            "Unsplash was rejected as the demo photo source: its licence forbids hot-linking.",
+        ),
+        (
+            EventType::Evidence,
+            r#"Bash: {"command":"cargo test"} → {"stdout":"all 12 tests pass"}"#,
+        ),
+    ] {
+        let mut e = Event::new(&task, ty, Author::Classifier, Source::Hook, text.into());
+        e.timestamp = "2026-01-01T00:00:00Z".into();
+        e.status = EventStatus::Confirmed;
+        writer.append(&e).unwrap();
+    }
+    writer.flush_durable().unwrap();
+    tj().args([
+        "event",
+        &task,
+        "--type",
+        "decision",
+        "--text",
+        "Decided to cache the pack per task.",
+    ])
+    .assert()
+    .success();
+    let before = std::fs::read_to_string(&journal_path).unwrap();
+
+    tj().args(["cleanup-noise", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("2 entries would be retired"));
+    assert_eq!(
+        std::fs::read_to_string(&journal_path).unwrap(),
+        before,
+        "a dry run writes nothing"
+    );
+    let list = std::fs::read_dir(xdg.path().join("task-journal"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().contains("cleanup-noise-"))
+        .expect("the dry run lists every entry in a file");
+    let list = std::fs::read_to_string(list).unwrap();
+    assert!(
+        list.contains("## Release") && list.contains("git push"),
+        "{list}"
+    );
+    assert!(
+        !list.contains("Unsplash") && !list.contains("cargo test"),
+        "{list}"
+    );
+
+    tj().args(["cleanup-noise", "--all"])
+        .assert()
+        .failure()
+        .stderr(contains("--yes"));
+
+    tj().args(["cleanup-noise"])
+        .assert()
+        .success()
+        .stdout(contains("2 entries retired"));
+    tj().args(["cleanup-noise"])
+        .assert()
+        .success()
+        .stdout(contains("nothing to clean"));
+
+    let pack = String::from_utf8(
+        tj().args(["pack", &task, "--mode", "full"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(pack.contains("Unsplash"), "{pack}");
+    assert!(!pack.contains("## Release"), "{pack}");
+    let recent = pack
+        .split("## Recent events")
+        .nth(1)
+        .expect("recent events section");
+    assert!(recent.contains("Decided to cache the pack"), "{recent}");
+}
+
 /// Claude Code takes its hooks from the plugin; the ones earlier versions
 /// wrote to settings.json ran next to them. install-hooks for Claude Code now
 /// takes ours out — after a copy of the file — and keeps everyone else's.
@@ -1752,6 +1903,14 @@ fn install_hooks_for_claude_code_removes_its_hooks_after_a_backup() {
             .assert()
             .success()
     };
+    // No plugin with hooks to take over yet: nothing is removed.
+    run().stderr(contains("ships no hooks yet"));
+    assert_eq!(
+        std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+        original
+    );
+
+    install_plugin_with_hooks(dir.path());
     run().stdout(contains("backup:"));
 
     let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
@@ -2569,6 +2728,80 @@ fn plugin_hooks_keep_session_start_and_model_switch_and_never_queue() {
             assert!(!hook_leaves_a_trace(kind, env, true), "{kind}, {env:?}");
         }
     }
+}
+
+/// Claude Code without the mod runs the plugin's hook and one left in
+/// settings.json side by side; a model switch is still recorded once.
+#[test]
+fn a_model_switch_is_recorded_once_by_two_hooks() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Switch host"])
+        .assert()
+        .success();
+    let payload = serde_json::json!({
+        "hook_event_name": "PostModelSwitch",
+        "session_id": "s-twice",
+        "from_model": "claude-opus-5-5",
+        "to_model": "claude-sonnet-5-5",
+        "source": "user",
+    })
+    .to_string();
+
+    for args in [vec!["ingest-hook"], vec!["ingest-hook", "--from-plugin"]] {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(args)
+            .write_stdin(payload.clone())
+            .assert()
+            .success();
+    }
+
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    let journal = project_events(xdg.path(), &hash);
+    assert_eq!(journal.matches("\"model_switch\"").count(), 1, "{journal}");
+}
+
+/// A test run is evidence by nature, and its record is the call: the
+/// heuristic's evidence from tool output is kept, not dropped as a raw call.
+#[test]
+fn evidence_from_tool_output_is_recorded() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args(["create", "Evidence host"])
+        .assert()
+        .success();
+    let payload = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "cargo test" },
+        "tool_response": { "stdout": "test result: ok. all 12 tests pass" },
+    })
+    .to_string();
+
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .env("TJ_INGEST_SYNC", "1")
+        .current_dir(proj.path())
+        .args(["ingest-hook", "--backend", "heuristic"])
+        .write_stdin(payload)
+        .assert()
+        .success();
+
+    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
+    let journal = project_events(xdg.path(), &hash);
+    assert!(journal.contains("\"evidence\""), "{journal}");
 }
 
 /// Push-recall is the plugin hook's job under the mod: a tool call that

@@ -79,9 +79,11 @@ the model-switch record. Full packs, honesty scores and chronicle gaps are on
 request (`task_pack`, `task-journal check`, `module_list`).
 
 If an earlier version's `task-journal install-hooks` wrote hooks into
-`settings.json`, run it once more: for Claude Code it now only takes them out,
-after copying the file to `settings.json.task-journal-backup-<time>`. Until
-then they stand down while the mod runs, so no event is handled twice.
+`settings.json`, update the plugin, restart Claude Code and run it once more:
+for Claude Code it now only takes them out, after copying the file to
+`settings.json.task-journal-backup-<time>` — and only once it finds the
+installed plugin's hooks. Until then they stand down beside the plugin's hooks,
+so no event is handled twice.
 
 ### Older Claude Code, or without the plugin
 
