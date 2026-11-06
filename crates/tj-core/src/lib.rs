@@ -74,6 +74,7 @@ pub mod harvest;
 pub mod llm;
 pub mod memory;
 pub mod modules;
+pub mod noise;
 pub mod pack;
 pub mod paths;
 pub mod project_hash;

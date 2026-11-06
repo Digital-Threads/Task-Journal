@@ -124,39 +124,13 @@ fn cached_open(state_path: &Path) -> anyhow::Result<Arc<Mutex<Connection>>> {
 
 /// MCP instructions delivered to every Claude Code session where this plugin is installed.
 /// This is the primary mechanism for self-contained plugin behavior — no manual CLAUDE.md edits needed.
-const MCP_INSTRUCTIONS: &str = r#"Task Journal — reasoning-chain memory. NON-NEGOTIABLE: you are the recorder.
-The code shows WHAT changed; only you can record WHY. If you don't log it the
-moment it happens, it is lost. This memory only works if you actually call the
-tools — so call them, every session, without being asked.
-
-THE RITUAL — do this on EVERY coding session, not optional:
-
-1. START. task_search(status="open") lists open tasks, newest first (add a
-   `query` to narrow; each entry in `tasks` has title + goal) → task_pack to
-   resume one; if nothing fits, task_create(title, goal=<one sentence: what the
-   user is trying to accomplish>). Hold the returned task_id for the whole session.
-2. AT THE MOMENT you commit to an approach → event_add(event_type="decision",
-   ...) and pass `alternatives` (the options you weighed). Right then — not at
-   the end, or you will forget.
-3. AT THE MOMENT you rule an approach out → event_add(event_type="rejection").
-4. When you verify a fact from code/logs → event_add(event_type="finding").
-   When a test/benchmark proves something → event_add(event_type="evidence").
-5. SELF-CHECK before you finish (or before the context compacts): "did I log
-   every decision, rejection, and key finding from this session?" If not, log
-   them NOW.
-6. DONE → task_close(reason, outcome, outcome_tag).
-7. MODULES: task_create(modules=[..]), read module_page first;
-   task_close(module_notes=[..]). "📚 Chronicle: …" names a gap: fix it after.
-
-Record in the user's language, terse and specific (file:line, ids, names). One
-task = one objective — don't spawn a new task per turn; events accumulate under
-the held task_id. Append-only: never edit — correct a mistake with a
-`correction` event (set `corrects`).
-
-event_type: hypothesis (unverified "maybe") | finding (verified from code/logs)
-| evidence (a test proved it) | decision (committed choice) | rejection (ruled
-out) | constraint (external limit) | correction (fixes an earlier event).
-`alternatives` is decision-only.
+const MCP_INSTRUCTIONS: &str = r#"Task Journal keeps why the work went the way it did; the code only shows what changed.
+When real work starts, resume an open task (task_search status="open", then task_pack) or open one with task_create and a one-sentence goal.
+Record as it happens with event_add: decision (pass the alternatives you weighed), rejection (an approach ruled out, and why), finding (a fact checked in code or logs), evidence (what a test or run proved), constraint (an outside limit).
+Write in the user's language, short and specific: files, lines, ids, numbers.
+One task per objective. The journal is append-only: fix an entry with a correction event (corrects=<event_id>).
+If the project has a module map (module_list), read the module's module_page first, pass modules= to task_create and module_notes= to task_close.
+When the work is done, close the task with task_close(reason, outcome).
 "#;
 
 #[derive(Clone, Default)]
@@ -261,9 +235,6 @@ pub struct TaskCreateResult {
     pub suggested_modules: Vec<tj_core::modules::Suggestion>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    /// The chronicle's most important gap, to close once the current work is done.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chronicle: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -579,36 +550,30 @@ fn has_journal() -> anyhow::Result<bool> {
 }
 
 /// What a new task's reply says about the chronicle: its modules with their
-/// state, or modules that look like a fit, and the archive's top gap.
+/// state, or modules that look like a fit. The archive's gaps are on request
+/// (module_list): a gap line on every task_create was noise about other work.
 fn new_task_chronicle(
-    task_id: &str,
     text: &str,
     linked: &[String],
-) -> anyhow::Result<(
-    Vec<ModuleBrief>,
-    Vec<tj_core::modules::Suggestion>,
-    Option<String>,
-)> {
-    with_chronicle(|chr, conn, project_hash| {
-        let mut modules = Vec::new();
-        for id in linked {
-            if let Some(m) = tj_core::modules::get(&chr.home, &chr.home_hash, id)? {
-                modules.push(ModuleBrief {
-                    module_id: m.module_id,
-                    name: m.name,
-                    state: m.state,
-                });
-            }
+) -> anyhow::Result<(Vec<ModuleBrief>, Vec<tj_core::modules::Suggestion>)> {
+    let chr = chronicle()?;
+    let mut modules = Vec::new();
+    for id in linked {
+        if let Some(m) = tj_core::modules::get(&chr.home, &chr.home_hash, id)? {
+            modules.push(ModuleBrief {
+                module_id: m.module_id,
+                name: m.name,
+                state: m.state,
+            });
         }
-        let suggested = if linked.is_empty() {
-            tj_core::modules::suggest(&chr.home, &chr.home_hash, text, &[])?
-        } else {
-            Vec::new()
-        };
-        let gaps = tj_core::archive::gaps(chr, conn, project_hash, Some(task_id))?;
+    }
+    let suggested = if linked.is_empty() {
+        tj_core::modules::suggest(&chr.home, &chr.home_hash, text, &[])?
+    } else {
+        Vec::new()
+    };
 
-        Ok((modules, suggested, tj_core::archive::headline(&gaps)))
-    })
+    Ok((modules, suggested))
 }
 
 /// What a closed task's modules still need: a link, or a fresh state.
@@ -999,8 +964,8 @@ impl TaskJournalServer {
                     p.goal.as_deref().unwrap_or(""),
                     p.initial_context.as_deref().unwrap_or("")
                 );
-                let (modules, suggested_modules, chronicle) =
-                    new_task_chronicle(&task_id, &text, &linked).unwrap_or_default();
+                let (modules, suggested_modules) =
+                    new_task_chronicle(&text, &linked).unwrap_or_default();
 
                 Ok(TaskCreateResult {
                     task_id,
@@ -1008,7 +973,6 @@ impl TaskJournalServer {
                     modules,
                     suggested_modules,
                     warnings: resolved.map(|(r, _)| r.warnings).unwrap_or_default(),
-                    chronicle,
                 })
             })
             .await
@@ -2680,11 +2644,21 @@ mod tests {
         assert!(l.links[0].remove.is_empty());
     }
 
+    /// Newer models follow plain instructions; shouting (capitals,
+    /// "NON-NEGOTIABLE") and length only crowd the context.
     #[test]
-    fn instructions_teach_the_chronicle() {
-        for needle in ["modules=", "module_page", "module_notes", "📚 Chronicle"] {
+    fn instructions_are_short_plain_and_teach_the_modules() {
+        for needle in ["modules=", "module_page", "module_notes"] {
             assert!(MCP_INSTRUCTIONS.contains(needle), "{needle}");
         }
+
+        assert!(MCP_INSTRUCTIONS.lines().count() <= 7, "{MCP_INSTRUCTIONS}");
+        assert!(!MCP_INSTRUCTIONS.contains("NON-NEGOTIABLE"));
+        let shouted = MCP_INSTRUCTIONS
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| w.chars().count() > 3 && w.chars().all(|c| c.is_uppercase()))
+            .collect::<Vec<_>>();
+        assert!(shouted.is_empty(), "{shouted:?}");
     }
 
     #[tokio::test]
@@ -2808,7 +2782,9 @@ mod tests {
             "{:?}",
             created.suggested_modules
         );
-        assert!(created.chronicle.is_some());
+        // The archive's gaps are on request (module_list), not in every reply.
+        let reply = serde_json::to_value(&created).unwrap();
+        assert!(reply.get("chronicle").is_none(), "{reply}");
 
         let candidates = server
             .module_backfill_candidates(Parameters(BackfillParams {

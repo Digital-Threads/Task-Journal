@@ -59,6 +59,67 @@ pub fn decide_status(confidence: f64) -> EventStatus {
     }
 }
 
+/// The longest a rejection can be: a sentence or two on what was ruled out
+/// and why. A whole answer that happens to say "rejected" is not one.
+pub const REJECTION_MAX_CHARS: usize = 600;
+
+/// Phrases that rule an approach out on their own.
+const REJECTION_CUES: &[&str] = &[
+    "decided against",
+    "won't work because",
+    "ruled out",
+    "rule it out",
+    "won't use",
+    "will not use",
+    "not going to use",
+    "not going with",
+    "gave up on",
+    "giving up on",
+    "abandoned the",
+    "abandon the",
+    "rejected the",
+    "rejecting the",
+    "отказались от",
+    "отказался от",
+    "отказываемся от",
+    "отказ от",
+    "отклонил",
+    "отклонён",
+    "отклонен",
+    "отклоняем",
+    "отверг",
+    "не будем использовать",
+    "не стали использовать",
+];
+
+/// An attempt and its failure together: "tried X, it didn't work".
+const TRIED: &[&str] = &["tried", "attempted", "пробовал", "попробовал"];
+const FAILED: &[&str] = &[
+    "instead",
+    "doesn't work",
+    "didn't work",
+    "won't work",
+    "failed",
+    "вместо",
+    "не работает",
+    "не сработал",
+    "не подходит",
+];
+
+/// True when `text` rules an approach out: a short statement with an
+/// explicit cue. A bug report ("X doesn't work"), a log line ("rejected 2
+/// files"), a tool call or a whole answer is not a rejection.
+pub fn is_explicit_rejection(text: &str) -> bool {
+    if text.chars().count() > REJECTION_MAX_CHARS || crate::noise::machine_text(text).is_some() {
+        return false;
+    }
+
+    let lower = text.to_lowercase();
+    let has = |cues: &[&str]| cues.iter().any(|c| lower.contains(c));
+
+    has(REJECTION_CUES) || (has(TRIED) && has(FAILED))
+}
+
 /// Parse a model's raw text reply into a strict-JSON `ClassifyOutput`,
 /// tolerating ```json code-fence wrapping. Shared by the HTTP and agent-sdk
 /// backends so the two never diverge on how they read the verdict.

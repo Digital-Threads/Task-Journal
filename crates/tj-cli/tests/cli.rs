@@ -22,6 +22,9 @@ impl Command {
             "CLAUDE_CODE_SESSION_ID",
             "TJ_IN_CLASSIFIER",
             "TJ_MOD_ACTIVE",
+            "TJ_PLUGIN_HOOKS",
+            "TJ_RECALL_EVERY",
+            "TJ_NUDGE_EVERY",
         ] {
             cmd.env_remove(var);
         }
@@ -1717,16 +1720,77 @@ fn event_correct_links_to_corrected_event() {
         .stdout(contains("Migration was NOT done").and(contains("[correction]")));
 }
 
+/// Claude Code takes its hooks from the plugin; the ones earlier versions
+/// wrote to settings.json ran next to them. install-hooks for Claude Code now
+/// takes ours out — after a copy of the file — and keeps everyone else's.
+#[test]
+fn install_hooks_for_claude_code_removes_its_hooks_after_a_backup() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let ours = |command: &str| serde_json::json!({ "type": "command", "command": command });
+    let original = serde_json::json!({
+        "theme": "dark",
+        "hooks": {
+            "UserPromptSubmit": [{ "matcher": "", "hooks": [
+                ours("task-journal nudge || true"),
+                ours("task-journal ingest-hook || true"),
+                ours("task-journal recall-hook || true"),
+                ours("other-plugin do-thing"),
+            ]}],
+            "Stop": [{ "matcher": "", "hooks": [ours("task-journal ingest-hook || true")] }],
+        }
+    })
+    .to_string();
+    std::fs::write(claude_dir.join("settings.json"), &original).unwrap();
+
+    let run = || {
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("HOME", dir.path())
+            .args(["install-hooks", "--scope", "user", "--auto-capture"])
+            .assert()
+            .success()
+    };
+    run().stdout(contains("backup:"));
+
+    let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(!content.contains("task-journal"), "{content}");
+    assert!(content.contains("other-plugin do-thing"), "{content}");
+    assert!(content.contains("dark"), "{content}");
+    assert!(
+        !content.contains("\"Stop\""),
+        "an event left empty goes: {content}"
+    );
+
+    let backups = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&claude_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.to_string_lossy()
+                    .contains("settings.json.task-journal-backup-")
+            })
+            .collect()
+    };
+    assert_eq!(backups().len(), 1);
+    assert_eq!(std::fs::read_to_string(&backups()[0]).unwrap(), original);
+
+    // Nothing left to take out: no write, no second backup.
+    run().stdout(contains("backup:").not());
+    assert_eq!(backups().len(), 1);
+}
+
 #[test]
 fn install_hooks_command_uses_no_fail_pattern() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user"])
+        .args(["install-hooks", "--scope", "user", "--client", "codex"])
         .assert()
         .success();
-    let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    let s = std::fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
     assert!(
         s.contains("|| true"),
         "hook command must end with || true so a failed classifier doesn't break Claude Code: {s}"
@@ -1734,16 +1798,16 @@ fn install_hooks_command_uses_no_fail_pattern() {
 }
 
 #[test]
-fn install_hooks_writes_to_settings_json() {
+fn install_hooks_default_wires_resume_and_nudge_only() {
     let dir = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user"])
+        .args(["install-hooks", "--scope", "user", "--client", "codex"])
         .assert()
         .success();
 
-    let settings_path = dir.path().join(".claude").join("settings.json");
+    let settings_path = dir.path().join(".codex").join("hooks.json");
     assert!(settings_path.exists());
     let content = std::fs::read_to_string(&settings_path).unwrap();
     assert!(content.contains("task-journal ingest-hook")); // SessionStart resume
@@ -1774,12 +1838,18 @@ fn install_hooks_auto_capture_wires_all_events() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user", "--auto-capture"])
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--client",
+            "codex",
+            "--auto-capture",
+        ])
         .assert()
         .success();
 
-    let content =
-        std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+    let content = std::fs::read_to_string(dir.path().join(".codex").join("hooks.json")).unwrap();
     for ev in [
         "SessionStart",
         "UserPromptSubmit",
@@ -1787,7 +1857,6 @@ fn install_hooks_auto_capture_wires_all_events() {
         "Stop",
         "PreCompact",
         "SessionEnd",
-        "PostModelSwitch",
     ] {
         assert!(content.contains(ev), "--auto-capture must wire {ev}");
     }
@@ -1967,32 +2036,6 @@ fn post_model_switch_without_active_task_is_a_noop() {
         .stdout("");
 }
 
-/// Claude Code 2.1.268: SessionEnd hooks share a 1.5-second budget unless a
-/// per-hook `timeout` raises it (up to 60s). Without one, the last-chance
-/// catch-up ingest is cancelled and the tail of the session is lost.
-#[test]
-fn install_hooks_gives_session_end_a_timeout() {
-    let dir = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user", "--auto-capture"])
-        .assert()
-        .success();
-
-    let settings: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap(),
-    )
-    .unwrap();
-    let timeout = settings["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"]
-        .as_u64()
-        .expect("SessionEnd hook must declare a timeout");
-    assert!(
-        (10..=60).contains(&timeout),
-        "SessionEnd timeout must raise the 1.5s budget without exceeding the 60s cap: {timeout}"
-    );
-}
-
 /// The heavy capture hooks spawn a classifier. `async: true` (Claude Code
 /// 2.1.x) runs them in the background, so the chat never waits on them and no
 /// timeout applies. SessionStart stays synchronous — its stdout is the resume
@@ -2003,12 +2046,19 @@ fn install_hooks_runs_heavy_capture_hooks_async() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user", "--auto-capture"])
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--client",
+            "codex",
+            "--auto-capture",
+        ])
         .assert()
         .success();
 
     let settings: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap(),
+        &std::fs::read_to_string(dir.path().join(".codex").join("hooks.json")).unwrap(),
     )
     .unwrap();
     for ev in ["PostToolUse", "Stop", "PreCompact"] {
@@ -2053,11 +2103,11 @@ fn session_end_hook_is_clean_noop_without_journal() {
 #[test]
 fn install_hooks_merges_and_preserves_third_party_hooks() {
     let dir = assert_fs::TempDir::new().unwrap();
-    let claude_dir = dir.path().join(".claude");
-    std::fs::create_dir_all(&claude_dir).unwrap();
+    let codex_dir = dir.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
     // Pre-existing foreign hooks (another plugin) on the same events we touch.
     std::fs::write(
-        claude_dir.join("settings.json"),
+        codex_dir.join("hooks.json"),
         serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{ "matcher": "", "hooks": [
@@ -2076,14 +2126,14 @@ fn install_hooks_merges_and_preserves_third_party_hooks() {
         Command::cargo_bin("task-journal")
             .unwrap()
             .env("HOME", dir.path())
-            .args(["install-hooks", "--scope", "user"])
+            .args(["install-hooks", "--scope", "user", "--client", "codex"])
             .assert()
             .success();
     };
     run();
     run(); // idempotent: second install must not duplicate task-journal entries
 
-    let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    let content = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
     // Foreign hooks survive.
     assert!(
         content.contains("other-plugin do-thing"),
@@ -2107,10 +2157,10 @@ fn install_hooks_merges_and_preserves_third_party_hooks() {
 #[test]
 fn install_hooks_is_idempotent_and_uninstall_works() {
     let dir = assert_fs::TempDir::new().unwrap();
-    let claude_dir = dir.path().join(".claude");
-    std::fs::create_dir_all(&claude_dir).unwrap();
+    let codex_dir = dir.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
     std::fs::write(
-        claude_dir.join("settings.json"),
+        codex_dir.join("hooks.json"),
         serde_json::json!({"theme": "dark"}).to_string(),
     )
     .unwrap();
@@ -2118,17 +2168,17 @@ fn install_hooks_is_idempotent_and_uninstall_works() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user"])
+        .args(["install-hooks", "--scope", "user", "--client", "codex"])
         .assert()
         .success();
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user"])
+        .args(["install-hooks", "--scope", "user", "--client", "codex"])
         .assert()
         .success();
 
-    let after_install = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    let after_install = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
     assert!(
         after_install.contains("\"theme\":\"dark\"")
             || after_install.contains("\"theme\": \"dark\""),
@@ -2139,11 +2189,18 @@ fn install_hooks_is_idempotent_and_uninstall_works() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user", "--uninstall"])
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--client",
+            "codex",
+            "--uninstall",
+        ])
         .assert()
         .success();
 
-    let after_uninstall = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    let after_uninstall = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
     assert!(
         after_uninstall.contains("\"theme\":\"dark\"")
             || after_uninstall.contains("\"theme\": \"dark\""),
@@ -2387,11 +2444,12 @@ fn ingest_hook_mock_drain_keeps_entries_it_cannot_record() {
     );
 }
 
-/// Run one `ingest-hook` payload of `kind` with `TJ_MOD_ACTIVE` set to
-/// `mod_value` (None = unset), in a fresh project with an open task and a
-/// transcript. True when the hook left any trace: stdout, a pending entry,
-/// or a new journal line.
-fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
+/// Run one `ingest-hook` payload of `kind` with the given environment (what
+/// the mod sets: `TJ_MOD_ACTIVE`, `TJ_PLUGIN_HOOKS`), as the plugin's hook
+/// (`--from-plugin`) or a settings.json one, in a fresh project with an open
+/// task and a transcript. True when the hook left any trace: stdout, a
+/// pending entry, or a new journal line.
+fn hook_leaves_a_trace(kind: &str, env: &[(&str, &str)], from_plugin: bool) -> bool {
     let xdg = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
     Command::cargo_bin("task-journal")
@@ -2432,11 +2490,16 @@ fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
     cmd.env("XDG_DATA_HOME", xdg.path())
         .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
         .current_dir(proj.path());
-    if let Some(v) = mod_value {
-        cmd.env("TJ_MOD_ACTIVE", v);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    if from_plugin {
+        cmd.arg("ingest-hook").arg("--from-plugin");
+    } else {
+        cmd.arg("ingest-hook");
     }
     let out = cmd
-        .args(["ingest-hook", "--backend", "heuristic"])
+        .args(["--backend", "heuristic"])
         .write_stdin(payload.to_string())
         .assert()
         .success()
@@ -2450,43 +2513,78 @@ fn hook_leaves_a_trace(kind: &str, mod_value: Option<&str>) -> bool {
     !out.is_empty() || pending > 0 || journal_len() != before
 }
 
-/// The Claude Code mod captures in-process and sets TJ_MOD_ACTIVE for the
-/// hooks it starts; the classic capture must then stand down. (Nothing here
-/// echoes a prior entry, so push-recall stays quiet too.)
+const NEW_MOD: &[(&str, &str)] = &[("TJ_MOD_ACTIVE", "1"), ("TJ_PLUGIN_HOOKS", "1")];
+const OLD_MOD: &[(&str, &str)] = &[("TJ_MOD_ACTIVE", "1")];
+const CAPTURE_KINDS: [&str; 5] = [
+    "UserPromptSubmit",
+    "PostToolUse",
+    "Stop",
+    "PreCompact",
+    "SessionEnd",
+];
+
+/// Beside a plugin that ships its own hooks, a task-journal hook still left
+/// in settings.json stands down for every event: one event, one record.
+/// Without a mod (Codex, older Claude Code) the classic hooks run whole.
 #[test]
-fn mod_active_silences_the_classic_capture_hooks() {
-    for kind in [
-        "UserPromptSubmit",
-        "PostToolUse",
-        "Stop",
-        "PreCompact",
-        "SessionEnd",
-    ] {
-        assert!(!hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
-        assert!(hook_leaves_a_trace(kind, Some("0")), "{kind}, mod \"0\"");
-        assert!(hook_leaves_a_trace(kind, None), "{kind}, mod unset");
+fn settings_json_hooks_stand_down_beside_the_plugins_hooks() {
+    for kind in CAPTURE_KINDS
+        .iter()
+        .chain(&["SessionStart", "PostModelSwitch"])
+    {
+        assert!(
+            !hook_leaves_a_trace(kind, NEW_MOD, false),
+            "{kind}, new mod"
+        );
+        assert!(
+            hook_leaves_a_trace(kind, &[("TJ_MOD_ACTIVE", "0")], false),
+            "{kind}, mod \"0\""
+        );
+        assert!(hook_leaves_a_trace(kind, &[], false), "{kind}, no mod");
     }
 }
 
-/// Resume packs and the model-switch constraint are not the mod's job.
+/// Beside an older mod whose plugin had no hooks, the settings.json hook
+/// keeps the session start and the model switch and leaves capture to it.
 #[test]
-fn mod_active_keeps_session_start_and_model_switch() {
+fn settings_json_hooks_beside_an_older_mod_skip_only_capture() {
     for kind in ["SessionStart", "PostModelSwitch"] {
-        assert!(hook_leaves_a_trace(kind, Some("1")), "{kind}, mod on");
+        assert!(hook_leaves_a_trace(kind, OLD_MOD, false), "{kind}");
+    }
+    for kind in CAPTURE_KINDS {
+        assert!(!hook_leaves_a_trace(kind, OLD_MOD, false), "{kind}");
     }
 }
 
-/// The mod takes over capture, not push-recall: a tool call that echoes a
-/// prior rejection still gets the recall on both paths, and nothing is queued.
+/// The plugin's hooks bring the session start and the model switch, with or
+/// without the mod — and never the classifier queue: without a mod to drain
+/// it, that queue only grew (0.14.4).
 #[test]
-fn mod_active_keeps_push_recall() {
-    let (dir, _task_id) = seed_axum_rejection();
+fn plugin_hooks_keep_session_start_and_model_switch_and_never_queue() {
+    for env in [NEW_MOD, &[]] {
+        for kind in ["SessionStart", "PostModelSwitch"] {
+            assert!(hook_leaves_a_trace(kind, env, true), "{kind}, {env:?}");
+        }
+        for kind in CAPTURE_KINDS {
+            assert!(!hook_leaves_a_trace(kind, env, true), "{kind}, {env:?}");
+        }
+    }
+}
 
-    for tool in ["Bash", "mcp__x__do"] {
+/// Push-recall is the plugin hook's job under the mod: a tool call that
+/// clearly touches a prior rejection of the session's task gets it, as
+/// additionalContext for any tool, and nothing is queued.
+#[test]
+fn plugin_hooks_keep_push_recall_under_the_mod() {
+    let (dir, task_id) = seed_axum_rejection();
+
+    for (tool, sid) in [("Bash", "s-bash"), ("mcp__x__do", "s-mcp")] {
+        join_session(dir.path(), &task_id, sid);
         let payload = serde_json::json!({
             "hook_event_name": "PostToolUse",
+            "session_id": sid,
             "tool_name": tool,
-            "tool_input": { "command": "let's switch the server to axum" },
+            "tool_input": { "command": AXUM },
             "tool_response": { "output": "" }
         });
         let out = Command::cargo_bin("task-journal")
@@ -2494,7 +2592,8 @@ fn mod_active_keeps_push_recall() {
             .env("XDG_DATA_HOME", dir.path())
             .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
             .env("TJ_MOD_ACTIVE", "1")
-            .args(["ingest-hook", "--backend", "heuristic"])
+            .env("TJ_PLUGIN_HOOKS", "1")
+            .args(["ingest-hook", "--from-plugin", "--backend", "heuristic"])
             .write_stdin(payload.to_string())
             .assert()
             .success()
@@ -2503,48 +2602,13 @@ fn mod_active_keeps_push_recall() {
             .clone();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("previously rejected"), "{tool}: {out}");
+        assert!(out.contains("additionalContext"), "{tool}: {out}");
     }
 
     let pending = std::fs::read_dir(dir.path().join("task-journal").join("pending"))
         .map(|d| d.count())
         .unwrap_or(0);
     assert_eq!(pending, 0, "the mod queues tool calls itself");
-}
-
-/// `/rewind` is the user rolling back a path — the mod doesn't record that,
-/// so the correction event still lands.
-#[test]
-fn mod_active_keeps_the_rewind_correction() {
-    let xdg = assert_fs::TempDir::new().unwrap();
-    let proj = assert_fs::TempDir::new().unwrap();
-    let hash = tj_core::project_hash::from_path(proj.path()).unwrap();
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", xdg.path())
-        .current_dir(proj.path())
-        .args(["create", "Rewind host"])
-        .assert()
-        .success();
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", xdg.path())
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
-        .env("TJ_MOD_ACTIVE", "1")
-        .current_dir(proj.path())
-        .args(["ingest-hook", "--backend", "heuristic"])
-        .write_stdin(
-            serde_json::json!({
-                "hook_event_name": "UserPromptSubmit",
-                "prompt": "/rewind go back to plan A",
-            })
-            .to_string(),
-        )
-        .assert()
-        .success();
-
-    let journal = project_events(xdg.path(), &hash);
-    assert_eq!(session_ids_of(&journal, "correction").len(), 1, "{journal}");
 }
 
 #[test]
@@ -2644,7 +2708,7 @@ fn ingest_hook_writes_telemetry_record() {
 }
 
 #[test]
-fn ingest_hook_session_start_emits_resume_pack_json() {
+fn ingest_hook_session_start_names_the_task_in_json() {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
         Command::cargo_bin("task-journal")
@@ -2705,10 +2769,8 @@ fn ingest_hook_session_start_emits_resume_pack_json() {
         ctx.contains("Wire SessionStart pack"),
         "additionalContext must include task title: {ctx}"
     );
-    assert!(
-        ctx.contains("Adopt Rust"),
-        "additionalContext must include event text: {ctx}"
-    );
+    // The decisions themselves are on request (task_pack), not at every start.
+    assert!(!ctx.contains("Adopt Rust"), "{ctx}");
     // 0.14.3: sessionTitle / initialUserMessage are no longer emitted —
     // they overrode Claude Code's native session name and seeded garbage
     // task titles. The resume context rides in additionalContext alone.
@@ -3282,13 +3344,13 @@ fn ingest_hook_reads_post_tool_use_payload_from_stdin() {
         .assert()
         .success();
 
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .args(["pack", &task_id, "--mode", "full"])
-        .assert()
-        .success()
-        .stdout(contains("Bash").and(contains("cargo test")));
+    // A raw tool call stays out of packs, so read the journal itself.
+    let hash = tj_core::project_hash::from_path(std::env::current_dir().unwrap()).unwrap();
+    let journal = project_events(dir.path(), &hash);
+    assert!(
+        journal.contains("Bash") && journal.contains("cargo test"),
+        "{journal}"
+    );
 }
 
 #[test]
@@ -3300,10 +3362,10 @@ fn install_hooks_writes_command_without_bogus_env_var_interpolation() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user"])
+        .args(["install-hooks", "--scope", "user", "--client", "codex"])
         .assert()
         .success();
-    let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    let s = std::fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
     assert!(
         !s.contains("$CLAUDE_HOOK_NAME") && !s.contains("$CLAUDE_HOOK_TEXT"),
         "install-hooks must not interpolate non-existent env vars: {s}"
@@ -5175,10 +5237,17 @@ fn install_hooks_wires_precompact_event() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user", "--auto-capture"])
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--client",
+            "codex",
+            "--auto-capture",
+        ])
         .assert()
         .success();
-    let s = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+    let s = std::fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
     assert!(
         s.contains("PreCompact"),
         "settings.json must wire PreCompact under --auto-capture: {s}"
@@ -6333,11 +6402,14 @@ fn list_tree_indents_children_under_parents() {
     );
 }
 
-// --- Push-recall (claude-memory-60m) -----------------------------------
+// --- Push-recall (claude-memory-60m / 7km) -----------------------------
 
-/// Seed a confirmed rejection mentioning `axum` on a fresh task, returning
-/// the (TempDir, task_id). Mirrors the SessionStart-test seeding: `create`
-/// + `event --type rejection`.
+/// A tool call that clearly touches the seeded rejection: it shares
+/// "switch", "server" and "axum" with it.
+const AXUM: &str = "switch the server to axum";
+
+/// Seed a confirmed rejection about axum on a fresh task, recorded outside
+/// any session (an earlier one), returning the (TempDir, task_id).
 fn seed_axum_rejection() -> (assert_fs::TempDir, String) {
     let dir = assert_fs::TempDir::new().unwrap();
     let task_id = String::from_utf8(
@@ -6364,75 +6436,42 @@ fn seed_axum_rejection() -> (assert_fs::TempDir, String) {
             "--type",
             "rejection",
             "--text",
-            "Tried switching the server to axum but it broke rmcp stdio.",
+            "Tried to switch the server to axum but it broke rmcp stdio.",
         ])
         .assert()
         .success();
     (dir, task_id)
 }
 
-#[test]
-fn post_tool_use_emits_recall_additional_context() {
-    let (dir, task_id) = seed_axum_rejection();
-
-    let payload = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
-        "tool_name": "Bash",
-        "tool_input": { "command": "let's switch the server to axum" },
-        "tool_response": { "output": "" }
-    })
-    .to_string();
-
-    let out = Command::cargo_bin("task-journal")
+/// Session `sid` records a finding on `task_id`, which makes it the
+/// session's active task.
+fn join_session(dir: &std::path::Path, task_id: &str, sid: &str) {
+    Command::cargo_bin("task-journal")
         .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
+        .env("XDG_DATA_HOME", dir)
         .args([
-            "ingest-hook",
-            "--backend",
-            "cli",
-            "--mock-event-type",
+            "event",
+            task_id,
+            "--type",
             "finding",
-            "--mock-task-id",
-            &task_id,
-            "--mock-confidence",
-            "0.9",
+            "--text",
+            "Picked the task up again.",
+            "--session",
+            sid,
         ])
-        .write_stdin(payload)
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let body = String::from_utf8(out).unwrap();
-
-    // The recall envelope is one of possibly several stdout lines (the
-    // mock path also prints the new event_id). Find the JSON line.
-    let env_line = body
-        .lines()
-        .find(|l| l.contains("additionalContext"))
-        .unwrap_or_else(|| panic!("no recall envelope on stdout, got: {body:?}"));
-    let v: serde_json::Value = serde_json::from_str(env_line.trim()).unwrap();
-    let ctx = v
-        .get("hookSpecificOutput")
-        .and_then(|h| h.get("additionalContext"))
-        .and_then(|s| s.as_str())
-        .expect("additionalContext missing");
-    assert!(ctx.contains("⚠ recall"), "ctx: {ctx}");
-    assert!(ctx.contains("axum"), "ctx: {ctx}");
-    assert_eq!(
-        v.get("hookSpecificOutput")
-            .and_then(|h| h.get("hookEventName"))
-            .and_then(|s| s.as_str()),
-        Some("PostToolUse"),
-    );
+        .success();
 }
 
 /// One real (non-mock) PostToolUse hook run; `session: None` sends no
-/// session id at all. Returns stdout.
-fn post_tool_use(dir: &std::path::Path, session: Option<&str>, tool: &str, input: &str) -> String {
+/// session id at all. Returns stdout. `TJ_RECALL_EVERY=0` unless `paced`.
+fn post_tool_use_paced(
+    dir: &std::path::Path,
+    session: Option<&str>,
+    tool: &str,
+    input: &str,
+    paced: bool,
+) -> String {
     let mut payload = serde_json::json!({
         "hook_event_name": "PostToolUse",
         "tool_name": tool,
@@ -6443,10 +6482,13 @@ fn post_tool_use(dir: &std::path::Path, session: Option<&str>, tool: &str, input
         payload["session_id"] = sid.into();
     }
 
-    let out = Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir)
-        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+    let mut cmd = Command::cargo_bin("task-journal").unwrap();
+    cmd.env("XDG_DATA_HOME", dir)
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1");
+    if !paced {
+        cmd.env("TJ_RECALL_EVERY", "0");
+    }
+    let out = cmd
         .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(payload.to_string())
         .assert()
@@ -6457,34 +6499,148 @@ fn post_tool_use(dir: &std::path::Path, session: Option<&str>, tool: &str, input
     String::from_utf8(out).unwrap()
 }
 
-/// After every tool call the same hits used to come back, flooding the
-/// agent's context. A session sees each hit once, on either recall path.
-#[test]
-fn push_recall_shows_each_hit_once_per_session() {
-    let (dir, _task_id) = seed_axum_rejection();
-    let axum = "let's switch the server to axum";
-
-    let first = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
-    assert!(first.contains("⚠ recall"), "{first}");
-
-    let again = post_tool_use(dir.path(), Some("s-a"), "Bash", axum);
-    assert!(!again.contains("recall"), "{again}");
-    let via_mcp = post_tool_use(dir.path(), Some("s-a"), "mcp__x__do", axum);
-    assert!(!via_mcp.contains("recall"), "{via_mcp}");
-
-    let other = post_tool_use(dir.path(), Some("s-b"), "Bash", axum);
-    assert!(other.contains("⚠ recall"), "{other}");
+fn post_tool_use(dir: &std::path::Path, session: Option<&str>, tool: &str, input: &str) -> String {
+    post_tool_use_paced(dir, session, tool, input, false)
 }
 
 #[test]
-fn push_recall_without_a_session_id_repeats_as_before() {
-    let (dir, _task_id) = seed_axum_rejection();
-    let axum = "let's switch the server to axum";
+fn post_tool_use_emits_recall_additional_context() {
+    let (dir, task_id) = seed_axum_rejection();
+    join_session(dir.path(), &task_id, "s-recall");
 
-    for _ in 0..2 {
-        let out = post_tool_use(dir.path(), None, "Bash", axum);
-        assert!(out.contains("⚠ recall"), "{out}");
-    }
+    let out = post_tool_use(dir.path(), Some("s-recall"), "Bash", AXUM);
+    let env_line = out
+        .lines()
+        .find(|l| l.contains("additionalContext"))
+        .unwrap_or_else(|| panic!("no recall envelope on stdout, got: {out:?}"));
+    let v: serde_json::Value = serde_json::from_str(env_line.trim()).unwrap();
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains("⚠ recall"), "ctx: {ctx}");
+    assert!(ctx.contains("axum"), "ctx: {ctx}");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+}
+
+/// An MCP tool gets the same additionalContext: the hook runs async, and an
+/// async updatedMCPToolOutput never reached the model.
+#[test]
+fn post_tool_use_recall_for_an_mcp_tool_is_additional_context() {
+    let (dir, task_id) = seed_axum_rejection();
+    join_session(dir.path(), &task_id, "s-mcp");
+
+    let out = post_tool_use(
+        dir.path(),
+        Some("s-mcp"),
+        "mcp__some-server__do_thing",
+        AXUM,
+    );
+    assert!(
+        out.contains("additionalContext") && out.contains("axum"),
+        "{out}"
+    );
+    assert!(!out.contains("updatedMCPToolOutput"), "{out}");
+}
+
+/// Recall belongs to the work at hand: no session id, or a session with no
+/// journal task, gets nothing — however well the call matches.
+#[test]
+fn push_recall_needs_a_session_with_an_active_task() {
+    let (dir, _task_id) = seed_axum_rejection();
+
+    assert!(!post_tool_use(dir.path(), None, "Bash", AXUM).contains("recall"));
+    assert!(!post_tool_use(dir.path(), Some("s-idle"), "Bash", AXUM).contains("recall"));
+}
+
+/// A rejection of another task stays out unless the two share a module.
+#[test]
+fn push_recall_skips_other_tasks() {
+    let (dir, _axum_task) = seed_axum_rejection();
+    let other = String::from_utf8(
+        Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", dir.path())
+            .args(["create", "Unrelated work"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    join_session(dir.path(), &other, "s-other-task");
+
+    let out = post_tool_use(dir.path(), Some("s-other-task"), "Bash", AXUM);
+    assert!(!out.contains("recall"), "{out}");
+}
+
+/// One or two shared words are not a match: "server" alone used to recall
+/// rejections from anywhere in the project.
+#[test]
+fn push_recall_needs_a_strong_match() {
+    let (dir, task_id) = seed_axum_rejection();
+    join_session(dir.path(), &task_id, "s-weak");
+
+    let out = post_tool_use(
+        dir.path(),
+        Some("s-weak"),
+        "Bash",
+        "restart the axum server",
+    );
+    assert!(!out.contains("recall"), "{out}");
+}
+
+/// After every tool call the same hits used to come back, flooding the
+/// agent's context. A session sees each hit once.
+#[test]
+fn push_recall_shows_each_hit_once_per_session() {
+    let (dir, task_id) = seed_axum_rejection();
+    join_session(dir.path(), &task_id, "s-a");
+    join_session(dir.path(), &task_id, "s-b");
+
+    let first = post_tool_use(dir.path(), Some("s-a"), "Bash", AXUM);
+    assert!(first.contains("⚠ recall"), "{first}");
+
+    let again = post_tool_use(dir.path(), Some("s-a"), "Bash", AXUM);
+    assert!(!again.contains("recall"), "{again}");
+    let via_mcp = post_tool_use(dir.path(), Some("s-a"), "mcp__x__do", AXUM);
+    assert!(!via_mcp.contains("recall"), "{via_mcp}");
+
+    let other = post_tool_use(dir.path(), Some("s-b"), "Bash", AXUM);
+    assert!(other.contains("⚠ recall"), "{other}");
+}
+
+/// No more than one recall per ten tool calls of a session.
+#[test]
+fn push_recall_waits_ten_calls_between_two_recalls() {
+    let (dir, task_id) = seed_axum_rejection();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", dir.path())
+        .args([
+            "event",
+            &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Rejected the warp server too: switch to axum was the plan, warp broke stdio as well.",
+        ])
+        .assert()
+        .success();
+    join_session(dir.path(), &task_id, "s-pace");
+
+    let shown = (0..11)
+        .map(|_| post_tool_use_paced(dir.path(), Some("s-pace"), "Bash", AXUM, true))
+        .map(|out| out.contains("⚠ recall"))
+        .collect::<Vec<_>>();
+    assert!(shown[0], "the first call may recall");
+    assert!(shown[1..10].iter().all(|s| !s), "{shown:?}");
+    assert!(
+        shown[10],
+        "the eleventh call may recall the other one: {shown:?}"
+    );
 }
 
 /// The agent just wrote that rejection on its own task in this session —
@@ -6506,105 +6662,65 @@ fn push_recall_skips_what_this_session_wrote_on_its_task() {
     .unwrap()
     .trim()
     .to_string();
-    let payload = serde_json::json!({
-        "hook_event_name": "UserPromptSubmit",
-        "session_id": "s-own",
-        "prompt": "Tried switching the server to axum but it broke rmcp stdio."
-    });
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .args([
-            "ingest-hook",
-            "--mock-event-type",
-            "rejection",
-            "--mock-task-id",
+            "event",
             &task_id,
+            "--type",
+            "rejection",
+            "--text",
+            "Tried to switch the server to axum but it broke rmcp stdio.",
+            "--session",
+            "s-own",
         ])
-        .write_stdin(payload.to_string())
         .assert()
         .success();
-    let axum = "let's switch the server to axum";
+    join_session(dir.path(), &task_id, "s-other");
 
-    let own = post_tool_use(dir.path(), Some("s-own"), "Bash", axum);
+    let own = post_tool_use(dir.path(), Some("s-own"), "Bash", AXUM);
     assert!(!own.contains("recall"), "{own}");
 
-    let other = post_tool_use(dir.path(), Some("s-other"), "Bash", axum);
+    let other = post_tool_use(dir.path(), Some("s-other"), "Bash", AXUM);
     assert!(other.contains("⚠ recall"), "{other}");
 }
 
+/// The journal's own tools never get recall: their output is the journal.
 #[test]
-fn post_tool_use_no_recall_when_no_match() {
+fn post_tool_use_skips_recall_for_the_journals_own_tools() {
     let (dir, task_id) = seed_axum_rejection();
+    join_session(dir.path(), &task_id, "s-own-tools");
 
-    let payload = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
-        "tool_name": "Bash",
-        "tool_input": { "command": "update the frontend stylesheet colors" },
-        "tool_response": { "output": "" }
-    })
-    .to_string();
-
-    let out = Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .args([
-            "ingest-hook",
-            "--backend",
-            "cli",
-            "--mock-event-type",
-            "finding",
-            "--mock-task-id",
-            &task_id,
-            "--mock-confidence",
-            "0.9",
-        ])
-        .write_stdin(payload)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let body = String::from_utf8(out).unwrap();
-    assert!(
-        !body.contains("additionalContext"),
-        "must not emit recall envelope for a non-matching tool turn, got: {body:?}"
-    );
+    for tool in [
+        "mcp__task-journal__task_search",
+        "mcp__plugin_task-journal_task-journal__event_add",
+    ] {
+        let out = post_tool_use(dir.path(), Some("s-own-tools"), tool, AXUM);
+        assert!(!out.contains("recall"), "{tool}: {out}");
+    }
 }
 
 #[test]
 fn tj_push_recall_env_disables() {
     let (dir, task_id) = seed_axum_rejection();
+    join_session(dir.path(), &task_id, "s-off");
 
     let payload = serde_json::json!({
         "hook_event_name": "PostToolUse",
-        "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
+        "session_id": "s-off",
         "tool_name": "Bash",
-        "tool_input": { "command": "let's switch the server to axum" },
+        "tool_input": { "command": AXUM },
         "tool_response": { "output": "" }
     })
     .to_string();
-
     let out = Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
         .env("TJ_PUSH_RECALL", "0")
-        .args([
-            "ingest-hook",
-            "--backend",
-            "cli",
-            "--mock-event-type",
-            "finding",
-            "--mock-task-id",
-            &task_id,
-            "--mock-confidence",
-            "0.9",
-        ])
+        .env("TJ_RECALL_EVERY", "0")
+        .env("TJ_DISABLE_CLASSIFY_SPAWN", "1")
+        .args(["ingest-hook", "--backend", "heuristic"])
         .write_stdin(payload)
         .assert()
         .success()
@@ -6619,65 +6735,17 @@ fn tj_push_recall_env_disables() {
 }
 
 #[test]
-fn post_tool_use_skips_recall_for_mcp_tools() {
-    // Dedup gate vs claude-memory-7km: mcp__ tool turns are 7km's territory
-    // (updatedMCPToolOutput). This path must stay silent for them.
+fn push_recall_does_not_drop_capture() {
+    // The push-recall block falls through to the normal capture path: the
+    // tool call is still ingested (the mock path writes it as an event).
     let (dir, task_id) = seed_axum_rejection();
+    join_session(dir.path(), &task_id, "s-recall");
 
     let payload = serde_json::json!({
         "hook_event_name": "PostToolUse",
         "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
-        "tool_name": "mcp__task-journal__task_search",
-        "tool_input": { "query": "let's switch the server to axum" },
-        "tool_response": { "output": "" }
-    })
-    .to_string();
-
-    let out = Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .args([
-            "ingest-hook",
-            "--backend",
-            "cli",
-            "--mock-event-type",
-            "finding",
-            "--mock-task-id",
-            &task_id,
-            "--mock-confidence",
-            "0.9",
-        ])
-        .write_stdin(payload)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let body = String::from_utf8(out).unwrap();
-    assert!(
-        !body.contains("additionalContext"),
-        "mcp__ tool turns must not emit a recall envelope (7km owns them), got: {body:?}"
-    );
-}
-
-// --- Push-recall via updatedMCPToolOutput (claude-memory-7km) ----------
-
-#[test]
-fn post_tool_use_mcp_prepends_recall_banner() {
-    // An MCP tool call whose input echoes a prior rejection must have a recall
-    // banner PREPENDED to what Claude sees of its output, with the real output
-    // preserved below the banner (7km's updatedMCPToolOutput path).
-    let (dir, task_id) = seed_axum_rejection();
-
-    let payload = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
         "tool_name": "mcp__some-server__do_thing",
-        "tool_input": { "approach": "let's switch the server to axum" },
+        "tool_input": { "approach": AXUM },
         "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
     })
     .to_string();
@@ -6685,6 +6753,7 @@ fn post_tool_use_mcp_prepends_recall_banner() {
     let out = Command::cargo_bin("task-journal")
         .unwrap()
         .env("XDG_DATA_HOME", dir.path())
+        .env("TJ_RECALL_EVERY", "0")
         .args([
             "ingest-hook",
             "--backend",
@@ -6702,178 +6771,14 @@ fn post_tool_use_mcp_prepends_recall_banner() {
         .get_output()
         .stdout
         .clone();
-    let body = String::from_utf8(out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("⚠ recall"), "{out}");
 
-    let env_line = body
-        .lines()
-        .find(|l| l.contains("updatedMCPToolOutput"))
-        .unwrap_or_else(|| panic!("no updatedMCPToolOutput envelope on stdout, got: {body:?}"));
-    let v: serde_json::Value = serde_json::from_str(env_line.trim()).unwrap();
-    let updated = v
-        .get("hookSpecificOutput")
-        .and_then(|h| h.get("updatedMCPToolOutput"))
-        .and_then(|s| s.as_str())
-        .expect("updatedMCPToolOutput missing");
+    let hash = tj_core::project_hash::from_path(std::env::current_dir().unwrap()).unwrap();
+    let journal = project_events(dir.path(), &hash);
     assert!(
-        updated.starts_with('\u{26a0}'),
-        "must start with banner: {updated}"
-    );
-    assert!(
-        updated.contains("axum"),
-        "banner must mention the recall: {updated}"
-    );
-    assert!(
-        updated.contains("REAL TOOL OUTPUT 12345"),
-        "original tool output must be preserved: {updated}"
-    );
-    assert_eq!(
-        v.get("hookSpecificOutput")
-            .and_then(|h| h.get("hookEventName"))
-            .and_then(|s| s.as_str()),
-        Some("PostToolUse"),
-    );
-}
-
-#[test]
-fn post_tool_use_non_mcp_tool_emits_no_mcp_output() {
-    // The 7km path is MCP-only: a non-MCP tool (Bash) must never emit
-    // updatedMCPToolOutput, even when its input echoes a rejection.
-    let (dir, task_id) = seed_axum_rejection();
-
-    let payload = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
-        "tool_name": "Bash",
-        "tool_input": { "command": "let's switch the server to axum" },
-        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
-    })
-    .to_string();
-
-    let out = Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .args([
-            "ingest-hook",
-            "--backend",
-            "cli",
-            "--mock-event-type",
-            "finding",
-            "--mock-task-id",
-            &task_id,
-            "--mock-confidence",
-            "0.9",
-        ])
-        .write_stdin(payload)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let body = String::from_utf8(out).unwrap();
-    assert!(
-        !body.contains("updatedMCPToolOutput"),
-        "non-MCP tool turns must not emit updatedMCPToolOutput, got: {body:?}"
-    );
-}
-
-#[test]
-fn post_tool_use_mcp_no_recall_passes_through() {
-    // MCP tool, but its input matches no rejection: emit nothing, pass through.
-    let (dir, task_id) = seed_axum_rejection();
-
-    let payload = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
-        "tool_name": "mcp__some-server__do_thing",
-        "tool_input": { "approach": "update the frontend stylesheet colors" },
-        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
-    })
-    .to_string();
-
-    let out = Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .args([
-            "ingest-hook",
-            "--backend",
-            "cli",
-            "--mock-event-type",
-            "finding",
-            "--mock-task-id",
-            &task_id,
-            "--mock-confidence",
-            "0.9",
-        ])
-        .write_stdin(payload)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let body = String::from_utf8(out).unwrap();
-    assert!(
-        !body.contains("updatedMCPToolOutput"),
-        "no-hit MCP turn must pass through (no envelope), got: {body:?}"
-    );
-}
-
-#[test]
-fn push_recall_mcp_does_not_drop_capture() {
-    // The push-recall block must fall through to the normal capture path:
-    // the MCP tool call is still ingested as an event (mock path emits the
-    // new event_id on stdout).
-    let (dir, task_id) = seed_axum_rejection();
-
-    let payload = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "session_id": "s-recall",
-        "transcript_path": "/tmp/x",
-        "cwd": "/tmp",
-        "tool_name": "mcp__some-server__do_thing",
-        "tool_input": { "approach": "let's switch the server to axum" },
-        "tool_response": { "output": "REAL TOOL OUTPUT 12345" }
-    })
-    .to_string();
-
-    Command::cargo_bin("task-journal")
-        .unwrap()
-        .env("XDG_DATA_HOME", dir.path())
-        .args([
-            "ingest-hook",
-            "--backend",
-            "cli",
-            "--mock-event-type",
-            "finding",
-            "--mock-task-id",
-            &task_id,
-            "--mock-confidence",
-            "0.9",
-        ])
-        .write_stdin(payload)
-        .assert()
-        .success();
-
-    // The captured finding lands in the task pack — capture is unaffected by
-    // the push-recall envelope.
-    let pack = String::from_utf8(
-        Command::cargo_bin("task-journal")
-            .unwrap()
-            .env("XDG_DATA_HOME", dir.path())
-            .args(["pack", &task_id, "--mode", "full"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap();
-    assert!(
-        pack.contains("do_thing"),
-        "MCP tool call must still be captured into the journal, pack: {pack}"
+        journal.contains("do_thing"),
+        "the MCP tool call must still be captured into the journal: {journal}"
     );
 }
 
@@ -6948,82 +6853,128 @@ fn session_start_additional_context_with(extra: serde_json::Value) -> String {
         .to_string()
 }
 
+/// The session start says one thing: which open task this session most
+/// likely continues, and how to resume it. Packs, honesty scores, artifact
+/// lists and constraints are on request — three packs on every start were
+/// thousands of tokens, mostly about other work.
 #[test]
-fn session_start_compact_prepends_active_task_reminder() {
-    let ctx = session_start_additional_context("compact");
-    assert!(
-        ctx.starts_with("[Active task after compaction]"),
-        "compact SessionStart must lead with the reminder: {ctx}"
-    );
-    assert!(
-        ctx.contains("Ship the widget"),
-        "reminder must include the task title: {ctx}"
-    );
-    assert!(
-        ctx.contains("Goal: Ship the dashboard widget"),
-        "reminder must include the goal: {ctx}"
-    );
-    assert!(
-        ctx.contains("Must ship before Friday"),
-        "reminder must include the in-force constraint: {ctx}"
-    );
-    assert!(
-        ctx.contains("task-journal-distiller"),
-        "compact SessionStart must advise delegating to the distiller subagent: {ctx}"
-    );
-}
-
-/// A conversation picked up the next day keeps its transcript, but what it was
-/// doing is no longer fresh — re-inject the active task. Claude Code 2.1.251+
-/// reports the gap in `seconds_since_last_response` on `resume` and `fork`.
-#[test]
-fn session_start_reinjects_active_task_after_a_long_idle_gap() {
-    for source in ["resume", "fork"] {
-        let ctx = session_start_additional_context_with(serde_json::json!({
-            "source": source,
-            "seconds_since_last_response": 32_400, // 9h
-            "prompt_cache_likely_expired": true,
-        }));
-        assert!(
-            ctx.starts_with("[Active task, idle for 9h]"),
-            "{source} after a long gap must lead with the reminder: {ctx}"
-        );
-        assert!(
-            ctx.contains("Must ship before Friday"),
-            "reminder must carry the in-force constraint: {ctx}"
-        );
-        assert!(
-            !ctx.contains("task-journal-distiller"),
-            "no compaction happened, so no distiller advice: {ctx}"
-        );
+fn session_start_is_one_line_about_the_task() {
+    let ctx = session_start_additional_context("startup");
+    assert!(!ctx.contains('\n'), "one line: {ctx}");
+    assert!(ctx.contains("\"Ship the widget\""), "{ctx}");
+    assert!(ctx.contains("goal: Ship the dashboard widget"), "{ctx}");
+    assert!(ctx.contains("task_pack(\"tj-"), "{ctx}");
+    for noise in [
+        "honesty",
+        "Completeness",
+        "Must ship before Friday",
+        "Chronicle",
+        "distiller",
+    ] {
+        assert!(!ctx.contains(noise), "{noise}: {ctx}");
     }
 }
 
-/// A session resumed minutes later still has everything in context — the
-/// reminder would just be noise.
+/// After a compaction without the mod, the line comes with the distiller
+/// advice; the mod catches up on its own.
 #[test]
-fn session_start_resume_after_short_gap_has_no_reminder() {
-    let ctx = session_start_additional_context_with(serde_json::json!({
-        "source": "resume",
-        "seconds_since_last_response": 120,
-    }));
-    assert!(
-        !ctx.contains("[Active task"),
-        "a fresh resume must NOT inject the reminder: {ctx}"
-    );
+fn session_start_after_compaction_points_at_the_distiller() {
+    let ctx = session_start_additional_context("compact");
+    assert!(ctx.contains("\"Ship the widget\""), "{ctx}");
+    assert!(ctx.contains("task-journal-distiller"), "{ctx}");
 }
 
+/// A session that already wrote to a task (a resume, a compaction) gets that
+/// task, not the folder's latest; a new one gets the task its branch names.
 #[test]
-fn session_start_startup_has_no_reminder() {
-    let ctx = session_start_additional_context("startup");
+fn session_start_names_the_sessions_own_task_then_the_branchs() {
+    let xdg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    std::fs::create_dir_all(proj.path().join(".git")).unwrap();
+    std::fs::write(
+        proj.path().join(".git").join("HEAD"),
+        "ref: refs/heads/feat/DEV-4621-write\n",
+    )
+    .unwrap();
+    let create = |title: &str| {
+        String::from_utf8(
+            Command::cargo_bin("task-journal")
+                .unwrap()
+                .env("XDG_DATA_HOME", xdg.path())
+                .current_dir(proj.path())
+                .args(["create", title])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    };
+    let issue_task = create("DEV-4621: move the write path");
+    let resumed = create("Fix the login redirect");
+    let latest = create("Tidy the README");
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "event",
+            &resumed,
+            "--type",
+            "finding",
+            "--text",
+            "Redirect loses ?next.",
+            "--session",
+            "s-old",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("task-journal")
+        .unwrap()
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(proj.path())
+        .args([
+            "event",
+            &latest,
+            "--type",
+            "finding",
+            "--text",
+            "README is stale.",
+        ])
+        .assert()
+        .success();
+
+    let start = |sid: &str| -> String {
+        let out = Command::cargo_bin("task-journal")
+            .unwrap()
+            .env("XDG_DATA_HOME", xdg.path())
+            .current_dir(proj.path())
+            .args(["ingest-hook"])
+            .write_stdin(
+                serde_json::json!({ "hook_event_name": "SessionStart", "session_id": sid })
+                    .to_string(),
+            )
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+
+    let own = start("s-old");
     assert!(
-        !ctx.contains("[Active task after compaction]"),
-        "non-compact SessionStart must NOT inject the reminder: {ctx}"
+        own.contains(&resumed) && own.contains("this session's task"),
+        "{own}"
     );
-    assert!(
-        !ctx.contains("task-journal-distiller"),
-        "non-compact SessionStart must NOT advise the distiller: {ctx}"
-    );
+    assert!(own.contains("2 more open"), "{own}");
+
+    let new = start("s-new");
+    assert!(new.contains(&issue_task), "{new}");
+    assert!(new.contains("branch feat/DEV-4621-write"), "{new}");
 }
 
 /// Recursively collect file names under `dir` that match a predicate.
@@ -7612,11 +7563,17 @@ fn install_hooks_proactive_recall_wires_recall_hook() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir.path())
-        .args(["install-hooks", "--scope", "user", "--proactive-recall"])
+        .args([
+            "install-hooks",
+            "--scope",
+            "user",
+            "--client",
+            "codex",
+            "--proactive-recall",
+        ])
         .assert()
         .success();
-    let content =
-        std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+    let content = std::fs::read_to_string(dir.path().join(".codex").join("hooks.json")).unwrap();
     assert!(
         content.contains("task-journal recall-hook"),
         "--proactive-recall must wire the recall-hook; got: {content}"
@@ -7630,10 +7587,10 @@ fn install_hooks_proactive_recall_wires_recall_hook() {
     Command::cargo_bin("task-journal")
         .unwrap()
         .env("HOME", dir2.path())
-        .args(["install-hooks", "--scope", "user"])
+        .args(["install-hooks", "--scope", "user", "--client", "codex"])
         .assert()
         .success();
-    let c2 = std::fs::read_to_string(dir2.path().join(".claude").join("settings.json")).unwrap();
+    let c2 = std::fs::read_to_string(dir2.path().join(".codex").join("hooks.json")).unwrap();
     assert!(
         !c2.contains("recall-hook"),
         "default install must not wire proactive recall"
@@ -8744,8 +8701,10 @@ fn unknown_module_and_bad_slug_fail_before_writing() {
     );
 }
 
+/// The chronicle's gaps are on request (module_list, `task-journal state`),
+/// not a line at every session start.
 #[test]
-fn session_start_names_the_top_chronicle_gap() {
+fn session_start_leaves_the_chronicle_gaps_out() {
     let (xdg, proj) = (
         assert_fs::TempDir::new().unwrap(),
         assert_fs::TempDir::new().unwrap(),
@@ -8760,7 +8719,8 @@ fn session_start_names_the_top_chronicle_gap() {
         .as_str()
         .unwrap();
 
-    assert!(ctx.contains("📚 Chronicle: no module map yet"), "{ctx}");
+    assert!(ctx.contains("Some work"), "{ctx}");
+    assert!(!ctx.contains("Chronicle"), "{ctx}");
 }
 
 #[test]
@@ -8874,10 +8834,9 @@ fn a_worktree_shares_the_main_checkouts_module_map() {
         .stdout(contains(id.as_str()).not());
 }
 
+/// No open task: nothing to resume, and the chronicle waits to be asked.
 #[test]
-fn session_start_names_the_chronicle_gap_with_no_open_task() {
-    // A project whose tasks are all closed has no resume pack to show, yet
-    // the chronicle still has something to say.
+fn session_start_with_only_closed_tasks_says_nothing() {
     let (xdg, proj) = (
         assert_fs::TempDir::new().unwrap(),
         assert_fs::TempDir::new().unwrap(),
@@ -8892,10 +8851,5 @@ fn session_start_names_the_chronicle_gap_with_no_open_task() {
 
     let mut hook = tj();
     hook.args(["ingest-hook", "--kind", "SessionStart", "--text", ""]);
-    let out: serde_json::Value = serde_json::from_str(&stdout_of(hook)).unwrap();
-    let ctx = out["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap_or("");
-
-    assert!(ctx.contains("📚 Chronicle: no module map yet"), "{out}");
+    assert_eq!(stdout_of(hook), "");
 }

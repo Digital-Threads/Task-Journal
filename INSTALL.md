@@ -6,8 +6,8 @@ server) plus thin integrations for each agent:
 | Client | What you install | What it gets |
 |--------|------------------|--------------|
 | Claude Code 2.1.287+ | the plugin (MCP server + skill + mod) | journal tools, the session's task kept in the system prompt, catch-up before compaction, the task above the prompt |
-| Claude Code, older | the plugin, optionally `install-hooks` | journal tools, resume packs on session start |
-| Codex | `codex mcp add` + `install-hooks --client codex` | journal tools, resume packs, optional auto-capture |
+| Claude Code, older | the plugin | journal tools, the open task named at session start, push-recall |
+| Codex | `codex mcp add` + `install-hooks --client codex` | journal tools, the open task named at session start, optional auto-capture |
 | Any other MCP client | the MCP server | the seven journal tools |
 
 ## Prerequisites
@@ -70,14 +70,18 @@ current (0.30+). If they aren't, it says so once and stays off. On Claude Code
 older than 2.1.287 the mod doesn't load; the MCP tools and the skill work as
 before.
 
-**Classic hooks next to the mod.** If you ran `task-journal install-hooks`
-before, you can keep it. The mod tells those hooks it is active
-(`TJ_MOD_ACTIVE=1`), and they skip what the mod replaces — the reminder,
-per-message classification (`--auto-capture`) and the transcript catch-ups at
-stop, compaction and `/clear` (the mod catches up once, right before each
-compaction). The rest keeps running: the session-start resume
-pack, the model-switch record, push-recall and `/rewind` corrections. To remove
-them anyway: `task-journal install-hooks --scope user --uninstall`.
+**Hooks.** The plugin ships its own: at session start, one line naming the
+open task the session most likely continues (its own after a resume or a
+compaction, else the one the git branch names, else the folder's latest);
+after a tool call, push-recall — at most one prior rejection or decision of the
+session's task that the call clearly touches, at most once every ten calls; and
+the model-switch record. Full packs, honesty scores and chronicle gaps are on
+request (`task_pack`, `task-journal check`, `module_list`).
+
+If an earlier version's `task-journal install-hooks` wrote hooks into
+`settings.json`, run it once more: for Claude Code it now only takes them out,
+after copying the file to `settings.json.task-journal-backup-<time>`. Until
+then they stand down while the mod runs, so no event is handled twice.
 
 ### Older Claude Code, or without the plugin
 
@@ -91,23 +95,9 @@ Wire the MCP server yourself in `~/.claude/settings.json`:
 }
 ```
 
-and, for resume packs at session start, install the hooks:
-
-```bash
-task-journal install-hooks --scope user             # → ~/.claude/settings.json
-task-journal install-hooks --scope project          # → .claude/settings.json
-task-journal install-hooks --scope user --auto-capture   # also classify prompts and tool calls in the background
-```
-
-The default install adds only a read-only `SessionStart` hook (resume packs) and
-a `UserPromptSubmit` reminder. `--auto-capture` adds background classification
-of prompts, tool calls and session ends; it is a safety net under self-tagging,
-not a replacement, and with `--backend hybrid` (the default) it may spawn
-`claude -p` for chunks the local heuristic can't classify.
-
-The installer keeps every unrelated key in the settings file, wraps each hook in
-`|| true` so a failure never breaks the session, runs the capture hooks `async`
-so the chat never waits, and gives `SessionEnd` an explicit timeout.
+The hooks come with the plugin, so on older Claude Code install the plugin
+too: its hooks run there, only the mod doesn't load. Without the plugin the MCP
+tools work on their own.
 
 > The hook payload arrives as JSON on stdin. There are no `$CLAUDE_HOOK_*`
 > environment variables.

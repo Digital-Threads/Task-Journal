@@ -1237,6 +1237,19 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Retire what the classifier once filed as reasoning but is not: raw
+    /// tool calls, compaction summaries, harness notifications, and
+    /// "rejections" that rule no approach out. The journal is append-only,
+    /// so each one gets a correction, which takes it out of packs, recall and
+    /// exports. Only classifier entries are touched, never the agent's or yours.
+    CleanupNoise {
+        /// Show what would be retired; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Clean every project's journal, not just the current one.
+        #[arg(long)]
+        all: bool,
+    },
     /// Set or update the goal of an existing task.
     Goal {
         task_id: String,
@@ -1470,6 +1483,11 @@ enum Commands {
         ///   - "cli" — removed in v0.8.0; use "agent-sdk" (its resurrection).
         #[arg(long, default_value = "hybrid")]
         backend: String,
+        /// Set by the hooks the Claude Code plugin ships: session start,
+        /// push-recall and model switches only — never the classifier queue,
+        /// which the plugin's mod replaces.
+        #[arg(long)]
+        from_plugin: bool,
         /// Test/dev override: bypass classifier and force this event type. Hidden from --help.
         #[arg(long, hide = true)]
         mock_event_type: Option<String>,
@@ -2264,6 +2282,9 @@ fn real_main() -> Result<()> {
                 );
             }
         }
+        Commands::CleanupNoise { dry_run, all } => {
+            run_cleanup_noise(dry_run, all)?;
+        }
         Commands::PendingGc { days, all } => {
             let pending_dir = tj_core::paths::events_dir()?
                 .parent()
@@ -2486,67 +2507,21 @@ fn real_main() -> Result<()> {
                 serde_json::json!({})
             };
 
+            let before = serde_json::to_string_pretty(&current)?;
             let hooks_obj = current
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("settings is not a JSON object"))?;
-            if uninstall {
-                // Surgical removal: walk the `hooks` block, drop only
-                // entries whose command contains "task-journal ingest-hook"
-                // — leaves co-located third-party plugin hooks (token-pilot
-                // etc.) intact. Old behavior `remove("hooks")` nuked
-                // everyone's hooks; this is the bxl-bug fix.
-                if let Some(hooks_block) =
-                    hooks_obj.get_mut("hooks").and_then(|v| v.as_object_mut())
-                {
-                    let kinds: Vec<String> = hooks_block.keys().cloned().collect();
-                    for kind in kinds {
-                        let Some(arr) = hooks_block.get_mut(&kind).and_then(|v| v.as_array_mut())
-                        else {
-                            continue;
-                        };
-                        // Each entry is { matcher, hooks: [{type, command}, ...] }.
-                        // Filter the inner array; keep only non-task-journal commands.
-                        for entry in arr.iter_mut() {
-                            let Some(inner) = entry.get_mut("hooks").and_then(|v| v.as_array_mut())
-                            else {
-                                continue;
-                            };
-                            inner.retain(|h| {
-                                h.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .map(|c| {
-                                        !(c.contains("task-journal ingest-hook")
-                                            || c.contains("task-journal nudge"))
-                                    })
-                                    .unwrap_or(true)
-                            });
-                        }
-                        // Drop matcher entries with empty inner arrays.
-                        arr.retain(|entry| {
-                            entry
-                                .get("hooks")
-                                .and_then(|v| v.as_array())
-                                .map(|a| !a.is_empty())
-                                .unwrap_or(true)
-                        });
-                        // If the whole kind is empty, remove it.
-                        if arr.is_empty() {
-                            hooks_block.remove(&kind);
-                        }
-                    }
-                    // Empty hooks block → remove entirely so settings.json
-                    // stays tidy when we were the only user.
-                    if hooks_block.is_empty() {
-                        hooks_obj.remove("hooks");
-                    }
-                }
-                // Remove our env key too — preserve other env entries.
-                if let Some(env) = hooks_obj.get_mut("env").and_then(|v| v.as_object_mut()) {
-                    env.remove("TJ_CLASSIFIER_CLI");
-                    // Drop empty env block to keep settings.json clean.
-                    if env.is_empty() {
-                        hooks_obj.remove("env");
-                    }
+            // Claude Code gets its hooks from the task-journal plugin. The
+            // settings.json entries earlier versions wrote ran next to them,
+            // so for Claude Code this only takes ours out again.
+            let is_claude = client == "claude";
+            if uninstall || is_claude {
+                remove_task_journal_hooks(hooks_obj);
+                if is_claude && !uninstall && (auto_capture || proactive_recall) {
+                    eprintln!(
+                        "--auto-capture / --proactive-recall do nothing for Claude Code: \
+                         the plugin's mod records the session."
+                    );
                 }
             } else {
                 // Wrap with `|| true` so a failed classifier (network down, rate limit,
@@ -2696,8 +2671,27 @@ fn real_main() -> Result<()> {
                     }
                 }
             }
-            std::fs::write(&settings_path, serde_json::to_string_pretty(&current)?)?;
+
+            let after = serde_json::to_string_pretty(&current)?;
+            if after != before {
+                // A copy first: the file holds every other tool's settings too.
+                if settings_path.exists() {
+                    let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+                    let backup = settings_path
+                        .with_file_name(format!("{config_file}.task-journal-backup-{stamp}"));
+                    std::fs::copy(&settings_path, &backup)
+                        .with_context(|| format!("back up {}", settings_path.display()))?;
+                    println!("backup: {}", backup.display());
+                }
+                std::fs::write(&settings_path, after)?;
+            }
             println!("{}", settings_path.display());
+            if is_claude && !uninstall {
+                println!(
+                    "Claude Code takes its task-journal hooks from the plugin \
+                     (/plugin install task-journal@task-journal); none are kept in this file."
+                );
+            }
 
             // Onboarding convenience: retro-import existing Claude Code history
             // so the journal isn't empty on day one. Always operates on the
@@ -2805,6 +2799,7 @@ fn real_main() -> Result<()> {
             kind,
             text,
             backend,
+            from_plugin,
             mock_event_type,
             mock_task_id,
             mock_confidence,
@@ -2833,14 +2828,12 @@ fn real_main() -> Result<()> {
                 _ => parse_hook_stdin()?,
             };
 
-            // The Claude Code mod captures in-process and marks the hooks it
-            // starts; the classic capture stands down where the mod does the
-            // same work: the Stop / PreCompact / SessionEnd transcript
-            // catch-up (and the compaction marker) here, per-message queueing
-            // and auto-open further down. Push-recall, the `/rewind`
-            // correction, resume packs and model switches stay ours.
+            // Where the plugin's own hooks run (its mod says so with
+            // TJ_PLUGIN_HOOKS), a hook still left in settings.json stands
+            // down: one event, one record. Next to an older plugin without
+            // hooks it keeps doing what that mod doesn't.
             let mod_on = mod_active();
-            if mod_on && matches!(kind.as_str(), "Stop" | "PreCompact" | "SessionEnd") {
+            if !from_plugin && env_flag("TJ_PLUGIN_HOOKS") {
                 return Ok(());
             }
 
@@ -2868,223 +2861,81 @@ fn real_main() -> Result<()> {
             // neither source is present (standalone behaviour unchanged).
             let live_session_id = tj_core::session_id::live_session_id(Some(&payload));
 
-            // Push-recall (claude-memory-60m). Best-effort, fail-open, read-only.
-            // After a (non-MCP) tool call, surface a relevant prior
-            // rejection/decision via an additionalContext envelope so the agent
-            // doesn't re-walk a ruled-out path. Gated by TJ_PUSH_RECALL=0.
-            //
-            // Dedup vs claude-memory-7km: skip MCP-tool turns — those are
-            // handled by 7km's updatedMCPToolOutput path, so emitting
-            // additionalContext here too would double-surface the same recall.
-            // The two paths are mutually exclusive by tool type (this =
-            // non-mcp tools; 7km = mcp__ tools). The block only adds a stdout
-            // envelope; it never touches the JSONL log or the pending flow
-            // below, and any error is swallowed so the hook can't break.
-            let tool_is_mcp = payload
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .map(|n| n.starts_with("mcp__"))
-                .unwrap_or(false);
-            if kind == "PostToolUse"
-                && !tool_is_mcp
-                && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0")
-                && events_path.exists()
-            {
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                if let Ok(conn) = tj_core::db::open(&state_path) {
-                    let _ = tj_core::db::ingest_new_events(&conn, &events_path, &project_hash);
-                    if let Ok(hits) = tj_core::recall::relevant_recall(
-                        &conn,
-                        &text,
-                        tj_core::recall::DEFAULT_MAX_HITS,
-                    ) {
-                        let hits = fresh_recall_hits(
-                            hits,
-                            live_session_id.as_deref(),
-                            &events_path,
-                            &project_hash,
-                        );
-                        if !hits.is_empty() {
-                            let mut ctx = String::new();
-                            for h in &hits {
-                                let verb = match h.event_type {
-                                    tj_core::event::EventType::Rejection => "previously rejected",
-                                    _ => "previously decided",
-                                };
-                                ctx.push_str(&format!(
-                                    "⚠ recall: in task {} you {}: {}\n",
-                                    h.task_id, verb, h.text
-                                ));
-                            }
-                            let envelope = serde_json::json!({
-                                "hookSpecificOutput": {
-                                    "hookEventName": "PostToolUse",
-                                    "additionalContext": ctx.trim_end(),
-                                }
-                            });
-                            println!("{}", serde_json::to_string(&envelope)?);
-                        }
-                    }
-                }
-            }
-
-            // Push-recall via updatedMCPToolOutput (claude-memory-7km). For an
-            // MCP PostToolUse turn whose input echoes a prior rejection/decision,
-            // prepend a recall banner to what Claude sees of that tool's output.
-            // Best-effort, read-only: any miss or error emits nothing and the
-            // real output passes through unchanged. Complements 60m (which skips
-            // mcp__ tools) — gated MCP-only, falls through to the queue path so
-            // event capture is unaffected. Disabled by TJ_PUSH_RECALL=0.
+            // Push-recall (claude-memory-60m / 7km). Best-effort, fail-open,
+            // read-only: after a tool call, at most one prior rejection or
+            // decision of the session's own task that the call clearly
+            // touches (see `session_recall`), as additionalContext. Gated by
+            // TJ_PUSH_RECALL=0.
             if kind == "PostToolUse" && std::env::var("TJ_PUSH_RECALL").as_deref() != Ok("0") {
-                if let Some(envelope) = push_recall_envelope(
+                let hits = session_recall(
                     &payload,
                     &events_path,
                     &project_hash,
                     live_session_id.as_deref(),
-                ) {
+                );
+                if let Some(envelope) = recall_envelope(&hits) {
                     println!("{}", serde_json::to_string(&envelope)?);
                 }
             }
 
-            // SessionStart: emit a JSON envelope with compact resume-packs of
-            // open tasks so Claude Code injects them into its system context
-            // automatically. This is the load-bearing UX for "the journal
-            // remembers" — without it, users would have to call task_pack
-            // manually each session. Empty stdout when no open tasks → no
-            // injection, keeps system prompt clean for fresh projects.
+            // SessionStart: one line naming the task this session most likely
+            // continues, plus the user's standing preferences. Packs, honesty
+            // scores and chronicle gaps are on request (task_pack, task_check,
+            // module_list): three packs on every start cost thousands of
+            // tokens, mostly about other work. Only `additionalContext` goes
+            // out — never `sessionTitle` (it overrode Claude Code's own session
+            // name) nor `initialUserMessage` (auto-open captured it as a task
+            // title), see 0.14.3. Nothing to say → empty stdout.
             if kind == "SessionStart" {
-                // User preferences are global, so they surface even in a fresh
-                // project with no events of its own (Pillar C "remember me").
-                let prefs_block = session_preferences_block();
-                // Skip early on a clean machine: nothing to surface, and we
-                // don't want SessionStart to spawn empty SQLite files in
-                // every project Claude Code is opened in. Preferences still go
-                // out if there are any.
-                if !events_path.exists() {
-                    if !prefs_block.is_empty() {
-                        emit_session_context(&prefs_block);
-                    }
-                    return Ok(());
-                }
-                let state_path =
-                    tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
-                let conn = tj_core::db::open(&state_path)?;
-                tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
-                // The chronicle's most important gap, for every client that
-                // reads this hook (Claude Code with or without the mod, Codex),
-                // also when no task is open. Advice only: it never fails the
-                // session start.
-                let chronicle_line = tj_core::chronicle::Chronicle::open(&cwd)
-                    .and_then(|chr| tj_core::archive::gaps(&chr, &conn, &project_hash, None))
-                    .ok()
-                    .and_then(|gaps| tj_core::archive::headline(&gaps));
-                let recent =
-                    recent_task_contexts(&conn, &project_hash, 3, live_session_id.as_deref())?;
-                if recent.is_empty() {
-                    let context = [Some(prefs_block.as_str()), chronicle_line.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    if !context.is_empty() {
-                        emit_session_context(&context);
-                    }
-                    return Ok(());
-                }
-                // After a compaction (source=="compact"), re-inject the
-                // active task + its in-force constraints so the rebuilt
-                // context doesn't lose what it was doing. Best-effort:
-                // any error → no reminder, never abort SessionStart.
-                let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                let mut bundle = String::new();
-                // Preferences lead the bundle — they're the smallest, most
-                // durable signal about how the user wants to be worked with.
-                if !prefs_block.is_empty() {
-                    bundle.push_str(&prefs_block);
-                    bundle.push_str("\n\n");
-                }
-                // A resumed or forked session keeps its transcript, so the
-                // reminder would be noise — except when the conversation sat
-                // idle long enough that what it was doing is no longer fresh
-                // for the user either. Claude Code 2.1.251+ reports the gap in
-                // `seconds_since_last_response` on `resume` and `fork`.
-                let idle_secs = payload
-                    .get("seconds_since_last_response")
-                    .and_then(|v| v.as_u64());
-                let stale_resume = matches!(source, "resume" | "fork")
-                    && idle_secs.is_some_and(|s| s >= STALE_RESUME_SECS);
-                if source == "compact" || stale_resume {
-                    let label = if source == "compact" {
-                        "Active task after compaction".to_string()
-                    } else {
-                        format!(
-                            "Active task, idle for {}",
-                            human_gap(idle_secs.unwrap_or_default())
-                        )
-                    };
-                    if let Ok(Some(reminder)) =
-                        tj_core::reminder::active_task_reminder(&conn, &label)
+                // Preferences are global, so they show in a fresh project too.
+                let mut parts = vec![session_preferences_block()];
+                let mut has_task = false;
+                // No journal yet: don't create a SQLite file for every
+                // project Claude Code is opened in.
+                if events_path.exists() {
+                    let state_path =
+                        tj_core::paths::state_dir()?.join(format!("{project_hash}.sqlite"));
+                    let conn = tj_core::db::open(&state_path)?;
+                    tj_core::db::ingest_new_events(&conn, &events_path, &project_hash)?;
+                    if let Some(line) =
+                        session_start_line(&conn, &project_hash, live_session_id.as_deref(), &cwd)?
                     {
-                        bundle.push_str(&reminder);
-                        bundle.push_str("\n\n");
+                        parts.push(line);
+                        has_task = true;
                     }
-                }
-                if source == "compact" {
-                    // Advisory (the hook can't force it): suggest the main agent
-                    // delegate the just-compacted segment to the in-session
-                    // distiller subagent, which backfills missed reasoning from
-                    // the transcript file (which survives compaction) for the
-                    // active task(s). Background → never blocks. Gated off by
-                    // TJ_DISTILLER_HINT=0 for users who don't want it.
-                    if std::env::var("TJ_DISTILLER_HINT").as_deref() != Ok("0") {
-                        let transcript_hint = payload
-                            .get("transcript_path")
-                            .and_then(|v| v.as_str())
-                            .map(|p| format!(" (transcript: {p})"))
-                            .unwrap_or_default();
-                        bundle.push_str(&format!(
-                            "[task-journal] A compaction just occurred. If decisions, rejections, \
-or findings from before it are not yet in the journal for the active task(s) above, delegate to \
-the `task-journal-distiller` subagent to capture them from the transcript{transcript_hint}. It \
-runs in the background and won't block you; it only fills gaps and never closes tasks.\n\n"
-                        ));
-                    }
-                }
-                if let Some(line) = &chronicle_line {
-                    bundle.push_str(line);
-                    bundle.push_str("\n\n");
-                }
-                for tc in &recent {
-                    let pack = tj_core::pack::assemble(
-                        &conn,
-                        &tc.task_id,
-                        tj_core::pack::PackMode::Compact,
-                    )?;
-                    bundle.push_str(&pack.text);
-                    bundle.push_str("\n\n");
                 }
 
-                // We deliberately DO NOT emit `sessionTitle` or
-                // `initialUserMessage` here. The v0.10.1 X2 experiment set
-                // `sessionTitle` to "TJ — <task_id> (<n> open)", which
-                // OVERRODE Claude Code's native session name with our task id
-                // — users saw "TJ — tj-qqay98cpc2" instead of a name derived
-                // from their own prompt. `initialUserMessage` injected a
-                // "[Task Journal resumed: …]" banner into the next prompt,
-                // which the auto-open path then captured as a garbage task
-                // title. The resume context the model actually needs already
-                // rides in `additionalContext`; the tab label belongs to
-                // Claude Code, not to us. (0.14.3)
-                let hook_specific = serde_json::json!({
-                    "hookEventName": "SessionStart",
-                    "additionalContext": bundle.trim_end(),
-                });
-                let envelope = serde_json::json!({
-                    "hookSpecificOutput": hook_specific,
-                });
-                println!("{}", serde_json::to_string(&envelope)?);
+                // After a compaction the mod catches up on its own; without
+                // it, point at the distiller subagent, which backfills what
+                // was not logged from the transcript (it survives compaction).
+                // TJ_DISTILLER_HINT=0 turns this off.
+                let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                if source == "compact"
+                    && has_task
+                    && !mod_on
+                    && std::env::var("TJ_DISTILLER_HINT").as_deref() != Ok("0")
+                {
+                    let transcript_hint = payload
+                        .get("transcript_path")
+                        .and_then(|v| v.as_str())
+                        .map(|p| format!(" (transcript: {p})"))
+                        .unwrap_or_default();
+                    parts.push(format!(
+                        "[task-journal] A compaction just occurred. If decisions, rejections or \
+findings from before it are missing from the journal, delegate to the `task-journal-distiller` \
+subagent to capture them from the transcript{transcript_hint}. It runs in the background and \
+never closes tasks."
+                    ));
+                }
+
+                let context = parts
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !context.is_empty() {
+                    emit_session_context(&context);
+                }
                 return Ok(());
             }
 
@@ -3146,6 +2997,14 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 writer.append(&event)?;
                 writer.flush_durable()?;
                 println!("{}", event.event_id);
+                return Ok(());
+            }
+
+            // Past this point is capture: transcript catch-ups and the
+            // classifier queue. The mod records the session in-process, and
+            // the plugin's hooks never start it — without the mod the queue
+            // grew with nothing to drain it (0.14.4).
+            if from_plugin || mod_on {
                 return Ok(());
             }
 
@@ -3417,11 +3276,6 @@ runs in the background and won't block you; it only fills gaps and never closes 
                 return Ok(());
             }
 
-            // The mod classifies prompts and tool calls itself (see above).
-            if mod_on && matches!(kind.as_str(), "UserPromptSubmit" | "PostToolUse") {
-                return Ok(());
-            }
-
             // A tool call arrives as its full input + response JSON; cap it
             // so one big file read or command output can't flood the queue.
             let text: String = if kind == "PostToolUse" {
@@ -3546,6 +3400,9 @@ runs in the background and won't block you; it only fills gaps and never closes 
                     let Some(tid) = out.task_id_guess else {
                         return Ok(());
                     };
+                    if !worth_recording(out.event_type, &out.suggested_text, &text) {
+                        return Ok(());
+                    }
 
                     // Journal-integrity safeguards. The classifier sometimes
                     // mis-attributes events to old or closed tasks (no fault
@@ -4876,9 +4733,9 @@ fn nudge_escalation_text(work_bytes: u64, recorded: usize) -> Option<String> {
         return None;
     }
     Some(format!(
-        "⚠ task-journal: this session has done substantial work but recorded only \
-{recorded} journal entr{} — log the key decisions, rejections, and findings NOW via \
-event_add before this reasoning is lost.",
+        "task-journal: this session has done substantial work but recorded only \
+{recorded} journal entr{} — log the key decisions, rejections and findings with \
+event_add while they are fresh.",
         if recorded == 1 { "y" } else { "ies" }
     ))
 }
@@ -4911,13 +4768,23 @@ fn count_session_events_tail(path: &std::path::Path, sid: &str, tail_lines: usiz
 /// True when the Claude Code mod (`plugin/hooks/register.ts`) runs in this
 /// session: it sets `TJ_MOD_ACTIVE` for every hook it starts. Codex never does.
 fn mod_active() -> bool {
-    std::env::var("TJ_MOD_ACTIVE").is_ok_and(|v| !v.is_empty() && v != "0")
+    env_flag("TJ_MOD_ACTIVE")
 }
 
-/// Adaptive UserPromptSubmit nudge (caveman pattern, non-blocking, free): always
-/// emit the base "record as you go" reminder, and — when the session has done
-/// substantial work but logged little — escalate. All signals are cheap (a file
-/// size + a tail scan); no model, never blocks the prompt.
+/// An environment flag the mod sets: on unless unset, empty or "0".
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Prompts of one session per nudge; `TJ_NUDGE_EVERY` overrides it. The same
+/// reminder on every prompt is noise the model learns to skip.
+const NUDGE_EVERY: u32 = 6;
+
+/// Adaptive UserPromptSubmit nudge (non-blocking, free): on the first prompt
+/// of a session and then every [`NUDGE_EVERY`]th, the base "record as you go"
+/// reminder — and, when the session has done substantial work but logged
+/// little, an escalation. All signals are cheap (a file size + a tail scan);
+/// no model, never blocks the prompt.
 fn run_nudge() -> anyhow::Result<()> {
     // Recursion guard, same as recall-hook: never inject into our own
     // classifier child (`claude -p` / `codex exec` re-run the user's hooks).
@@ -4929,20 +4796,40 @@ fn run_nudge() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut ctx = NUDGE_BASE.to_string();
-    let escalation = (|| -> Option<String> {
+    let payload = (|| -> Option<serde_json::Value> {
         use std::io::{IsTerminal, Read};
-        // Manual `task-journal nudge` in a terminal has no hook payload — don't
-        // block waiting on stdin.
+        // Manual `task-journal nudge` in a terminal has no hook payload —
+        // don't block waiting on stdin.
         if std::io::stdin().is_terminal() {
             return None;
         }
         let mut buf = String::new();
-        if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
-            return None;
+        std::io::stdin().read_to_string(&mut buf).ok()?;
+        serde_json::from_str(&buf).ok()
+    })();
+    let sid = payload
+        .as_ref()
+        .and_then(|p| tj_core::session_id::live_session_id(Some(p)));
+
+    if let (Some(sid), Ok(state_dir)) = (&sid, tj_core::paths::state_dir()) {
+        let every = std::env::var("TJ_NUDGE_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(NUDGE_EVERY)
+            .max(1);
+        let _ = std::fs::create_dir_all(&state_dir);
+        let prompt = session_counter(&state_dir.join("nudge.pace"), sid, |n| {
+            n.unwrap_or(0).saturating_add(1)
+        });
+        if (prompt - 1) % every != 0 {
+            return Ok(());
         }
-        let payload: serde_json::Value = serde_json::from_str(&buf).ok()?;
-        let sid = tj_core::session_id::live_session_id(Some(&payload))?;
+    }
+
+    let mut ctx = NUDGE_BASE.to_string();
+    let escalation = (|| -> Option<String> {
+        let payload = payload.as_ref()?;
+        let sid = sid.as_deref()?;
         let transcript = payload.get("transcript_path").and_then(|v| v.as_str())?;
         let work_bytes = std::fs::metadata(transcript).map(|m| m.len()).unwrap_or(0);
         let cwd = std::env::current_dir().ok()?;
@@ -4950,7 +4837,7 @@ fn run_nudge() -> anyhow::Result<()> {
         let events_path = tj_core::paths::events_dir()
             .ok()?
             .join(format!("{project_hash}.jsonl"));
-        let recorded = count_session_events_tail(&events_path, &sid, 400);
+        let recorded = count_session_events_tail(&events_path, sid, 400);
         nudge_escalation_text(work_bytes, recorded)
     })();
     if let Some(extra) = escalation {
@@ -5137,19 +5024,130 @@ fn session_preferences_block() -> String {
     s.trim_end().to_string()
 }
 
-/// How long a resumed or forked conversation must have sat idle before the
-/// active-task reminder earns its place in `additionalContext`. Eight hours —
-/// roughly "picked it up the next day".
-const STALE_RESUME_SECS: u64 = 8 * 60 * 60;
+/// Most characters of a goal the SessionStart line repeats.
+const START_GOAL_MAX: usize = 200;
 
-/// Coarse, human-readable gap ("14h", "3d") for the reminder label.
-fn human_gap(secs: u64) -> String {
-    let hours = secs / 3600;
-    if hours >= 48 {
-        format!("{}d", hours / 24)
-    } else {
-        format!("{hours}h")
+/// The SessionStart line: the open task this session most likely continues —
+/// its own (after a compaction or a resume), else the one the git branch
+/// names, else the folder's latest — and how to resume it. `None` when the
+/// folder has no open task.
+fn session_start_line(
+    conn: &rusqlite::Connection,
+    project_hash: &str,
+    session: Option<&str>,
+    cwd: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    let open: i64 = conn.query_row("SELECT COUNT(*) FROM tasks WHERE status='open'", [], |r| {
+        r.get(0)
+    })?;
+    if open == 0 {
+        return Ok(None);
     }
+
+    let own = match session {
+        Some(sid) => tj_core::db::active_task_for_session(conn, project_hash, sid)?,
+        None => None,
+    };
+    let by_branch = match (&own, git_branch(cwd)) {
+        (None, Some(branch)) => task_for_branch(conn, &branch)?.map(|id| (id, branch)),
+        _ => None,
+    };
+    let (task_id, why) = match (own, by_branch) {
+        (Some(id), _) => (id, "this session's task".to_string()),
+        (None, Some((id, branch))) => (id, format!("the task for branch {branch}")),
+        (None, None) => {
+            let id: String = conn.query_row(
+                "SELECT task_id FROM tasks WHERE status='open' ORDER BY last_event_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?;
+            (id, "the latest open task here".to_string())
+        }
+    };
+
+    let (title, goal): (String, Option<String>) = conn.query_row(
+        "SELECT title, goal FROM tasks WHERE task_id=?1",
+        rusqlite::params![task_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let goal = goal
+        .filter(|g| !g.trim().is_empty())
+        .map(|g| {
+            let short: String = g.chars().take(START_GOAL_MAX).collect();
+            format!(" — goal: {}", short.trim_end().trim_end_matches('.'))
+        })
+        .unwrap_or_default();
+    let others = match open - 1 {
+        0 => String::new(),
+        n => format!(" {n} more open: task_search(status=\"open\")."),
+    };
+
+    Ok(Some(format!(
+        "📓 Task Journal — {why}: {task_id} \"{title}\"{goal}. If this work continues it, resume with task_pack(\"{task_id}\").{others}"
+    )))
+}
+
+/// The open task the branch names: one whose events carry the branch, or
+/// carry (or whose title holds) the issue key in it — `feat/DEV-4621-x`
+/// names DEV-4621. Newest first.
+fn task_for_branch(conn: &rusqlite::Connection, branch: &str) -> anyhow::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+
+    let mut needles = vec![(branch.to_string(), false)];
+    needles.extend(
+        tj_core::artifacts::extract(branch)
+            .linked_issues
+            .into_iter()
+            .map(|issue| (issue, true)),
+    );
+
+    for (needle, by_title) in needles {
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT t.task_id FROM tasks t
+                 WHERE t.status = 'open'
+                   AND ((?3 AND t.title LIKE ?2)
+                        OR EXISTS (SELECT 1 FROM events_index ei
+                                   WHERE ei.task_id = t.task_id AND ei.artifacts LIKE ?1))
+                 ORDER BY t.last_event_at DESC LIMIT 1",
+                rusqlite::params![format!("%\"{needle}\"%"), format!("%{needle}%"), by_title],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if id.is_some() {
+            return Ok(id);
+        }
+    }
+
+    Ok(None)
+}
+
+/// The checked-out branch of the repository holding `dir`, read from its
+/// `HEAD` (a worktree's `.git` file points at its own). `None` outside a
+/// repository or on a detached HEAD.
+fn git_branch(dir: &std::path::Path) -> Option<String> {
+    let git = dir
+        .ancestors()
+        .map(|d| d.join(".git"))
+        .find(|p| p.exists())?;
+    let head = if git.is_dir() {
+        git.join("HEAD")
+    } else {
+        let body = std::fs::read_to_string(&git).ok()?;
+        let gitdir = std::path::Path::new(body.trim().strip_prefix("gitdir:")?.trim());
+        let gitdir = if gitdir.is_absolute() {
+            gitdir.to_path_buf()
+        } else {
+            git.parent()?.join(gitdir)
+        };
+        gitdir.join("HEAD")
+    };
+
+    std::fs::read_to_string(head)
+        .ok()?
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
 }
 
 /// Emit a SessionStart `additionalContext` envelope and nothing else.
@@ -5161,6 +5159,170 @@ fn emit_session_context(ctx: &str) {
         }
     });
     println!("{env}");
+}
+
+/// Takes task-journal's hooks (`ingest-hook`, `nudge`, `recall-hook`) and its
+/// legacy env key out of a settings.json / hooks.json object. Surgical: other
+/// tools' hooks and env entries stay (the old `remove("hooks")` nuked
+/// everyone's — the bxl bug); a matcher, event, `hooks` or `env` block this
+/// leaves empty goes too.
+fn remove_task_journal_hooks(settings: &mut serde_json::Map<String, serde_json::Value>) {
+    let is_ours = |c: &str| {
+        c.contains("task-journal ingest-hook")
+            || c.contains("task-journal nudge")
+            || c.contains("task-journal recall-hook")
+    };
+
+    if let Some(hooks_block) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
+        let kinds: Vec<String> = hooks_block.keys().cloned().collect();
+        for kind in kinds {
+            let Some(arr) = hooks_block.get_mut(&kind).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            // Each entry is { matcher, hooks: [{type, command}, ...] }.
+            for entry in arr.iter_mut() {
+                if let Some(inner) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                    inner.retain(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|c| !is_ours(c))
+                            .unwrap_or(true)
+                    });
+                }
+            }
+            arr.retain(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(true)
+            });
+            if arr.is_empty() {
+                hooks_block.remove(&kind);
+            }
+        }
+        if hooks_block.is_empty() {
+            settings.remove("hooks");
+        }
+    }
+
+    if let Some(env) = settings.get_mut("env").and_then(|v| v.as_object_mut()) {
+        env.remove("TJ_CLASSIFIER_CLI");
+        if env.is_empty() {
+            settings.remove("env");
+        }
+    }
+}
+
+/// Why `event` is noise the classifier filed as reasoning, or `None` when it
+/// stays: only classifier entries of a reasoning type are judged — machine
+/// text of any type, and a rejection that rules no approach out.
+fn cleanup_reason(event: &tj_core::event::Event) -> Option<&'static str> {
+    use tj_core::event::{Author, EventType};
+
+    let reasoning = matches!(
+        event.event_type,
+        EventType::Decision
+            | EventType::Rejection
+            | EventType::Finding
+            | EventType::Evidence
+            | EventType::Hypothesis
+            | EventType::Constraint
+    );
+    // Compaction markers and model switches are the journal's own
+    // bookkeeping, already kept out of packs and recall.
+    if event.author != Author::Classifier || !reasoning || tj_core::db::is_bookkeeping(event) {
+        return None;
+    }
+
+    tj_core::noise::machine_text(&event.text).or_else(|| {
+        (event.event_type == EventType::Rejection
+            && !tj_core::classifier::is_explicit_rejection(&event.text))
+        .then_some("rejection that rules no approach out")
+    })
+}
+
+/// `task-journal cleanup-noise [--dry-run] [--all]`: one bookkeeping
+/// correction per noise entry not corrected yet, so a second run finds
+/// nothing. Prints counts by reason per journal, with samples on a dry run.
+fn run_cleanup_noise(dry_run: bool, all: bool) -> Result<()> {
+    let events_dir = tj_core::paths::events_dir()?;
+    let journals: Vec<std::path::PathBuf> = if all {
+        let mut paths: Vec<_> = std::fs::read_dir(&events_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .collect();
+        paths.sort();
+        paths
+    } else {
+        let hash = tj_core::project_hash::from_path(std::env::current_dir()?)?;
+        vec![events_dir.join(format!("{hash}.jsonl"))]
+    };
+
+    let mut total = 0usize;
+    for path in journals.iter().filter(|p| p.exists()) {
+        let events = read_events_lenient(path, "cleanup-noise")?;
+        let corrected: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|e| e.corrects.as_deref())
+            .collect();
+        let noise: Vec<(&tj_core::event::Event, &str)> = events
+            .iter()
+            .filter(|e| !corrected.contains(e.event_id.as_str()))
+            .filter_map(|e| cleanup_reason(e).map(|why| (e, why)))
+            .collect();
+        if noise.is_empty() {
+            continue;
+        }
+
+        let mut by_reason: std::collections::BTreeMap<&str, Vec<&tj_core::event::Event>> =
+            Default::default();
+        for (e, why) in &noise {
+            by_reason.entry(why).or_default().push(e);
+        }
+        let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("?");
+        println!(
+            "{name}: {} entr{}",
+            noise.len(),
+            if noise.len() == 1 { "y" } else { "ies" }
+        );
+        for (why, list) in &by_reason {
+            println!("  {why}: {}", list.len());
+            if dry_run {
+                for e in list.iter().take(3) {
+                    let sample: String = e.text.chars().take(100).collect();
+                    println!("    {:?}: {}", e.event_type, sample.replace('\n', " "));
+                }
+            }
+        }
+        total += noise.len();
+
+        if !dry_run {
+            let mut writer = tj_core::storage::JsonlWriter::open(path)?;
+            for (e, why) in &noise {
+                let mut fix = tj_core::event::Event::new(
+                    &e.task_id,
+                    tj_core::event::EventType::Correction,
+                    tj_core::event::Author::User,
+                    tj_core::event::Source::Cli,
+                    format!("{} not reasoning: {why}", tj_core::noise::CLEANUP_PREFIX),
+                );
+                fix.corrects = Some(e.event_id.clone());
+                fix.status = tj_core::event::EventStatus::Confirmed;
+                fix.meta = serde_json::json!({ "kind": tj_core::db::NOISE_CLEANUP });
+                writer.append(&fix)?;
+            }
+            writer.flush_durable()?;
+        }
+    }
+
+    match (total, dry_run) {
+        (0, _) => println!("nothing to clean"),
+        (n, true) => println!("{n} entries would be retired; run without --dry-run to retire them"),
+        (n, false) => println!("{n} entries retired"),
+    }
+
+    Ok(())
 }
 
 const CONSOLIDATE_TASK_TITLE: &str = "Project conventions (consolidated)";
@@ -6351,6 +6513,26 @@ fn process_pending_entry(
     Ok(())
 }
 
+/// Whether a classified chunk is worth an event: its text is reasoning, not
+/// a raw tool call, a summary or a notification, and a rejection rules an
+/// approach out in so many words. Whole answers, tool payloads and summaries
+/// filed as rejections were most of what recall later pushed back.
+fn worth_recording(
+    event_type: tj_core::event::EventType,
+    suggested_text: &str,
+    chunk: &str,
+) -> bool {
+    use tj_core::classifier::is_explicit_rejection;
+
+    if tj_core::noise::machine_text(suggested_text).is_some() {
+        return false;
+    }
+
+    event_type != tj_core::event::EventType::Rejection
+        || is_explicit_rejection(suggested_text)
+        || is_explicit_rejection(chunk)
+}
+
 /// What became of one classified chunk.
 enum ChunkOutcome {
     /// An event was written to the journal.
@@ -6438,6 +6620,12 @@ fn classify_chunk(
         recent.push(new_task);
     }
 
+    // A compaction summary or a harness notification is never reasoning; a
+    // tool call still may carry a test result, so it goes on.
+    if kind != "PostToolUse" && tj_core::noise::machine_text(text).is_some() {
+        return Ok(ChunkOutcome::Dropped);
+    }
+
     let author_hint = if kind.contains("UserPrompt") {
         "user"
     } else {
@@ -6458,6 +6646,9 @@ fn classify_chunk(
     let Some(tid) = out.task_id_guess else {
         return Ok(ChunkOutcome::Dropped);
     };
+    if !worth_recording(out.event_type, &out.suggested_text, text) {
+        return Ok(ChunkOutcome::Dropped);
+    }
 
     use tj_core::event::EventType;
     if matches!(out.event_type, EventType::Close) && kind == "Stop" {
@@ -6582,91 +6773,166 @@ fn drain_pending(
 /// Read a Claude Code hook payload from stdin and project it down to
 /// the (kind, text) pair the rest of `ingest-hook` operates on.
 ///
-/// Claude Code passes hook input as a JSON object on stdin. The fields
-/// we care about (per the public hooks spec):
-///
-/// - common: `hook_event_name`
-/// - UserPromptSubmit: `prompt`
-/// - PreToolUse / PostToolUse: `tool_name`, `tool_input`, `tool_response`
-/// - Stop / SessionStart: nothing extra worth ingesting (SessionStart
-///   takes a separate fast path further up)
-///
-/// If stdin is empty (someone runs the command interactively without
-/// piping), we silently return ("Stop", "") so the hook becomes a no-op
-/// instead of erroring — matches the `|| true` safety net in the
-/// installed hook command.
-/// Build a PostToolUse `updatedMCPToolOutput` envelope when an MCP tool call
-/// echoes a prior rejection/decision (claude-memory-7km). Returns None
-/// (pass through, emit nothing) for non-MCP tools, no hits, or any error.
-/// Never panics, never mutates the journal.
-///
-/// Dedup vs claude-memory-60m: this fires ONLY for `mcp__` tools; 60m's
-/// `additionalContext` path skips those. The two are mutually exclusive by
-/// tool type so a single recall is never double-surfaced.
-fn push_recall_envelope(
+/// Least tool calls between two recalls in one session; `TJ_RECALL_EVERY`
+/// overrides it (0 lets every call recall).
+const RECALL_EVERY: u32 = 10;
+
+/// What push-recall may show after one tool call: at most one prior
+/// rejection or decision of the session's active task (or of a task in the
+/// same module) that the call clearly touches — see
+/// `tj_core::recall::recall_for_task`. Each event at most once per session,
+/// and no more often than once every [`RECALL_EVERY`] tool calls. Nothing
+/// without a session id or an active task, and nothing for the journal's own
+/// tools, whose output already is the journal. Best-effort: any error is
+/// silence.
+fn session_recall(
     payload: &serde_json::Value,
     events_path: &std::path::Path,
     project_hash: &str,
     session_id: Option<&str>,
-) -> Option<serde_json::Value> {
-    // MCP-only gate: Claude Code prefixes MCP tools `mcp__<server>__<tool>`.
-    let tool_name = payload.get("tool_name").and_then(|v| v.as_str())?;
-    if !tool_name.starts_with("mcp__") {
-        return None;
-    }
-    if !events_path.exists() {
-        return None;
-    }
-    let query_text = payload
-        .get("tool_input")
-        .map(|v| v.to_string())
+) -> Vec<tj_core::recall::RecallHit> {
+    let tool = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
         .unwrap_or_default();
-    if query_text.trim().is_empty() {
-        return None;
+    let (Some(sid), Ok(state_dir)) = (session_id, tj_core::paths::state_dir()) else {
+        return Vec::new();
+    };
+    if tool.contains("task-journal__") || !events_path.exists() {
+        return Vec::new();
     }
-    let original = payload
-        .get("tool_response")
-        .map(render_tool_response)
-        .unwrap_or_default();
 
-    let state_path = tj_core::paths::state_dir()
-        .ok()?
-        .join(format!("{project_hash}.sqlite"));
-    let conn = tj_core::db::open(&state_path).ok()?;
+    let every = std::env::var("TJ_RECALL_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RECALL_EVERY);
+    let pace = state_dir.join(format!("{project_hash}.recall-pace"));
+    // Calls since the last recall; a session's first call counts as due.
+    let since_last = session_counter(&pace, sid, |n| n.map_or(every, |n| n.saturating_add(1)));
+    if since_last < every {
+        return Vec::new();
+    }
+
+    let Ok(conn) = tj_core::db::open(state_dir.join(format!("{project_hash}.sqlite"))) else {
+        return Vec::new();
+    };
     let _ = tj_core::db::ingest_new_events(&conn, events_path, project_hash);
-    // Reuse 60m's recall engine + threshold — no recall logic lives here.
-    let hits =
-        tj_core::recall::relevant_recall(&conn, &query_text, tj_core::recall::DEFAULT_MAX_HITS)
-            .ok()?;
-    let hits = fresh_recall_hits(hits, session_id, events_path, project_hash);
+    let Ok(Some(task)) = tj_core::db::active_task_for_session(&conn, project_hash, sid) else {
+        return Vec::new();
+    };
+
+    let query = tool_input_text(payload);
+    let hits = tj_core::recall::recall_for_task(&conn, &task, &query, 5).unwrap_or_default();
+    let hits = fresh_recall_hits(
+        hits,
+        Some(sid),
+        events_path,
+        project_hash,
+        tj_core::recall::DEFAULT_MAX_HITS,
+    );
+    if !hits.is_empty() {
+        session_counter(&pace, sid, |_| 0);
+    }
+
+    hits
+}
+
+/// What a tool call did, as text: the string values of its input, without
+/// the JSON keys (`file_path`, `old_string` say nothing about the work) and
+/// without the output (a log or a file's content is not the agent's intent).
+fn tool_input_text(payload: &serde_json::Value) -> String {
+    fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(items) => items.iter().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|x| strings(x, out)),
+            _ => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    if let Some(input) = payload.get("tool_input") {
+        strings(input, &mut parts);
+    }
+
+    parts.join(" ")
+}
+
+/// The PostToolUse `additionalContext` envelope for recall hits, or `None`
+/// without any. Every tool gets the same shape: the hook runs async, and an
+/// async `updatedMCPToolOutput` (the old banner over an MCP tool's output)
+/// never reached the model — besides rewriting other servers' output.
+fn recall_envelope(hits: &[tj_core::recall::RecallHit]) -> Option<serde_json::Value> {
     if hits.is_empty() {
         return None;
     }
-    let updated = format!("{}\n\n{}", render_recall_banner(&hits), original);
+
+    let context = hits
+        .iter()
+        .map(|h| {
+            let verb = match h.event_type {
+                tj_core::event::EventType::Rejection => "previously rejected",
+                _ => "previously decided",
+            };
+            format!("⚠ recall: in task {} you {}: {}", h.task_id, verb, h.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     Some(serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "updatedMCPToolOutput": updated,
-        }
+        "hookSpecificOutput": { "hookEventName": "PostToolUse", "additionalContext": context }
     }))
+}
+
+/// Most `<session> <n>` lines a per-session counter file keeps.
+const SESSION_COUNTER_CAP: usize = 500;
+
+/// Sets `sid`'s counter in `path` (lines `<session> <n>`, newest last) to
+/// `next(current)` and returns the new value. Best-effort: an unreadable file
+/// counts as empty, a failed write is ignored.
+// ponytail: read-modify-write without a lock; two parallel hooks can lose
+// one count, which only shifts the next reminder by a call.
+fn session_counter(
+    path: &std::path::Path,
+    sid: &str,
+    next: impl FnOnce(Option<u32>) -> u32,
+) -> u32 {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    let mut current = None;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        match line.split_once(' ') {
+            Some((s, n)) if s == sid => current = n.parse().ok(),
+            _ => lines.push(line),
+        }
+    }
+
+    let value = next(current);
+    let own = format!("{sid} {value}");
+    lines.push(&own);
+    let keep = &lines[lines.len().saturating_sub(SESSION_COUNTER_CAP)..];
+    let _ = std::fs::write(path, keep.join("\n") + "\n");
+
+    value
 }
 
 /// Most `<session> <event_id>` lines the shown-recall log keeps.
 const RECALL_SHOWN_CAP: usize = 2000;
 
-/// The recall hits still worth pushing to `session_id`: each one at most once
-/// per session (remembered in `<state_dir>/<project>.recall-shown`, newest
-/// [`RECALL_SHOWN_CAP`] lines), and never an event the session wrote on its
-/// current task — the agent just wrote it. Without a session id every hit
-/// passes, as before. Best-effort: an unreadable log never hides a hit.
+/// The first `max` recall hits still worth pushing to `session_id`: each one
+/// at most once per session (remembered in `<state_dir>/<project>.recall-shown`,
+/// newest [`RECALL_SHOWN_CAP`] lines), and never an event the session wrote on
+/// its current task — the agent just wrote it. Without a session id every hit
+/// passes. Best-effort: an unreadable log never hides a hit.
 fn fresh_recall_hits(
     hits: Vec<tj_core::recall::RecallHit>,
     session_id: Option<&str>,
     events_path: &std::path::Path,
     project_hash: &str,
+    max: usize,
 ) -> Vec<tj_core::recall::RecallHit> {
     let Some(sid) = session_id else {
-        return hits;
+        return hits.into_iter().take(max).collect();
     };
     if hits.is_empty() {
         return hits;
@@ -6674,7 +6940,7 @@ fn fresh_recall_hits(
     let Ok(log) =
         tj_core::paths::state_dir().map(|d| d.join(format!("{project_hash}.recall-shown")))
     else {
-        return hits;
+        return hits.into_iter().take(max).collect();
     };
 
     let own = session_task_event_ids(events_path, sid);
@@ -6684,6 +6950,7 @@ fn fresh_recall_hits(
         .into_iter()
         .filter(|h| !own.contains(&h.event_id))
         .filter(|h| !shown.contains(format!("{sid} {}", h.event_id).as_str()))
+        .take(max)
         .collect();
     if fresh.is_empty() {
         return fresh;
@@ -6728,32 +6995,19 @@ fn session_task_event_ids(
         .collect()
 }
 
-/// One ⚠ line per recall hit (mirrors the close-gate / SessionStart convention).
-fn render_recall_banner(hits: &[tj_core::recall::RecallHit]) -> String {
-    let mut s = String::from("\u{26a0} Task Journal recall — you may be repeating a prior path:");
-    for h in hits {
-        let verb = match h.event_type {
-            tj_core::event::EventType::Rejection => "rejected",
-            _ => "decided on",
-        };
-        s.push_str(&format!(
-            "\n  \u{26a0} in task {} you previously {} this: {}",
-            h.task_id, verb, h.text
-        ));
-    }
-    s
-}
-
-/// Collapse a `tool_response` JSON value to the text Claude would have seen.
-/// A bare string is used as-is; any other JSON is stringified (mirrors how
-/// `parse_hook_stdin` stringifies `tool_response`).
-fn render_tool_response(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
+/// Claude Code passes hook input as a JSON object on stdin. The fields
+/// we care about (per the public hooks spec):
+///
+/// - common: `hook_event_name`
+/// - UserPromptSubmit: `prompt`
+/// - PreToolUse / PostToolUse: `tool_name`, `tool_input`, `tool_response`
+/// - Stop / SessionStart: nothing extra worth ingesting (SessionStart
+///   takes a separate fast path further up)
+///
+/// If stdin is empty (someone runs the command interactively without
+/// piping), we silently return ("Stop", "") so the hook becomes a no-op
+/// instead of erroring — matches the `|| true` safety net in the
+/// installed hook command.
 fn parse_hook_stdin() -> anyhow::Result<(String, String, serde_json::Value)> {
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)

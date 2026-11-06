@@ -1,4 +1,29 @@
 {
   "modules": ["./register.tsx"],
-  "hooks": {}
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "task-journal ingest-hook --from-plugin || true", "timeout": 20 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "task-journal ingest-hook --from-plugin || true", "async": true }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "task-journal ingest-hook --from-plugin || true", "async": true }
+        ]
+      }
+    ]
+  }
 }

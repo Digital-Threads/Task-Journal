@@ -261,33 +261,20 @@ fn classify_text_heuristic(task_id: &str, text: &str, timestamp: &str) -> Option
         }
     }
 
-    // Rejection patterns.
-    let rejection_patterns = [
-        "won't work",
-        "doesn't work",
-        "can't use",
-        "не работает",
-        "не подходит",
-        "отказались",
-        "tried but",
-        "rejected",
-        "abandoned",
-    ];
-    for pattern in &rejection_patterns {
-        if lower.contains(pattern) {
-            let mut ev = Event::new(
-                task_id,
-                EventType::Rejection,
-                Author::Agent,
-                Source::Cli,
-                truncate(text, 300),
-            );
-            ev.timestamp = timestamp.to_string();
-            ev.confidence = Some(0.6);
-            ev.status = EventStatus::Suggested;
-            ev.meta = serde_json::json!({"backfill": true, "heuristic": "rejection_keyword"});
-            return Some(ev);
-        }
+    // Only an approach explicitly ruled out, the same rule the classifier uses.
+    if crate::classifier::is_explicit_rejection(text) {
+        let mut ev = Event::new(
+            task_id,
+            EventType::Rejection,
+            Author::Agent,
+            Source::Cli,
+            truncate(text, 300),
+        );
+        ev.timestamp = timestamp.to_string();
+        ev.confidence = Some(0.6);
+        ev.status = EventStatus::Suggested;
+        ev.meta = serde_json::json!({"backfill": true, "heuristic": "rejection_keyword"});
+        return Some(ev);
     }
 
     // Constraint patterns.

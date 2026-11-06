@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Less noise in the agent's context. Measured on 300 sessions: push-recall was
+added to tool results 13,696 times, almost never about the work at hand.
+
+### Changed
+- **Push-recall only on a strong match with the session's task.** A hit must be a
+  rejection or decision the agent or the user recorded (classifier output is not
+  trusted) on the session's active task or a task of the same module, sharing a
+  file, issue or commit with the tool call, or at least three meaningful words —
+  one shared word used to be enough. Paths count as files, not words. No session
+  task, no recall. At most one hit, at most once per ten tool calls of a session
+  (`TJ_RECALL_EVERY`), never for the journal's own tools. It arrives as
+  `additionalContext` for every tool: the async hook's `updatedMCPToolOutput`
+  never reached the model and rewrote other servers' output.
+- **The session start is one line.** It names the open task the session most
+  likely continues — its own after a resume or compaction, else the one the git
+  branch names (the branch, or an issue key in it), else the folder's latest — and
+  how to resume it. Resume packs, honesty scores and chronicle gaps are on request
+  (`task_pack`, `task-journal check`, `module_list`).
+- **No chronicle line in replies or prompts.** `task_create` no longer carries a
+  `chronicle` field, and the mod no longer adds a chronicle reminder to prompts.
+- **Short MCP instructions.** Seven plain lines on what to record and why, without
+  capitals or "NON-NEGOTIABLE".
+- **Hooks ship with the plugin.** `plugin/hooks/hooks.json` wires the session start,
+  push-recall and model switches (`ingest-hook --from-plugin`, never the classifier
+  queue). `install-hooks` for Claude Code now only takes the hooks earlier versions
+  wrote out of `settings.json`, after copying it to
+  `settings.json.task-journal-backup-<time>`; Codex is unchanged. While the mod runs,
+  a hook still left in `settings.json` stands down, so no event is handled twice.
+  `--auto-capture` and `--proactive-recall` no longer apply to Claude Code.
+- **The classic nudge runs on a session's first prompt and then every sixth**
+  (`TJ_NUDGE_EVERY`), not on every prompt, and no longer shouts.
+- **A rejection is an approach ruled out in so many words** ("decided against",
+  "ruled out", "отказались от", "tried X … didn't work"), at most 600 characters.
+  The classifier and `backfill` no longer file bug reports, log lines or whole
+  answers as rejections, and the classifier drops raw tool calls, compaction
+  summaries and notifications instead of recording them.
+
+### Added
+- `task-journal cleanup-noise [--dry-run] [--all]` retires what the classifier once
+  filed as reasoning but is not: raw tool calls, compaction summaries, harness
+  notifications, and rejections that rule no approach out. Each gets a correction
+  (the journal stays append-only), which keeps it out of packs, recall and exports
+  without moving its task up the "newest first" lists. Only classifier entries are
+  touched.
+
 ## [0.31.2] - 2026-10-05
 
 ### Changed

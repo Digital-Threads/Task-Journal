@@ -30,6 +30,19 @@ pub fn try_heuristic(input: &ClassifyInput) -> Option<ClassifyOutput> {
     let lower = text.to_lowercase();
     let task_id_guess = input.recent_tasks.first().map(|t| t.task_id.clone());
 
+    // A rejection first, so "tried X, didn't work; we'll use Y" is not a
+    // decision — but only an explicit one, never from tool output.
+    if !input.tool_output && super::is_explicit_rejection(text) {
+        return Some(ClassifyOutput {
+            event_type: EventType::Rejection,
+            task_id_guess,
+            confidence: 0.85,
+            evidence_strength: None,
+            suggested_text: truncate(text, SUGGESTED_TEXT_MAX),
+            artifacts: None,
+        });
+    }
+
     for (patterns, etype, confidence) in RULES {
         // Tool output is JSON and logs full of "must be" / "requires" /
         // "rejected": only a test result is a reliable signal there.
@@ -52,27 +65,9 @@ pub fn try_heuristic(input: &ClassifyInput) -> Option<ClassifyOutput> {
     None
 }
 
-/// Pattern table. Order matters — rejection should test before decision
-/// because "decided to abandon" should land as Rejection, not Decision.
+/// Pattern table, after the rejection check above. Order matters: the first
+/// rule that matches wins.
 const RULES: &[(&[&str], EventType, f64)] = &[
-    // Rejection: explicit abandonment / "this doesn't work".
-    (
-        &[
-            "won't work",
-            "doesn't work",
-            "didn't work",
-            "rejected",
-            "abandoned",
-            "tried but failed",
-            "tried that, didn't",
-            "не работает",
-            "не подходит",
-            "отказались",
-            "отказался",
-        ],
-        EventType::Rejection,
-        0.85,
-    ),
     // Evidence: test outcomes / experiment results.
     (
         &[
@@ -218,6 +213,34 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(out.event_type, EventType::Rejection);
+    }
+
+    /// A rejection rules an approach out. A bug report, a log line or a long
+    /// answer that merely says "rejected" / "не работает" is not one.
+    #[test]
+    fn only_an_explicit_rejection_is_a_rejection() {
+        for text in [
+            "Decided against the Redis cache: one more service to run for a 5% gain.",
+            "Отказались от chown -R в Dockerfile: веб-корень становится записываемым.",
+            "Попробовал ленивую загрузку, не работает с SSR — оставляем как было.",
+        ] {
+            let out = try_heuristic(&input(text)).unwrap();
+            assert_eq!(out.event_type, EventType::Rejection, "{text}");
+        }
+
+        let long_answer = format!(
+            "Here is the summary of the release. {} The PR was rejected by CI once.",
+            "Details follow. ".repeat(60)
+        );
+        for text in [
+            "The login page doesn't work after the deploy, looking at logs now.",
+            "Тест падает: страница не работает после деплоя, смотрю логи.",
+            "The upload was rejected 2 files because of their size limits.",
+            long_answer.as_str(),
+        ] {
+            let kind = try_heuristic(&input(text)).map(|o| o.event_type);
+            assert_ne!(kind, Some(EventType::Rejection), "{text}");
+        }
     }
 
     #[test]

@@ -7,20 +7,17 @@
 //   its own active task;
 // - shows the task in a band above the prompt and a toast on every entry;
 // - reminds the agent to log only after N turns without an entry;
-// - brings up a project-chronicle gap that opened during the session (the
-//   session start already showed the one it began with);
 // - before a compaction, asks the model (from its own prompt cache) what
 //   was not logged and records it as suggested events.
 //
 // It sets TJ_MOD_ACTIVE=1 for the hooks Claude Code starts, so the classic
 // hooks skip what the mod does here (the reminder, per-message
-// classification, the transcript catch-ups) and keep the rest.
+// classification, the transcript catch-ups), and TJ_PLUGIN_HOOKS=1, so a
+// hook left in settings.json leaves the rest to the plugin's own hooks.
 
 import type { EngineInterface, Register } from 'claude-code'
 
 import {
-  chronicleKeys,
-  chronicleNudge,
   compactInstruction,
   distillPrompt,
   journalTool,
@@ -67,9 +64,6 @@ const mod = {
   pinned: null as string | null,
   turnsSinceEntry: 0,
   workSinceEntry: 0,
-  // Chronicle gaps this session has been told about. Seeded at its start
-  // with every gap the SessionStart hook showed, so none is repeated.
-  chronicleSeen: new Set<string>(),
 }
 
 type CliResult =
@@ -131,10 +125,7 @@ async function refresh($: EngineInterface): Promise<void> {
     return
   }
 
-  if (mod.session !== session) {
-    mod.pinned = null
-    mod.chronicleSeen = new Set(chronicleKeys(state))
-  }
+  if (mod.session !== session) mod.pinned = null
   mod.session = session
   mod.state = state
   mod.pinned = state.active?.task_id ?? null
@@ -218,6 +209,9 @@ export const register: Register = (on, options) => {
     }
 
     mod.cwd = e.cwd
+    // The plugin's hooks run beside the mod; a task-journal hook an earlier
+    // version left in settings.json stands down when it sees this.
+    await $.env.set('TJ_PLUGIN_HOOKS', '1')
     await refresh($)
     if (mod.state !== null) await $.env.set('TJ_MOD_ACTIVE', '1')
 
@@ -231,7 +225,6 @@ export const register: Register = (on, options) => {
     mod.retryAt = 0
     mod.turnsSinceEntry = 0
     mod.workSinceEntry = 0
-    mod.chronicleSeen = new Set()
 
     return next(e)
   })
@@ -276,25 +269,17 @@ export const register: Register = (on, options) => {
     const state = await current($)
     if (state === null) return next(e)
 
-    // Both reminders ride in the prompt's context, never in the system
-    // prompt: a change there would re-send the conversation uncached.
-    const added: string[] = []
-    const chronicle = chronicleNudge(state, mod.chronicleSeen)
-    if (chronicle !== null) {
-      mod.chronicleSeen.add(chronicle.key)
-      added.push(chronicle.text)
-    }
-
+    // The reminder rides in the prompt's context, never in the system
+    // prompt: a change there would re-send the conversation uncached. The
+    // chronicle's gaps are on request (module_list), not reminders.
     mod.turnsSinceEntry += 1
     const isDue =
       nudgeAfter > 0 && mod.turnsSinceEntry > nudgeAfter && (state.active !== null || mod.workSinceEntry > 0)
-    if (isDue) {
-      mod.turnsSinceEntry = 0
-      added.push(nudgeText(state, nudgeAfter))
-    }
-    if (added.length === 0) return next(e)
+    if (!isDue) return next(e)
 
-    return next({ ...e, context: [...(e.context ?? []), ...added] })
+    mod.turnsSinceEntry = 0
+
+    return next({ ...e, context: [...(e.context ?? []), nudgeText(state, nudgeAfter)] })
   })
 
   on('tool.call', async ($, e, next) => {
