@@ -42,8 +42,8 @@ added to tool results 13,696 times, almost never about the work at hand.
   sets `TJ_PLUGIN_HOOKS`), a hook, `nudge` or `recall-hook` still left in
   `settings.json` stands down, and a model switch is recorded once even where both
   run (Claude Code without the mod). `--auto-capture` and `--proactive-recall` no
-  longer apply to Claude Code, and `/rewind` in a prompt is no longer recorded there
-  (the built-in command never reached the hook).
+  longer apply to Claude Code, and `/rewind` typed in a prompt is no longer recorded
+  there.
 - **The classic nudge runs on a session's first prompt and then every sixth**
   (`TJ_NUDGE_EVERY`), not on every prompt, and no longer shouts.
 - **Rejections.** The keyword heuristic and `backfill` file a rejection only for an
